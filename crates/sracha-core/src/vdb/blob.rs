@@ -1192,16 +1192,11 @@ fn decode_types(n: usize, src: &[u8]) -> Vec<u8> {
 ///
 /// Returns the decoded integers as a byte vector in native (little-endian)
 /// format, with `num_elements * (elem_bits / 8)` bytes.
-pub fn izip_decode(data: &[u8], elem_bits: u32, num_elements: u32) -> Result<Vec<u8>> {
+pub fn izip_decode(data: &[u8], elem_bits: u32, _num_elements_hint: u32) -> Result<Vec<u8>> {
     let encoded = deserialize_izip_encoded(data)?;
-    let n = num_elements as usize;
-
-    if encoded.data_count as usize != n {
-        return Err(Error::Vdb(format!(
-            "izip: data_count ({}) != num_elements ({n})",
-            encoded.data_count
-        )));
-    }
+    // Use the data_count from the izip header as the authoritative element count.
+    // The caller's hint may not match (e.g., blob id_range vs actual element count).
+    let n = encoded.data_count as usize;
 
     let enc_type = encoded.flags & 0x03;
     let _size_type = ((encoded.flags >> 2) & 3) as u32;

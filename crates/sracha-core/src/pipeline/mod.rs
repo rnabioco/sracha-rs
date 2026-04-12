@@ -167,8 +167,16 @@ fn decode_and_write(
     // ------------------------------------------------------------------
 
     /// Decode a raw blob, stripping envelope/headers/page_map.
-    fn decode_raw(raw: &[u8], row_count: u64) -> Result<blob::DecodedBlob> {
-        blob::decode_blob(raw, 0, row_count, 8) // skip CRC for now
+    fn decode_raw(raw: &[u8], checksum_type: u8, row_count: u64) -> Result<blob::DecodedBlob> {
+        // Strip CRC bytes from the end but skip validation for now.
+        // The CRC computation boundary needs further investigation.
+        let cs_size: usize = match checksum_type {
+            1 => 4,  // CRC32
+            2 => 16, // MD5
+            _ => 0,
+        };
+        let effective = if raw.len() > cs_size { &raw[..raw.len() - cs_size] } else { raw };
+        blob::decode_blob(effective, 0, row_count, 8)
     }
 
     // Concatenate all decoded data across all blobs for each column.
@@ -177,9 +185,10 @@ fn decode_and_write(
     let mut all_read_len_data = Vec::new();
 
     // Decode all READ blobs → 2na packed data → unpack to ASCII.
+    let read_cs = cursor.read_col().meta().checksum_type;
     for blob_loc in cursor.read_col().blobs() {
         let raw = cursor.read_col().read_raw_blob_for_row(blob_loc.start_id)?;
-        let decoded = decode_raw(&raw, blob_loc.id_range as u64)?;
+        let decoded = decode_raw(&raw, read_cs, blob_loc.id_range as u64)?;
         // READ is 2na packed: unpack to ASCII bases.
         let bases = crate::vdb::encoding::unpack_2na(&decoded.data, decoded.data.len() * 4);
         all_read_data.extend_from_slice(&bases);
@@ -187,9 +196,10 @@ fn decode_and_write(
 
     // Decode all QUALITY blobs.
     if let Some(qcol) = cursor.quality_col() {
+        let qcs = qcol.meta().checksum_type;
         for blob_loc in qcol.blobs() {
             let raw = qcol.read_raw_blob_for_row(blob_loc.start_id)?;
-            let decoded = decode_raw(&raw, blob_loc.id_range as u64)?;
+            let decoded = decode_raw(&raw, qcs, blob_loc.id_range as u64)?;
             // Quality may be raw phred values or already phred+33.
             all_quality_data.extend_from_slice(&decoded.data);
         }
@@ -197,9 +207,10 @@ fn decode_and_write(
 
     // Decode all READ_LEN blobs → izip → u32 lengths.
     if let Some(rlcol) = cursor.read_len_col() {
+        let rlcs = rlcol.meta().checksum_type;
         for blob_loc in rlcol.blobs() {
             let raw = rlcol.read_raw_blob_for_row(blob_loc.start_id)?;
-            let decoded = decode_raw(&raw, blob_loc.id_range as u64)?;
+            let decoded = decode_raw(&raw, rlcs, blob_loc.id_range as u64)?;
             // READ_LEN uses izip encoding: decode to u32 values.
             // Use row_length from blob envelope (= total elements) or compute from data bits.
             let num_elems = decoded.row_length
