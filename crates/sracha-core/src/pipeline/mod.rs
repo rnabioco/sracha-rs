@@ -195,33 +195,61 @@ fn decode_and_write(
     }
 
     // Decode all QUALITY blobs.
+    // QUALITY uses zip_encoding = zlib of raw phred values, or irzip for some files.
     if let Some(qcol) = cursor.quality_col() {
         let qcs = qcol.meta().checksum_type;
         for blob_loc in qcol.blobs() {
             let raw = qcol.read_raw_blob_for_row(blob_loc.start_id)?;
             let decoded = decode_raw(&raw, qcs, blob_loc.id_range as u64)?;
-            // Quality may be raw phred values or already phred+33.
-            all_quality_data.extend_from_slice(&decoded.data);
+
+            let hdr_version = decoded.headers.first().map(|h| h.version).unwrap_or(0);
+
+            // QUALITY uses zip_encoding (plain zlib), not izip.
+            // Try raw deflate decompression first; fall back to raw bytes.
+            use std::io::Read;
+            let mut decoder = flate2::read::DeflateDecoder::new(decoded.data.as_slice());
+            let mut decompressed = Vec::new();
+            if decoder.read_to_end(&mut decompressed).is_ok() && !decompressed.is_empty() {
+                all_quality_data.extend_from_slice(&decompressed);
+            } else {
+                // Not compressed — use raw bytes (might already be phred values)
+                all_quality_data.extend_from_slice(&decoded.data);
+            }
         }
     }
 
-    // Decode all READ_LEN blobs → izip → u32 lengths.
+    // Decode all READ_LEN blobs → izip/irzip → u32 lengths.
     if let Some(rlcol) = cursor.read_len_col() {
         let rlcs = rlcol.meta().checksum_type;
         for blob_loc in rlcol.blobs() {
             let raw = rlcol.read_raw_blob_for_row(blob_loc.start_id)?;
             let decoded = decode_raw(&raw, rlcs, blob_loc.id_range as u64)?;
-            // READ_LEN uses izip encoding: decode to u32 values.
-            // Use row_length from blob envelope (= total elements) or compute from data bits.
-            let num_elems = decoded.row_length
-                .unwrap_or_else(|| (decoded.data.len() as u64 * 8) / 32)
-                as u32;
-            tracing::debug!(
-                "READ_LEN blob: {} bytes decoded data, row_length={:?}, id_range={}, using num_elems={}, first_bytes={:02x?}",
-                decoded.data.len(), decoded.row_length, blob_loc.id_range, num_elems,
-                &decoded.data[..decoded.data.len().min(20)],
-            );
-            let decoded_ints = blob::izip_decode(&decoded.data, 32, num_elems)?;
+
+            // Check blob header version to determine izip vs irzip.
+            let hdr_version = decoded.headers.first().map(|h| h.version).unwrap_or(0);
+
+            let decoded_ints = if hdr_version >= 1 {
+                // irzip v1+: plane-based zlib with min/slope from header
+                let hdr = &decoded.headers[0];
+                let planes = hdr.ops.first().copied().unwrap_or(0xFF);
+                let min = hdr.args.first().copied().unwrap_or(0);
+                let slope = hdr.args.get(1).copied().unwrap_or(0);
+                let num_elems = (hdr.osize as u32) / 4; // osize is in bytes, u32 = 4 bytes
+
+                tracing::debug!(
+                    "READ_LEN irzip: {} bytes data, hdr_ver={}, planes=0x{:02x}, min={}, slope={}, num_elems={}",
+                    decoded.data.len(), hdr_version, planes, min, slope, num_elems,
+                );
+
+                blob::irzip_decode(&decoded.data, 32, num_elems, min, slope, planes)?
+            } else {
+                // izip v0: traditional format
+                let num_elems = decoded.row_length
+                    .unwrap_or_else(|| (decoded.data.len() as u64 * 8) / 32)
+                    as u32;
+                blob::izip_decode(&decoded.data, 32, num_elems)?
+            };
+
             all_read_len_data.extend_from_slice(&decoded_ints);
         }
     }

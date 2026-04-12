@@ -1440,6 +1440,86 @@ fn write_element(output: &mut [u8], idx: usize, val: i64, elem_bits: u32) {
 }
 
 // ---------------------------------------------------------------------------
+// irzip decode (v2 integer compression — plane-based zlib)
+// ---------------------------------------------------------------------------
+
+/// Decode irzip-compressed integers (v2 format used for READ_LEN, READ_START, etc.).
+///
+/// The irzip format compresses integer arrays by splitting each value into
+/// byte-planes, zlib-compressing each plane independently, then reconstructing
+/// values by OR-ing the planes back together with min/slope adjustment.
+///
+/// Parameters from the blob header:
+/// - `min`: minimum value offset (added to each decoded value)
+/// - `slope`: linear prediction slope (applied as `val + i * slope`)
+/// - `planes`: bitmask indicating which byte-planes are present
+/// - `num_elements`: number of output elements
+pub fn irzip_decode(
+    data: &[u8],
+    elem_bits: u32,
+    num_elements: u32,
+    min: i64,
+    slope: i64,
+    planes: u8,
+) -> Result<Vec<u8>> {
+    let n = num_elements as usize;
+    let out_bytes = (elem_bits / 8) as usize;
+
+    // Decompress each byte-plane from concatenated zlib streams.
+    let mut values = vec![0i64; n];
+    let mut offset = 0usize;
+    let mut first_plane = true;
+
+    for bit in 0..8u32 {
+        let mask = 1u8 << bit;
+        if planes & mask == 0 {
+            continue;
+        }
+
+        // Each plane is a separate raw-deflate stream producing N bytes.
+        let remaining = &data[offset..];
+        let mut decoder = flate2::read::DeflateDecoder::new(remaining);
+        let mut plane_bytes = vec![0u8; n];
+        use std::io::Read;
+        let bytes_read = decoder.read(&mut plane_bytes).map_err(|e| {
+            Error::Vdb(format!("irzip: deflate decompression of plane {bit} failed: {e}"))
+        })?;
+        if bytes_read < n {
+            // Partial decompress — pad with zeros.
+            tracing::warn!(
+                "irzip plane {bit}: decompressed {bytes_read} of {n} expected bytes"
+            );
+        }
+
+        // How many compressed bytes were consumed?
+        let consumed = decoder.total_in() as usize;
+        offset += consumed;
+
+        // OR this plane's bytes into the values.
+        let shift = bit * 8;
+        if first_plane {
+            for i in 0..n {
+                values[i] = (plane_bytes[i] as i64) << shift;
+            }
+            first_plane = false;
+        } else {
+            for i in 0..n {
+                values[i] |= (plane_bytes[i] as i64) << shift;
+            }
+        }
+    }
+
+    // Apply min and slope: Y[i] = decoded[i] + min + i * slope
+    let mut output = vec![0u8; n * out_bytes];
+    for i in 0..n {
+        let val = values[i] + min + (i as i64) * slope;
+        write_element(&mut output, i, val, elem_bits);
+    }
+
+    Ok(output)
+}
+
+// ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
 
