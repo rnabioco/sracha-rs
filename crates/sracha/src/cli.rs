@@ -113,9 +113,9 @@ pub struct FastqArgs {
     #[arg(long, default_value_t = 6, value_parser = clap::value_parser!(u32).range(1..=9))]
     pub gzip_level: u32,
 
-    /// Number of threads
-    #[arg(short, long)]
-    pub threads: Option<usize>,
+    /// Number of threads for decode [default: 8]
+    #[arg(short, long, default_value_t = 8)]
+    pub threads: usize,
 
     /// Minimum read length
     #[arg(long)]
@@ -168,9 +168,9 @@ pub struct GetArgs {
     #[arg(long, default_value_t = 6, value_parser = clap::value_parser!(u32).range(1..=9))]
     pub gzip_level: u32,
 
-    /// Number of threads
-    #[arg(short, long)]
-    pub threads: Option<usize>,
+    /// Number of threads for decode [default: 8]
+    #[arg(short, long, default_value_t = 8)]
+    pub threads: usize,
 
     /// HTTP connections per file
     #[arg(long, default_value_t = 8)]

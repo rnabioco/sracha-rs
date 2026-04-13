@@ -37,8 +37,8 @@ pub struct PipelineConfig {
     pub gzip: bool,
     /// Gzip compression level (1-9).
     pub gzip_level: u32,
-    /// Number of threads for compression (None = all cores).
-    pub threads: Option<usize>,
+    /// Number of threads for decode/compression.
+    pub threads: usize,
     /// Number of parallel HTTP connections for downloading.
     pub connections: usize,
     /// Skip technical reads.
@@ -529,14 +529,15 @@ fn decode_and_write(
     //   1. Read raw bytes sequentially (disk I/O, ColumnReader is !Send).
     //   2. Decode all blobs in the batch in parallel (CPU-bound, rayon).
     //   3. Write FASTQ output sequentially (I/O, preserves order).
-    //
-    // Physical encodings:
-    //   READ:     INSDC:2na:packed (2 bits/base, 4 bases/byte)
-    //   QUALITY:  zip_encoding of phred scores (raw-deflate-compressed u8 array)
-    //   READ_LEN: izip_encoding of u32 values
-    //   READ_TYPE: zip_encoding of u8 values
-    //   NAME:     zip_encoding of ASCII bytes
     // ------------------------------------------------------------------
+
+    // Build a scoped rayon thread pool with the requested thread count.
+    let num_threads = config.threads;
+    let pool = rayon::ThreadPoolBuilder::new()
+        .num_threads(num_threads)
+        .build()
+        .map_err(|e| Error::Vdb(format!("failed to build rayon thread pool: {e}")))?;
+    tracing::info!("{accession}: using {num_threads} threads for decode");
 
     let fastq_config = FastqConfig {
         split_mode: config.split_mode,
@@ -664,19 +665,21 @@ fn decode_and_write(
             }
         }
 
-        let decoded_batches: Vec<Result<Vec<SpotRecord>>> = raw_batch
-            .par_iter()
-            .enumerate()
-            .map(|(i, raw)| {
-                decode_blob_to_spots(
-                    raw,
-                    read_cs,
-                    is_lite,
-                    blob_idx + i,
-                    spots_before_per_blob[i],
-                )
-            })
-            .collect();
+        let decoded_batches: Vec<Result<Vec<SpotRecord>>> = pool.install(|| {
+            raw_batch
+                .par_iter()
+                .enumerate()
+                .map(|(i, raw)| {
+                    decode_blob_to_spots(
+                        raw,
+                        read_cs,
+                        is_lite,
+                        blob_idx + i,
+                        spots_before_per_blob[i],
+                    )
+                })
+                .collect()
+        });
 
         // Drop raw bytes now that decoding is done to free memory.
         drop(raw_batch);

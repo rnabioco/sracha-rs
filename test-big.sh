@@ -7,12 +7,14 @@
 
 set -euo pipefail
 
+export RAYON_NUM_THREADS=${SLURM_CPUS_PER_TASK}
+
 echo "Starting sracha get SRR17778108 at $(date)"
-echo "Cores: $SLURM_CPUS_PER_TASK"
+echo "Cores: $SLURM_CPUS_PER_TASK, RAYON_NUM_THREADS=$RAYON_NUM_THREADS"
 
 time ./target/release/sracha get SRR17778108 \
     -O /tmp/sracha-big-${SLURM_JOB_ID} \
-    --force --no-gzip
+    --force --no-gzip -t ${SLURM_CPUS_PER_TASK}
 
 echo "Done at $(date)"
 ls -lh /tmp/sracha-big-${SLURM_JOB_ID}/
