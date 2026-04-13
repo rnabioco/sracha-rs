@@ -156,9 +156,10 @@ impl VdbCursor {
 /// This function detects which layout is present and returns the path to the
 /// `col/` directory containing the column subdirectories.
 fn find_sequence_col_base<R: Read + Seek>(archive: &KarArchive<R>) -> Result<String> {
-    // Strategy 1: look for database-style `*/tbl/SEQUENCE/col` directory.
+    // Strategy 1: look for database-style `tbl/SEQUENCE/col` directory.
+    // May be at root (`tbl/SEQUENCE/col`) or under a prefix (`SRR.../tbl/SEQUENCE/col`).
     for path in archive.entries().keys() {
-        if path.ends_with("/tbl/SEQUENCE/col")
+        if (path == "tbl/SEQUENCE/col" || path.ends_with("/tbl/SEQUENCE/col"))
             && matches!(
                 archive.entries().get(path.as_str()),
                 Some(crate::vdb::kar::KarEntry::Directory)
@@ -168,8 +169,11 @@ fn find_sequence_col_base<R: Read + Seek>(archive: &KarArchive<R>) -> Result<Str
         }
     }
 
-    // Strategy 2: look for `*/tbl/SEQUENCE/col/` prefix in any entry.
+    // Strategy 2: look for `tbl/SEQUENCE/col/` prefix in any entry.
     for path in archive.entries().keys() {
+        if path.starts_with("tbl/SEQUENCE/col/") {
+            return Ok("tbl/SEQUENCE/col".to_string());
+        }
         if let Some(idx) = path.find("/tbl/SEQUENCE/col/") {
             let base = &path[..idx + "/tbl/SEQUENCE/col".len()];
             return Ok(base.to_string());
