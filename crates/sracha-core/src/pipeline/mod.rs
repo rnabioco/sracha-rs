@@ -577,112 +577,92 @@ fn decode_and_write(
     );
 
     /// Number of blobs per batch for parallel decode.
-    const BATCH_SIZE: usize = 256;
+    const BATCH_SIZE: usize = 1024;
 
     let mut blob_idx: usize = 0;
     while blob_idx < num_blobs {
         let batch_end = (blob_idx + BATCH_SIZE).min(num_blobs);
         let batch_len = batch_end - blob_idx;
 
-        // ==============================================================
-        // Step 1: Read raw blob bytes sequentially (I/O bound).
-        // ColumnReader holds RefCell<File> and is !Send, so all disk
-        // reads must happen here on the main thread.
-        // ==============================================================
-        let mut raw_batch: Vec<RawBlobData> = Vec::with_capacity(batch_len);
-
-        for bi in blob_idx..batch_end {
-            // READ column (always present).
-            let read_blob = &cursor.read_col().blobs()[bi];
-            let read_raw = cursor.read_col().read_raw_blob_for_row(read_blob.start_id)?;
-            let read_id_range = read_blob.id_range as u64;
-
-            // QUALITY column.
-            let (q_raw, q_id_range) = if has_quality && bi < quality_blob_count {
-                let qcol = cursor.quality_col().unwrap();
-                let qblob = &qcol.blobs()[bi];
-                let qraw = qcol.read_raw_blob_for_row(qblob.start_id)?;
-                (qraw, qblob.id_range as u64)
-            } else {
-                (Vec::new(), 0)
-            };
-
-            // READ_LEN column.
-            let (rl_raw, rl_id_range) = if has_read_len && bi < read_len_blob_count {
-                let rlcol = cursor.read_len_col().unwrap();
-                let rlblob = &rlcol.blobs()[bi];
-                let rlraw = rlcol.read_raw_blob_for_row(rlblob.start_id)?;
-                (rlraw, rlblob.id_range as u64)
-            } else {
-                (Vec::new(), 0)
-            };
-
-            // NAME column.
-            let (n_raw, n_id_range) = if has_name && bi < name_blob_count {
-                let ncol = cursor.name_col().unwrap();
-                let nblob = &ncol.blobs()[bi];
-                let nraw = ncol.read_raw_blob_for_row(nblob.start_id)?;
-                (nraw, nblob.id_range as u64)
-            } else {
-                (Vec::new(), 0)
-            };
-
-            raw_batch.push(RawBlobData {
-                read_raw,
-                read_id_range,
-                quality_raw: q_raw,
-                quality_id_range: q_id_range,
-                quality_cs,
-                read_len_raw: rl_raw,
-                read_len_id_range: rl_id_range,
-                read_len_cs,
-                name_raw: n_raw,
-                name_id_range: n_id_range,
-                name_cs,
-                has_read_len,
-                has_name,
-            });
-        }
-
-        // ==============================================================
-        // Step 2: Decode all blobs in the batch in parallel (CPU bound).
-        //
-        // We pre-compute a cumulative spot offset for each blob so that
-        // synthetic fallback names are globally unique even though blobs
-        // are decoded independently.
-        // ==============================================================
-
-        // Pre-compute per-blob spots_before offsets. We use the id_range
-        // as a conservative upper bound; the actual spot count may be
-        // fewer (if some rows are skipped due to overruns), but for
-        // synthetic name numbering this is acceptable.
+        // Pre-compute per-blob spots_before offsets for synthetic naming.
         let mut spots_before_per_blob: Vec<u64> = Vec::with_capacity(batch_len);
         {
             let mut cumulative = spots_read;
-            for raw in &raw_batch {
+            for bi in blob_idx..batch_end {
                 spots_before_per_blob.push(cumulative);
-                cumulative += raw.read_id_range;
+                cumulative += cursor.read_col().blobs()[bi].id_range as u64;
             }
         }
 
+        // ==============================================================
+        // Fully parallel: read from mmap + decode on rayon workers.
+        //
+        // With mmap, ColumnReader is Send+Sync — blob reads are just
+        // memory slices with zero syscalls. Each rayon worker reads its
+        // own blob data directly from the shared mmap.
+        // ==============================================================
         let decoded_batches: Vec<Result<Vec<SpotRecord>>> = pool.install(|| {
-            raw_batch
-                .par_iter()
+            (blob_idx..batch_end)
+                .into_par_iter()
                 .enumerate()
-                .map(|(i, raw)| {
+                .map(|(i, bi)| {
+                    // Read raw bytes from mmap (zero-copy slice → Vec).
+                    let read_blob = &cursor.read_col().blobs()[bi];
+                    let read_raw = cursor.read_col().read_raw_blob_for_row(read_blob.start_id)?;
+                    let read_id_range = read_blob.id_range as u64;
+
+                    let (q_raw, q_id_range) = if has_quality && bi < quality_blob_count {
+                        let qcol = cursor.quality_col().unwrap();
+                        let qblob = &qcol.blobs()[bi];
+                        (qcol.read_raw_blob_for_row(qblob.start_id)?, qblob.id_range as u64)
+                    } else {
+                        (Vec::new(), 0)
+                    };
+
+                    let (rl_raw, rl_id_range) = if has_read_len && bi < read_len_blob_count {
+                        let rlcol = cursor.read_len_col().unwrap();
+                        let rlblob = &rlcol.blobs()[bi];
+                        (rlcol.read_raw_blob_for_row(rlblob.start_id)?, rlblob.id_range as u64)
+                    } else {
+                        (Vec::new(), 0)
+                    };
+
+                    let (n_raw, n_id_range) = if has_name && bi < name_blob_count {
+                        let ncol = cursor.name_col().unwrap();
+                        let nblob = &ncol.blobs()[bi];
+                        (ncol.read_raw_blob_for_row(nblob.start_id)?, nblob.id_range as u64)
+                    } else {
+                        (Vec::new(), 0)
+                    };
+
+                    let raw = RawBlobData {
+                        read_raw,
+                        read_id_range,
+                        quality_raw: q_raw,
+                        quality_id_range: q_id_range,
+                        quality_cs,
+                        read_len_raw: rl_raw,
+                        read_len_id_range: rl_id_range,
+                        read_len_cs,
+                        name_raw: n_raw,
+                        name_id_range: n_id_range,
+                        name_cs,
+                        has_read_len,
+                        has_name,
+                    };
+
                     decode_blob_to_spots(
-                        raw,
+                        &raw,
                         read_cs,
                         is_lite,
-                        blob_idx + i,
+                        bi,
                         spots_before_per_blob[i],
                     )
                 })
                 .collect()
         });
 
-        // Drop raw bytes now that decoding is done to free memory.
-        drop(raw_batch);
+        // Raw blob data was decoded inside the parallel closure and dropped.
 
         // ==============================================================
         // Step 3: Write FASTQ output sequentially (I/O, maintains order).
