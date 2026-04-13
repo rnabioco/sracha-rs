@@ -309,6 +309,10 @@ struct RawBlobData<'a> {
     has_name: bool,
     /// Whether there is a READ_TYPE column at all.
     has_read_type: bool,
+    /// Reads-per-spot from table metadata (fallback when READ_LEN absent).
+    metadata_reads_per_spot: Option<usize>,
+    /// Fixed spot length in bases (from READ column page_size).
+    fixed_spot_len: Option<u32>,
 }
 
 /// Decode a single blob and produce FASTQ records directly.
@@ -443,17 +447,96 @@ fn decode_blob_to_fastq(
 
             (lengths, rps)
         } else if !raw.has_read_len {
+            // No READ_LEN column — use page map for per-spot lengths and
+            // metadata for reads_per_spot (defaults to 1 if unknown).
+            let meta_rps = raw.metadata_reads_per_spot.unwrap_or(1);
             if let Some(ref pm) = read_page_map {
+                if blob_idx == 0 {
+                    tracing::info!(
+                        "READ page_map (no READ_LEN): lengths={:?}, leng_runs={:?}, data_recs={}",
+                        &pm.lengths[..pm.lengths.len().min(10)],
+                        &pm.leng_runs[..pm.leng_runs.len().min(10)],
+                        pm.data_recs,
+                    );
+                }
                 let mut row_lengths = Vec::new();
+                // Determine the expected per-spot length from the most
+                // common (smallest reasonable) page-map entry.
+                let typical_spot_len = pm
+                    .lengths
+                    .iter()
+                    .copied()
+                    .filter(|&l| l > 0 && l <= 100_000)
+                    .min()
+                    .unwrap_or(0);
+
                 for (len, run) in pm.lengths.iter().zip(pm.leng_runs.iter()) {
                     for _ in 0..*run {
-                        if *len > 100_000 {
-                            continue;
+                        if *len <= 100_000 || typical_spot_len == 0 {
+                            // Normal per-spot entry: split into reads.
+                            let spot_len = *len;
+                            if meta_rps > 1 && spot_len > 0 {
+                                let per_read = spot_len / meta_rps as u32;
+                                for r in 0..meta_rps as u32 {
+                                    if r < meta_rps as u32 - 1 {
+                                        row_lengths.push(per_read);
+                                    } else {
+                                        row_lengths.push(spot_len - per_read * r);
+                                    }
+                                }
+                            } else {
+                                row_lengths.push(spot_len);
+                            }
+                        } else {
+                            // Blob-aggregate entry: split into individual
+                            // spots using the typical spot length.
+                            let n_spots = *len / typical_spot_len;
+                            let remainder = *len - n_spots * typical_spot_len;
+                            for s in 0..n_spots {
+                                let spot_len = if s == n_spots - 1 {
+                                    typical_spot_len + remainder
+                                } else {
+                                    typical_spot_len
+                                };
+                                if meta_rps > 1 {
+                                    let per_read = spot_len / meta_rps as u32;
+                                    for r in 0..meta_rps as u32 {
+                                        if r < meta_rps as u32 - 1 {
+                                            row_lengths.push(per_read);
+                                        } else {
+                                            row_lengths.push(spot_len - per_read * r);
+                                        }
+                                    }
+                                } else {
+                                    row_lengths.push(spot_len);
+                                }
+                            }
                         }
-                        row_lengths.push(*len);
                     }
                 }
-                (row_lengths, 1)
+                (row_lengths, meta_rps)
+            } else if let Some(spot_len) = raw.fixed_spot_len.filter(|_| meta_rps > 1) {
+                // No page map but we know the fixed spot length from the
+                // READ column metadata. Split blob into uniform spots.
+                let total = read_data.len() as u32;
+                let n_spots = total / spot_len.max(1);
+                let mut row_lengths = Vec::with_capacity(n_spots as usize * meta_rps);
+                for s in 0..n_spots {
+                    let sl = if s < n_spots - 1 {
+                        spot_len
+                    } else {
+                        total - spot_len * s
+                    };
+                    let per_read = sl / meta_rps as u32;
+                    for r in 0..meta_rps as u32 {
+                        if r < meta_rps as u32 - 1 {
+                            row_lengths.push(per_read);
+                        } else {
+                            row_lengths.push(sl - per_read * r);
+                        }
+                    }
+                }
+                (row_lengths, meta_rps)
             } else {
                 (vec![read_data.len() as u32], 1)
             }
@@ -803,10 +886,31 @@ fn decode_and_write(
     let read_type_blob_count = cursor.read_type_col().map_or(0, |c| c.blob_count());
     let read_type_cs = cursor.read_type_col().map_or(0, |c| c.meta().checksum_type);
 
+    let metadata_reads_per_spot = cursor.metadata_reads_per_spot();
+
+    // For SRA-lite files without READ_LEN, determine the fixed spot length
+    // by reading blob 0's page map.
+    let fixed_spot_len: Option<u32> = if !has_read_len && num_blobs > 0 {
+        let blob0_info = &cursor.read_col().blobs()[0];
+        let blob0_raw = cursor.read_col().read_raw_blob_slice(blob0_info.start_id)?;
+        let blob0_id_range = blob0_info.id_range as u64;
+        let decoded = decode_raw(blob0_raw, read_cs, blob0_id_range)?;
+        decoded
+            .page_map
+            .as_ref()
+            .and_then(|pm| pm.lengths.iter().copied().find(|&l| l > 0 && l <= 100_000))
+    } else {
+        None
+    };
+    if let Some(fsl) = fixed_spot_len {
+        tracing::info!("fixed_spot_len={fsl} (from blob 0 page map)");
+    }
+
     tracing::info!(
         "{accession}: has_read_len={has_read_len} (blobs={read_len_blob_count}), \
          has_read_type={has_read_type} (blobs={read_type_blob_count}), \
-         has_name={has_name}, has_quality={has_quality}",
+         has_name={has_name}, has_quality={has_quality}, \
+         metadata_rps={metadata_reads_per_spot:?}",
     );
     tracing::info!("{accession}: streaming decode of {num_blobs} blobs (batch-parallel)",);
 
@@ -987,6 +1091,8 @@ fn decode_and_write(
                             has_read_len,
                             has_name,
                             has_read_type,
+                            metadata_reads_per_spot,
+                            fixed_spot_len,
                         };
 
                         decode_blob_to_fastq(
