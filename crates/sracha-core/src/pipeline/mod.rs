@@ -13,7 +13,6 @@ use std::collections::HashMap;
 use std::io::Write;
 use std::path::PathBuf;
 
-use crate::compress::{DEFAULT_BLOCK_SIZE, ParGzWriter};
 use flate2::write::GzEncoder;
 use crate::download::{DownloadConfig, download_file};
 use crate::error::{Error, Result};
@@ -148,15 +147,12 @@ fn decode_and_write(
     let mut archive = KarArchive::open(std::io::BufReader::new(file))?;
     let cursor = VdbCursor::open(&mut archive)?;
 
-    let _first_row = cursor.first_row();
-    let _has_quality = cursor.has_quality();
-
     // ------------------------------------------------------------------
-    // Decode blobs and produce FASTQ output.
+    // Streaming blob-by-blob decode and FASTQ output.
     //
-    // Strategy: iterate through READ column blobs. For each blob, decode
-    // the physical encoding (2na packed DNA → ASCII), then output FASTQ.
-    // Corresponding QUALITY blobs are decoded in parallel for each blob.
+    // Instead of loading all blobs into memory at once, process one blob
+    // index at a time: decode READ, QUALITY, and READ_LEN for that blob,
+    // split into reads, write FASTQ, then free the data before moving on.
     //
     // Physical encodings:
     //   READ:     INSDC:2na:packed (2 bits/base, 4 bases/byte)
@@ -167,8 +163,6 @@ fn decode_and_write(
 
     /// Decode a raw blob, stripping envelope/headers/page_map.
     fn decode_raw(raw: &[u8], checksum_type: u8, row_count: u64) -> Result<blob::DecodedBlob> {
-        // Strip CRC bytes from the end but skip validation for now.
-        // The CRC computation boundary needs further investigation.
         let cs_size: usize = match checksum_type {
             1 => 4,  // CRC32
             2 => 16, // MD5
@@ -182,164 +176,6 @@ fn decode_and_write(
         blob::decode_blob(effective, 0, row_count, 8)
     }
 
-    // ------------------------------------------------------------------
-    // Parallel blob decode with rayon.
-    // Collect raw blobs (sequential I/O), then decode in parallel.
-    // ------------------------------------------------------------------
-    use rayon::prelude::*;
-
-    // Step 1: Collect raw blob bytes (sequential — disk I/O).
-    let read_raw: Vec<_> = cursor.read_col().blobs().iter()
-        .map(|b| (cursor.read_col().read_raw_blob_for_row(b.start_id).unwrap_or_default(), b.id_range as u64))
-        .collect();
-    let read_cs = cursor.read_col().meta().checksum_type;
-
-    // Step 2: Decode READ blobs in parallel → 2na → ASCII bases.
-    let all_read_data: Vec<u8> = read_raw.par_iter()
-        .map(|(raw, id_range)| {
-            let decoded = decode_raw(raw, read_cs, *id_range).unwrap_or_default();
-            let total_bits = decoded.data.len() * 8;
-            let adjust = decoded.adjust as usize;
-            let actual_bases = (total_bits.saturating_sub(adjust)) / 2;
-            crate::vdb::encoding::unpack_2na(&decoded.data, actual_bases)
-        })
-        .flatten()
-        .collect();
-
-    // Decode QUALITY blobs in parallel.
-    let all_quality_data: Vec<u8> = if let Some(qcol) = cursor.quality_col() {
-        let qcs = qcol.meta().checksum_type;
-        let qual_raw: Vec<_> = qcol.blobs().iter()
-            .map(|b| (qcol.read_raw_blob_for_row(b.start_id).unwrap_or_default(), b.id_range as u64))
-            .collect();
-
-        qual_raw.par_iter()
-            .map(|(raw, id_range)| {
-                let decoded = decode_raw(raw, qcs, *id_range).unwrap_or_default();
-                use std::io::Read;
-                let mut dec = flate2::read::DeflateDecoder::new(decoded.data.as_slice());
-                let mut out = Vec::new();
-                if dec.read_to_end(&mut out).is_ok() && !out.is_empty() {
-                    out
-                } else {
-                    decoded.data
-                }
-            })
-            .flatten()
-            .collect()
-    } else {
-        Vec::new()
-    };
-
-    // Decode READ_LEN blobs in parallel → irzip/izip → u32 lengths.
-    let all_read_len_data: Vec<u8> = if let Some(rlcol) = cursor.read_len_col() {
-        let rlcs = rlcol.meta().checksum_type;
-        let rl_raw: Vec<_> = rlcol.blobs().iter()
-            .map(|b| (rlcol.read_raw_blob_for_row(b.start_id).unwrap_or_default(), b.id_range as u64))
-            .collect();
-
-        rl_raw.par_iter()
-            .map(|(raw, id_range)| {
-                let decoded = decode_raw(raw, rlcs, *id_range).unwrap_or_default();
-                let hdr_version = decoded.headers.first().map(|h| h.version).unwrap_or(0);
-
-                let decoded_ints = if hdr_version >= 1 {
-                    let hdr = &decoded.headers[0];
-                    let planes = hdr.ops.first().copied().unwrap_or(0xFF);
-                    let min = hdr.args.first().copied().unwrap_or(0);
-                    let slope = hdr.args.get(1).copied().unwrap_or(0);
-                    let num_elems = (hdr.osize as u32) / 4;
-                    blob::irzip_decode(&decoded.data, 32, num_elems, min, slope, planes)
-                        .unwrap_or_default()
-                } else {
-                    let num_elems = decoded.row_length
-                        .unwrap_or_else(|| (decoded.data.len() as u64 * 8) / 32)
-                        as u32;
-                    blob::izip_decode(&decoded.data, 32, num_elems).unwrap_or_default()
-                };
-
-                // Expand via page map data_runs if present.
-                if let Some(ref pm) = decoded.page_map {
-                    pm.expand_data_runs_bytes(&decoded_ints, 4)
-                } else {
-                    decoded_ints
-                }
-            })
-            .flatten()
-            .collect()
-    } else {
-        Vec::new()
-    };
-
-    let read_data = &all_read_data;
-
-    // Parse READ_LEN as u32 LE values.
-    let read_lengths: Vec<u32> = if !all_read_len_data.is_empty() {
-        all_read_len_data
-            .chunks_exact(4)
-            .map(|chunk| u32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]))
-            .collect()
-    } else {
-        // No READ_LEN: treat entire decoded data as one read.
-        vec![read_data.len() as u32]
-    };
-
-    let num_reads = read_lengths.len();
-
-    // Convert quality to phred+33 ASCII if needed.
-    let quality_all: Vec<u8> = if !all_quality_data.is_empty() {
-        if all_quality_data.len() == read_data.len() {
-            // Same length as sequence — check if already ASCII.
-            if all_quality_data.iter().all(|&b| b >= 33) {
-                all_quality_data
-            } else {
-                crate::vdb::encoding::phred_to_ascii(&all_quality_data)
-            }
-        } else {
-            crate::vdb::encoding::phred_to_ascii(&all_quality_data)
-        }
-    } else {
-        // SRA-lite: synthetic quality.
-        crate::vdb::encoding::sra_lite_quality(read_data.len(), !is_lite)
-    };
-
-    // ------------------------------------------------------------------
-    // Parse READ_TYPE (if present).
-    //
-    // Values: SRA_READ_TYPE_BIOLOGICAL has bit 0 set (value 1 or 3).
-    // We map to: 0 = biological, 1 = technical (matching SpotRecord).
-    //
-    // The blob may contain u8 values (one per read) or u32 LE values
-    // (4 bytes per read). Detect based on blob length vs num_reads.
-    // ------------------------------------------------------------------
-    // TODO: decode READ_TYPE and READ_FILTER from their physical encodings.
-    // For now, assume all reads are biological and pass filter.
-    let read_types: Vec<u8> = vec![0u8; num_reads]; // 0 = biological
-    let read_filters: Vec<u8> = vec![0u8; num_reads]; // 0 = pass
-
-    // Verify that we have enough sequence and quality data for the declared
-    // read lengths.
-    let total_declared: u64 = read_lengths.iter().map(|&l| u64::from(l)).sum();
-    if (total_declared as usize) > read_data.len() {
-        return Err(Error::Vdb(format!(
-            "READ_LEN declares {total_declared} total bases but READ blob has only {} bytes",
-            read_data.len(),
-        )));
-    }
-    if (total_declared as usize) > quality_all.len() {
-        return Err(Error::Vdb(format!(
-            "READ_LEN declares {total_declared} total bases but QUALITY has only {} bytes",
-            quality_all.len(),
-        )));
-    }
-
-    let has_qual = !quality_all.is_empty() && quality_all.iter().any(|&b| b > 0);
-    tracing::info!(
-        "{accession}: decode complete -- {num_reads} reads, {} bases, quality={}",
-        read_data.len(),
-        if has_qual { "yes" } else { "no (SRA-lite)" },
-    );
-
     let fastq_config = FastqConfig {
         split_mode: config.split_mode,
         skip_technical: config.skip_technical,
@@ -349,94 +185,228 @@ fn decode_and_write(
     // Create output directory.
     std::fs::create_dir_all(&config.output_dir)?;
 
-    // We lazily create output writers as we encounter different output slots.
+    // Lazily create output writers as we encounter different output slots.
     let mut writers: HashMap<OutputSlot, OutputWriter> = HashMap::new();
     let mut output_files: Vec<PathBuf> = Vec::new();
 
     let mut spots_read: u64 = 0;
     let mut reads_written: u64 = 0;
 
-    // ------------------------------------------------------------------
-    // Iterate through reads.
-    //
-    // Each READ_LEN entry corresponds to one read. For single-end data
-    // (most 454/Ion Torrent) each read is its own spot. For the first
-    // version we treat each read as an independent spot; paired-end
-    // grouping will be improved later.
-    // ------------------------------------------------------------------
-    let mut seq_offset: usize = 0;
-    let mut qual_offset: usize = 0;
-    let _name_offset: usize = 0;
+    // Use the READ column as the primary blob source.
+    let read_cs = cursor.read_col().meta().checksum_type;
+    let num_blobs = cursor.read_col().blob_count();
 
-    for (read_idx, &rlen) in read_lengths.iter().enumerate() {
-        let rlen = rlen as usize;
+    tracing::info!(
+        "{accession}: streaming decode of {num_blobs} blobs",
+    );
 
-        // Extract sequence slice for this read.
-        let seq_end = seq_offset + rlen;
-        if seq_end > read_data.len() {
-            tracing::warn!(
-                "read {read_idx}: sequence overrun at offset {seq_offset} + {rlen} > {}; stopping",
-                read_data.len(),
-            );
-            break;
-        }
-        let sequence = &read_data[seq_offset..seq_end];
-        seq_offset = seq_end;
+    for blob_idx in 0..num_blobs {
+        // --------------------------------------------------------------
+        // Decode READ blob → 2na → ASCII bases.
+        // --------------------------------------------------------------
+        let read_blob = &cursor.read_col().blobs()[blob_idx];
+        let read_raw = cursor.read_col().read_raw_blob_for_row(read_blob.start_id)?;
+        let read_decoded = decode_raw(&read_raw, read_cs, read_blob.id_range as u64)?;
+        let total_bits = read_decoded.data.len() * 8;
+        let adjust = read_decoded.adjust as usize;
+        let actual_bases = (total_bits.saturating_sub(adjust)) / 2;
+        let read_data = crate::vdb::encoding::unpack_2na(&read_decoded.data, actual_bases);
+        drop(read_raw);
 
-        // Extract quality slice for this read.
-        let qual_end = qual_offset + rlen;
-        if qual_end > quality_all.len() {
-            tracing::warn!(
-                "read {read_idx}: quality overrun at offset {qual_offset} + {rlen} > {}; stopping",
-                quality_all.len(),
-            );
-            break;
-        }
-        let quality = &quality_all[qual_offset..qual_end];
-        qual_offset = qual_end;
+        // --------------------------------------------------------------
+        // Decode QUALITY blob (same index).
+        // Try deflate decompression, fall back to raw bytes.
+        // --------------------------------------------------------------
+        let quality_data: Vec<u8> = if let Some(qcol) = cursor.quality_col() {
+            if blob_idx < qcol.blob_count() {
+                let qblob = &qcol.blobs()[blob_idx];
+                let qcs = qcol.meta().checksum_type;
+                let qraw = qcol.read_raw_blob_for_row(qblob.start_id)?;
+                let qdecoded = decode_raw(&qraw, qcs, qblob.id_range as u64)?;
+                drop(qraw);
 
-        // TODO: decode NAME column from physical encoding.
-        // For now, use synthetic names: accession.row_number
-        let name: Vec<u8> = format!("{accession}.{}", read_idx + 1).into_bytes();
-
-        // Build a SpotRecord for this single read.
-        let read_type = read_types.get(read_idx).copied().unwrap_or(0);
-        let read_filter = read_filters.get(read_idx).copied().unwrap_or(0);
-
-        let spot = SpotRecord {
-            name,
-            sequence: sequence.to_vec(),
-            quality: quality.to_vec(),
-            read_lengths: vec![rlen as u32],
-            read_types: vec![read_type],
-            read_filter: vec![read_filter],
-            spot_group: Vec::new(),
+                use std::io::Read as _;
+                let mut dec = flate2::read::DeflateDecoder::new(qdecoded.data.as_slice());
+                let mut out = Vec::new();
+                if dec.read_to_end(&mut out).is_ok() && !out.is_empty() {
+                    out
+                } else {
+                    qdecoded.data
+                }
+            } else {
+                Vec::new()
+            }
+        } else {
+            Vec::new()
         };
 
-        let records = format_spot(&spot, accession, &fastq_config);
-
-        for (slot, record) in &records {
-            let writer = writers.entry(*slot).or_insert_with(|| {
-                let filename = output_filename(accession, *slot, config.gzip);
-                let path = config.output_dir.join(&filename);
-                output_files.push(path.clone());
-
-                let file = std::fs::File::create(&path).expect("failed to create output file");
-                let buf = std::io::BufWriter::with_capacity(256 * 1024, file);
-
-                if config.gzip {
-                    OutputWriter::Gz(GzEncoder::new(buf, flate2::Compression::new(config.gzip_level)))
+        // Convert quality to phred+33 ASCII if needed.
+        let quality_all: Vec<u8> = if !quality_data.is_empty() {
+            if quality_data.len() == read_data.len() {
+                if quality_data.iter().all(|&b| b >= 33) {
+                    quality_data
                 } else {
-                    OutputWriter::Plain(buf)
+                    crate::vdb::encoding::phred_to_ascii(&quality_data)
                 }
-            });
+            } else {
+                crate::vdb::encoding::phred_to_ascii(&quality_data)
+            }
+        } else {
+            // SRA-lite: synthetic quality.
+            crate::vdb::encoding::sra_lite_quality(read_data.len(), !is_lite)
+        };
 
-            writer.write_all(&record.data).map_err(Error::Io)?;
-            reads_written += 1;
+        // --------------------------------------------------------------
+        // Decode READ_LEN blob (same index) → irzip/izip → u32 lengths.
+        // --------------------------------------------------------------
+        let read_lengths: Vec<u32> = if let Some(rlcol) = cursor.read_len_col() {
+            if blob_idx < rlcol.blob_count() {
+                let rlblob = &rlcol.blobs()[blob_idx];
+                let rlcs = rlcol.meta().checksum_type;
+                let rlraw = rlcol.read_raw_blob_for_row(rlblob.start_id)?;
+                let rldecoded = decode_raw(&rlraw, rlcs, rlblob.id_range as u64)?;
+                drop(rlraw);
+
+                let hdr_version = rldecoded.headers.first().map(|h| h.version).unwrap_or(0);
+
+                let decoded_ints = if hdr_version >= 1 {
+                    let hdr = &rldecoded.headers[0];
+                    let planes = hdr.ops.first().copied().unwrap_or(0xFF);
+                    let min = hdr.args.first().copied().unwrap_or(0);
+                    let slope = hdr.args.get(1).copied().unwrap_or(0);
+                    let num_elems = (hdr.osize as u32) / 4;
+                    blob::irzip_decode(&rldecoded.data, 32, num_elems, min, slope, planes)
+                        .unwrap_or_default()
+                } else {
+                    let num_elems = rldecoded.row_length
+                        .unwrap_or_else(|| (rldecoded.data.len() as u64 * 8) / 32)
+                        as u32;
+                    blob::izip_decode(&rldecoded.data, 32, num_elems).unwrap_or_default()
+                };
+
+                // Expand via page map data_runs if present.
+                let rl_bytes = if let Some(ref pm) = rldecoded.page_map {
+                    pm.expand_data_runs_bytes(&decoded_ints, 4)
+                } else {
+                    decoded_ints
+                };
+
+                rl_bytes
+                    .chunks_exact(4)
+                    .map(|chunk| u32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]))
+                    .collect()
+            } else {
+                // Fewer READ_LEN blobs than READ blobs: treat as one read.
+                vec![read_data.len() as u32]
+            }
+        } else {
+            // No READ_LEN column: treat entire blob as one read.
+            vec![read_data.len() as u32]
+        };
+
+        // TODO: decode READ_TYPE and READ_FILTER from their physical encodings.
+        // For now, assume all reads are biological and pass filter.
+
+        // --------------------------------------------------------------
+        // Iterate reads in THIS blob and write FASTQ immediately.
+        // --------------------------------------------------------------
+        let mut seq_offset: usize = 0;
+        let mut qual_offset: usize = 0;
+
+        for (local_read_idx, &rlen) in read_lengths.iter().enumerate() {
+            let rlen = rlen as usize;
+
+            // Extract sequence slice for this read.
+            let seq_end = seq_offset + rlen;
+            if seq_end > read_data.len() {
+                tracing::warn!(
+                    "blob {blob_idx}, read {local_read_idx}: sequence overrun at offset \
+                     {seq_offset} + {rlen} > {}; stopping blob",
+                    read_data.len(),
+                );
+                break;
+            }
+            let sequence = &read_data[seq_offset..seq_end];
+            seq_offset = seq_end;
+
+            // Extract quality slice for this read.
+            let qual_end = qual_offset + rlen;
+            if qual_end > quality_all.len() {
+                tracing::warn!(
+                    "blob {blob_idx}, read {local_read_idx}: quality overrun at offset \
+                     {qual_offset} + {rlen} > {}; stopping blob",
+                    quality_all.len(),
+                );
+                break;
+            }
+            let quality = &quality_all[qual_offset..qual_end];
+            qual_offset = qual_end;
+
+            // Global read index for naming.
+            let global_read_idx = spots_read as usize + local_read_idx;
+
+            // Synthetic name: accession.row_number
+            let name: Vec<u8> = format!("{accession}.{}", global_read_idx + 1).into_bytes();
+
+            // Build a SpotRecord for this single read.
+            let spot = SpotRecord {
+                name,
+                sequence: sequence.to_vec(),
+                quality: quality.to_vec(),
+                read_lengths: vec![rlen as u32],
+                read_types: vec![0u8],  // 0 = biological
+                read_filter: vec![0u8], // 0 = pass
+                spot_group: Vec::new(),
+            };
+
+            let records = format_spot(&spot, accession, &fastq_config);
+
+            for (slot, record) in &records {
+                let writer = writers.entry(*slot).or_insert_with(|| {
+                    let filename = output_filename(accession, *slot, config.gzip);
+                    let path = config.output_dir.join(&filename);
+                    output_files.push(path.clone());
+
+                    let file =
+                        std::fs::File::create(&path).expect("failed to create output file");
+                    let buf = std::io::BufWriter::with_capacity(256 * 1024, file);
+
+                    if config.gzip {
+                        OutputWriter::Gz(GzEncoder::new(
+                            buf,
+                            flate2::Compression::new(config.gzip_level),
+                        ))
+                    } else {
+                        OutputWriter::Plain(buf)
+                    }
+                });
+
+                writer.write_all(&record.data).map_err(Error::Io)?;
+                reads_written += 1;
+            }
         }
 
-        spots_read += 1;
+        spots_read += read_lengths.len() as u64;
+
+        // Log progress every 50 blobs.
+        if (blob_idx + 1) % 50 == 0 || blob_idx + 1 == num_blobs {
+            tracing::info!(
+                "{accession}: decoded {}/{} blobs, {} reads so far",
+                blob_idx + 1,
+                num_blobs,
+                spots_read,
+            );
+        }
+
+        // Blob data (read_data, quality_all, read_lengths) is dropped here,
+        // freeing memory before processing the next blob.
     }
+
+    tracing::info!(
+        "{accession}: streaming decode complete -- {} reads, {} written",
+        spots_read,
+        reads_written,
+    );
 
     // Finish all writers.
     for (_, writer) in writers {
