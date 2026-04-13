@@ -211,7 +211,10 @@ fn ensure_srr10971381() -> Option<PathBuf> {
         let resp = match reqwest::blocking::get(url) {
             Ok(r) if r.status().is_success() => r,
             Ok(r) => {
-                eprintln!("HTTP {} downloading SRR10971381 fixture — skipping", r.status());
+                eprintln!(
+                    "HTTP {} downloading SRR10971381 fixture — skipping",
+                    r.status()
+                );
                 return;
             }
             Err(e) => {
@@ -224,7 +227,11 @@ fn ensure_srr10971381() -> Option<PathBuf> {
                 if let Err(e) = std::fs::write(&path, &bytes) {
                     eprintln!("could not write fixture: {e}");
                 } else {
-                    eprintln!("fixture saved to {} ({} bytes)", path.display(), bytes.len());
+                    eprintln!(
+                        "fixture saved to {} ({} bytes)",
+                        path.display(),
+                        bytes.len()
+                    );
                 }
             }
             Err(e) => eprintln!("failed to read response bytes: {e} — skipping"),
