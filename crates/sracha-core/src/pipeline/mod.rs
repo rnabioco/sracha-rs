@@ -311,6 +311,22 @@ struct RawBlobData<'a> {
     has_name: bool,
     /// Whether there is a READ_TYPE column at all.
     has_read_type: bool,
+    /// ALTREAD column raw bytes (unused directly, but triggers name reconstruction).
+    altread_raw: &'a [u8],
+    /// X column raw bytes.
+    x_raw: &'a [u8],
+    x_id_range: u64,
+    x_cs: u8,
+    /// Y column raw bytes.
+    y_raw: &'a [u8],
+    y_id_range: u64,
+    y_cs: u8,
+    /// Whether Illumina name parts (ALTREAD + X + Y) are available.
+    has_illumina_name_parts: bool,
+    /// Shared name format templates (from skey index), sorted by spot_start.
+    name_templates: &'a [Vec<u8>],
+    /// Starting spot_id for each name template (parallel to name_templates).
+    name_spot_starts: &'a [i64],
     /// Reads-per-spot from table metadata (fallback when READ_LEN absent).
     metadata_reads_per_spot: Option<usize>,
     /// Fixed spot length in bases (from READ column page_size).
@@ -359,8 +375,13 @@ fn decode_blob_to_fastq(
     let quality_is_empty =
         quality_data.is_empty() || quality_data.iter().take(1000).all(|&b| b == 0);
     let quality_all: Vec<u8> = if !quality_is_empty {
-        let looks_like_ascii = quality_data.iter().take(100).all(|&b| b >= 33);
-        if looks_like_ascii && quality_data.len() == read_data.len() {
+        // Check ALL bytes to decide if data is already Phred+33 ASCII.
+        // A partial check (e.g. first 100 bytes) can miss raw binary values
+        // later in the buffer — values < 33 (especially 0x0A newline) would
+        // corrupt the FASTQ output.
+        let all_valid_ascii = quality_data.len() == read_data.len()
+            && quality_data.iter().all(|&b| (33..=126).contains(&b));
+        if all_valid_ascii {
             quality_data
         } else {
             crate::vdb::encoding::phred_to_ascii(&quality_data)
@@ -638,6 +659,168 @@ fn decode_blob_to_fastq(
     };
 
     // ------------------------------------------------------------------
+    // Illumina name reconstruction from ALTREAD + X + Y columns.
+    // If the NAME column is absent but ALTREAD/X/Y are present, reconstruct
+    // the original Illumina read name by substituting $X and $Y placeholders
+    // in the ALTREAD template string with per-spot X/Y coordinates.
+    // ------------------------------------------------------------------
+    let spot_names: Option<Vec<Vec<u8>>> = if spot_names.is_none()
+        && raw.has_illumina_name_parts
+        && !raw.altread_raw.is_empty()
+        && !raw.x_raw.is_empty()
+        && !raw.y_raw.is_empty()
+    {
+        // Decode ALTREAD blob → name format template(s).
+        // ALTREAD stores ASCII name templates — use raw decoded data directly
+        // (not zip_encoding, as these are plain text strings).
+        // Use name templates preloaded from the skey index.
+
+        // Decode X column → u32 coordinates (irzip/izip encoded integers).
+        let x_decoded = decode_raw(raw.x_raw, raw.x_cs, raw.x_id_range)?;
+        let x_bytes = {
+            let hdr_version = x_decoded.headers.first().map(|h| h.version).unwrap_or(0);
+            if hdr_version >= 1 {
+                let hdr = &x_decoded.headers[0];
+                let planes = hdr.ops.first().copied().unwrap_or(0xFF);
+                let min = hdr.args.first().copied().unwrap_or(0);
+                let slope = hdr.args.get(1).copied().unwrap_or(0);
+                let num_elems = (hdr.osize as u32) / 4;
+                blob::irzip_decode(&x_decoded.data, 32, num_elems, min, slope, planes)
+                    .unwrap_or_default()
+            } else {
+                let num_elems = x_decoded
+                    .row_length
+                    .unwrap_or_else(|| (x_decoded.data.len() as u64 * 8) / 32)
+                    as u32;
+                blob::izip_decode(&x_decoded.data, 32, num_elems).unwrap_or_default()
+            }
+        };
+
+        // Decode Y column → u32 coordinates (irzip/izip encoded integers).
+        let y_decoded = decode_raw(raw.y_raw, raw.y_cs, raw.y_id_range)?;
+        let y_bytes = {
+            let hdr_version = y_decoded.headers.first().map(|h| h.version).unwrap_or(0);
+            if hdr_version >= 1 {
+                let hdr = &y_decoded.headers[0];
+                let planes = hdr.ops.first().copied().unwrap_or(0xFF);
+                let min = hdr.args.first().copied().unwrap_or(0);
+                let slope = hdr.args.get(1).copied().unwrap_or(0);
+                let num_elems = (hdr.osize as u32) / 4;
+                blob::irzip_decode(&y_decoded.data, 32, num_elems, min, slope, planes)
+                    .unwrap_or_default()
+            } else {
+                let num_elems = y_decoded
+                    .row_length
+                    .unwrap_or_else(|| (y_decoded.data.len() as u64 * 8) / 32)
+                    as u32;
+                blob::izip_decode(&y_decoded.data, 32, num_elems).unwrap_or_default()
+            }
+        };
+
+        // ALTREAD is a per-spot ASCII template (may vary per tile).
+        // Parse templates: each spot's template is stored as a fixed-length or
+        // page-map-delineated string.
+        let num_spots = if reads_per_spot > 0 {
+            read_lengths.len() / reads_per_spot
+        } else {
+            read_lengths.len()
+        };
+
+        // The skey index maps spot ranges to name templates. Each blob covers
+        // a contiguous spot range corresponding to one tile. Use the ALTREAD
+        // blob index to determine which template this blob uses.
+        // For now, use blob_idx to index into the templates list. If the
+        // blob count exceeds the template count, wrap around.
+        let all_templates: &[Vec<u8>] = raw.name_templates;
+
+        // X/Y values are already decoded as u32 by irzip/izip (stored as
+        // little-endian 4-byte groups in the output Vec<u8>).
+        let x_vals: Vec<u32> = x_bytes
+            .chunks_exact(4)
+            .map(|c| u32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+            .collect();
+
+        let y_vals: Vec<u32> = y_bytes
+            .chunks_exact(4)
+            .map(|c| u32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+            .collect();
+
+        // Pick the template for this blob using the skey spot_start mapping.
+        // Binary search name_spot_starts to find which template covers the
+        // first spot_id of this blob.
+        let first_spot_id = spots_before as i64 + 1; // 1-based spot IDs
+        let blob_template: &[u8] = if !all_templates.is_empty() && !raw.name_spot_starts.is_empty()
+        {
+            // Binary search: find the last spot_start <= first_spot_id.
+            let tmpl_idx = match raw.name_spot_starts.binary_search(&first_spot_id) {
+                Ok(i) => i,
+                Err(i) => i.saturating_sub(1),
+            };
+            &all_templates[tmpl_idx.min(all_templates.len() - 1)]
+        } else if !all_templates.is_empty() {
+            // Fallback: use blob_idx modulo template count.
+            &all_templates[blob_idx % all_templates.len()]
+        } else {
+            b""
+        };
+
+        if blob_idx == 0 && !blob_template.is_empty() {
+            tracing::info!(
+                "name reconstruction: {} templates, x_vals={}, y_vals={}, blob_template={:?}",
+                all_templates.len(),
+                x_vals.len(),
+                y_vals.len(),
+                String::from_utf8_lossy(blob_template),
+            );
+        }
+
+        if !blob_template.is_empty() && !x_vals.is_empty() && !y_vals.is_empty() {
+            let mut names = Vec::with_capacity(num_spots);
+            let mut itoa_x = itoa::Buffer::new();
+            let mut itoa_y = itoa::Buffer::new();
+            for spot_i in 0..num_spots {
+                let tmpl = blob_template;
+                let x = x_vals.get(spot_i).copied().unwrap_or(0);
+                let y = y_vals.get(spot_i).copied().unwrap_or(0);
+
+                // Substitute $X and $Y in the template.
+                let x_str = itoa_x.format(x);
+                let y_str = itoa_y.format(y);
+                let mut name = Vec::with_capacity(tmpl.len() + 10);
+                let mut ti = 0;
+                while ti < tmpl.len() {
+                    if tmpl[ti] == b'$' && ti + 1 < tmpl.len() {
+                        if tmpl[ti + 1] == b'X' {
+                            name.extend_from_slice(x_str.as_bytes());
+                            ti += 2;
+                            continue;
+                        } else if tmpl[ti + 1] == b'Y' {
+                            name.extend_from_slice(y_str.as_bytes());
+                            ti += 2;
+                            continue;
+                        }
+                    }
+                    name.push(tmpl[ti]);
+                    ti += 1;
+                }
+                names.push(name);
+            }
+
+            if blob_idx == 0 && !names.is_empty() {
+                tracing::info!(
+                    "Illumina name reconstructed: first={:?}",
+                    String::from_utf8_lossy(&names[0]),
+                );
+            }
+            Some(names)
+        } else {
+            None
+        }
+    } else {
+        spot_names
+    };
+
+    // ------------------------------------------------------------------
     // Decode READ_TYPE blob -> byte array of per-read type codes.
     // 0 = biological, 1 = technical (SRA_READ_TYPE values).
     // ------------------------------------------------------------------
@@ -689,11 +872,18 @@ fn decode_blob_to_fastq(
         seq_offset = seq_end;
 
         let quality: &[u8] = if quality_is_empty {
-            &lite_qual_buf[..spot_total_bases]
+            &lite_qual_buf[seq_offset - spot_total_bases..seq_offset]
         } else {
             let qual_end = qual_offset + spot_total_bases;
             if qual_end > quality_all.len() {
-                &lite_qual_buf[..spot_total_bases.min(lite_qual_buf.len())]
+                tracing::debug!(
+                    "blob {blob_idx}, spot {spot_idx_in_blob}: quality overrun at offset \
+                     {qual_offset} + {spot_total_bases} > {}; using fallback quality",
+                    quality_all.len(),
+                );
+                // Advance qual_offset so subsequent spots don't re-read stale data.
+                qual_offset = qual_end;
+                &lite_qual_buf[seq_offset - spot_total_bases..seq_offset]
             } else {
                 let q = &quality_all[qual_offset..qual_end];
                 qual_offset = qual_end;
@@ -701,24 +891,28 @@ fn decode_blob_to_fastq(
             }
         };
 
-        // Spot name: borrow from decoded names or format a number.
-        let name_owned: Vec<u8>;
-        let spot_name: &[u8] = if let Some(ref names) = spot_names {
+        // Invariant: quality must be exactly as long as sequence.
+        debug_assert_eq!(
+            quality.len(),
+            sequence.len(),
+            "blob {blob_idx}, spot {spot_idx_in_blob}: quality length {} != sequence length {}",
+            quality.len(),
+            sequence.len(),
+        );
+
+        // Spot number: always numeric 1-based index.
+        let spot_number_str = itoa_buf.format(spots_before as usize + spot_idx_in_blob + 1);
+        let spot_number = spot_number_str.as_bytes();
+
+        // Original read name from the NAME column (if present).
+        let original_name: Option<&[u8]> = if let Some(ref names) = spot_names {
             if spot_idx_in_blob < names.len() {
-                &names[spot_idx_in_blob]
+                Some(&names[spot_idx_in_blob])
             } else {
-                name_owned = itoa_buf
-                    .format(spots_before as usize + spot_idx_in_blob + 1)
-                    .as_bytes()
-                    .to_vec();
-                &name_owned
+                None
             }
         } else {
-            name_owned = itoa_buf
-                .format(spots_before as usize + spot_idx_in_blob + 1)
-                .as_bytes()
-                .to_vec();
-            &name_owned
+            None
         };
 
         // Read types for this spot: borrow from decoded data or default to biological.
@@ -774,19 +968,20 @@ fn decode_blob_to_fastq(
         }
 
         if !segments.is_empty() {
-            // Base offset into the spot's sequence/quality slices.
             match config.split_mode {
                 SplitMode::Split3 | SplitMode::Interleaved => {
                     if segments.len() == 2 {
                         let r1 = format_read(
                             run_name,
-                            spot_name,
+                            spot_number,
+                            original_name,
                             &sequence[segments[0].start..segments[0].start + segments[0].len],
                             &quality[segments[0].start..segments[0].start + segments[0].len],
                         );
                         let r2 = format_read(
                             run_name,
-                            spot_name,
+                            spot_number,
+                            original_name,
                             &sequence[segments[1].start..segments[1].start + segments[1].len],
                             &quality[segments[1].start..segments[1].start + segments[1].len],
                         );
@@ -796,7 +991,8 @@ fn decode_blob_to_fastq(
                         for seg in &segments {
                             let rec = format_read(
                                 run_name,
-                                spot_name,
+                                spot_number,
+                                original_name,
                                 &sequence[seg.start..seg.start + seg.len],
                                 &quality[seg.start..seg.start + seg.len],
                             );
@@ -808,7 +1004,8 @@ fn decode_blob_to_fastq(
                     for (file_idx, seg) in segments.iter().enumerate() {
                         let rec = format_read(
                             run_name,
-                            spot_name,
+                            spot_number,
+                            original_name,
                             &sequence[seg.start..seg.start + seg.len],
                             &quality[seg.start..seg.start + seg.len],
                         );
@@ -819,7 +1016,8 @@ fn decode_blob_to_fastq(
                     for seg in &segments {
                         let rec = format_read(
                             run_name,
-                            spot_name,
+                            spot_number,
+                            original_name,
                             &sequence[seg.start..seg.start + seg.len],
                             &quality[seg.start..seg.start + seg.len],
                         );
@@ -855,6 +1053,14 @@ fn decode_and_write(
     let file = std::fs::File::open(sra_path)?;
     let mut archive = KarArchive::open(std::io::BufReader::new(file))?;
     let cursor = VdbCursor::open(&mut archive, sra_path)?;
+
+    // Load Illumina name format templates from skey index.
+    let (name_templates, name_spot_starts): (Vec<Vec<u8>>, Vec<i64>) =
+        if cursor.has_illumina_name_parts() {
+            VdbCursor::load_name_templates(&mut archive)
+        } else {
+            (Vec::new(), Vec::new())
+        };
 
     // ------------------------------------------------------------------
     // Batch-parallel blob decode and FASTQ output.
@@ -921,6 +1127,14 @@ fn decode_and_write(
     let has_read_type = cursor.read_type_col().is_some();
     let read_type_blob_count = cursor.read_type_col().map_or(0, |c| c.blob_count());
     let read_type_cs = cursor.read_type_col().map_or(0, |c| c.meta().checksum_type);
+
+    let has_illumina_name_parts = cursor.has_illumina_name_parts();
+    let altread_blob_count = cursor.altread_col().map_or(0, |c| c.blob_count());
+    let _altread_cs = cursor.altread_col().map_or(0, |c| c.meta().checksum_type);
+    let x_blob_count = cursor.x_col().map_or(0, |c| c.blob_count());
+    let x_cs = cursor.x_col().map_or(0, |c| c.meta().checksum_type);
+    let y_blob_count = cursor.y_col().map_or(0, |c| c.blob_count());
+    let y_cs = cursor.y_col().map_or(0, |c| c.meta().checksum_type);
 
     let metadata_reads_per_spot = cursor.metadata_reads_per_spot();
 
@@ -1118,6 +1332,38 @@ fn decode_and_write(
                                 (&[], 0)
                             };
 
+                        // Illumina name columns (ALTREAD templates + X + Y coords).
+                        let alt_raw: &[u8] =
+                            if has_illumina_name_parts && bi < altread_blob_count {
+                                let col = cursor.altread_col().unwrap();
+                                let blob = &col.blobs()[bi];
+                                col.read_raw_blob_slice(blob.start_id)?
+                            } else {
+                                &[]
+                            };
+                        let (xr, xi): (&[u8], u64) = if has_illumina_name_parts && bi < x_blob_count
+                        {
+                            let col = cursor.x_col().unwrap();
+                            let blob = &col.blobs()[bi];
+                            (
+                                col.read_raw_blob_slice(blob.start_id)?,
+                                blob.id_range as u64,
+                            )
+                        } else {
+                            (&[], 0)
+                        };
+                        let (yr, yi): (&[u8], u64) = if has_illumina_name_parts && bi < y_blob_count
+                        {
+                            let col = cursor.y_col().unwrap();
+                            let blob = &col.blobs()[bi];
+                            (
+                                col.read_raw_blob_slice(blob.start_id)?,
+                                blob.id_range as u64,
+                            )
+                        } else {
+                            (&[], 0)
+                        };
+
                         let raw = RawBlobData {
                             read_raw,
                             read_id_range,
@@ -1133,6 +1379,16 @@ fn decode_and_write(
                             read_type_raw: rt_raw,
                             read_type_id_range: rt_id_range,
                             read_type_cs,
+                            altread_raw: alt_raw,
+                            x_raw: xr,
+                            x_id_range: xi,
+                            x_cs,
+                            y_raw: yr,
+                            y_id_range: yi,
+                            y_cs,
+                            has_illumina_name_parts,
+                            name_templates: &name_templates,
+                            name_spot_starts: &name_spot_starts,
                             has_read_len,
                             has_name,
                             has_read_type,

@@ -1,12 +1,15 @@
 mod cli;
 mod style;
 
-use anyhow::Result;
+use std::path::Path;
+
+use anyhow::{Context, Result};
 use clap::Parser;
 use tracing_subscriber::EnvFilter;
 
 use cli::{Cli, Command};
-use sracha_core::sdl::ResolvedAccession;
+use sracha_core::accession::{self, InputAccession};
+use sracha_core::sdl::{ResolvedAccession, SdlClient};
 use sracha_core::util::format_size;
 
 #[tokio::main]
@@ -30,10 +33,13 @@ async fn main() -> Result<()> {
 
     match cli.command {
         Command::Fetch(args) => {
-            let client = sracha_core::sdl::SdlClient::new();
+            let raw = collect_accessions(&args.accessions, args.accession_list.as_deref())?;
+            let client = SdlClient::new();
+            let run_accessions = resolve_to_runs(&raw, &client).await?;
+
             tokio::fs::create_dir_all(&args.output_dir).await?;
-            for acc_str in &args.accessions {
-                let acc = sracha_core::accession::parse(acc_str)?;
+            for acc_str in &run_accessions {
+                let acc = accession::parse(acc_str)?;
                 let resolved = client.resolve_one(&acc.to_string()).await?;
                 let mirror = resolved
                     .sra_file
@@ -125,7 +131,11 @@ async fn main() -> Result<()> {
             Ok(())
         }
         Command::Get(args) => {
-            tracing::info!("get {} accession(s) -> FASTQ", args.accessions.len());
+            let raw = collect_accessions(&args.accessions, args.accession_list.as_deref())?;
+            let sdl_client = SdlClient::new();
+            let run_accessions = resolve_to_runs(&raw, &sdl_client).await?;
+
+            tracing::info!("get {} run accession(s) -> FASTQ", run_accessions.len());
 
             let split_mode = match args.split {
                 cli::SplitMode::Split3 => sracha_core::fastq::SplitMode::Split3,
@@ -134,10 +144,8 @@ async fn main() -> Result<()> {
                 cli::SplitMode::Interleaved => sracha_core::fastq::SplitMode::Interleaved,
             };
 
-            let sdl_client = sracha_core::sdl::SdlClient::new();
-
-            for acc_str in &args.accessions {
-                let acc = sracha_core::accession::parse(acc_str)?;
+            for acc_str in &run_accessions {
+                let acc = accession::parse(acc_str)?;
                 let resolved = sdl_client.resolve_one(&acc.to_string()).await?;
 
                 let pipeline_config = sracha_core::pipeline::PipelineConfig {
@@ -178,12 +186,15 @@ async fn main() -> Result<()> {
             Ok(())
         }
         Command::Info(args) => {
-            let client = sracha_core::sdl::SdlClient::new();
-            for (i, acc_str) in args.accessions.iter().enumerate() {
+            let raw = collect_accessions(&args.accessions, args.accession_list.as_deref())?;
+            let client = SdlClient::new();
+            let run_accessions = resolve_to_runs(&raw, &client).await?;
+
+            for (i, acc_str) in run_accessions.iter().enumerate() {
                 if i > 0 {
                     println!();
                 }
-                let acc = match sracha_core::accession::parse(acc_str) {
+                let acc = match accession::parse(acc_str) {
                     Ok(a) => a,
                     Err(e) => {
                         eprintln!("{} {acc_str}: {e}", style::error_label("error:"));
@@ -198,6 +209,64 @@ async fn main() -> Result<()> {
             Ok(())
         }
     }
+}
+
+/// Collect accessions from positional arguments and an optional file.
+///
+/// Lines in the accession list file are trimmed; blank lines and lines
+/// starting with `#` are skipped.
+fn collect_accessions(positional: &[String], list_file: Option<&Path>) -> Result<Vec<String>> {
+    let mut accessions: Vec<String> = positional.to_vec();
+
+    if let Some(path) = list_file {
+        let contents =
+            std::fs::read_to_string(path).with_context(|| format!("reading {}", path.display()))?;
+        for line in contents.lines() {
+            let trimmed = line.trim();
+            if !trimmed.is_empty() && !trimmed.starts_with('#') {
+                accessions.push(trimmed.to_string());
+            }
+        }
+    }
+
+    if accessions.is_empty() {
+        anyhow::bail!("no accessions provided (use positional arguments or --accession-list)");
+    }
+
+    Ok(accessions)
+}
+
+/// Parse each input string and resolve project/study accessions to run accessions.
+///
+/// Run accessions (SRR/ERR/DRR) pass through unchanged.
+/// Study (SRP/ERP/DRP) and BioProject (PRJNA/PRJEB/PRJDB) accessions are
+/// resolved to their constituent runs via the NCBI EUtils API.
+async fn resolve_to_runs(inputs: &[String], client: &SdlClient) -> Result<Vec<String>> {
+    let mut run_accessions = Vec::new();
+
+    for input in inputs {
+        let parsed = accession::parse_input(input)?;
+        match parsed {
+            InputAccession::Run(acc) => {
+                run_accessions.push(acc.to_string());
+            }
+            InputAccession::Project(proj) => {
+                eprintln!(
+                    "{}: resolving project to run accessions...",
+                    style::header(&proj),
+                );
+                let runs = client.resolve_project(&proj).await?;
+                eprintln!(
+                    "{}: found {} run(s)",
+                    style::header(&proj),
+                    style::count(runs.len()),
+                );
+                run_accessions.extend(runs);
+            }
+        }
+    }
+
+    Ok(run_accessions)
 }
 
 fn print_resolved(resolved: &ResolvedAccession) {

@@ -1,23 +1,53 @@
 # CLI reference
 
+## Accession types
+
+sracha accepts three types of accessions:
+
+| Type | Prefixes | Example | Description |
+|------|----------|---------|-------------|
+| Run | SRR, ERR, DRR | `SRR1234567` | Single sequencing run (directly downloadable) |
+| Study | SRP, ERP, DRP | `SRP123456` | Study containing multiple runs |
+| BioProject | PRJNA, PRJEB, PRJDB | `PRJNA123456` | BioProject containing multiple runs |
+
+Study and BioProject accessions are automatically resolved to their
+constituent run accessions via the NCBI EUtils API.
+
+## Accession lists
+
+The `get`, `fetch`, and `info` commands accept `--accession-list` to read
+accessions from a file (one per line). Blank lines and lines starting with
+`#` are skipped. This can be combined with positional arguments.
+
+```bash
+# From a file
+sracha get --accession-list SRR_Acc_List.txt
+
+# Mixed: positional + file
+sracha get SRR9999999 --accession-list more_accessions.txt
+```
+
+---
+
 ## sracha get
 
 Download, convert, and compress SRA data in one shot.
 
 ```
-sracha get [OPTIONS] <ACCESSION>...
+sracha get [OPTIONS] [ACCESSION]...
 ```
 
 ### Arguments
 
 | Argument | Description |
 |----------|-------------|
-| `ACCESSION` | One or more SRA run accessions (SRR/ERR/DRR) |
+| `ACCESSION` | One or more accessions (run, study, or BioProject) |
 
 ### Options
 
 | Option | Default | Description |
 |--------|---------|-------------|
+| `--accession-list` | | Read accessions from a file (one per line) |
 | `-O, --output-dir` | `.` | Output directory |
 | `--format` | `sra` | Preferred format: `sra` or `sralite` |
 | `--split` | `split-3` | Split mode: `split-3`, `split-files`, `split-spot`, `interleaved` |
@@ -28,7 +58,7 @@ sracha get [OPTIONS] <ACCESSION>...
 | `--min-read-len` | | Minimum read length filter |
 | `--include-technical` | | Include technical reads |
 | `-f, --force` | | Overwrite existing files |
-| `-p, --progress` | | Show progress bar |
+| `--no-progress` | | Disable progress bar |
 
 ---
 
@@ -37,19 +67,26 @@ sracha get [OPTIONS] <ACCESSION>...
 Download SRA files without conversion.
 
 ```
-sracha fetch [OPTIONS] <ACCESSION>...
+sracha fetch [OPTIONS] [ACCESSION]...
 ```
+
+### Arguments
+
+| Argument | Description |
+|----------|-------------|
+| `ACCESSION` | One or more accessions (run, study, or BioProject) |
 
 ### Options
 
 | Option | Default | Description |
 |--------|---------|-------------|
+| `--accession-list` | | Read accessions from a file (one per line) |
 | `-O, --output-dir` | `.` | Output directory |
 | `--format` | `sra` | Preferred format: `sra` or `sralite` |
 | `--connections` | `8` | HTTP connections per file |
 | `--validate` | | Verify MD5 after download |
 | `-f, --force` | | Overwrite existing files |
-| `-p, --progress` | | Show progress bar |
+| `--no-progress` | | Disable progress bar |
 
 ---
 
@@ -65,7 +102,7 @@ sracha fastq [OPTIONS] <INPUT>...
 
 | Argument | Description |
 |----------|-------------|
-| `INPUT` | SRA accession(s) or local `.sra` file path(s) |
+| `INPUT` | Local `.sra` file path(s) |
 
 ### Options
 
@@ -80,7 +117,7 @@ sracha fastq [OPTIONS] <INPUT>...
 | `-Z, --stdout` | | Write to stdout |
 | `-O, --output-dir` | `.` | Output directory |
 | `-f, --force` | | Overwrite existing files |
-| `-p, --progress` | | Show progress bar |
+| `--no-progress` | | Disable progress bar |
 
 ---
 
@@ -89,8 +126,21 @@ sracha fastq [OPTIONS] <INPUT>...
 Show accession metadata.
 
 ```
-sracha info <ACCESSION>...
+sracha info [OPTIONS] [ACCESSION]...
 ```
 
+### Arguments
+
+| Argument | Description |
+|----------|-------------|
+| `ACCESSION` | One or more accessions (run, study, or BioProject) |
+
+### Options
+
+| Option | Default | Description |
+|--------|---------|-------------|
+| `--accession-list` | | Read accessions from a file (one per line) |
+
 Displays file sizes, available formats, download mirrors, and quality
-information for each accession.
+information for each accession. Study and BioProject accessions are
+resolved to runs first.

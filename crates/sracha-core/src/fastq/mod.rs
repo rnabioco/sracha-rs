@@ -100,37 +100,130 @@ pub enum OutputSlot {
 // Core formatting
 // ---------------------------------------------------------------------------
 
+/// Minimum valid quality byte in Phred+33 encoding (ASCII `!`).
+const MIN_QUAL_BYTE: u8 = 33;
+/// Maximum valid quality byte in Phred+33 encoding (ASCII `~`).
+const MAX_QUAL_BYTE: u8 = 126;
+/// Fallback quality byte used when quality data is invalid or missing.
+/// Phred 30 + 33 = ASCII `?`.
+const FALLBACK_QUAL_BYTE: u8 = b'?';
+
 /// Format a single read segment into a [`FastqRecord`].
 ///
-/// The defline follows the format: `@{run_name}.{spot_name} length={len}`
+/// Defline format matches fasterq-dump: `@{run}.{spot_num} {description} length={len}`
+/// where `description` is the original read name if available, or the spot number again.
+/// The `+` line repeats the defline content.
+///
+/// Bases with Phred quality 0 (ASCII `!`) are replaced with `N` to match
+/// the NCBI convention for no-call bases stored in 2na encoding.
+///
+/// Quality is validated: if its length differs from the sequence, it is
+/// padded or truncated to match. Any byte outside the valid Phred+33
+/// range `[33, 126]` is replaced with `?` (Q30).
 pub fn format_read(
     run_name: &str,
-    spot_name: &[u8],
+    spot_number: &[u8],
+    original_name: Option<&[u8]>,
     sequence: &[u8],
     quality: &[u8],
 ) -> FastqRecord {
     let len = sequence.len();
-    // Pre-allocate: @defline\nseq\n+\nqual\n
-    // defline: @ + run_name + . + spot_name + " length=" + digits + \n
-    let mut data =
-        Vec::with_capacity(1 + run_name.len() + 1 + spot_name.len() + 8 + 10 + 1 + len + 3 + len);
 
+    // Validate quality. Only allocate a corrected copy when something is wrong;
+    // the common case (correct length, all bytes valid) is zero-copy.
+    let needs_pad = quality.len() != len;
+    let needs_sanitize = !needs_pad
+        && quality
+            .iter()
+            .any(|&b| !(MIN_QUAL_BYTE..=MAX_QUAL_BYTE).contains(&b));
+
+    let qual_corrected: Vec<u8>;
+    let quality: &[u8] = if needs_pad {
+        tracing::warn!(
+            "quality length ({}) != sequence length ({}) for spot; padding/truncating",
+            quality.len(),
+            len,
+        );
+        qual_corrected = {
+            let mut q = quality[..quality.len().min(len)].to_vec();
+            q.resize(len, FALLBACK_QUAL_BYTE);
+            q
+        };
+        &qual_corrected
+    } else if needs_sanitize {
+        tracing::warn!("quality contains invalid bytes outside [33, 126] range; sanitizing");
+        qual_corrected = quality
+            .iter()
+            .map(|&b| {
+                if (MIN_QUAL_BYTE..=MAX_QUAL_BYTE).contains(&b) {
+                    b
+                } else {
+                    FALLBACK_QUAL_BYTE
+                }
+            })
+            .collect();
+        &qual_corrected
+    } else {
+        quality
+    };
+
+    // Replace bases with N where quality <= Phred 2 (ASCII '#', ordinal 35).
+    // In 2na encoding, N bases are stored as arbitrary A/C/G/T values;
+    // Illumina uses quality score 2 as the no-call indicator.
+    const NOCALL_QUAL_BYTE: u8 = 35; // Phred 2 + 33 offset = ASCII '#'
+    let seq_corrected: Vec<u8>;
+    let sequence: &[u8] = if quality.len() == len && quality.iter().any(|&q| q <= NOCALL_QUAL_BYTE)
+    {
+        seq_corrected = sequence
+            .iter()
+            .zip(quality.iter())
+            .map(|(&base, &qual)| if qual <= NOCALL_QUAL_BYTE { b'N' } else { base })
+            .collect();
+        &seq_corrected
+    } else {
+        sequence
+    };
+
+    // Description part of the defline: original name if available, else spot number.
+    let description = original_name.unwrap_or(spot_number);
+
+    // Build defline bytes: "{run_name}.{spot_number} {description} length={len}"
+    let mut itoa_buf = itoa::Buffer::new();
+    let len_str = itoa_buf.format(len);
+
+    let defline_len =
+        run_name.len() + 1 + spot_number.len() + 1 + description.len() + 8 + len_str.len();
+
+    // Pre-allocate full record: @defline\nseq\n+defline\nqual\n
+    let mut data = Vec::with_capacity(1 + defline_len + 1 + len + 2 + defline_len + 1 + len + 1);
+
+    // @defline
     data.push(b'@');
     data.extend_from_slice(run_name.as_bytes());
     data.push(b'.');
-    data.extend_from_slice(spot_name);
+    data.extend_from_slice(spot_number);
+    data.push(b' ');
+    data.extend_from_slice(description);
     data.extend_from_slice(b" length=");
-    // Write the length as ASCII digits (itoa: zero-alloc).
-    let mut itoa_buf = itoa::Buffer::new();
-    data.extend_from_slice(itoa_buf.format(len).as_bytes());
+    data.extend_from_slice(len_str.as_bytes());
     data.push(b'\n');
 
+    // Sequence
     data.extend_from_slice(sequence);
     data.push(b'\n');
 
+    // + line repeats defline (matching fasterq-dump)
     data.push(b'+');
+    data.extend_from_slice(run_name.as_bytes());
+    data.push(b'.');
+    data.extend_from_slice(spot_number);
+    data.push(b' ');
+    data.extend_from_slice(description);
+    data.extend_from_slice(b" length=");
+    data.extend_from_slice(len_str.as_bytes());
     data.push(b'\n');
 
+    // Quality
     data.extend_from_slice(quality);
     data.push(b'\n');
 
@@ -210,38 +303,38 @@ pub fn format_spot(
     match config.split_mode {
         SplitMode::Split3 | SplitMode::Interleaved => {
             if segments.len() == 2 {
-                // Two biological reads -> paired.
                 let r1 = format_read(
                     run_name,
                     &spot.name,
+                    None,
                     segments[0].sequence,
                     segments[0].quality,
                 );
                 let r2 = format_read(
                     run_name,
                     &spot.name,
+                    None,
                     segments[1].sequence,
                     segments[1].quality,
                 );
                 results.push((OutputSlot::Read1, r1));
                 results.push((OutputSlot::Read2, r2));
             } else {
-                // Anything else -> unpaired.
                 for seg in &segments {
-                    let rec = format_read(run_name, &spot.name, seg.sequence, seg.quality);
+                    let rec = format_read(run_name, &spot.name, None, seg.sequence, seg.quality);
                     results.push((OutputSlot::Unpaired, rec));
                 }
             }
         }
         SplitMode::SplitFiles => {
             for (file_idx, seg) in segments.iter().enumerate() {
-                let rec = format_read(run_name, &spot.name, seg.sequence, seg.quality);
+                let rec = format_read(run_name, &spot.name, None, seg.sequence, seg.quality);
                 results.push((OutputSlot::ReadN(file_idx as u32), rec));
             }
         }
         SplitMode::SplitSpot => {
             for seg in &segments {
-                let rec = format_read(run_name, &spot.name, seg.sequence, seg.quality);
+                let rec = format_read(run_name, &spot.name, None, seg.sequence, seg.quality);
                 results.push((OutputSlot::Single, rec));
             }
         }
@@ -372,7 +465,7 @@ mod tests {
         assert_eq!(results.len(), 1);
         let data = &results[0].1.data;
         let text = std::str::from_utf8(data).unwrap();
-        assert!(text.starts_with("@SRR123456.42 length=4\n"));
+        assert!(text.starts_with("@SRR123456.42 42 length=4\n"));
     }
 
     #[test]
@@ -384,8 +477,8 @@ mod tests {
         assert_eq!(results.len(), 2);
         let r1 = std::str::from_utf8(&results[0].1.data).unwrap();
         let r2 = std::str::from_utf8(&results[1].1.data).unwrap();
-        assert!(r1.starts_with("@SRR999.99 length=4\n"));
-        assert!(r2.starts_with("@SRR999.99 length=4\n"));
+        assert!(r1.starts_with("@SRR999.99 99 length=4\n"));
+        assert!(r2.starts_with("@SRR999.99 99 length=4\n"));
     }
 
     #[test]
@@ -399,7 +492,7 @@ mod tests {
 
         assert_eq!(results.len(), 1);
         let text = std::str::from_utf8(&results[0].1.data).unwrap();
-        assert_eq!(text, "@SRR1.1 length=4\nACGT\n+\nIIII\n");
+        assert_eq!(text, "@SRR1.1 1 length=4\nACGT\n+SRR1.1 1 length=4\nIIII\n");
     }
 
     // -----------------------------------------------------------------------
@@ -531,8 +624,15 @@ mod tests {
         let r1 = std::str::from_utf8(&results[0].1.data).unwrap();
         let r2 = std::str::from_utf8(&results[1].1.data).unwrap();
 
-        assert_eq!(r1, "@SRR1.10 length=4\nAACC\n+\nIIII\n");
-        assert_eq!(r2, "@SRR1.10 length=4\nGGTT\n+\n!!!!\n");
+        assert_eq!(
+            r1,
+            "@SRR1.10 10 length=4\nAACC\n+SRR1.10 10 length=4\nIIII\n"
+        );
+        // R2 has quality '!!!!' (Phred 0) → all bases become N
+        assert_eq!(
+            r2,
+            "@SRR1.10 10 length=4\nNNNN\n+SRR1.10 10 length=4\n!!!!\n"
+        );
     }
 
     // -----------------------------------------------------------------------
@@ -760,7 +860,7 @@ mod tests {
         let results = format_spot(&spot, "SRR1", &config);
 
         let text = std::str::from_utf8(&results[0].1.data).unwrap();
-        assert!(text.starts_with("@SRR1.spot.123_abc length=4\n"));
+        assert!(text.starts_with("@SRR1.spot.123_abc spot.123_abc length=4\n"));
     }
 
     // -----------------------------------------------------------------------
@@ -870,5 +970,88 @@ mod tests {
         assert_eq!(config.split_mode, SplitMode::Split3);
         assert!(config.skip_technical);
         assert!(config.min_read_len.is_none());
+    }
+
+    // -----------------------------------------------------------------------
+    // format_read quality validation
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn format_read_pads_short_quality() {
+        let rec = format_read("RUN", b"1", None, b"ACGT", b"II");
+        let text = std::str::from_utf8(&rec.data).unwrap();
+        let lines: Vec<&str> = text.lines().collect();
+        assert_eq!(lines[1], "ACGT");
+        assert_eq!(lines[3].len(), 4);
+        assert!(lines[3].starts_with("II"));
+        assert!(lines[3].ends_with("??"));
+    }
+
+    #[test]
+    fn format_read_truncates_long_quality() {
+        let rec = format_read("RUN", b"1", None, b"AC", b"IIII");
+        let text = std::str::from_utf8(&rec.data).unwrap();
+        let lines: Vec<&str> = text.lines().collect();
+        assert_eq!(lines[1], "AC");
+        assert_eq!(lines[3], "II");
+    }
+
+    #[test]
+    fn format_read_sanitizes_invalid_quality_bytes() {
+        let qual = &[b'I', 10u8, 0u8, b'I'];
+        let rec = format_read("RUN", b"1", None, b"ACGT", qual);
+        let text = std::str::from_utf8(&rec.data).unwrap();
+        let lines: Vec<&str> = text.lines().collect();
+        assert_eq!(lines[1], "ACGT");
+        assert_eq!(lines[3].len(), 4);
+        assert_eq!(lines[3], "I??I");
+    }
+
+    #[test]
+    fn format_read_valid_quality_passthrough() {
+        let rec = format_read("RUN", b"1", None, b"ACGT", b"IIII");
+        let text = std::str::from_utf8(&rec.data).unwrap();
+        let lines: Vec<&str> = text.lines().collect();
+        assert_eq!(lines[0], "@RUN.1 1 length=4");
+        assert_eq!(lines[1], "ACGT");
+        assert_eq!(lines[2], "+RUN.1 1 length=4");
+        assert_eq!(lines[3], "IIII");
+    }
+
+    #[test]
+    fn format_read_with_original_name() {
+        let rec = format_read(
+            "SRR1",
+            b"42",
+            Some(b"INSTRUMENT:1:FLOW:1:1234:5678"),
+            b"ACGT",
+            b"IIII",
+        );
+        let text = std::str::from_utf8(&rec.data).unwrap();
+        let lines: Vec<&str> = text.lines().collect();
+        assert_eq!(lines[0], "@SRR1.42 INSTRUMENT:1:FLOW:1:1234:5678 length=4");
+        assert_eq!(lines[2], "+SRR1.42 INSTRUMENT:1:FLOW:1:1234:5678 length=4");
+    }
+
+    #[test]
+    fn format_read_n_masking_from_quality() {
+        // Quality '#' is Phred 2 (no-call threshold) → base should become N
+        // Quality '!' is Phred 0 → also becomes N
+        let rec = format_read("RUN", b"1", None, b"ACGT", b"#I#I");
+        let text = std::str::from_utf8(&rec.data).unwrap();
+        let lines: Vec<&str> = text.lines().collect();
+        assert_eq!(lines[1], "NCNT"); // positions with quality <= '#' become N
+
+        // Phred 0 also triggers N
+        let rec2 = format_read("RUN", b"1", None, b"ACGT", b"!I!I");
+        let text2 = std::str::from_utf8(&rec2.data).unwrap();
+        let lines2: Vec<&str> = text2.lines().collect();
+        assert_eq!(lines2[1], "NCNT");
+
+        // Phred 3 ('$') does NOT trigger N
+        let rec3 = format_read("RUN", b"1", None, b"ACGT", b"$I$I");
+        let text3 = std::str::from_utf8(&rec3.data).unwrap();
+        let lines3: Vec<&str> = text3.lines().collect();
+        assert_eq!(lines3[1], "ACGT");
     }
 }

@@ -20,8 +20,12 @@ Examples:
   Download and convert to FASTQ in one shot:
     sracha get SRR1234567
 
-  Download multiple accessions:
-    sracha get SRR1234567 SRR7654321
+  Download all runs from a BioProject or study:
+    sracha get PRJNA123456
+    sracha get SRP123456
+
+  Download from an accession list file:
+    sracha get --accession-list SRR_Acc_List.txt
 
   Fetch SRA file, then convert separately:
     sracha fetch SRR1234567
@@ -66,9 +70,12 @@ pub enum Command {
 
 #[derive(Args)]
 pub struct FetchArgs {
-    /// SRA accession(s) to download
-    #[arg(required = true)]
+    /// SRA accession(s) to download (run, study, or BioProject)
     pub accessions: Vec<String>,
+
+    /// Read accessions from a file (one per line)
+    #[arg(long)]
+    pub accession_list: Option<PathBuf>,
 
     /// Output directory
     #[arg(short = 'O', long, default_value = ".")]
@@ -144,9 +151,12 @@ pub struct FastqArgs {
 
 #[derive(Args)]
 pub struct GetArgs {
-    /// SRA accession(s) to download and convert
-    #[arg(required = true)]
+    /// SRA accession(s) to download and convert (run, study, or BioProject)
     pub accessions: Vec<String>,
+
+    /// Read accessions from a file (one per line)
+    #[arg(long)]
+    pub accession_list: Option<PathBuf>,
 
     /// Output directory
     #[arg(short = 'O', long, default_value = ".")]
@@ -195,9 +205,12 @@ pub struct GetArgs {
 
 #[derive(Args)]
 pub struct InfoArgs {
-    /// SRA accession(s) to query
-    #[arg(required = true)]
+    /// SRA accession(s) to query (run, study, or BioProject)
     pub accessions: Vec<String>,
+
+    /// Read accessions from a file (one per line)
+    #[arg(long)]
+    pub accession_list: Option<PathBuf>,
 }
 
 #[derive(Clone, Copy, ValueEnum)]

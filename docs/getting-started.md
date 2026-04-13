@@ -17,13 +17,52 @@ This will:
 
 Output files: `SRR000001_1.fastq.gz`, `SRR000001_2.fastq.gz`
 
+## Downloading entire projects
+
+You can pass a BioProject or study accession to download all runs at once:
+
+```bash
+# Download all runs in a BioProject
+sracha get PRJNA123456
+
+# Download all runs in a study
+sracha get SRP123456
+```
+
+sracha resolves project and study accessions to individual runs via the
+NCBI EUtils API, then processes each run.
+
+## Accession lists
+
+For batch downloads, create a text file with one accession per line:
+
+```bash
+# SRR_Acc_List.txt
+SRR1234567
+SRR1234568
+SRR1234569
+```
+
+Then pass it with `--accession-list`:
+
+```bash
+sracha get --accession-list SRR_Acc_List.txt
+```
+
+Lines starting with `#` are treated as comments and blank lines are
+skipped. You can also combine positional accessions with a list file:
+
+```bash
+sracha get SRR9999999 --accession-list SRR_Acc_List.txt
+```
+
 ## Step by step
 
 If you prefer more control, use the individual subcommands:
 
 ```bash
 # Download only
-sracha fetch SRR000001 -O /data/sra/ --progress
+sracha fetch SRR000001 -O /data/sra/
 
 # Convert to FASTQ
 sracha fastq /data/sra/SRR000001.sra -O /data/fastq/

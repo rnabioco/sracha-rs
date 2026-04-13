@@ -2,12 +2,19 @@ mod response;
 
 pub use response::*;
 
+use crate::accession::{ProjectAccession, ProjectKind};
 use crate::error::{Error, Result};
 
 const SDL_URL: &str = "https://locate.ncbi.nlm.nih.gov/sdl/2/retrieve";
 
+/// NCBI EUtils ESearch endpoint (returns JSON).
+const EUTILS_ESEARCH_URL: &str = "https://eutils.ncbi.nlm.nih.gov/entrez/eutils/esearch.fcgi";
+
 /// NCBI EUtils RunInfo endpoint (returns CSV).
 const EUTILS_EFETCH_URL: &str = "https://eutils.ncbi.nlm.nih.gov/entrez/eutils/efetch.fcgi";
+
+/// Maximum UIDs per EFetch request to stay within URL length limits.
+const EFETCH_BATCH_SIZE: usize = 500;
 
 /// A single download mirror for a resolved file.
 #[derive(Debug, Clone)]
@@ -184,6 +191,116 @@ impl SdlClient {
 
         parse_run_info_csv(&body, accession)
     }
+
+    /// Resolve a project/study accession to a list of run accession strings.
+    ///
+    /// Uses ESearch to find SRA UIDs for the project, then EFetch RunInfo CSV
+    /// to extract the individual run accessions (SRR/ERR/DRR).
+    pub async fn resolve_project(&self, project: &ProjectAccession) -> Result<Vec<String>> {
+        let accession = project.to_string();
+
+        // Build the ESearch query term based on accession type.
+        let term = match project.kind {
+            ProjectKind::Study => format!("{accession}[accn]"),
+            ProjectKind::BioProject => format!("{accession}[bioproject]"),
+        };
+
+        tracing::info!("{accession}: resolving project to run accessions via EUtils");
+
+        // Step 1: ESearch to get SRA UIDs.
+        let search_url =
+            format!("{EUTILS_ESEARCH_URL}?db=sra&term={term}&retmax=10000&retmode=json");
+        tracing::debug!("ESearch request: {search_url}");
+
+        let resp = self
+            .http
+            .get(&search_url)
+            .send()
+            .await
+            .map_err(|e| Error::Sdl {
+                message: format!("{accession}: ESearch request failed: {e}"),
+            })?;
+
+        if !resp.status().is_success() {
+            return Err(Error::Sdl {
+                message: format!("{accession}: ESearch HTTP {}", resp.status()),
+            });
+        }
+
+        let body: serde_json::Value = resp.json().await.map_err(|e| Error::Sdl {
+            message: format!("{accession}: ESearch JSON parse failed: {e}"),
+        })?;
+
+        tracing::debug!("ESearch response: {body}");
+
+        let id_list = body["esearchresult"]["idlist"]
+            .as_array()
+            .ok_or_else(|| Error::Sdl {
+                message: format!("{accession}: ESearch returned no idlist"),
+            })?;
+
+        if id_list.is_empty() {
+            return Err(Error::NotFound(format!(
+                "no SRA runs found for {accession}"
+            )));
+        }
+
+        let uids: Vec<String> = id_list
+            .iter()
+            .filter_map(|v| v.as_str().map(|s| s.to_string()))
+            .collect();
+
+        tracing::info!("{accession}: ESearch found {} SRA UIDs", uids.len());
+
+        // Step 2: EFetch RunInfo CSV in batches to get run accessions.
+        let mut run_accessions = Vec::new();
+
+        for chunk in uids.chunks(EFETCH_BATCH_SIZE) {
+            let ids = chunk.join(",");
+            let fetch_url =
+                format!("{EUTILS_EFETCH_URL}?db=sra&id={ids}&rettype=runinfo&retmode=text");
+
+            tracing::debug!("EFetch RunInfo batch request ({} UIDs)", chunk.len());
+
+            let resp = self
+                .http
+                .get(&fetch_url)
+                .send()
+                .await
+                .map_err(|e| Error::Sdl {
+                    message: format!("{accession}: EFetch request failed: {e}"),
+                })?;
+
+            if !resp.status().is_success() {
+                return Err(Error::Sdl {
+                    message: format!("{accession}: EFetch HTTP {}", resp.status()),
+                });
+            }
+
+            let csv_body = resp.text().await.map_err(|e| Error::Sdl {
+                message: format!("{accession}: EFetch body read failed: {e}"),
+            })?;
+
+            let runs = parse_run_accessions_from_csv(&csv_body);
+            run_accessions.extend(runs);
+        }
+
+        if run_accessions.is_empty() {
+            return Err(Error::NotFound(format!(
+                "EFetch returned no run accessions for {accession}"
+            )));
+        }
+
+        run_accessions.sort();
+        run_accessions.dedup();
+
+        tracing::info!(
+            "{accession}: resolved to {} run accession(s)",
+            run_accessions.len()
+        );
+
+        Ok(run_accessions)
+    }
 }
 
 /// Parse the EFetch RunInfo CSV to extract read structure.
@@ -251,6 +368,35 @@ fn parse_run_info_csv(body: &str, accession: &str) -> Option<RunInfo> {
         avg_read_len,
         spot_len: avg_length,
     })
+}
+
+/// Parse run accessions from an EFetch RunInfo CSV body.
+///
+/// Extracts the `Run` column from each data row. Rows with empty or missing
+/// `Run` values are silently skipped.
+fn parse_run_accessions_from_csv(body: &str) -> Vec<String> {
+    let mut lines = body.lines().filter(|l| !l.trim().is_empty());
+    let Some(header) = lines.next() else {
+        return Vec::new();
+    };
+
+    let headers: Vec<&str> = header.split(',').collect();
+    let run_idx = match headers.iter().position(|h| *h == "Run") {
+        Some(i) => i,
+        None => return Vec::new(),
+    };
+
+    lines
+        .filter_map(|line| {
+            let fields: Vec<&str> = line.split(',').collect();
+            let run = fields.get(run_idx).copied().unwrap_or("");
+            if run.is_empty() {
+                None
+            } else {
+                Some(run.to_string())
+            }
+        })
+        .collect()
 }
 
 /// Extract a [`ResolvedFile`] from an [`SdlFile`] response entry.
@@ -407,5 +553,36 @@ mod tests {
     fn parse_run_info_header_only() {
         let csv = "avgLength,LibraryLayout\n";
         assert!(parse_run_info_csv(csv, "test").is_none());
+    }
+
+    // -----------------------------------------------------------------------
+    // Run accession extraction from RunInfo CSV
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn parse_run_accessions_multiple_rows() {
+        let csv = "Run,spots,bases,avgLength,LibraryLayout\n\
+                   SRR1234567,100,200,150,PAIRED\n\
+                   SRR1234568,200,400,150,PAIRED\n\
+                   SRR1234569,300,600,150,SINGLE\n";
+        let runs = parse_run_accessions_from_csv(csv);
+        assert_eq!(runs, vec!["SRR1234567", "SRR1234568", "SRR1234569"]);
+    }
+
+    #[test]
+    fn parse_run_accessions_empty_csv() {
+        assert!(parse_run_accessions_from_csv("").is_empty());
+    }
+
+    #[test]
+    fn parse_run_accessions_header_only() {
+        let csv = "Run,spots\n";
+        assert!(parse_run_accessions_from_csv(csv).is_empty());
+    }
+
+    #[test]
+    fn parse_run_accessions_no_run_column() {
+        let csv = "spots,bases\n100,200\n";
+        assert!(parse_run_accessions_from_csv(csv).is_empty());
     }
 }

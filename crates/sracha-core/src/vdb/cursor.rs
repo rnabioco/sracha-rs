@@ -20,7 +20,12 @@ const COL_READ_LEN: &str = "READ_LEN";
 const COL_READ_TYPE: &str = "READ_TYPE";
 const COL_READ_FILTER: &str = "READ_FILTER";
 const COL_NAME: &str = "NAME";
+const COL_SPOT_NAME: &str = "SPOT_NAME";
 const COL_SPOT_GROUP: &str = "SPOT_GROUP";
+/// Illumina name format templates with `$X:$Y` placeholders.
+const COL_ALTREAD: &str = "ALTREAD";
+const COL_X: &str = "X";
+const COL_Y: &str = "Y";
 
 // ---------------------------------------------------------------------------
 // VdbCursor
@@ -39,6 +44,12 @@ pub struct VdbCursor {
     read_filter_col: Option<ColumnReader>,
     name_col: Option<ColumnReader>,
     spot_group_col: Option<ColumnReader>,
+    /// ALTREAD column: Illumina name format templates with `$X:$Y`.
+    altread_col: Option<ColumnReader>,
+    /// Per-spot X coordinate (Illumina tile X position).
+    x_col: Option<ColumnReader>,
+    /// Per-spot Y coordinate (Illumina tile Y position).
+    y_col: Option<ColumnReader>,
     first_row: i64,
     row_count: u64,
     /// Reads per spot inferred from table metadata (used when READ_LEN
@@ -98,14 +109,34 @@ impl VdbCursor {
             sra_path,
         )
         .ok();
-        let name_col =
-            ColumnReader::open(archive, &format!("{seq_col_base}/{COL_NAME}"), sra_path).ok();
+        // NAME column: try NAME first, then SPOT_NAME.
+        let name_col = ColumnReader::open(archive, &format!("{seq_col_base}/{COL_NAME}"), sra_path)
+            .or_else(|_| {
+                ColumnReader::open(
+                    archive,
+                    &format!("{seq_col_base}/{COL_SPOT_NAME}"),
+                    sra_path,
+                )
+            })
+            .ok();
         let spot_group_col = ColumnReader::open(
             archive,
             &format!("{seq_col_base}/{COL_SPOT_GROUP}"),
             sra_path,
         )
         .ok();
+
+        // Illumina name reconstruction columns (ALTREAD templates + X/Y coords).
+        let altread_col =
+            ColumnReader::open(archive, &format!("{seq_col_base}/{COL_ALTREAD}"), sra_path).ok();
+        let x_col = ColumnReader::open(archive, &format!("{seq_col_base}/{COL_X}"), sra_path).ok();
+        let y_col = ColumnReader::open(archive, &format!("{seq_col_base}/{COL_Y}"), sra_path).ok();
+
+        if name_col.is_some() {
+            tracing::info!("found physical NAME/SPOT_NAME column");
+        } else if altread_col.is_some() && x_col.is_some() && y_col.is_some() {
+            tracing::info!("found ALTREAD + X + Y columns for Illumina name reconstruction");
+        }
 
         let first_row = read_col.first_row_id().unwrap_or(1);
         let row_count = read_col.row_count();
@@ -118,6 +149,9 @@ impl VdbCursor {
             read_filter_col,
             name_col,
             spot_group_col,
+            altread_col,
+            x_col,
+            y_col,
             first_row,
             row_count,
             metadata_reads_per_spot,
@@ -176,6 +210,26 @@ impl VdbCursor {
         self.spot_group_col.as_ref()
     }
 
+    /// Reference to the ALTREAD column reader (Illumina name templates), if present.
+    pub fn altread_col(&self) -> Option<&ColumnReader> {
+        self.altread_col.as_ref()
+    }
+
+    /// Reference to the X column reader (Illumina tile X), if present.
+    pub fn x_col(&self) -> Option<&ColumnReader> {
+        self.x_col.as_ref()
+    }
+
+    /// Reference to the Y column reader (Illumina tile Y), if present.
+    pub fn y_col(&self) -> Option<&ColumnReader> {
+        self.y_col.as_ref()
+    }
+
+    /// Whether Illumina name reconstruction is possible (ALTREAD + X + Y columns present).
+    pub fn has_illumina_name_parts(&self) -> bool {
+        self.altread_col.is_some() && self.x_col.is_some() && self.y_col.is_some()
+    }
+
     /// Reads-per-spot inferred from table metadata, if available.
     ///
     /// This is used as a fallback when the physical `READ_LEN` column is
@@ -183,6 +237,210 @@ impl VdbCursor {
     /// doesn't provide enough info to determine the read structure.
     pub fn metadata_reads_per_spot(&self) -> Option<usize> {
         self.metadata_reads_per_spot
+    }
+
+    /// Load NAME_FMT templates from the skey index.
+    ///
+    /// The skey file at `tbl/SEQUENCE/idx/skey` contains name format templates
+    /// (e.g. `M05881:542:...:$X:$Y`) that map spot ranges to template strings.
+    ///
+    /// Returns `(templates, spot_starts)` where `spot_starts[i]` is the first
+    /// spot_id that uses `templates[i]`. The last template extends to the end
+    /// of the file. Templates are sorted by spot_start.
+    pub fn load_name_templates<R: Read + Seek>(
+        archive: &mut KarArchive<R>,
+    ) -> (Vec<Vec<u8>>, Vec<i64>) {
+        let skey_data = archive
+            .read_file("tbl/SEQUENCE/idx/skey")
+            .ok()
+            .unwrap_or_default();
+
+        if skey_data.is_empty() {
+            return (Vec::new(), Vec::new());
+        }
+
+        // Extract template strings by scanning for "$X" placeholders.
+        let mut templates = Vec::new();
+        let mut template_offsets = Vec::new(); // byte offset within skey data
+        let mut i = 0;
+        while i < skey_data.len() {
+            if skey_data[i] == b'$' && i + 1 < skey_data.len() && skey_data[i + 1] == b'X' {
+                let mut start = i;
+                while start > 0 && skey_data[start - 1] >= 32 && skey_data[start - 1] < 127 {
+                    start -= 1;
+                }
+                let mut end = i;
+                while end < skey_data.len() && skey_data[end] >= 32 && skey_data[end] < 127 {
+                    end += 1;
+                }
+                if end > start {
+                    template_offsets.push(start);
+                    templates.push(skey_data[start..end].to_vec());
+                }
+                i = end;
+            } else {
+                i += 1;
+            }
+        }
+
+        templates.dedup();
+
+        // Parse the skey header to get first spot_id and count.
+        // The header is at the start of skey_data. Try v4 (40 bytes) then v2 (32 bytes).
+        let (first_spot, last_spot, count, id_bits) = if skey_data.len() >= 40 {
+            let endian = u32::from_le_bytes(skey_data[0..4].try_into().unwrap());
+            let version = u32::from_le_bytes(skey_data[4..8].try_into().unwrap());
+
+            if endian == 0x05031988 && (version == 3 || version == 4) {
+                // v3/v4 header: 16 bytes base + first(8) + last(8) + id_bits(2) + span_bits(2) + align(4)
+                let first = i64::from_le_bytes(skey_data[16..24].try_into().unwrap());
+                let last = i64::from_le_bytes(skey_data[24..32].try_into().unwrap());
+                let id_bits = u16::from_le_bytes(skey_data[32..34].try_into().unwrap());
+                (first, last, templates.len(), id_bits as usize)
+            } else if endian == 0x05031988 && version <= 2 && skey_data.len() >= 32 {
+                // v2: 8 bytes base + first(8) + last(8) + id_bits(2) + span_bits(2) + align(4)
+                let first = i64::from_le_bytes(skey_data[8..16].try_into().unwrap());
+                let last = i64::from_le_bytes(skey_data[16..24].try_into().unwrap());
+                let id_bits = u16::from_le_bytes(skey_data[24..26].try_into().unwrap());
+                (first, last, templates.len(), id_bits as usize)
+            } else {
+                (1i64, 0i64, templates.len(), 0)
+            }
+        } else {
+            (1i64, 0i64, templates.len(), 0)
+        };
+
+        tracing::info!(
+            "skey: first={first_spot}, last={last_spot}, count={count}, \
+             id_bits={id_bits}, {} templates extracted",
+            templates.len()
+        );
+
+        let expected_count = count as u32;
+
+        // Parse the skey projection data (ord2node + id2ord).
+        // Layout after PTrie: count(u32) + ord2node[count](u32) + packed_deltas
+        // The packed deltas use span_bits per element with count-1 entries.
+        // After unpacking, integrate (prefix sum) to get spot_id offsets.
+        let span_bits = if skey_data.len() >= 36 {
+            u16::from_le_bytes(skey_data[34..36].try_into().unwrap_or([0, 0])) as usize
+        } else {
+            0
+        };
+
+        // Search for ord2node count in the skey data.
+        // The remaining bytes after ord2node should equal ceil(span_bits * (count-1) / 8).
+        let packed_size = if count > 1 && span_bits > 0 {
+            (span_bits * (count - 1)).div_ceil(8)
+        } else {
+            0
+        };
+
+        'skey_search: for scan_pos in 0..skey_data.len().saturating_sub(4) {
+            let candidate =
+                u32::from_le_bytes(skey_data[scan_pos..scan_pos + 4].try_into().unwrap());
+            if candidate != expected_count || candidate == 0 {
+                continue;
+            }
+
+            let ord2node_start = scan_pos + 4;
+            let ord2node_end = ord2node_start + count * 4;
+            let remaining = skey_data.len().saturating_sub(ord2node_end);
+
+            if remaining != packed_size {
+                continue;
+            }
+
+            tracing::debug!(
+                "skey: found count={} at offset {}, packed_size={}, span_bits={}",
+                candidate,
+                scan_pos,
+                packed_size,
+                span_bits,
+            );
+
+            // Read ord2node entries.
+            let ord2node: Vec<u32> = (0..count)
+                .map(|j| {
+                    u32::from_le_bytes(
+                        skey_data[ord2node_start + j * 4..ord2node_start + j * 4 + 4]
+                            .try_into()
+                            .unwrap(),
+                    )
+                })
+                .collect();
+
+            // Unpack id2ord deltas from span_bits-packed data.
+            let packed_data = &skey_data[ord2node_end..];
+            let mut id2ord: Vec<i64> = vec![0i64; count];
+            if count > 1 && span_bits > 0 {
+                let mut bit_offset = 0usize;
+                for i in 0..count - 1 {
+                    let byte_pos = bit_offset / 8;
+                    let bit_pos = bit_offset % 8;
+                    // Read enough bytes for span_bits starting at bit_pos.
+                    let mut raw: u64 = 0;
+                    for b in 0..(span_bits + bit_pos).div_ceil(8).min(8) {
+                        if byte_pos + b < packed_data.len() {
+                            raw |= (packed_data[byte_pos + b] as u64) << (b * 8);
+                        }
+                    }
+                    let delta = ((raw >> bit_pos) & ((1u64 << span_bits) - 1)) as i64;
+                    id2ord[i + 1] = delta;
+                    bit_offset += span_bits;
+                }
+                // Integrate (prefix sum).
+                for i in 1..count {
+                    id2ord[i] += id2ord[i - 1];
+                }
+            }
+
+            // Convert offsets to absolute spot_ids.
+            for v in &mut id2ord {
+                *v += first_spot;
+            }
+
+            tracing::debug!(
+                "skey: ord2node[0..5]={:?}, id2ord[0..5]={:?}",
+                &ord2node[..ord2node.len().min(5)],
+                &id2ord[..id2ord.len().min(5)],
+            );
+
+            // Build sorted (template, spot_start) using ord2node → template mapping.
+            // node_id N maps to template[N-1] (1-indexed in PTrie).
+            let mut pairs: Vec<(i64, usize)> = id2ord
+                .iter()
+                .zip(ord2node.iter())
+                .map(|(&spot_start, &node_id)| (spot_start, node_id.saturating_sub(1) as usize))
+                .collect();
+            pairs.sort_by_key(|&(s, _)| s);
+
+            let mut sorted_templates = Vec::with_capacity(count);
+            let mut sorted_starts = Vec::with_capacity(count);
+            for (spot_start, tmpl_idx) in &pairs {
+                if *tmpl_idx < templates.len() {
+                    sorted_templates.push(templates[*tmpl_idx].clone());
+                    sorted_starts.push(*spot_start);
+                }
+            }
+
+            if !sorted_templates.is_empty() {
+                tracing::info!(
+                    "skey: {} entries, first spot_start={}, first template={:?}",
+                    sorted_templates.len(),
+                    sorted_starts.first().unwrap_or(&0),
+                    String::from_utf8_lossy(&sorted_templates[0]),
+                );
+                return (sorted_templates, sorted_starts);
+            }
+
+            break 'skey_search;
+        }
+
+        // Fallback: return templates without spot range info.
+        // They'll be assigned sequentially by blob index.
+        let starts = vec![0i64; templates.len()];
+        (templates, starts)
     }
 
     /// Detect reads_per_spot from the table metadata (`md/cur`).
@@ -240,6 +498,14 @@ impl VdbCursor {
 /// This function detects which layout is present and returns the path to the
 /// `col/` directory containing the column subdirectories.
 fn find_sequence_col_base<R: Read + Seek>(archive: &KarArchive<R>) -> Result<String> {
+    tracing::debug!(
+        "KAR archive has {} entries; looking for SEQUENCE column base",
+        archive.entries().len()
+    );
+    for (path, entry) in archive.entries().iter() {
+        tracing::trace!("  KAR entry: {path} ({entry:?})");
+    }
+
     // Strategy 1: look for database-style `tbl/SEQUENCE/col` directory.
     // May be at root (`tbl/SEQUENCE/col`) or under a prefix (`SRR.../tbl/SEQUENCE/col`).
     for path in archive.entries().keys() {
