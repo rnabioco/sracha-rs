@@ -172,7 +172,11 @@ fn parse_fastq_records(data: &[u8]) -> Vec<(u64, Vec<u8>, Vec<u8>)> {
             .next()
             .unwrap_or("0");
         let spot_id: u64 = id_str.parse().unwrap_or(0);
-        records.push((spot_id, chunk[1].as_bytes().to_vec(), chunk[3].as_bytes().to_vec()));
+        records.push((
+            spot_id,
+            chunk[1].as_bytes().to_vec(),
+            chunk[3].as_bytes().to_vec(),
+        ));
     }
     records.sort_by_key(|(id, _, _)| *id);
     records
@@ -352,8 +356,7 @@ fn run_fastq_illumina_quality_bytes_valid() {
     let tmp = tempfile::tempdir().unwrap();
     let config = test_config(tmp.path(), SplitMode::Split3, false);
 
-    let stats =
-        sracha_core::pipeline::run_fastq(&sra_path, Some("SRR10971381"), &config).unwrap();
+    let stats = sracha_core::pipeline::run_fastq(&sra_path, Some("SRR10971381"), &config).unwrap();
 
     assert!(stats.spots_read > 0, "should read at least one spot");
     assert!(stats.reads_written > 0, "should write at least one read");
