@@ -2,8 +2,6 @@
 
 Fast SRA downloader and FASTQ converter, written in pure Rust.
 
-**Status: early development** -- download, VDB parsing, and FASTQ conversion are functional.
-
 ## Features
 
 - **Parallel downloads** -- chunked HTTP Range requests with multiple connections
@@ -26,6 +24,12 @@ sracha get PRJNA123456
 
 # Batch download from an accession list
 sracha get --accession-list SRR_Acc_List.txt
+
+# Just download
+sracha fetch SRR000001
+
+# Convert a local .sra file
+sracha fastq SRR000001.sra
 
 # Show accession info
 sracha info SRR000001

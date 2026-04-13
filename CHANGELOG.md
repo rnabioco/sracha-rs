@@ -11,9 +11,6 @@
 - **Illumina name reconstruction**: Deflines now include the original Illumina
   read name (instrument:run:flowcell:lane:tile:X:Y) reconstructed from the
   skey index and physical X/Y columns.
-- Validation comparison script (`validation/compare_fastq.py`) for byte-level
-  verification against fasterq-dump output.
-
 ### Fixed
 
 - **Quality string corruption**: Fixed three bugs that could produce invalid

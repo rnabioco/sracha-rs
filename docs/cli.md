@@ -53,7 +53,7 @@ sracha get [OPTIONS] [ACCESSION]...
 | `--split` | `split-3` | Split mode: `split-3`, `split-files`, `split-spot`, `interleaved` |
 | `--no-gzip` | | Disable gzip (compressed by default) |
 | `--gzip-level` | `6` | Compression level (1-9) |
-| `-t, --threads` | all CPUs | Thread count |
+| `-t, --threads` | `8` | Thread count |
 | `--connections` | `8` | HTTP connections per file |
 | `--min-read-len` | | Minimum read length filter |
 | `--include-technical` | | Include technical reads |
@@ -111,7 +111,7 @@ sracha fastq [OPTIONS] <INPUT>...
 | `--split` | `split-3` | Split mode |
 | `--no-gzip` | | Disable gzip |
 | `--gzip-level` | `6` | Compression level (1-9) |
-| `-t, --threads` | all CPUs | Thread count |
+| `-t, --threads` | `8` | Thread count |
 | `--min-read-len` | | Minimum read length filter |
 | `--include-technical` | | Include technical reads |
 | `-Z, --stdout` | | Write to stdout |

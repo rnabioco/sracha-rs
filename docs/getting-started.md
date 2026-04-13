@@ -62,7 +62,7 @@ If you prefer more control, use the individual subcommands:
 
 ```bash
 # Download only
-sracha fetch SRR000001 -O /data/sra/
+sracha fetch SRR000001 -O /data/sra/ --validate
 
 # Convert to FASTQ
 sracha fastq /data/sra/SRR000001.sra -O /data/fastq/
@@ -97,7 +97,7 @@ Quality scores will be uniform: Q30 for pass-filter reads, Q3 for rejects.
 # More download connections (default: 8)
 sracha get SRR000001 --connections 12
 
-# More threads for compression (default: all CPUs)
+# More threads for decode (default: 8)
 sracha get SRR000001 --threads 16
 
 # Faster compression (lower ratio)
