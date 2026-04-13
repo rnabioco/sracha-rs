@@ -1,0 +1,64 @@
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.22s
+     Running unittests src/lib.rs (target/debug/deps/sracha_core-d795cb640012ae6d)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 222 filtered out; finished in 0.00s
+
+     Running tests/pipeline.rs (target/debug/deps/pipeline-308cd0e4c2167d0b)
+
+running 6 tests
+test run_fastq_split3 ... FAILED
+test run_fastq_split_spot ... FAILED
+test run_fastq_gzip ... FAILED
+test run_fastq_deterministic ... FAILED
+test run_fastq_cross_validate_fasterq_dump ... FAILED
+test run_fastq_illumina_quality_bytes_valid ... FAILED
+
+failures:
+
+---- run_fastq_split3 stdout ----
+downloading SRR000001 fixture from https://sra-pub-run-odp.s3.amazonaws.com/sra/SRR000001/SRR000001 ...
+
+thread 'run_fastq_split3' (4257850) panicked at crates/sracha-core/tests/pipeline.rs:50:34:
+called `Result::unwrap()` on an `Err` value: reqwest::Error { kind: Decode, source: TimedOut }
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+
+---- run_fastq_split_spot stdout ----
+
+thread 'run_fastq_split_spot' (4257851) panicked at crates/sracha-core/tests/pipeline.rs:34:14:
+Once instance has previously been poisoned
+
+---- run_fastq_gzip stdout ----
+
+thread 'run_fastq_gzip' (4257848) panicked at crates/sracha-core/tests/pipeline.rs:34:14:
+Once instance has previously been poisoned
+
+---- run_fastq_deterministic stdout ----
+
+thread 'run_fastq_deterministic' (4257847) panicked at crates/sracha-core/tests/pipeline.rs:34:14:
+Once instance has previously been poisoned
+
+---- run_fastq_cross_validate_fasterq_dump stdout ----
+downloading SRR10971381 fixture from https://sra-pub-run-odp.s3.amazonaws.com/sra/SRR10971381/SRR10971381 ...
+
+thread 'run_fastq_cross_validate_fasterq_dump' (4257846) panicked at crates/sracha-core/tests/pipeline.rs:209:34:
+called `Result::unwrap()` on an `Err` value: reqwest::Error { kind: Decode, source: TimedOut }
+
+---- run_fastq_illumina_quality_bytes_valid stdout ----
+
+thread 'run_fastq_illumina_quality_bytes_valid' (4257849) panicked at crates/sracha-core/tests/pipeline.rs:193:14:
+Once instance has previously been poisoned
+
+
+failures:
+    run_fastq_cross_validate_fasterq_dump
+    run_fastq_deterministic
+    run_fastq_gzip
+    run_fastq_illumina_quality_bytes_valid
+    run_fastq_split3
+    run_fastq_split_spot
+
+test result: FAILED. 0 passed; 6 failed; 0 ignored; 0 measured; 2 filtered out; finished in 30.47s
+
+error: test failed, to rerun pass `-p sracha-core --test pipeline`

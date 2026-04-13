@@ -358,13 +358,17 @@ fn decode_blob_to_fastq(
 
     let quality_is_empty =
         quality_data.is_empty() || quality_data.iter().take(1000).all(|&b| b == 0);
+    // VDB quality columns always store raw Phred integers (0–93), never
+    // Phred+33 ASCII. Always apply the +33 offset. A previous heuristic
+    // sampled only the first 100 bytes to guess the encoding: for
+    // high-quality Illumina data the first 100 raw Phred values are often
+    // all ≥ 33, causing the heuristic to skip phred_to_ascii. Later in the
+    // same blob, lower-quality bases produce raw bytes below 33 — including
+    // 0x0a (Phred 10 = newline) — which end up embedded in the FASTQ quality
+    // string and cause "quality string length ≠ sequence length" errors in
+    // downstream aligners (e.g. STAR).
     let quality_all: Vec<u8> = if !quality_is_empty {
-        let looks_like_ascii = quality_data.iter().take(100).all(|&b| b >= 33);
-        if looks_like_ascii && quality_data.len() == read_data.len() {
-            quality_data
-        } else {
-            crate::vdb::encoding::phred_to_ascii(&quality_data)
-        }
+        crate::vdb::encoding::phred_to_ascii(&quality_data)
     } else {
         Vec::new() // will use lite_qual_buf below
     };
