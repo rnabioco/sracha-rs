@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## 0.1.0 (2026-04-13)
 
 ### Added
 
@@ -32,4 +32,4 @@
 
 - Illumina tile assignment in deflines has boundary offsets for some spots near
   tile transitions due to incomplete skey id2ord delta unpacking. Sequence and
-  quality data are unaffected. See issue #2.
+  quality data are unaffected. See #3.
