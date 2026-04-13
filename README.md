@@ -2,7 +2,7 @@
 
 Fast SRA downloader and FASTQ converter, written in pure Rust.
 
-**Status: early development** -- download and VDB parsing work, FASTQ output coming soon.
+**Status: early development** -- download, VDB parsing, and FASTQ conversion are functional.
 
 ## Features
 
@@ -16,10 +16,10 @@ Fast SRA downloader and FASTQ converter, written in pure Rust.
 ## Quick start
 
 ```bash
-# Show accession info (works now)
+# Show accession info
 sracha info SRR000001
 
-# Download, convert, and compress (WIP)
+# Download, convert, and compress
 sracha get SRR000001
 ```
 
@@ -39,17 +39,18 @@ pixi run release
 
 ## Architecture
 
-```
-sracha get SRR000001
-  |
-  +-- SDL resolve (NCBI API) --> mirror URLs
-  +-- Parallel download (8 connections, HTTP Range)
-  +-- KAR archive parse (container format)
-  +-- VDB column decode (idx1/idx2 blob index, page maps)
-  +-- FASTQ format (split-3, interleaved, etc.)
-  +-- Parallel gzip (rayon + flate2)
-  |
-  --> SRR000001_1.fastq.gz, SRR000001_2.fastq.gz
+```mermaid
+flowchart LR
+    A[sracha get SRR000001] --> B[SDL Resolve]
+    B -->|mirror URLs| C[Parallel Download]
+    C -->|".sra file"| D[KAR Archive Parse]
+    D --> E[VDB Column Decode]
+    E -->|"READ, QUALITY,\nREAD_LEN, NAME"| F[FASTQ Format]
+    F --> G[Parallel gzip]
+    G --> H["_1.fastq.gz\n_2.fastq.gz"]
+
+    style A fill:#4a9eff,color:#fff
+    style H fill:#2ecc71,color:#fff
 ```
 
 ## License
