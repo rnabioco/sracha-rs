@@ -103,7 +103,7 @@ pub enum OutputSlot {
 /// Format a single read segment into a [`FastqRecord`].
 ///
 /// The defline follows the format: `@{run_name}.{spot_name} length={len}`
-fn format_read(run_name: &str, spot_name: &[u8], sequence: &[u8], quality: &[u8]) -> FastqRecord {
+pub fn format_read(run_name: &str, spot_name: &[u8], sequence: &[u8], quality: &[u8]) -> FastqRecord {
     let len = sequence.len();
     // Pre-allocate: @defline\nseq\n+\nqual\n
     // defline: @ + run_name + . + spot_name + " length=" + digits + \n
@@ -115,9 +115,9 @@ fn format_read(run_name: &str, spot_name: &[u8], sequence: &[u8], quality: &[u8]
     data.push(b'.');
     data.extend_from_slice(spot_name);
     data.extend_from_slice(b" length=");
-    // Write the length as ASCII digits.
-    let len_str = len.to_string();
-    data.extend_from_slice(len_str.as_bytes());
+    // Write the length as ASCII digits (itoa: zero-alloc).
+    let mut itoa_buf = itoa::Buffer::new();
+    data.extend_from_slice(itoa_buf.format(len).as_bytes());
     data.push(b'\n');
 
     data.extend_from_slice(sequence);

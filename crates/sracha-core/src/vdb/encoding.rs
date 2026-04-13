@@ -21,9 +21,6 @@ pub const SRA_LITE_REJECT_QUAL: u8 = 3;
 // Lookup tables (const, lives in .rodata)
 // ---------------------------------------------------------------------------
 
-/// 2-bit encoding: 0=A, 1=C, 2=G, 3=T.
-const DNA_2NA: [u8; 4] = [b'A', b'C', b'G', b'T'];
-
 /// 4-bit IUPAC ambiguity code lookup (indices 0..=15).
 ///
 /// | bits | base | bits | base |
@@ -59,12 +56,25 @@ const DNA_4NA: [u8; 16] = [
 // 2na helpers
 // ---------------------------------------------------------------------------
 
-/// Decode a single 2-bit code to an ASCII base.
-#[inline]
-fn decode_2na(code: u8) -> u8 {
-    // Safety: `code & 0x03` guarantees the index is 0..3.
-    DNA_2NA[(code & 0x03) as usize]
-}
+/// Byte-level lookup table for 2na decoding: `LUT_2NA[byte]` yields the 4 ASCII
+/// bases packed in that byte (MSB-first). Built at compile time so it lives in
+/// `.rodata` with zero runtime cost.
+const LUT_2NA: [[u8; 4]; 256] = {
+    let mut lut = [[0u8; 4]; 256];
+    let bases = [b'A', b'C', b'G', b'T'];
+    let mut i = 0u16;
+    while i < 256 {
+        let b = i as u8;
+        lut[i as usize] = [
+            bases[((b >> 6) & 0x03) as usize],
+            bases[((b >> 4) & 0x03) as usize],
+            bases[((b >> 2) & 0x03) as usize],
+            bases[(b & 0x03) as usize],
+        ];
+        i += 1;
+    }
+    lut
+};
 
 /// Decode a single 4-bit nibble to an ASCII IUPAC base.
 #[inline]
@@ -94,27 +104,18 @@ fn decode_4na(nibble: u8) -> u8 {
 /// padding bits.
 pub fn unpack_2na(packed: &[u8], num_bases: usize) -> Vec<u8> {
     let mut bases = Vec::with_capacity(num_bases);
-    let mut remaining = num_bases;
 
-    for &byte in packed {
-        if remaining == 0 {
-            break;
-        }
-        // Each byte holds up to 4 bases, MSB first.
-        let to_emit = remaining.min(4);
-        if to_emit >= 1 {
-            bases.push(decode_2na(byte >> 6));
-        }
-        if to_emit >= 2 {
-            bases.push(decode_2na(byte >> 4));
-        }
-        if to_emit >= 3 {
-            bases.push(decode_2na(byte >> 2));
-        }
-        if to_emit >= 4 {
-            bases.push(decode_2na(byte));
-        }
-        remaining -= to_emit;
+    // Fast path: process full bytes (4 bases each) via lookup table.
+    let full_bytes = num_bases / 4;
+    for &byte in &packed[..full_bytes] {
+        bases.extend_from_slice(&LUT_2NA[byte as usize]);
+    }
+
+    // Handle trailing bases from the last partial byte.
+    let trailing = num_bases % 4;
+    if trailing > 0 && full_bytes < packed.len() {
+        let entry = &LUT_2NA[packed[full_bytes] as usize];
+        bases.extend_from_slice(&entry[..trailing]);
     }
 
     bases

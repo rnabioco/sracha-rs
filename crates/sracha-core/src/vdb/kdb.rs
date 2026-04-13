@@ -20,10 +20,9 @@
 //! 2=magnitude, 3=predictable). The `parse_idx2_block` function decodes the
 //! idx2 data for each block into individual [`BlobLoc`] entries.
 
-use std::io::{Read, Seek};
+use std::io::Seek;
 
 use byteorder::{ByteOrder, LittleEndian};
-use flate2::read::ZlibDecoder;
 
 use crate::error::{Error, Result};
 use crate::vdb::kar::KarArchive;
@@ -646,26 +645,33 @@ fn parse_idx0(buf: &[u8]) -> Result<Vec<BlobLoc>> {
 
 /// Try to decompress `data` as zlib. Returns decompressed bytes on success,
 /// or `None` if the data does not appear to be zlib-compressed.
+///
+/// Uses libdeflate for speed, with flate2 streaming fallback when the
+/// output size is not known in advance.
 fn try_zlib_decompress(data: &[u8]) -> Option<Vec<u8>> {
+    use crate::vdb::blob;
+
     if data.is_empty() {
         return None;
     }
+
+    // Estimate output size: 4× input is a reasonable heuristic for VDB data.
+    let estimated = data.len() * 4;
+
     // Try zlib format first (0x78 header).
-    {
-        let mut decoder = ZlibDecoder::new(data);
-        let mut out = Vec::new();
-        if decoder.read_to_end(&mut out).is_ok() && !out.is_empty() {
+    if let Ok(out) = blob::zlib_decompress(data, estimated) {
+        if !out.is_empty() {
             return Some(out);
         }
     }
+
     // Try raw deflate (no header — VDB uses inflateInit2 with -15).
-    {
-        let mut decoder = flate2::read::DeflateDecoder::new(data);
-        let mut out = Vec::new();
-        if decoder.read_to_end(&mut out).is_ok() && !out.is_empty() {
+    if let Ok(out) = blob::deflate_decompress(data, estimated) {
+        if !out.is_empty() {
             return Some(out);
         }
     }
+
     None
 }
 

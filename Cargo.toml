@@ -41,6 +41,7 @@ crc32fast = "1"
 
 # Binary parsing
 byteorder = "1"
+itoa = "1"
 memmap2 = "0.9"
 
 # Styling
@@ -52,7 +53,6 @@ tempfile = "3"
 bytes = "1"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
-num_cpus = "1"
 
 # Internal
 sracha-core = { path = "crates/sracha-core" }

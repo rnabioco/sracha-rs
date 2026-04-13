@@ -4,6 +4,7 @@
 //! on a rayon thread pool, and concatenates the resulting gzip members.
 //! Multiple concatenated gzip members form a valid gzip stream per RFC 1952.
 
+use std::collections::BTreeMap;
 use std::io::{self, Write};
 use std::sync::Arc;
 
@@ -46,7 +47,7 @@ pub struct ParGzWriter<W: Write + Send> {
     /// Sequence number of the next block we expect to write out.
     drain_seq: u64,
     /// Out-of-order blocks waiting for earlier ones to arrive.
-    reorder_buf: Vec<(u64, Vec<u8>)>,
+    reorder_buf: BTreeMap<u64, Vec<u8>>,
     /// Tracks whether an I/O error occurred during draining, so we can
     /// propagate it on the next `write` or `finish` call.
     drain_error: Option<io::Error>,
@@ -77,7 +78,7 @@ impl<W: Write + Send> ParGzWriter<W> {
             rx,
             pending: 0,
             drain_seq: 0,
-            reorder_buf: Vec::new(),
+            reorder_buf: BTreeMap::new(),
             drain_error: None,
         }
     }
@@ -171,18 +172,17 @@ impl<W: Write + Send> ParGzWriter<W> {
             self.flush_reorder_buf();
         } else {
             // Out-of-order — stash for later.
-            self.reorder_buf.push((seq, data));
+            self.reorder_buf.insert(seq, data);
         }
     }
 
     /// Flush consecutive blocks from the reorder buffer.
     fn flush_reorder_buf(&mut self) {
-        while let Some(pos) = self
-            .reorder_buf
-            .iter()
-            .position(|(s, _)| *s == self.drain_seq)
-        {
-            let (_, data) = self.reorder_buf.swap_remove(pos);
+        while let Some(entry) = self.reorder_buf.first_entry() {
+            if *entry.key() != self.drain_seq {
+                break;
+            }
+            let data = entry.remove();
             self.write_compressed(&data);
             self.drain_seq += 1;
         }

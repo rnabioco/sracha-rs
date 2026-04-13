@@ -18,7 +18,7 @@ use crate::compress::{DEFAULT_BLOCK_SIZE, ParGzWriter};
 use crate::download::{DownloadConfig, download_file};
 use crate::error::{Error, Result};
 use crate::fastq::{
-    FastqConfig, FastqRecord, OutputSlot, SplitMode, SpotRecord, format_spot, output_filename,
+    FastqConfig, FastqRecord, OutputSlot, SplitMode, format_read, output_filename,
 };
 use crate::sdl::ResolvedAccession;
 use crate::vdb::blob;
@@ -202,6 +202,11 @@ fn select_mirror(resolved: &ResolvedAccession) -> Result<String> {
 // ---------------------------------------------------------------------------
 
 /// Decode a raw blob, stripping envelope/headers/page_map.
+///
+/// The blob locator `size` field includes trailing checksum bytes, so we
+/// strip them here before handing the data to [`blob::decode_blob`].
+/// Checksum validation is not performed because the stored CRC covers only
+/// a portion of the blob that doesn't align with the full raw slice.
 fn decode_raw(raw: &[u8], checksum_type: u8, row_count: u64) -> Result<blob::DecodedBlob> {
     let cs_size: usize = match checksum_type {
         1 => 4,  // CRC32
@@ -295,23 +300,36 @@ struct RawBlobData<'a> {
     name_id_range: u64,
     /// Checksum type for the NAME column.
     name_cs: u8,
+    /// READ_TYPE column raw bytes (empty if column absent).
+    read_type_raw: &'a [u8],
+    /// Row count for the READ_TYPE blob (0 if absent).
+    read_type_id_range: u64,
+    /// Checksum type for the READ_TYPE column.
+    read_type_cs: u8,
     /// Whether there is a READ_LEN column at all.
     has_read_len: bool,
     /// Whether there is a NAME column at all.
     has_name: bool,
+    /// Whether there is a READ_TYPE column at all.
+    has_read_type: bool,
 }
 
-/// Decode a single blob's raw bytes into `Vec<SpotRecord>`.
+/// Decode a single blob and produce FASTQ records directly.
 ///
-/// This is a pure function that operates only on borrowed data -- no references
-/// to `ColumnReader` -- so it is `Send` and safe to call from rayon threads.
-fn decode_blob_to_spots(
+/// This fused function replaces the former two-step decode_blob_to_spots +
+/// format_spot, eliminating intermediate `SpotRecord` allocations. It operates
+/// only on borrowed data (Send-safe for rayon).
+///
+/// Returns `(records, num_spots)`.
+fn decode_blob_to_fastq(
     raw: &RawBlobData<'_>,
     read_cs: u8,
     is_lite: bool,
     blob_idx: usize,
     spots_before: u64,
-) -> Result<Vec<SpotRecord>> {
+    run_name: &str,
+    config: &FastqConfig,
+) -> Result<(Vec<(OutputSlot, FastqRecord)>, u64)> {
     // ------------------------------------------------------------------
     // Decode READ blob -> 2na -> ASCII bases.
     // ------------------------------------------------------------------
@@ -342,8 +360,19 @@ fn decode_blob_to_spots(
             crate::vdb::encoding::phred_to_ascii(&quality_data)
         }
     } else {
-        crate::vdb::encoding::sra_lite_quality(read_data.len(), !is_lite)
+        Vec::new() // will use lite_qual_buf below
     };
+
+    // Pre-allocate a single quality buffer for SRA-lite / empty quality.
+    // Reused across all spots in this blob instead of allocating per spot.
+    // Always allocated so it can serve as a fallback when real quality data
+    // runs out before sequence data.
+    let lite_qual_char = if is_lite {
+        crate::vdb::encoding::SRA_LITE_REJECT_QUAL + crate::vdb::encoding::QUAL_PHRED_OFFSET
+    } else {
+        crate::vdb::encoding::SRA_LITE_PASS_QUAL + crate::vdb::encoding::QUAL_PHRED_OFFSET
+    };
+    let lite_qual_buf: Vec<u8> = vec![lite_qual_char; read_data.len()];
 
     // ------------------------------------------------------------------
     // Decode READ_LEN blob -> irzip/izip -> u32 lengths.
@@ -493,15 +522,38 @@ fn decode_blob_to_spots(
     };
 
     // ------------------------------------------------------------------
-    // Group read_lengths into spots and build SpotRecords.
+    // Decode READ_TYPE blob -> byte array of per-read type codes.
+    // 0 = biological, 1 = technical (SRA_READ_TYPE values).
     // ------------------------------------------------------------------
-    let mut spots = Vec::new();
+    let read_type_data: Vec<u8> = if raw.has_read_type && !raw.read_type_raw.is_empty() {
+        let rtdecoded =
+            decode_raw(raw.read_type_raw, raw.read_type_cs, raw.read_type_id_range)?;
+        let raw_bytes = decode_zip_encoding(&rtdecoded);
+        if !raw_bytes.is_empty() {
+            raw_bytes
+        } else {
+            rtdecoded.data
+        }
+    } else {
+        Vec::new()
+    };
+
+    // ------------------------------------------------------------------
+    // Iterate spots and produce FASTQ records directly (fused path).
+    //
+    // Instead of building intermediate SpotRecord structs, we slice
+    // directly into the decoded column data and call format_read.
+    // ------------------------------------------------------------------
+    let rps = reads_per_spot.max(1);
+    let mut records: Vec<(OutputSlot, FastqRecord)> = Vec::new();
     let mut seq_offset: usize = 0;
     let mut qual_offset: usize = 0;
+    let mut rt_offset: usize = 0;
     let mut spot_idx_in_blob: usize = 0;
-
-    let rps = reads_per_spot.max(1);
     let mut rl_cursor = 0usize;
+
+    // Reusable buffer for itoa spot-name formatting.
+    let mut itoa_buf = itoa::Buffer::new();
 
     while rl_cursor + rps <= read_lengths.len() {
         let spot_read_lengths = &read_lengths[rl_cursor..rl_cursor + rps];
@@ -516,50 +568,154 @@ fn decode_blob_to_spots(
             );
             break;
         }
+
+        // Borrow slices directly -- no .to_vec().
         let sequence = &read_data[seq_offset..seq_end];
         seq_offset = seq_end;
 
-        let quality: Vec<u8> = if quality_is_empty {
-            crate::vdb::encoding::sra_lite_quality(spot_total_bases, true)
+        let quality: &[u8] = if quality_is_empty {
+            &lite_qual_buf[..spot_total_bases]
         } else {
             let qual_end = qual_offset + spot_total_bases;
             if qual_end > quality_all.len() {
-                crate::vdb::encoding::sra_lite_quality(spot_total_bases, true)
+                &lite_qual_buf[..spot_total_bases.min(lite_qual_buf.len())]
             } else {
-                let q = quality_all[qual_offset..qual_end].to_vec();
+                let q = &quality_all[qual_offset..qual_end];
                 qual_offset = qual_end;
                 q
             }
         };
 
-        let name: Vec<u8> = if let Some(ref names) = spot_names {
+        // Spot name: borrow from decoded names or format a number.
+        let name_owned: Vec<u8>;
+        let spot_name: &[u8] = if let Some(ref names) = spot_names {
             if spot_idx_in_blob < names.len() {
-                names[spot_idx_in_blob].clone()
+                &names[spot_idx_in_blob]
             } else {
-                format!("{}", spots_before as usize + spot_idx_in_blob + 1).into_bytes()
+                name_owned =
+                    itoa_buf.format(spots_before as usize + spot_idx_in_blob + 1).as_bytes().to_vec();
+                &name_owned
             }
         } else {
-            format!("{}", spots_before as usize + spot_idx_in_blob + 1).into_bytes()
+            name_owned =
+                itoa_buf.format(spots_before as usize + spot_idx_in_blob + 1).as_bytes().to_vec();
+            &name_owned
         };
 
-        let read_types = vec![0u8; rps];
-        let read_filter = vec![0u8; rps];
+        // Read types for this spot: borrow from decoded data or default to biological.
+        let spot_read_types: &[u8] = if !read_type_data.is_empty()
+            && rt_offset + rps <= read_type_data.len()
+        {
+            let rt = &read_type_data[rt_offset..rt_offset + rps];
+            rt_offset += rps;
+            rt
+        } else {
+            rt_offset += rps;
+            &[] // empty = all biological (checked below)
+        };
 
-        spots.push(SpotRecord {
-            name,
-            sequence: sequence.to_vec(),
-            quality,
-            read_lengths: spot_read_lengths.to_vec(),
-            read_types,
-            read_filter,
-            spot_group: Vec::new(),
-        });
+        // ------------------------------------------------------------------
+        // Inline format_spot logic: split reads, filter, route, format.
+        // ------------------------------------------------------------------
+        struct ReadSeg {
+            start: usize,
+            len: usize,
+        }
+
+        let mut segments: Vec<ReadSeg> = Vec::with_capacity(rps);
+        let mut read_offset: usize = 0;
+        for (i, &rlen) in spot_read_lengths.iter().enumerate() {
+            let rlen_usize = rlen as usize;
+            let end = read_offset + rlen_usize;
+            if end > spot_total_bases {
+                break;
+            }
+
+            // Filter: skip technical reads if configured.
+            if config.skip_technical {
+                let rtype = spot_read_types.get(i).copied().unwrap_or(0);
+                if rtype != 0 {
+                    read_offset = end;
+                    continue;
+                }
+            }
+
+            // Filter: skip reads shorter than the minimum length.
+            if let Some(min_len) = config.min_read_len {
+                if rlen < min_len {
+                    read_offset = end;
+                    continue;
+                }
+            }
+
+            segments.push(ReadSeg {
+                start: read_offset,
+                len: rlen_usize,
+            });
+            read_offset = end;
+        }
+
+        if !segments.is_empty() {
+            // Base offset into the spot's sequence/quality slices.
+            match config.split_mode {
+                SplitMode::Split3 | SplitMode::Interleaved => {
+                    if segments.len() == 2 {
+                        let r1 = format_read(
+                            run_name,
+                            spot_name,
+                            &sequence[segments[0].start..segments[0].start + segments[0].len],
+                            &quality[segments[0].start..segments[0].start + segments[0].len],
+                        );
+                        let r2 = format_read(
+                            run_name,
+                            spot_name,
+                            &sequence[segments[1].start..segments[1].start + segments[1].len],
+                            &quality[segments[1].start..segments[1].start + segments[1].len],
+                        );
+                        records.push((OutputSlot::Read1, r1));
+                        records.push((OutputSlot::Read2, r2));
+                    } else {
+                        for seg in &segments {
+                            let rec = format_read(
+                                run_name,
+                                spot_name,
+                                &sequence[seg.start..seg.start + seg.len],
+                                &quality[seg.start..seg.start + seg.len],
+                            );
+                            records.push((OutputSlot::Unpaired, rec));
+                        }
+                    }
+                }
+                SplitMode::SplitFiles => {
+                    for (file_idx, seg) in segments.iter().enumerate() {
+                        let rec = format_read(
+                            run_name,
+                            spot_name,
+                            &sequence[seg.start..seg.start + seg.len],
+                            &quality[seg.start..seg.start + seg.len],
+                        );
+                        records.push((OutputSlot::ReadN(file_idx as u32), rec));
+                    }
+                }
+                SplitMode::SplitSpot => {
+                    for seg in &segments {
+                        let rec = format_read(
+                            run_name,
+                            spot_name,
+                            &sequence[seg.start..seg.start + seg.len],
+                            &quality[seg.start..seg.start + seg.len],
+                        );
+                        records.push((OutputSlot::Single, rec));
+                    }
+                }
+            }
+        }
 
         rl_cursor += rps;
         spot_idx_in_blob += 1;
     }
 
-    Ok(spots)
+    Ok((records, spot_idx_in_blob as u64))
 }
 
 /// Decode VDB columns from a local SRA file, format FASTQ, and write to
@@ -643,6 +799,10 @@ fn decode_and_write(
     let has_name = cursor.name_col().is_some();
     let name_blob_count = cursor.name_col().map_or(0, |c| c.blob_count());
     let name_cs = cursor.name_col().map_or(0, |c| c.meta().checksum_type);
+
+    let has_read_type = cursor.read_type_col().is_some();
+    let read_type_blob_count = cursor.read_type_col().map_or(0, |c| c.blob_count());
+    let read_type_cs = cursor.read_type_col().map_or(0, |c| c.meta().checksum_type);
 
     tracing::info!("{accession}: streaming decode of {num_blobs} blobs (batch-parallel)",);
 
@@ -795,6 +955,18 @@ fn decode_and_write(
                                 (&[], 0)
                             };
 
+                        let (rt_raw, rt_id_range): (&[u8], u64) =
+                            if has_read_type && bi < read_type_blob_count {
+                                let rtcol = cursor.read_type_col().unwrap();
+                                let rtblob = &rtcol.blobs()[bi];
+                                (
+                                    rtcol.read_raw_blob_slice(rtblob.start_id)?,
+                                    rtblob.id_range as u64,
+                                )
+                            } else {
+                                (&[], 0)
+                            };
+
                         let raw = RawBlobData {
                             read_raw,
                             read_id_range,
@@ -807,26 +979,23 @@ fn decode_and_write(
                             name_raw: n_raw,
                             name_id_range: n_id_range,
                             name_cs,
+                            read_type_raw: rt_raw,
+                            read_type_id_range: rt_id_range,
+                            read_type_cs,
                             has_read_len,
                             has_name,
+                            has_read_type,
                         };
 
-                        let spots = decode_blob_to_spots(
+                        decode_blob_to_fastq(
                             &raw,
                             read_cs,
                             is_lite,
                             bi,
                             spots_before_per_blob[i],
-                        )?;
-
-                        let num_spots = spots.len() as u64;
-                        let mut records = Vec::new();
-                        for spot in &spots {
-                            let formatted = format_spot(spot, accession, &fastq_config);
-                            records.extend(formatted);
-                        }
-
-                        Ok((records, num_spots))
+                            accession,
+                            &fastq_config,
+                        )
                     })
                     .collect()
             });
