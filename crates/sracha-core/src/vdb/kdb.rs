@@ -148,8 +148,10 @@ enum DataSource {
     /// Data loaded in memory (for `from_parts` / selective fetch).
     InMemory(Vec<u8>),
     /// Data in a file on disk at a specific offset and size.
+    /// The file handle is kept open for the lifetime of the ColumnReader
+    /// to avoid re-opening the file on every blob read.
     OnDisk {
-        sra_path: std::path::PathBuf,
+        file: std::cell::RefCell<std::fs::File>,
         /// Absolute byte offset in the SRA file where the column data starts.
         file_offset: u64,
         /// Size of the column data in the SRA file.
@@ -849,8 +851,11 @@ impl ColumnReader {
                 });
             }
 
+            let file = std::fs::File::open(sra_path).map_err(|e| {
+                Error::Io(e)
+            })?;
             reader.data = DataSource::OnDisk {
-                sra_path: sra_path.to_path_buf(),
+                file: std::cell::RefCell::new(file),
                 file_offset,
                 file_size,
             };
@@ -895,7 +900,7 @@ impl ColumnReader {
                 Ok(data[blob_offset..blob_offset + size].to_vec())
             }
             DataSource::OnDisk {
-                sra_path,
+                file,
                 file_offset,
                 file_size,
             } => {
@@ -905,24 +910,19 @@ impl ColumnReader {
                     )));
                 }
                 let abs_offset = file_offset + blob_offset as u64;
-                let mut file = std::fs::File::open(sra_path).map_err(|e| {
-                    Error::Vdb(format!(
-                        "failed to open SRA file {}: {e}",
-                        sra_path.display()
-                    ))
-                })?;
+                let mut file = file.borrow_mut();
                 file.seek(std::io::SeekFrom::Start(abs_offset))
                     .map_err(|e| {
                         Error::Vdb(format!(
                             "failed to seek in SRA file {}: {e}",
-                            sra_path.display()
+                            "<sra>"
                         ))
                     })?;
                 let mut buf = vec![0u8; size];
                 file.read_exact(&mut buf).map_err(|e| {
                     Error::Vdb(format!(
                         "failed to read blob from SRA file {}: {e}",
-                        sra_path.display()
+                        "<sra>"
                     ))
                 })?;
                 Ok(buf)
