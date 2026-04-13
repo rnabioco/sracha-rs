@@ -15,6 +15,23 @@ const STYLES: Styles = Styles::styled()
     version,
     about = "Fast SRA downloader and FASTQ converter",
     styles = STYLES,
+    after_help = "\
+Examples:
+  Download and convert to FASTQ in one shot:
+    sracha get SRR1234567
+
+  Download multiple accessions with progress:
+    sracha get SRR1234567 SRR7654321 -p
+
+  Fetch SRA file, then convert separately:
+    sracha fetch SRR1234567
+    sracha fastq SRR1234567.sra
+
+  Interleaved paired-end output to stdout:
+    sracha fastq SRR1234567.sra --split interleaved -Z
+
+  Show accession metadata:
+    sracha info SRR1234567"
 )]
 pub struct Cli {
     #[command(subcommand)]

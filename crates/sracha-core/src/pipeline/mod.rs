@@ -232,6 +232,7 @@ fn decode_and_write(
         // Save page map for per-row splitting when READ_LEN is absent.
         let read_page_map = read_decoded.page_map;
         if blob_idx == 0 {
+            tracing::info!("blob 0: page_map={}, read_len_col={}", read_page_map.is_some(), cursor.read_len_col().is_some());
             if let Some(ref pm) = read_page_map {
                 tracing::info!(
                     "blob 0 page_map: data_recs={}, lengths={:?}, leng_runs={:?}, data_runs_len={}",
@@ -336,17 +337,43 @@ fn decode_and_write(
             // No READ_LEN column: use the READ blob's page map for row lengths.
             if blob_idx == 0 {
                 tracing::info!(
-                    "using page map for row lengths: lengths={:?}, leng_runs={:?}, data_recs={}, total_bases={}",
-                    &pm.lengths[..pm.lengths.len().min(5)],
-                    &pm.leng_runs[..pm.leng_runs.len().min(5)],
+                    "using page map: {} lengths, {} leng_runs, data_recs={}, total_bases={}, lengths[20..30]={:?}, leng_runs[20..30]={:?}",
+                    pm.lengths.len(),
+                    pm.leng_runs.len(),
                     pm.data_recs,
                     read_data.len(),
+                    &pm.lengths[20..pm.lengths.len().min(30)],
+                    &pm.leng_runs[20..pm.leng_runs.len().min(30)],
                 );
             }
             let mut row_lengths = Vec::new();
             for (len, run) in pm.lengths.iter().zip(pm.leng_runs.iter()) {
                 for _ in 0..*run {
+                    // Sanity check: individual reads shouldn't exceed 100KB
+                    if *len > 100_000 {
+                        tracing::warn!(
+                            "blob {blob_idx}: page map length {} exceeds 100KB, skipping (likely deserialization error)",
+                            len
+                        );
+                        continue;
+                    }
                     row_lengths.push(*len);
+                }
+            }
+            if blob_idx == 0 {
+                let bad_count = row_lengths.iter().filter(|&&l| l > 10000).count();
+                let skipped = pm.lengths.iter().zip(pm.leng_runs.iter())
+                    .flat_map(|(l, r)| std::iter::repeat(*l).take(*r as usize))
+                    .filter(|&l| l > 100_000)
+                    .count();
+                tracing::info!(
+                    "blob 0: {} row_lengths from page map (skipped {} > 100KB), {} > 10KB, pm.lengths has {} entries",
+                    row_lengths.len(), skipped, bad_count, pm.lengths.len(),
+                );
+                // Show some of the bad values
+                let bad_vals: Vec<_> = pm.lengths.iter().filter(|&&l| l > 10000).take(5).collect();
+                if !bad_vals.is_empty() {
+                    tracing::warn!("bad page map lengths: {bad_vals:?}");
                 }
             }
             row_lengths

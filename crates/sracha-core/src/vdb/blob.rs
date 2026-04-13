@@ -397,7 +397,37 @@ fn page_map_deserialize_v1(data: &[u8], row_count: u64) -> Result<PageMap> {
     }
 
     // Now deserialize as v0 with the full decompressed data.
-    page_map_deserialize_v0(&decompressed, row_count)
+    tracing::debug!(
+        "page_map_v1: variant={variant}, hsize={hsize}, decompressed_len={}, first_20_bytes={:02x?}",
+        decompressed.len(),
+        &decompressed[..decompressed.len().min(20)],
+    );
+    let result = page_map_deserialize_v0(&decompressed, row_count);
+    if let Ok(ref pm) = result {
+        let bad = pm.lengths.iter().filter(|&&v| v > 1000).count();
+        if bad > 0 {
+            let first_bad_idx = pm.lengths.iter().position(|&v| v > 100_000).unwrap_or(0);
+            tracing::warn!(
+                "page_map: {bad} of {} lengths > 100K. First bad at [{first_bad_idx}]={}, context: {:?}",
+                pm.lengths.len(),
+                pm.lengths[first_bad_idx],
+                &pm.lengths[first_bad_idx.saturating_sub(2)..pm.lengths.len().min(first_bad_idx + 3)],
+            );
+            // Show raw bytes around where the bad value was decoded from
+            // v0 variant 2: header = byte[0] + vlen(leng_recs), then data
+            let v0_variant = decompressed[0] & 3;
+            if v0_variant == 2 && decompressed.len() > 3 {
+                let (lr, lr_sz) = vlen_decode_u64(&decompressed[1..]).unwrap_or((0, 1));
+                let body_start = 1 + lr_sz;
+                tracing::warn!(
+                    "v0 variant=2, leng_recs={lr}, body_start={body_start}, decompressed_len={}, body bytes[0..20]={:02x?}",
+                    decompressed.len(),
+                    &decompressed[body_start..decompressed.len().min(body_start + 20)],
+                );
+            }
+        }
+    }
+    result
 }
 
 // ---------------------------------------------------------------------------
@@ -1558,7 +1588,7 @@ pub fn irzip_decode(
     // Apply min and slope: Y[i] = decoded[i] + min + i * slope
     let mut output = vec![0u8; n * out_bytes];
     for (i, &v) in values.iter().enumerate().take(n) {
-        let val = v + min + (i as i64) * slope;
+        let val = v.wrapping_add(min).wrapping_add((i as i64).wrapping_mul(slope));
         write_element(&mut output, i, val, elem_bits);
     }
 
