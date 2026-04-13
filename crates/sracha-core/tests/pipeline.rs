@@ -140,7 +140,7 @@ fn assert_quality_bytes_valid(data: &[u8], label: &str) {
 
         for (pos, &byte) in qual.iter().enumerate() {
             assert!(
-                byte >= 33 && byte <= 126,
+                (33..=126).contains(&byte),
                 "{label}: record {record_idx}, position {pos}: quality byte {byte} (0x{byte:02x}) \
                  is outside valid Phred+33 ASCII range [33, 126]. \
                  This indicates raw Phred integers were written without the +33 offset.",
