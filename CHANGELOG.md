@@ -1,6 +1,6 @@
 # Changelog
 
-## 0.1.1 (2026-04-13)
+## 0.1.1 (2026-04-14)
 
 ### Added
 
@@ -23,6 +23,11 @@
 
 ### Changed
 
+- **Batch API calls for `info` and `get`**: Multi-accession and project queries
+  now resolve all runs in 2 HTTP requests (1 SDL + 1 EUtils) instead of 2N
+  sequential calls. Significantly faster for projects with many runs.
+- **Improved error messages**: Not-found accessions now include an NCBI search
+  link to help verify the accession exists.
 - Compression is now configured via a `CompressionMode` enum (`None`, `Gzip`,
   `Zstd`) instead of separate `--gzip` / `--no-gzip` boolean flags. Existing
   flag behavior is preserved: gzip is the default, `--no-gzip` disables

@@ -5,7 +5,7 @@ pub enum Error {
     #[error("invalid accession format: {0}")]
     InvalidAccession(String),
 
-    #[error("accession not found: {0}")]
+    #[error("not found: {0}")]
     NotFound(String),
 
     #[error("SDL API error: {message}")]

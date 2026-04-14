@@ -226,17 +226,10 @@ async fn main() -> Result<()> {
             let run_accessions = resolve_to_runs(&raw, &client).await?;
 
             let mut resolved_all = Vec::new();
-            for acc_str in &run_accessions {
-                let acc = match accession::parse(acc_str) {
-                    Ok(a) => a,
-                    Err(e) => {
-                        eprintln!("{} {acc_str}: {e}", style::error_label("error:"));
-                        continue;
-                    }
-                };
-                match client.resolve_one(&acc.to_string()).await {
+            for result in client.resolve_many(&run_accessions).await? {
+                match result {
                     Ok(resolved) => resolved_all.push(resolved),
-                    Err(e) => eprintln!("{} {acc_str}: {e}", style::error_label("error:")),
+                    Err(e) => eprintln!("{} {e}", style::error_label("error:")),
                 }
             }
 
@@ -461,11 +454,11 @@ async fn resolve_and_check_size(
     client: &SdlClient,
     yes: bool,
 ) -> Result<Vec<ResolvedAccession>> {
-    let mut resolved = Vec::with_capacity(run_accessions.len());
-    for acc_str in run_accessions {
-        let acc = accession::parse(acc_str)?;
-        resolved.push(client.resolve_one(&acc.to_string()).await?);
-    }
+    let resolved: Vec<ResolvedAccession> = client
+        .resolve_many(run_accessions)
+        .await?
+        .into_iter()
+        .collect::<std::result::Result<Vec<_>, _>>()?;
 
     let total_size: u64 = resolved.iter().map(|r| r.sra_file.size).sum();
 

@@ -2,6 +2,8 @@ mod response;
 
 pub use response::*;
 
+use std::collections::HashMap;
+
 use crate::accession::{ProjectAccession, ProjectKind};
 use crate::error::{Error, Result};
 
@@ -202,39 +204,112 @@ impl SdlClient {
         })
     }
 
+    /// Resolve multiple accessions in batch (one SDL call + one EUtils call).
+    ///
+    /// The outer `Result` fails if the SDL batch request itself fails.
+    /// Individual per-accession failures (404, missing SRA file) are returned
+    /// as `Err` entries in the inner `Vec`.
+    pub async fn resolve_many(&self, accessions: &[String]) -> Result<Vec<Result<ResolvedAccession>>> {
+        if accessions.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        // Single batched SDL call.
+        let sdl_response = self.resolve(accessions).await?;
+
+        // Single batched EUtils RunInfo call (non-fatal).
+        let run_info_map = self.fetch_run_info_batch(accessions).await;
+
+        // Assemble per-accession results.
+        let results = accessions
+            .iter()
+            .map(|acc| {
+                let result = sdl_response
+                    .find_result(acc)
+                    .ok_or_else(|| Error::NotFound(acc.clone()))?;
+
+                if let Some(status) = result.status
+                    && status != 200
+                {
+                    let msg = result.message.as_deref().unwrap_or("unknown error");
+                    return Err(Error::Sdl {
+                        message: format!("{acc}: SDL status {status} — {msg}"),
+                    });
+                }
+
+                let sra_sdl = result.find_sra_file().ok_or_else(|| Error::Sdl {
+                    message: format!("no SRA file found for {acc}"),
+                })?;
+
+                let sra_file = resolved_file_from_sdl(sra_sdl)?;
+
+                let vdbcache_file = result
+                    .find_vdbcache_file()
+                    .and_then(|f| resolved_file_from_sdl(f).ok());
+
+                let run_info = run_info_map.get(acc).cloned();
+
+                Ok(ResolvedAccession {
+                    accession: acc.clone(),
+                    sra_file,
+                    vdbcache_file,
+                    run_info,
+                })
+            })
+            .collect();
+
+        Ok(results)
+    }
+
     /// Query NCBI EUtils EFetch RunInfo CSV for read structure metadata.
     ///
     /// Returns `None` on any failure (network, parse, unexpected format) —
     /// this is a best-effort enhancement, not a hard requirement.
     async fn fetch_run_info(&self, accession: &str) -> Option<RunInfo> {
-        let url = format!("{EUTILS_EFETCH_URL}?db=sra&id={accession}&rettype=runinfo&retmode=text");
+        let map = self.fetch_run_info_batch(&[accession.to_string()]).await;
+        map.into_values().next()
+    }
 
-        tracing::debug!("EUtils RunInfo request: {url}");
+    /// Batch-fetch RunInfo for multiple accessions in chunks of [`EFETCH_BATCH_SIZE`].
+    ///
+    /// Non-fatal: accessions that fail to resolve simply won't appear in the map.
+    async fn fetch_run_info_batch(&self, accessions: &[String]) -> HashMap<String, RunInfo> {
+        let mut result = HashMap::new();
 
-        let resp = match http_get_with_retry(&self.http, &url).await {
-            Ok(r) => r,
-            Err(e) => {
-                tracing::warn!("{accession}: EUtils RunInfo request failed: {e}");
-                return None;
+        for chunk in accessions.chunks(EFETCH_BATCH_SIZE) {
+            let ids = chunk.join(",");
+            let url =
+                format!("{EUTILS_EFETCH_URL}?db=sra&id={ids}&rettype=runinfo&retmode=text");
+
+            tracing::debug!("EUtils RunInfo batch request ({} accessions)", chunk.len());
+
+            let resp = match http_get_with_retry(&self.http, &url).await {
+                Ok(r) => r,
+                Err(e) => {
+                    tracing::warn!("EUtils RunInfo batch request failed: {e}");
+                    continue;
+                }
+            };
+
+            if !resp.status().is_success() {
+                tracing::warn!("EUtils RunInfo batch HTTP {}", resp.status());
+                continue;
             }
-        };
 
-        if !resp.status().is_success() {
-            tracing::warn!("{accession}: EUtils RunInfo HTTP {}", resp.status());
-            return None;
+            let body = match resp.text().await {
+                Ok(b) => b,
+                Err(e) => {
+                    tracing::warn!("EUtils RunInfo batch body read failed: {e}");
+                    continue;
+                }
+            };
+
+            tracing::debug!("EUtils RunInfo batch response: {body}");
+
+            result.extend(parse_run_info_csv_multi(&body));
         }
 
-        let body = match resp.text().await {
-            Ok(b) => b,
-            Err(e) => {
-                tracing::warn!("{accession}: EUtils RunInfo body read failed: {e}");
-                return None;
-            }
-        };
-
-        tracing::debug!("EUtils RunInfo response: {body}");
-
-        parse_run_info_csv(&body, accession)
+        result
     }
 
     /// Resolve a project/study accession to a list of run accession strings.
@@ -283,7 +358,7 @@ impl SdlClient {
 
         if id_list.is_empty() {
             return Err(Error::NotFound(format!(
-                "no SRA runs found for {accession}"
+                "{accession} — verify the accession exists at https://www.ncbi.nlm.nih.gov/sra/?term={accession}"
             )));
         }
 
@@ -326,7 +401,7 @@ impl SdlClient {
 
         if run_accessions.is_empty() {
             return Err(Error::NotFound(format!(
-                "EFetch returned no run accessions for {accession}"
+                "{accession} — project exists but contains no run accessions"
             )));
         }
 
@@ -342,71 +417,99 @@ impl SdlClient {
     }
 }
 
-/// Parse the EFetch RunInfo CSV to extract read structure.
+/// Parse an EFetch RunInfo CSV with multiple data rows into a map of accession → RunInfo.
 ///
-/// The CSV has a header row and one data row. We need `LibraryLayout`
-/// (PAIRED/SINGLE) and `avgLength` (total bases per spot).
-fn parse_run_info_csv(body: &str, accession: &str) -> Option<RunInfo> {
+/// The CSV has a header row followed by one data row per run. We need the `Run`
+/// column as key, and `LibraryLayout` + `avgLength` to build each `RunInfo`.
+/// Rows that fail to parse are silently skipped.
+fn parse_run_info_csv_multi(body: &str) -> HashMap<String, RunInfo> {
+    let mut result = HashMap::new();
     let mut lines = body.lines().filter(|l| !l.trim().is_empty());
-    let header = lines.next()?;
-    let data = lines.next()?;
+
+    let Some(header) = lines.next() else {
+        return result;
+    };
 
     let headers: Vec<&str> = header.split(',').collect();
-    let values: Vec<&str> = data.split(',').collect();
+    let col = |name: &str| headers.iter().position(|h| *h == name);
 
-    if headers.len() != values.len() {
-        tracing::warn!(
-            "{accession}: RunInfo CSV header/data column mismatch ({} vs {})",
-            headers.len(),
-            values.len()
-        );
-        return None;
-    }
-
-    let get_field = |name: &str| -> Option<&str> {
-        headers
-            .iter()
-            .position(|h| *h == name)
-            .and_then(|i| values.get(i).copied())
+    let Some(layout_idx) = col("LibraryLayout") else {
+        return result;
     };
+    let Some(avg_len_idx) = col("avgLength") else {
+        return result;
+    };
+    let run_idx = col("Run");
 
-    let layout = get_field("LibraryLayout")?;
-    let avg_length: u32 = get_field("avgLength")?.parse().ok()?;
-
-    let nreads = match layout {
-        "PAIRED" => 2usize,
-        "SINGLE" => 1,
-        other => {
-            tracing::warn!("{accession}: unknown LibraryLayout '{other}', defaulting to 1");
-            1
+    for data in lines {
+        let values: Vec<&str> = data.split(',').collect();
+        if values.len() != headers.len() {
+            continue;
         }
-    };
 
-    let per_read = avg_length / nreads as u32;
-    if per_read == 0 {
-        tracing::warn!("{accession}: computed per_read_len=0 from avgLength={avg_length}");
-        return None;
+        let accession = run_idx
+            .and_then(|i| values.get(i).copied())
+            .unwrap_or("")
+            .to_string();
+        if accession.is_empty() {
+            continue;
+        }
+
+        let Some(layout) = values.get(layout_idx).copied() else {
+            continue;
+        };
+        let Some(avg_length) = values.get(avg_len_idx).and_then(|v| v.parse::<u32>().ok()) else {
+            continue;
+        };
+
+        let nreads = match layout {
+            "PAIRED" => 2usize,
+            "SINGLE" => 1,
+            other => {
+                tracing::warn!("{accession}: unknown LibraryLayout '{other}', defaulting to 1");
+                1
+            }
+        };
+
+        let per_read = avg_length / nreads as u32;
+        if per_read == 0 {
+            tracing::warn!("{accession}: computed per_read_len=0 from avgLength={avg_length}");
+            continue;
+        }
+
+        let mut avg_read_len = vec![per_read; nreads];
+        let used = per_read * nreads as u32;
+        if used < avg_length
+            && let Some(last) = avg_read_len.last_mut()
+        {
+            *last += avg_length - used;
+        }
+
+        tracing::info!(
+            "{accession}: EUtils RunInfo: layout={layout}, avgLength={avg_length}, \
+             nreads={nreads}, per_read_len={avg_read_len:?}",
+        );
+
+        result.insert(
+            accession,
+            RunInfo {
+                nreads,
+                avg_read_len,
+                spot_len: avg_length,
+            },
+        );
     }
 
-    // Build per-read lengths. Last read gets any remainder from integer division.
-    let mut avg_read_len = vec![per_read; nreads];
-    let used = per_read * nreads as u32;
-    if used < avg_length
-        && let Some(last) = avg_read_len.last_mut()
-    {
-        *last += avg_length - used;
-    }
+    result
+}
 
-    tracing::info!(
-        "{accession}: EUtils RunInfo: layout={layout}, avgLength={avg_length}, \
-         nreads={nreads}, per_read_len={avg_read_len:?}",
-    );
-
-    Some(RunInfo {
-        nreads,
-        avg_read_len,
-        spot_len: avg_length,
-    })
+/// Parse the EFetch RunInfo CSV to extract read structure for a single accession.
+///
+/// Thin wrapper around [`parse_run_info_csv_multi`] that looks up the given accession.
+#[cfg(test)]
+fn parse_run_info_csv(body: &str, accession: &str) -> Option<RunInfo> {
+    let mut map = parse_run_info_csv_multi(body);
+    map.remove(accession)
 }
 
 /// Parse run accessions from an EFetch RunInfo CSV body.
@@ -570,8 +673,8 @@ mod tests {
     #[test]
     fn parse_run_info_odd_avg_length() {
         // avgLength=301 for PAIRED → 150 + 151
-        let csv = "avgLength,LibraryLayout\n301,PAIRED\n";
-        let ri = parse_run_info_csv(csv, "test").unwrap();
+        let csv = "Run,avgLength,LibraryLayout\nTEST,301,PAIRED\n";
+        let ri = parse_run_info_csv(csv, "TEST").unwrap();
         assert_eq!(ri.nreads, 2);
         assert_eq!(ri.avg_read_len, vec![150, 151]);
         assert_eq!(ri.spot_len, 301);
@@ -579,8 +682,8 @@ mod tests {
 
     #[test]
     fn parse_run_info_missing_layout() {
-        let csv = "avgLength\n302\n";
-        assert!(parse_run_info_csv(csv, "test").is_none());
+        let csv = "Run,avgLength\nTEST,302\n";
+        assert!(parse_run_info_csv(csv, "TEST").is_none());
     }
 
     #[test]
@@ -590,8 +693,25 @@ mod tests {
 
     #[test]
     fn parse_run_info_header_only() {
-        let csv = "avgLength,LibraryLayout\n";
+        let csv = "Run,avgLength,LibraryLayout\n";
         assert!(parse_run_info_csv(csv, "test").is_none());
+    }
+
+    #[test]
+    fn parse_run_info_multi_rows() {
+        let csv = "Run,spots,bases,avgLength,LibraryLayout\n\
+                   SRR111,100,200,302,PAIRED\n\
+                   SRR222,200,400,150,SINGLE\n";
+        let map = parse_run_info_csv_multi(csv);
+        assert_eq!(map.len(), 2);
+        let r1 = map.get("SRR111").unwrap();
+        assert_eq!(r1.nreads, 2);
+        assert_eq!(r1.spot_len, 302);
+        assert_eq!(r1.avg_read_len, vec![151, 151]);
+        let r2 = map.get("SRR222").unwrap();
+        assert_eq!(r2.nreads, 1);
+        assert_eq!(r2.spot_len, 150);
+        assert_eq!(r2.avg_read_len, vec![150]);
     }
 
     // -----------------------------------------------------------------------
