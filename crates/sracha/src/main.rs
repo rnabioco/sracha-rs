@@ -37,11 +37,11 @@ async fn main() -> Result<()> {
             let raw = collect_accessions(&args.accessions, args.accession_list.as_deref())?;
             let client = SdlClient::new();
             let run_accessions = resolve_to_runs(&raw, &client).await?;
+            let resolved_all = resolve_and_check_size(&run_accessions, &client, args.yes).await?;
 
             tokio::fs::create_dir_all(&args.output_dir).await?;
-            for acc_str in &run_accessions {
-                let acc = accession::parse(acc_str)?;
-                let resolved = client.resolve_one(&acc.to_string()).await?;
+            for resolved in &resolved_all {
+                let acc = &resolved.accession;
                 let mirror = resolved
                     .sra_file
                     .mirrors
@@ -153,11 +153,13 @@ async fn main() -> Result<()> {
             let raw = collect_accessions(&args.accessions, args.accession_list.as_deref())?;
             let sdl_client = SdlClient::new();
             let run_accessions = resolve_to_runs(&raw, &sdl_client).await?;
+            let resolved_all =
+                resolve_and_check_size(&run_accessions, &sdl_client, args.yes).await?;
 
             let format_label = if args.fasta { "FASTA" } else { "FASTQ" };
             tracing::info!(
                 "get {} run accession(s) -> {format_label}",
-                run_accessions.len()
+                resolved_all.len()
             );
 
             let split_mode = match args.split {
@@ -180,10 +182,7 @@ async fn main() -> Result<()> {
                 }
             };
 
-            for acc_str in &run_accessions {
-                let acc = accession::parse(acc_str)?;
-                let resolved = sdl_client.resolve_one(&acc.to_string()).await?;
-
+            for resolved in &resolved_all {
                 let pipeline_config = sracha_core::pipeline::PipelineConfig {
                     output_dir: args.output_dir.clone(),
                     split_mode,
@@ -198,7 +197,7 @@ async fn main() -> Result<()> {
                     fasta: args.fasta,
                 };
 
-                let stats = sracha_core::pipeline::run_get(&resolved, &pipeline_config).await?;
+                let stats = sracha_core::pipeline::run_get(resolved, &pipeline_config).await?;
 
                 let pct = if stats.total_sra_size > 0 {
                     stats.bytes_downloaded as f64 / stats.total_sra_size as f64 * 100.0
@@ -226,10 +225,8 @@ async fn main() -> Result<()> {
             let client = SdlClient::new();
             let run_accessions = resolve_to_runs(&raw, &client).await?;
 
-            for (i, acc_str) in run_accessions.iter().enumerate() {
-                if i > 0 {
-                    println!();
-                }
+            let mut resolved_all = Vec::new();
+            for acc_str in &run_accessions {
                 let acc = match accession::parse(acc_str) {
                     Ok(a) => a,
                     Err(e) => {
@@ -238,8 +235,18 @@ async fn main() -> Result<()> {
                     }
                 };
                 match client.resolve_one(&acc.to_string()).await {
-                    Ok(resolved) => print_resolved(&resolved),
+                    Ok(resolved) => resolved_all.push(resolved),
                     Err(e) => eprintln!("{} {acc_str}: {e}", style::error_label("error:")),
+                }
+            }
+
+            if resolved_all.len() > 1 {
+                // Project/multi-accession: print summary table then total.
+                print_info_table(&resolved_all);
+            } else {
+                // Single accession: detailed view.
+                for resolved in &resolved_all {
+                    print_resolved(resolved);
                 }
             }
             Ok(())
@@ -399,4 +406,78 @@ fn print_resolved(resolved: &ResolvedAccession) {
             ri.avg_read_len
         );
     }
+}
+
+/// Print a compact table for multiple resolved accessions (project view).
+fn print_info_table(resolved: &[ResolvedAccession]) {
+    // Header
+    println!(
+        "  {:<14} {:>10}  {:>6}  {}",
+        style::label("Accession"),
+        style::label("Size"),
+        style::label("Layout"),
+        style::label("Lite"),
+    );
+    println!("  {}", "-".repeat(50));
+
+    let mut total_size: u64 = 0;
+
+    for r in resolved {
+        let layout = r
+            .run_info
+            .as_ref()
+            .map(|ri| if ri.nreads == 2 { "PAIRED" } else { "SINGLE" })
+            .unwrap_or("?");
+        let lite = if r.sra_file.is_lite { "yes" } else { "no" };
+        total_size += r.sra_file.size;
+
+        println!(
+            "  {:<14} {:>10}  {:>6}  {}",
+            r.accession,
+            format_size(r.sra_file.size),
+            layout,
+            lite,
+        );
+    }
+
+    println!("  {}", "-".repeat(50));
+    println!(
+        "  {} {} across {} run(s)",
+        style::label("Total:"),
+        style::value(format_size(total_size)),
+        style::count(resolved.len()),
+    );
+}
+
+/// Size threshold (in bytes) above which downloads require `--yes` confirmation.
+const LARGE_DOWNLOAD_THRESHOLD: u64 = 500 * 1024 * 1024 * 1024; // 500 GiB
+
+/// Resolve all accessions and check total download size.
+///
+/// If the total exceeds [`LARGE_DOWNLOAD_THRESHOLD`] and `yes` is `false`,
+/// prints the summary and exits with an error asking the user to confirm.
+async fn resolve_and_check_size(
+    run_accessions: &[String],
+    client: &SdlClient,
+    yes: bool,
+) -> Result<Vec<ResolvedAccession>> {
+    let mut resolved = Vec::with_capacity(run_accessions.len());
+    for acc_str in run_accessions {
+        let acc = accession::parse(acc_str)?;
+        resolved.push(client.resolve_one(&acc.to_string()).await?);
+    }
+
+    let total_size: u64 = resolved.iter().map(|r| r.sra_file.size).sum();
+
+    if total_size > LARGE_DOWNLOAD_THRESHOLD && !yes {
+        eprintln!();
+        print_info_table(&resolved);
+        eprintln!();
+        anyhow::bail!(
+            "total download size {} exceeds 500 GiB -- rerun with --yes / -y to confirm",
+            format_size(total_size),
+        );
+    }
+
+    Ok(resolved)
 }

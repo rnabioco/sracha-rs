@@ -107,6 +107,10 @@ pub struct FetchArgs {
     /// Disable download resume (re-download from scratch)
     #[arg(long)]
     pub no_resume: bool,
+
+    /// Skip confirmation prompt for large downloads (>500 GiB)
+    #[arg(short, long)]
+    pub yes: bool,
 }
 
 #[derive(Args)]
@@ -236,6 +240,10 @@ pub struct GetArgs {
     /// Disable download resume (re-download from scratch)
     #[arg(long)]
     pub no_resume: bool,
+
+    /// Skip confirmation prompt for large downloads (>500 GiB)
+    #[arg(short, long)]
+    pub yes: bool,
 }
 
 #[derive(Args)]
