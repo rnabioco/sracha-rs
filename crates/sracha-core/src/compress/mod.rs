@@ -222,6 +222,21 @@ impl<W: Write + Send> Write for ParGzWriter<W> {
                 // bounded even when the caller writes far more data than the
                 // channel bound × block_size.
                 self.drain_ready();
+                // Apply backpressure: if the producer is dispatching blocks
+                // faster than the compression pool can process them, block
+                // until the pool catches up.  Without this, pool.spawn()
+                // enqueues closures in rayon's unbounded work queue, and
+                // finish() stalls for seconds draining the backlog.
+                let max_pending = (self.pool.current_num_threads() as u64) * 2;
+                while self.pending > max_pending {
+                    match self.rx.recv() {
+                        Ok((seq, data)) => {
+                            self.pending -= 1;
+                            self.insert_and_flush(seq, data);
+                        }
+                        Err(_) => break,
+                    }
+                }
             }
         }
 
