@@ -37,7 +37,9 @@ async fn main() -> Result<()> {
             let raw = collect_accessions(&args.accessions, args.accession_list.as_deref())?;
             let client = SdlClient::new();
             let run_accessions = resolve_to_runs(&raw, &client).await?;
-            let resolved_all = resolve_and_check_size(&run_accessions, &client, args.yes).await?;
+            let resolved_all =
+                resolve_accessions(&run_accessions, &client, args.prefer_sdl, false).await?;
+            check_download_size(&resolved_all, args.yes)?;
 
             tokio::fs::create_dir_all(&args.output_dir).await?;
             for resolved in &resolved_all {
@@ -47,7 +49,7 @@ async fn main() -> Result<()> {
                     .mirrors
                     .iter()
                     .min_by_key(|m| match m.service.as_str() {
-                        "s3" => 0u8,
+                        "s3" | "s3-direct" => 0u8,
                         "gs" => 1,
                         _ if m.service.contains("sra-ncbi") => 2,
                         "ncbi" => 3,
@@ -154,7 +156,8 @@ async fn main() -> Result<()> {
             let sdl_client = SdlClient::new();
             let run_accessions = resolve_to_runs(&raw, &sdl_client).await?;
             let resolved_all =
-                resolve_and_check_size(&run_accessions, &sdl_client, args.yes).await?;
+                resolve_accessions(&run_accessions, &sdl_client, args.prefer_sdl, true).await?;
+            check_download_size(&resolved_all, args.yes)?;
 
             let format_label = if args.fasta { "FASTA" } else { "FASTQ" };
             tracing::info!(
@@ -445,26 +448,99 @@ fn print_info_table(resolved: &[ResolvedAccession]) {
 /// Size threshold (in bytes) above which downloads require `--yes` confirmation.
 const LARGE_DOWNLOAD_THRESHOLD: u64 = 500 * 1024 * 1024 * 1024; // 500 GiB
 
-/// Resolve all accessions and check total download size.
+/// Resolve accessions with direct S3 probing, falling back to SDL per-accession.
 ///
-/// If the total exceeds [`LARGE_DOWNLOAD_THRESHOLD`] and `yes` is `false`,
-/// prints the summary and exits with an error asking the user to confirm.
-async fn resolve_and_check_size(
+/// When `prefer_sdl` is `true`, skips S3 and uses SDL directly (current behavior).
+/// When `need_run_info` is `true`, fetches read structure metadata via EUtils
+/// for FASTQ conversion (needed by the `get` command).
+async fn resolve_accessions(
     run_accessions: &[String],
     client: &SdlClient,
-    yes: bool,
+    prefer_sdl: bool,
+    need_run_info: bool,
 ) -> Result<Vec<ResolvedAccession>> {
-    let resolved: Vec<ResolvedAccession> = client
-        .resolve_many(run_accessions)
-        .await?
-        .into_iter()
-        .collect::<std::result::Result<Vec<_>, _>>()?;
+    if prefer_sdl {
+        tracing::info!("using SDL for all accessions (--prefer-sdl)");
+        let resolved: Vec<ResolvedAccession> = client
+            .resolve_many(run_accessions)
+            .await?
+            .into_iter()
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        return Ok(resolved);
+    }
 
+    // Phase 1: Try direct S3 for all accessions.
+    tracing::info!(
+        "probing direct S3 for {} accession(s)...",
+        run_accessions.len()
+    );
+    let s3_results =
+        sracha_core::s3::resolve_direct_many(client.http_client(), run_accessions).await;
+
+    let mut resolved: Vec<Option<ResolvedAccession>> = vec![None; run_accessions.len()];
+    let mut sdl_needed: Vec<(usize, String)> = Vec::new();
+
+    for (i, acc) in run_accessions.iter().enumerate() {
+        match s3_results.get(acc) {
+            Some(Ok(r)) => {
+                tracing::info!(
+                    "{acc}: resolved via direct S3 ({})",
+                    format_size(r.sra_file.size)
+                );
+                resolved[i] = Some(r.clone());
+            }
+            Some(Err(e)) => {
+                tracing::debug!("{acc}: direct S3 probe failed: {e}");
+                sdl_needed.push((i, acc.clone()));
+            }
+            None => {
+                sdl_needed.push((i, acc.clone()));
+            }
+        }
+    }
+
+    // Phase 2: Fall back to SDL for accessions that failed direct S3.
+    if !sdl_needed.is_empty() {
+        let sdl_accs: Vec<String> = sdl_needed.iter().map(|(_, a)| a.clone()).collect();
+        tracing::info!("falling back to SDL for {} accession(s)", sdl_accs.len());
+        let sdl_results = client.resolve_many(&sdl_accs).await?;
+
+        for ((i, acc), result) in sdl_needed.into_iter().zip(sdl_results) {
+            match result {
+                Ok(r) => {
+                    tracing::info!("{acc}: resolved via SDL ({})", format_size(r.sra_file.size));
+                    resolved[i] = Some(r);
+                }
+                Err(e) => {
+                    anyhow::bail!("{acc}: failed to resolve via both S3 and SDL: {e}");
+                }
+            }
+        }
+    }
+
+    let mut resolved: Vec<ResolvedAccession> = resolved.into_iter().flatten().collect();
+
+    // Phase 3: Fetch run_info if needed (for FASTQ conversion).
+    if need_run_info {
+        let all_accs: Vec<String> = resolved.iter().map(|r| r.accession.clone()).collect();
+        let run_info_map = client.fetch_run_info_batch(&all_accs).await;
+        for r in &mut resolved {
+            if r.run_info.is_none() {
+                r.run_info = run_info_map.get(&r.accession).cloned();
+            }
+        }
+    }
+
+    Ok(resolved)
+}
+
+/// Check total download size and prompt for confirmation if above threshold.
+fn check_download_size(resolved: &[ResolvedAccession], yes: bool) -> Result<()> {
     let total_size: u64 = resolved.iter().map(|r| r.sra_file.size).sum();
 
     if total_size > LARGE_DOWNLOAD_THRESHOLD && !yes {
         eprintln!();
-        print_info_table(&resolved);
+        print_info_table(resolved);
         eprintln!();
         anyhow::bail!(
             "total download size {} exceeds 500 GiB -- rerun with --yes / -y to confirm",
@@ -472,5 +548,5 @@ async fn resolve_and_check_size(
         );
     }
 
-    Ok(resolved)
+    Ok(())
 }

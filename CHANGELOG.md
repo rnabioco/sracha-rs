@@ -2,6 +2,14 @@
 
 ## Unreleased
 
+### Added
+
+- **Direct S3 fetch**: Downloads now probe the NCBI SRA Open Data S3 bucket
+  directly, skipping the SDL API round-trip. Falls back to SDL automatically
+  when the direct URL is unavailable (old/non-public accessions). Stable URLs
+  also improve resume reliability vs. expiring presigned SDL URLs. Use
+  `--prefer-sdl` to opt out.
+
 ### Changed
 
 - **Simplify KAR/VDB parsing**: Unified duplicated PBSTree parsers across

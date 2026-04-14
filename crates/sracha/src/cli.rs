@@ -111,6 +111,10 @@ pub struct FetchArgs {
     /// Skip confirmation prompt for large downloads (>500 GiB)
     #[arg(short, long)]
     pub yes: bool,
+
+    /// Skip direct S3 and resolve via the SDL API
+    #[arg(long)]
+    pub prefer_sdl: bool,
 }
 
 #[derive(Args)]
@@ -244,6 +248,10 @@ pub struct GetArgs {
     /// Skip confirmation prompt for large downloads (>500 GiB)
     #[arg(short, long)]
     pub yes: bool,
+
+    /// Skip direct S3 and resolve via the SDL API
+    #[arg(long)]
+    pub prefer_sdl: bool,
 }
 
 #[derive(Args)]

@@ -184,7 +184,7 @@ fn select_mirror(resolved: &ResolvedAccession) -> Result<String> {
     // Priority: s3 > gs > sra-ncbi > ncbi > any
     let priority = |s: &str| -> u8 {
         match s {
-            "s3" => 0,
+            "s3" | "s3-direct" => 0,
             "gs" => 1,
             s if s.contains("sra-ncbi") => 2,
             "ncbi" => 3,

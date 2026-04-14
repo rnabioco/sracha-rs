@@ -276,7 +276,7 @@ impl SdlClient {
     /// Batch-fetch RunInfo for multiple accessions in chunks of [`EFETCH_BATCH_SIZE`].
     ///
     /// Non-fatal: accessions that fail to resolve simply won't appear in the map.
-    async fn fetch_run_info_batch(&self, accessions: &[String]) -> HashMap<String, RunInfo> {
+    pub async fn fetch_run_info_batch(&self, accessions: &[String]) -> HashMap<String, RunInfo> {
         let mut result = HashMap::new();
 
         for chunk in accessions.chunks(EFETCH_BATCH_SIZE) {
