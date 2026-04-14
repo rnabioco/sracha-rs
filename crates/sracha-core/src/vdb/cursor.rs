@@ -618,21 +618,20 @@ mod tests {
         use std::io::Write;
         let dir = std::env::temp_dir();
         let path = dir.join(format!(
-            "sracha-test-{}.sra",
-            std::process::id() as u64 * 1000 + rand_u64()
+            "sracha-test-{}-{}.sra",
+            std::process::id(),
+            next_id()
         ));
         let mut f = std::fs::File::create(&path).unwrap();
         f.write_all(archive_bytes).unwrap();
         path
     }
 
-    /// Simple pseudo-random u64 for unique temp file names.
-    fn rand_u64() -> u64 {
-        use std::time::SystemTime;
-        SystemTime::now()
-            .duration_since(SystemTime::UNIX_EPOCH)
-            .unwrap()
-            .subsec_nanos() as u64
+    /// Monotonic counter for unique temp file names across parallel tests.
+    fn next_id() -> u64 {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static COUNTER: AtomicU64 = AtomicU64::new(0);
+        COUNTER.fetch_add(1, Ordering::Relaxed)
     }
 
     #[test]
