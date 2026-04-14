@@ -2,6 +2,25 @@
 
 ## Unreleased
 
+## 0.1.5 (2026-04-14)
+
+### Added
+
+- **Benchmarks**: Added `validation/benchmark.sh` script comparing sracha
+  against fastq-dump and fasterq-dump, and added benchmark results to README.
+- **Graceful Ctrl-C handling**: The `get` command now cancels in-flight
+  downloads cleanly on SIGINT.
+
+### Changed
+
+- **Progress bars**: Switched to Unicode thin-bar style and extracted shared
+  progress bar helper.
+- **MIT license**: Added LICENSE file.
+
+### Fixed
+
+- **Cursor tests**: Fixed temp file name collision in parallel cursor tests.
+
 ## 0.1.4 (2026-04-14)
 
 ### Performance
