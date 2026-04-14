@@ -2282,8 +2282,8 @@ mod tests {
 
     /// Build irzip test data: single plane of raw-deflate bytes.
     fn make_irzip_single_plane(values: &[u8]) -> Vec<u8> {
-        use flate2::write::DeflateEncoder;
         use flate2::Compression;
+        use flate2::write::DeflateEncoder;
         use std::io::Write as _;
 
         let mut encoder = DeflateEncoder::new(Vec::new(), Compression::default());

@@ -317,8 +317,7 @@ fn illumina_paired_spot_count() {
     let tmp = tempfile::tempdir().unwrap();
     let config = test_config(tmp.path(), SplitMode::Split3, CompressionMode::None);
 
-    let stats =
-        sracha_core::pipeline::run_fastq(&sra_path, Some("SRR28588231"), &config).unwrap();
+    let stats = sracha_core::pipeline::run_fastq(&sra_path, Some("SRR28588231"), &config).unwrap();
 
     assert_eq!(stats.spots_read, 66_220, "expected 66,220 spots");
     assert_eq!(stats.reads_written, 132_440, "expected 132,440 reads");
@@ -349,8 +348,7 @@ fn illumina_paired_byte_identity() {
     let tmp = tempfile::tempdir().unwrap();
     let config = test_config(tmp.path(), SplitMode::Split3, CompressionMode::None);
 
-    let stats =
-        sracha_core::pipeline::run_fastq(&sra_path, Some("SRR28588231"), &config).unwrap();
+    let stats = sracha_core::pipeline::run_fastq(&sra_path, Some("SRR28588231"), &config).unwrap();
 
     let md5_1 = md5_file(&stats.output_files[0]);
     let md5_2 = md5_file(&stats.output_files[1]);

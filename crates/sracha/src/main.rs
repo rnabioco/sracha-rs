@@ -5,8 +5,8 @@ use std::path::Path;
 
 use anyhow::{Context, Result};
 use clap::Parser;
-use tracing_subscriber::fmt::time::FormatTime;
 use tracing_subscriber::EnvFilter;
+use tracing_subscriber::fmt::time::FormatTime;
 
 struct LocalTimer;
 

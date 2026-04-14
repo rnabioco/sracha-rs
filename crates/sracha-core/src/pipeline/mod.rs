@@ -249,8 +249,7 @@ fn decode_irzip_column(decoded: &blob::DecodedBlob) -> Vec<u8> {
     } else {
         let num_elems = decoded
             .row_length
-            .unwrap_or_else(|| (decoded.data.len() as u64 * 8) / 32)
-            as u32;
+            .unwrap_or_else(|| (decoded.data.len() as u64 * 8) / 32) as u32;
         blob::izip_decode(&decoded.data, 32, num_elems).unwrap_or_default()
     };
     expand_via_page_map(decoded_ints, &decoded.page_map)
@@ -739,8 +738,7 @@ fn decode_blob_to_fastq(
         // Pick the template per spot using the skey spot_start mapping.
         // A single blob can span multiple tile ranges, so we look up the
         // correct template for each spot_id via binary search.
-        let has_templates =
-            !all_templates.is_empty() && !raw.name_spot_starts.is_empty();
+        let has_templates = !all_templates.is_empty() && !raw.name_spot_starts.is_empty();
 
         if blob_idx == 0 && has_templates {
             tracing::info!(
@@ -1113,7 +1111,10 @@ fn decode_and_write(
             .page_map
             .as_ref()
             .and_then(|pm| pm.lengths.iter().copied().find(|&l| l > 0 && l <= 100_000))
-            .or(decoded.row_length.map(|rl| rl as u32).filter(|&l| l > 0 && l <= 100_000))
+            .or(decoded
+                .row_length
+                .map(|rl| rl as u32)
+                .filter(|&l| l > 0 && l <= 100_000))
     } else {
         None
     };
