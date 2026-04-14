@@ -23,6 +23,11 @@
   the next file's download starts while the current one is being decoded,
   overlapping network and CPU.
 
+### Changed
+
+- Added `profiling` cargo profile (optimized, no LTO) for heap profiling
+  with valgrind/dhat.
+
 ### Fixed
 
 - **Illumina tile boundaries**: Fixed skey id2ord delta unpacking to use
