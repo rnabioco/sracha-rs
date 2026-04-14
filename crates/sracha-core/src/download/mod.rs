@@ -87,7 +87,7 @@ fn effective_chunk_size(file_size: u64, config: &DownloadConfig) -> u64 {
     } else if file_size < LARGE_FILE {
         16 * 1024 * 1024 // 16 MiB
     } else {
-        32 * 1024 * 1024 // 32 MiB
+        64 * 1024 * 1024 // 64 MiB
     }
 }
 
@@ -455,6 +455,7 @@ pub async fn download_file(
 
     let client = reqwest::Client::builder()
         .user_agent(format!("sracha/{}", env!("CARGO_PKG_VERSION")))
+        .http2_adaptive_window(true)
         .build()?;
 
     // Probe the first URL.
@@ -476,6 +477,13 @@ pub async fn download_file(
     }
 
     let use_parallel = probe.supports_range && file_size >= SMALL_FILE;
+
+    // Scale up connections for large files (16 for >256 MiB, user value otherwise).
+    let connections = if file_size >= MEDIUM_FILE {
+        config.connections.max(16)
+    } else {
+        config.connections
+    };
 
     if use_parallel {
         // --- Parallel chunked download (with resume support) ---
@@ -545,7 +553,7 @@ pub async fn download_file(
                 chunks_to_download.len(),
                 total_chunks,
                 crate::util::format_size(chunk_size),
-                config.connections,
+                connections,
             );
 
             // Calculate bytes remaining for progress bar.
@@ -569,7 +577,7 @@ pub async fn download_file(
             }
             // If resuming, file already exists at full pre-allocated size.
 
-            let semaphore = std::sync::Arc::new(Semaphore::new(config.connections));
+            let semaphore = std::sync::Arc::new(Semaphore::new(connections));
             let client = std::sync::Arc::new(client);
             let url = std::sync::Arc::new(url.clone());
             let path = std::sync::Arc::new(output_path.to_path_buf());
@@ -813,10 +821,10 @@ mod tests {
             effective_chunk_size(512 * 1024 * 1024, &config),
             16 * 1024 * 1024
         );
-        // >= 2 GiB => 32 MiB chunks
+        // >= 2 GiB => 64 MiB chunks
         assert_eq!(
             effective_chunk_size(3 * 1024 * 1024 * 1024, &config),
-            32 * 1024 * 1024
+            64 * 1024 * 1024
         );
     }
 
