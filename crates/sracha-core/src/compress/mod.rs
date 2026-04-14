@@ -266,7 +266,10 @@ fn compress_block(data: &[u8], level: u32) -> Vec<u8> {
         let mut slot = cell.borrow_mut();
 
         // Recreate if this is the first call or the level changed.
-        if slot.as_ref().map_or(true, |(cached_lvl, _, _)| *cached_lvl != lvl_i32) {
+        if slot
+            .as_ref()
+            .is_none_or(|(cached_lvl, _, _)| *cached_lvl != lvl_i32)
+        {
             let lvl = CompressionLvl::new(lvl_i32).expect("valid compression level");
             *slot = Some((lvl_i32, Compressor::new(lvl), Vec::new()));
         }

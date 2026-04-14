@@ -199,7 +199,9 @@ async fn main() -> Result<()> {
             // decoding accession N, start downloading accession N+1 so that
             // network and CPU overlap.
             let mut pending_download: Option<
-                tokio::task::JoinHandle<sracha_core::error::Result<sracha_core::pipeline::DownloadedSra>>,
+                tokio::task::JoinHandle<
+                    sracha_core::error::Result<sracha_core::pipeline::DownloadedSra>,
+                >,
             > = None;
 
             for (i, resolved) in resolved_all.iter().enumerate() {

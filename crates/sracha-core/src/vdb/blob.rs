@@ -27,6 +27,8 @@
 //! - [`page_map_deserialize`]: Page map deserialization.
 //! - [`blob_headers_deserialize`]: Blob header stack deserialization.
 
+use std::borrow::Cow;
+
 use crate::error::{Error, Result};
 
 // ---------------------------------------------------------------------------
@@ -633,12 +635,12 @@ fn decode_blob_v2(data: &[u8]) -> Result<BlobEnvelope> {
 // ---------------------------------------------------------------------------
 
 /// Result of decoding a VDB blob.
-#[derive(Debug, Clone, Default)]
-pub struct DecodedBlob {
+#[derive(Debug, Clone)]
+pub struct DecodedBlob<'a> {
     /// The raw column data (after stripping envelope, headers, page map).
-    /// This may be deflate-compressed or izip-compressed data that needs
-    /// further processing by the appropriate transform.
-    pub data: Vec<u8>,
+    /// Borrows directly from the mmap'd blob slice when possible, avoiding
+    /// a copy. Falls back to owned data only for the empty-blob case.
+    pub data: Cow<'a, [u8]>,
     /// Number of trailing adjustment bits in the last data byte.
     pub adjust: u8,
     /// Whether the data is big-endian.
@@ -660,15 +662,15 @@ pub struct DecodedBlob {
 ///
 /// Returns the decoded blob structure with separated envelope, headers,
 /// page map, and raw column data.
-pub fn decode_blob(
-    raw: &[u8],
+pub fn decode_blob<'a>(
+    raw: &'a [u8],
     checksum_type: u8,
     row_count: u64,
     _elem_bits: u32,
-) -> Result<DecodedBlob> {
+) -> Result<DecodedBlob<'a>> {
     if raw.is_empty() {
         return Ok(DecodedBlob {
-            data: vec![],
+            data: Cow::Borrowed(b""),
             adjust: 0,
             big_endian: false,
             headers: vec![],
@@ -715,7 +717,7 @@ pub fn decode_blob(
         let (big_endian, adjust, row_length, offset) = decode_blob_v1(blob_data)?;
 
         Ok(DecodedBlob {
-            data: blob_data[offset..].to_vec(),
+            data: Cow::Borrowed(&blob_data[offset..]),
             adjust,
             big_endian,
             headers: vec![],
@@ -754,10 +756,9 @@ pub fn decode_blob(
         };
 
         let data_start = es + hs + ms;
-        let data = blob_data[data_start..].to_vec();
 
         Ok(DecodedBlob {
-            data,
+            data: Cow::Borrowed(&blob_data[data_start..]),
             adjust: envelope.adjust,
             big_endian: envelope.big_endian,
             headers,
@@ -1248,8 +1249,6 @@ fn nbuf_read_min(data: &[u8], idx: usize, variant: u32, min: i64) -> i64 {
     nbuf_read(data, idx, variant).wrapping_add(min)
 }
 
-
-
 /// Decode types bitmap: each bit in `src` maps to one segment type (0=line, 1=outlier).
 fn decode_types(n: usize, src: &[u8]) -> Vec<u8> {
     let mut dst = vec![0u8; n];
@@ -1433,18 +1432,17 @@ pub fn izip_decode(data: &[u8], elem_bits: u32, _num_elements_hint: u32) -> Resu
             let mut u = 0usize; // line segment index
             let mut v = 0usize; // outlier value index
 
-            for seg_idx in 0..iz.segments as usize {
+            for (seg_idx, &seg_type) in segment_types.iter().enumerate() {
                 let seg_len =
                     nbuf_read_min(&length_raw, seg_idx, length_var, iz.min_length) as usize;
 
-                if segment_types[seg_idx] != 0 {
+                if seg_type != 0 {
                     // Outlier segment: copy values directly.
                     for j in 0..seg_len {
                         if k + j >= n {
                             break;
                         }
-                        let val =
-                            nbuf_read_min(&outlier_raw, v + j, outlier_var, iz.min_outlier);
+                        let val = nbuf_read_min(&outlier_raw, v + j, outlier_var, iz.min_outlier);
                         write_element(&mut output, k + j, val, elem_bits);
                     }
                     k += seg_len;
@@ -1466,8 +1464,7 @@ pub fn izip_decode(data: &[u8], elem_bits: u32, _num_elements_hint: u32) -> Resu
                             break;
                         }
                         let predicted = a_val as f64 + j as f64 * m;
-                        let diff_val =
-                            nbuf_read_min(&diff_raw, k + j, diff_var, iz.min_diff);
+                        let diff_val = nbuf_read_min(&diff_raw, k + j, diff_var, iz.min_diff);
                         let val = diff_val.wrapping_add(predicted as i64);
                         write_element(&mut output, k + j, val, elem_bits);
                     }

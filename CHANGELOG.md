@@ -2,6 +2,27 @@
 
 ## Unreleased
 
+## 0.1.3 (2026-04-14)
+
+### Performance
+
+- **Thread-local compressor reuse**: Gzip compression reuses libdeflater
+  `Compressor` and output buffer across blocks via thread-local storage,
+  avoiding ~300 KiB malloc/free per 256 KiB block.
+- **Cap gzip thread pool**: Compression pool threads are now capped at
+  `available_parallelism()` to prevent oversubscription.
+- **Lazy quality fallback buffer**: The lite quality buffer is only allocated
+  when quality data is actually missing, skipping ~300 KiB per blob in the
+  common case.
+- **Inline izip type 0 reads**: Eliminated intermediate `Vec<i64>` allocations
+  in izip decode by reading packed values directly from raw buffers during
+  output reconstruction.
+- **Zero-copy blob data**: `DecodedBlob` now borrows data directly from
+  mmap'd slices via `Cow<'a, [u8]>`, eliminating ~9% of heap allocations.
+- **Multi-accession download prefetch**: When processing multiple accessions,
+  the next file's download starts while the current one is being decoded,
+  overlapping network and CPU.
+
 ### Fixed
 
 - **Illumina tile boundaries**: Fixed skey id2ord delta unpacking to use

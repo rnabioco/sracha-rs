@@ -217,7 +217,11 @@ fn select_mirror(resolved: &ResolvedAccession) -> Result<String> {
 /// strip them here before handing the data to [`blob::decode_blob`].
 /// Checksum validation is not performed because the stored CRC covers only
 /// a portion of the blob that doesn't align with the full raw slice.
-fn decode_raw(raw: &[u8], checksum_type: u8, row_count: u64) -> Result<blob::DecodedBlob> {
+fn decode_raw<'a>(
+    raw: &'a [u8],
+    checksum_type: u8,
+    row_count: u64,
+) -> Result<blob::DecodedBlob<'a>> {
     let cs_size: usize = match checksum_type {
         1 => 4,  // CRC32
         2 => 16, // MD5
@@ -232,7 +236,7 @@ fn decode_raw(raw: &[u8], checksum_type: u8, row_count: u64) -> Result<blob::Dec
 }
 
 /// Decode irzip-compressed integers from a blob, detecting single vs dual series.
-fn decode_irzip_column(decoded: &blob::DecodedBlob) -> Vec<u8> {
+fn decode_irzip_column(decoded: &blob::DecodedBlob<'_>) -> Vec<u8> {
     let hdr_version = decoded.headers.first().map(|h| h.version).unwrap_or(0);
     let decoded_ints = if hdr_version >= 1 {
         let hdr = &decoded.headers[0];
@@ -291,7 +295,7 @@ fn expand_via_page_map(decoded_ints: Vec<u8>, page_map: &Option<blob::PageMap>) 
 /// data is already the raw-deflate stream.
 ///
 /// Returns decompressed bytes, or falls back to raw bytes on failure.
-fn decode_zip_encoding(decoded: &blob::DecodedBlob) -> Vec<u8> {
+fn decode_zip_encoding(decoded: &blob::DecodedBlob<'_>) -> Vec<u8> {
     let hdr_version = decoded.headers.first().map(|h| h.version).unwrap_or(0);
 
     if decoded.data.is_empty() {
@@ -307,7 +311,7 @@ fn decode_zip_encoding(decoded: &blob::DecodedBlob) -> Vec<u8> {
         .unwrap_or(decoded.data.len() * 4);
 
     // Try raw deflate via libdeflate.
-    if let Ok(mut out) = blob::deflate_decompress(decoded.data.as_slice(), estimated)
+    if let Ok(mut out) = blob::deflate_decompress(&decoded.data, estimated)
         && !out.is_empty()
     {
         // Version 2: trim trailing bits if specified in header args.
@@ -323,14 +327,14 @@ fn decode_zip_encoding(decoded: &blob::DecodedBlob) -> Vec<u8> {
     }
 
     // Fallback: try zlib (with header).
-    if let Ok(out2) = blob::zlib_decompress(decoded.data.as_slice(), estimated)
+    if let Ok(out2) = blob::zlib_decompress(&decoded.data, estimated)
         && !out2.is_empty()
     {
         return out2;
     }
 
     // Last resort: return raw bytes (might already be uncompressed).
-    decoded.data.clone()
+    decoded.data.to_vec()
 }
 
 // ---------------------------------------------------------------------------
@@ -814,7 +818,7 @@ fn decode_blob_to_fastq(
         if !raw_bytes.is_empty() {
             raw_bytes
         } else {
-            rtdecoded.data
+            rtdecoded.data.into_owned()
         }
     } else {
         Vec::new()
@@ -1045,8 +1049,7 @@ fn decode_and_write(
     // Dedicated thread pool for parallel gzip compression (only needed for gzip).
     let compress_pool: Option<Arc<rayon::ThreadPool>> =
         if matches!(config.compression, CompressionMode::Gzip { .. }) {
-            let max_hw = std::thread::available_parallelism()
-                .map_or(usize::MAX, |p| p.get());
+            let max_hw = std::thread::available_parallelism().map_or(usize::MAX, |p| p.get());
             let compress_threads = (num_threads * 2).min(max_hw);
             Some(Arc::new(
                 rayon::ThreadPoolBuilder::new()

@@ -3,7 +3,7 @@ resolver = "2"
 members = ["crates/sracha", "crates/sracha-core"]
 
 [workspace.package]
-version = "0.1.2"
+version = "0.1.3"
 edition = "2024"
 rust-version = "1.92"
 license = "MIT"
@@ -70,6 +70,14 @@ opt-level = 3
 # Debug-friendly release build with symbols
 [profile.release-with-debug]
 inherits = "release"
+strip = false
+debug = 2
+
+# Profiling: optimized but no LTO so frames are visible to valgrind/perf
+[profile.profiling]
+inherits = "release"
+lto = false
+codegen-units = 16
 strip = false
 debug = 2
 
