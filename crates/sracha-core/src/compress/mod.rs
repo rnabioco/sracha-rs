@@ -249,17 +249,37 @@ impl<W: Write + Send> Write for ParGzWriter<W> {
 // --------------------------------------------------------------------------
 
 fn compress_block(data: &[u8], level: u32) -> Vec<u8> {
+    use std::cell::RefCell;
+
     use libdeflater::{CompressionLvl, Compressor};
 
-    let lvl = CompressionLvl::new(level.clamp(1, 12) as i32).expect("valid compression level");
-    let mut compressor = Compressor::new(lvl);
-    let max_sz = compressor.gzip_compress_bound(data.len());
-    let mut out = vec![0u8; max_sz];
-    let actual = compressor
-        .gzip_compress(data, &mut out)
-        .expect("gzip compression should not fail");
-    out.truncate(actual);
-    out
+    // Reuse the Compressor and output buffer across calls on the same rayon
+    // worker thread.  Compressor allocates ~300 KiB of internal hash tables;
+    // reusing it avoids thousands of malloc/free cycles per file.
+    thread_local! {
+        static TL: RefCell<Option<(i32, Compressor, Vec<u8>)>> = const { RefCell::new(None) };
+    }
+
+    let lvl_i32 = level.clamp(1, 12) as i32;
+
+    TL.with(|cell| {
+        let mut slot = cell.borrow_mut();
+
+        // Recreate if this is the first call or the level changed.
+        if slot.as_ref().map_or(true, |(cached_lvl, _, _)| *cached_lvl != lvl_i32) {
+            let lvl = CompressionLvl::new(lvl_i32).expect("valid compression level");
+            *slot = Some((lvl_i32, Compressor::new(lvl), Vec::new()));
+        }
+
+        let (_, compressor, out_buf) = slot.as_mut().unwrap();
+
+        let max_sz = compressor.gzip_compress_bound(data.len());
+        out_buf.resize(max_sz, 0);
+        let actual = compressor
+            .gzip_compress(data, out_buf)
+            .expect("gzip compression should not fail");
+        out_buf[..actual].to_vec()
+    })
 }
 
 // --------------------------------------------------------------------------

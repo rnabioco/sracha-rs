@@ -455,16 +455,19 @@ fn decode_blob_to_fastq(
         (all, is_empty)
     };
 
-    // Pre-allocate a single quality buffer for SRA-lite / empty quality.
-    // Reused across all spots in this blob instead of allocating per spot.
-    // Always allocated so it can serve as a fallback when real quality data
-    // runs out before sequence data.
+    // Quality fallback buffer for SRA-lite / empty quality.  Only allocated
+    // when quality is actually missing; the quality-overrun fallback path
+    // allocates on demand (rare).
     let lite_qual_char = if is_lite {
         crate::vdb::encoding::SRA_LITE_REJECT_QUAL + crate::vdb::encoding::QUAL_PHRED_OFFSET
     } else {
         crate::vdb::encoding::SRA_LITE_PASS_QUAL + crate::vdb::encoding::QUAL_PHRED_OFFSET
     };
-    let lite_qual_buf: Vec<u8> = vec![lite_qual_char; read_data.len()];
+    let mut lite_qual_buf: Option<Vec<u8>> = if quality_is_empty {
+        Some(vec![lite_qual_char; read_data.len()])
+    } else {
+        None
+    };
 
     // ------------------------------------------------------------------
     // Decode READ_LEN blob -> irzip/izip -> u32 lengths.
@@ -852,7 +855,7 @@ fn decode_blob_to_fastq(
         seq_offset = seq_end;
 
         let quality: &[u8] = if quality_is_empty {
-            &lite_qual_buf[seq_offset - spot_total_bases..seq_offset]
+            &lite_qual_buf.as_ref().unwrap()[seq_offset - spot_total_bases..seq_offset]
         } else {
             let qual_end = qual_offset + spot_total_bases;
             if qual_end > quality_all.len() {
@@ -863,7 +866,11 @@ fn decode_blob_to_fastq(
                 );
                 // Advance qual_offset so subsequent spots don't re-read stale data.
                 qual_offset = qual_end;
-                &lite_qual_buf[seq_offset - spot_total_bases..seq_offset]
+                // Lazily allocate fallback buffer on first overrun (rare path).
+                if lite_qual_buf.is_none() {
+                    lite_qual_buf = Some(vec![lite_qual_char; read_data.len()]);
+                }
+                &lite_qual_buf.as_ref().unwrap()[seq_offset - spot_total_bases..seq_offset]
             } else {
                 let q = &quality_all[qual_offset..qual_end];
                 qual_offset = qual_end;
@@ -1037,7 +1044,9 @@ fn decode_and_write(
     // Dedicated thread pool for parallel gzip compression (only needed for gzip).
     let compress_pool: Option<Arc<rayon::ThreadPool>> =
         if matches!(config.compression, CompressionMode::Gzip { .. }) {
-            let compress_threads = num_threads * 2;
+            let max_hw = std::thread::available_parallelism()
+                .map_or(usize::MAX, |p| p.get());
+            let compress_threads = (num_threads * 2).min(max_hw);
             Some(Arc::new(
                 rayon::ThreadPoolBuilder::new()
                     .num_threads(compress_threads)
