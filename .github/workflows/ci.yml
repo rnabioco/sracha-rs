@@ -53,7 +53,7 @@ jobs:
         uses: actions/cache@v4
         with:
           path: crates/sracha-core/tests/fixtures
-          key: sra-fixture-SRR000001-v1
+          key: sra-fixture-SRR28588231-v1
       - name: Run integration tests
         run: cargo test -p sracha-core --all-features -- --ignored
 

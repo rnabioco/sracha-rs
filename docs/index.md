@@ -29,7 +29,7 @@ Fast SRA downloader and FASTQ converter, written in pure Rust.
 
 ```bash
 # Download, convert, and compress in one shot
-sracha get SRR000001
+sracha get SRR28588231
 
 # Download all runs from a BioProject
 sracha get PRJNA675068
@@ -38,16 +38,16 @@ sracha get PRJNA675068
 sracha get --accession-list SRR_Acc_List.txt
 
 # Just download
-sracha fetch SRR000001
+sracha fetch SRR28588231
 
 # Convert a local .sra file
-sracha fastq SRR000001.sra
+sracha fastq SRR28588231.sra
 
 # Show accession info
-sracha info SRR000001
+sracha info SRR28588231
 
 # Validate a downloaded file
-sracha validate SRR000001.sra
+sracha validate SRR28588231.sra
 ```
 
 See the [Getting Started](getting-started.md) guide for more examples, or

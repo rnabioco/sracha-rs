@@ -12,7 +12,7 @@ clear error message.
 The simplest way to get FASTQ files from an SRA accession:
 
 ```bash
-sracha get SRR000001
+sracha get SRR28588231
 ```
 
 This will:
@@ -22,7 +22,7 @@ This will:
 3. Parse the VDB format natively
 4. Output compressed FASTQ files (gzipped by default)
 
-Output files: `SRR000001_1.fastq.gz`, `SRR000001_2.fastq.gz`
+Output files: `SRR28588231_1.fastq.gz`, `SRR28588231_2.fastq.gz`
 
 ## Downloading entire projects
 
@@ -69,13 +69,13 @@ If you prefer more control, use the individual subcommands:
 
 ```bash
 # Download only
-sracha fetch SRR000001 -O /data/sra/ --validate
+sracha fetch SRR28588231 -O /data/sra/ --validate
 
 # Convert to FASTQ
-sracha fastq /data/sra/SRR000001.sra -O /data/fastq/
+sracha fastq /data/sra/SRR28588231.sra -O /data/fastq/
 
 # Uncompressed output
-sracha fastq SRR000001.sra --no-gzip
+sracha fastq SRR28588231.sra --no-gzip
 ```
 
 ## SRA-lite
@@ -84,7 +84,7 @@ SRA-lite files are smaller (4-10x) because they use simplified quality
 scores. To prefer SRA-lite downloads:
 
 ```bash
-sracha get SRR000001 --format sralite
+sracha get SRR28588231 --format sralite
 ```
 
 Quality scores will be uniform: Q30 for pass-filter reads, Q3 for rejects.
@@ -105,16 +105,16 @@ to zstd:
 
 ```bash
 # Faster gzip (lower ratio)
-sracha get SRR000001 --gzip-level 1
+sracha get SRR28588231 --gzip-level 1
 
 # No compression at all
-sracha get SRR000001 --no-gzip
+sracha get SRR28588231 --no-gzip
 
 # Use zstd instead of gzip
-sracha get SRR000001 --zstd
+sracha get SRR28588231 --zstd
 
 # Zstd with a specific level (1-22)
-sracha get SRR000001 --zstd --zstd-level 10
+sracha get SRR28588231 --zstd --zstd-level 10
 ```
 
 ## FASTA output
@@ -122,8 +122,8 @@ sracha get SRR000001 --zstd --zstd-level 10
 To drop quality scores and output FASTA instead of FASTQ:
 
 ```bash
-sracha get SRR000001 --fasta
-sracha fastq SRR000001.sra --fasta
+sracha get SRR28588231 --fasta
+sracha fastq SRR28588231.sra --fasta
 ```
 
 ## Piping to stdout
@@ -132,7 +132,7 @@ Use `-Z` to write interleaved output to stdout, useful for piping
 into other tools:
 
 ```bash
-sracha fastq SRR000001.sra --split interleaved -Z | bwa mem -p ref.fa -
+sracha fastq SRR28588231.sra --split interleaved -Z | bwa mem -p ref.fa -
 ```
 
 ## Validating files
@@ -140,7 +140,7 @@ sracha fastq SRR000001.sra --split interleaved -Z | bwa mem -p ref.fa -
 After downloading, you can verify that an SRA file is intact:
 
 ```bash
-sracha validate SRR000001.sra
+sracha validate SRR28588231.sra
 ```
 
 This decodes all records and reports any errors. Useful after a
@@ -150,10 +150,10 @@ transfer that may have been interrupted.
 
 ```bash
 # More download connections (default: 8)
-sracha get SRR000001 --connections 12
+sracha get SRR28588231 --connections 12
 
 # More threads for decode and compression (default: 8)
-sracha get SRR000001 --threads 16
+sracha get SRR28588231 --threads 16
 ```
 
 ## Download behavior
@@ -163,7 +163,7 @@ re-running the same command picks up where it left off. To force
 a fresh download:
 
 ```bash
-sracha fetch SRR000001 --no-resume
+sracha fetch SRR28588231 --no-resume
 ```
 
 For very large downloads (>500 GiB), sracha prompts for confirmation.
@@ -179,6 +179,6 @@ Use `-v` for more detail, `-vv` for debug output, or `-q` to suppress
 everything except errors:
 
 ```bash
-sracha -vv get SRR000001
+sracha -vv get SRR28588231
 sracha -q get --accession-list SRR_Acc_List.txt
 ```
