@@ -6,13 +6,37 @@ use std::path::Path;
 use anyhow::{Context, Result};
 use clap::Parser;
 use tracing_subscriber::EnvFilter;
-use tracing_subscriber::fmt::time::FormatTime;
+use tracing_subscriber::fmt::format::{self, FormatEvent, FormatFields};
+use tracing_subscriber::registry::LookupSpan;
 
-struct LocalTimer;
+struct SrachaFormatter;
 
-impl FormatTime for LocalTimer {
-    fn format_time(&self, w: &mut tracing_subscriber::fmt::format::Writer<'_>) -> std::fmt::Result {
-        write!(w, "{}", chrono::Local::now().format("%Y-%m-%d %H:%M:%S %Z"))
+impl<S, N> FormatEvent<S, N> for SrachaFormatter
+where
+    S: tracing::Subscriber + for<'a> LookupSpan<'a>,
+    N: for<'a> FormatFields<'a> + 'static,
+{
+    fn format_event(
+        &self,
+        ctx: &tracing_subscriber::fmt::FmtContext<'_, S, N>,
+        mut writer: format::Writer<'_>,
+        event: &tracing::Event<'_>,
+    ) -> std::fmt::Result {
+        let now = chrono::Local::now();
+        write!(writer, "{}", now.format("%Y-%m-%d %H:%M:%S"))?;
+
+        write!(writer, " {:>5}", event.metadata().level())?;
+
+        let target = event.metadata().target();
+        if let Some(module) = target.strip_prefix("sracha_core::") {
+            write!(writer, " [{module}]")?;
+        } else if target != "sracha" && target != "sracha_core" {
+            write!(writer, " [{target}]")?;
+        }
+
+        write!(writer, " ")?;
+        ctx.field_format().format_fields(writer.by_ref(), event)?;
+        writeln!(writer)
     }
 }
 
@@ -35,7 +59,7 @@ async fn main() -> Result<()> {
         _ => "trace",
     };
     tracing_subscriber::fmt()
-        .with_timer(LocalTimer)
+        .event_format(SrachaFormatter)
         .with_env_filter(
             EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new(filter)),
         )

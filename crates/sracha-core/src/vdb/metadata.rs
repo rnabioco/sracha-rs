@@ -90,7 +90,7 @@ pub fn parse_read_structure(tree_data: &[u8]) -> Result<Vec<ReadDescriptor>, Str
 /// Infer reads-per-spot from the schema table name.
 fn infer_nreads_from_schema(schema_text: &str) -> Option<usize> {
     if schema_text.contains("Illumina") {
-        tracing::info!("metadata: schema indicates Illumina platform, assuming nreads=2");
+        tracing::debug!("metadata: schema indicates Illumina platform, assuming nreads=2");
         return Some(2);
     }
     None

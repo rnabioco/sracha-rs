@@ -219,7 +219,7 @@ fn select_mirror(resolved: &ResolvedAccession) -> Result<String> {
         .min_by_key(|m| priority(m.service.as_str()))
         .unwrap();
 
-    tracing::info!(
+    tracing::debug!(
         "selected mirror: [{}] {}",
         best.service,
         &best.url[..best.url.len().min(80)],
@@ -517,7 +517,7 @@ fn decode_blob_to_fastq(
             .collect();
 
         if blob_idx == 0 {
-            tracing::info!(
+            tracing::debug!(
                 "READ_LEN: {} values, reads_per_spot={}, first_10={:?}",
                 lengths.len(),
                 rps,
@@ -537,7 +537,7 @@ fn decode_blob_to_fastq(
             let n_spots = total_bases / spot_len.max(1);
 
             if blob_idx == 0 {
-                tracing::info!(
+                tracing::debug!(
                     "using EUtils API read lengths: {:?}, spot_len={}, n_spots={}",
                     api_lens,
                     spot_len,
@@ -561,7 +561,7 @@ fn decode_blob_to_fastq(
             let meta_rps = raw.metadata_reads_per_spot.unwrap_or(1);
             if let Some(ref pm) = read_page_map {
                 if blob_idx == 0 {
-                    tracing::info!(
+                    tracing::debug!(
                         "READ page_map (no READ_LEN): lengths={:?}, leng_runs={:?}, data_recs={}",
                         &pm.lengths[..pm.lengths.len().min(10)],
                         &pm.leng_runs[..pm.leng_runs.len().min(10)],
@@ -681,7 +681,7 @@ fn decode_blob_to_fastq(
                 }
             }
             if blob_idx == 0 {
-                tracing::info!(
+                tracing::debug!(
                     "NAME: {} names decoded, first={:?}",
                     names.len(),
                     names
@@ -770,7 +770,7 @@ fn decode_blob_to_fastq(
         let has_templates = !all_templates.is_empty() && !raw.name_spot_starts.is_empty();
 
         if blob_idx == 0 && has_templates {
-            tracing::info!(
+            tracing::debug!(
                 "name reconstruction: {} templates, x_vals={}, y_vals={}",
                 all_templates.len(),
                 x_vals.len(),
@@ -816,7 +816,7 @@ fn decode_blob_to_fastq(
             }
 
             if blob_idx == 0 && !names.is_empty() {
-                tracing::info!(
+                tracing::debug!(
                     "Illumina name reconstructed: first={:?}",
                     String::from_utf8_lossy(&names[0]),
                 );
@@ -1083,7 +1083,7 @@ fn decode_and_write(
             None
         };
 
-    tracing::info!("{accession}: using {num_threads} threads for decode");
+    tracing::debug!("{accession}: using {num_threads} threads for decode");
 
     let fastq_config = FastqConfig {
         split_mode: config.split_mode,
@@ -1153,7 +1153,7 @@ fn decode_and_write(
         None
     };
     if let Some(fsl) = fixed_spot_len {
-        tracing::info!("fixed_spot_len={fsl} (from blob 0)");
+        tracing::debug!("fixed_spot_len={fsl} (from blob 0)");
     }
 
     // API-derived per-read lengths (from NCBI EUtils). Only used when
@@ -1165,18 +1165,18 @@ fn decode_and_write(
         None
     };
 
-    tracing::info!(
+    tracing::debug!(
         "{accession}: has_read_len={has_read_len} (blobs={read_len_blob_count}), \
          has_read_type={has_read_type} (blobs={read_type_blob_count}), \
          has_name={has_name}, has_quality={has_quality}, \
          metadata_rps={metadata_reads_per_spot:?}, api_read_lengths={api_read_lengths:?}",
     );
-    tracing::info!("{accession}: streaming decode of {num_blobs} blobs (batch-parallel)",);
+    tracing::debug!("{accession}: streaming decode of {num_blobs} blobs (batch-parallel)",);
 
     let decode_pb = if config.progress {
         Some(make_styled_pb(
             num_blobs as u64,
-            "  {elapsed_precise} {bar:40} {pos}/{len} blobs  {per_sec}  eta {eta}",
+            "  {elapsed_precise} [{bar:40.cyan}] {pos}/{len} blobs  {per_sec}  eta {eta}",
         ))
     } else {
         None
@@ -1450,7 +1450,7 @@ fn decode_and_write(
     }
 
     let total_spots = spots_read.load(Ordering::Relaxed);
-    tracing::info!(
+    tracing::debug!(
         "{accession}: streaming decode complete -- {total_spots} spots, {reads_written} reads written",
     );
 
@@ -1589,7 +1589,7 @@ pub fn run_validate(
     let decode_pb = if progress {
         Some(make_styled_pb(
             num_blobs as u64,
-            "  {elapsed_precise} {bar:40} {pos}/{len} blobs  {per_sec}  eta {eta}",
+            "  {elapsed_precise} [{bar:40.cyan}] {pos}/{len} blobs  {per_sec}  eta {eta}",
         ))
     } else {
         None
@@ -1776,7 +1776,7 @@ pub async fn download_sra(
     let url = select_mirror(resolved)?;
     let urls = vec![url.clone()];
 
-    tracing::info!("{accession}: starting full download from {url}");
+    tracing::debug!("{accession}: starting full download from {url}");
 
     let temp_filename = format!(".sracha-tmp-{accession}.sra");
     let temp_path = config.output_dir.join(&temp_filename);

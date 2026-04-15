@@ -346,7 +346,7 @@ fn delete_progress(path: &Path) {
 fn make_progress_bar(total_size: u64) -> indicatif::ProgressBar {
     crate::pipeline::make_styled_pb(
         total_size,
-        "  {elapsed_precise} {bar:40} {bytes}/{total_bytes}  {bytes_per_sec}  eta {eta}",
+        "  {elapsed_precise} [{bar:40.cyan}] {bytes}/{total_bytes}  {bytes_per_sec}  eta {eta}",
     )
 }
 
@@ -503,7 +503,9 @@ pub async fn download_file(
                     );
                     (remaining, prev)
                 } else {
-                    tracing::info!("progress sidecar parameters changed — starting fresh download",);
+                    tracing::debug!(
+                        "progress sidecar parameters changed — starting fresh download",
+                    );
                     let indexed: Vec<(usize, ChunkRange)> =
                         all_chunks.into_iter().enumerate().collect();
                     let progress = DownloadProgress {
@@ -716,7 +718,7 @@ pub async fn download_file(
                 });
             }
         } else {
-            tracing::info!(
+            tracing::debug!(
                 "downloading {} in single stream (range support: {}, size < 32 MiB: {})",
                 crate::util::format_size(file_size),
                 probe.supports_range,

@@ -133,9 +133,9 @@ impl VdbCursor {
         let y_col = ColumnReader::open(archive, &format!("{seq_col_base}/{COL_Y}"), sra_path).ok();
 
         if name_col.is_some() {
-            tracing::info!("found physical NAME/SPOT_NAME column");
+            tracing::debug!("found physical NAME/SPOT_NAME column");
         } else if altread_col.is_some() && x_col.is_some() && y_col.is_some() {
-            tracing::info!("found ALTREAD + X + Y columns for Illumina name reconstruction");
+            tracing::debug!("found ALTREAD + X + Y columns for Illumina name reconstruction");
         }
 
         let first_row = read_col.first_row_id().unwrap_or(1);
@@ -310,7 +310,7 @@ impl VdbCursor {
             (1i64, 0i64, templates.len(), 0)
         };
 
-        tracing::info!(
+        tracing::debug!(
             "skey: first={first_spot}, last={last_spot}, count={count}, \
              id_bits={id_bits}, {} templates extracted",
             templates.len()
@@ -441,7 +441,7 @@ impl VdbCursor {
             }
 
             if !sorted_templates.is_empty() {
-                tracing::info!(
+                tracing::debug!(
                     "skey: {} entries, first spot_start={}, first template={:?}",
                     sorted_templates.len(),
                     sorted_starts.first().unwrap_or(&0),
@@ -488,7 +488,7 @@ impl VdbCursor {
         match crate::vdb::metadata::parse_read_structure(tree_data) {
             Ok(descs) => {
                 let rps = descs.len();
-                tracing::info!("metadata: detected {rps} reads per spot");
+                tracing::debug!("metadata: detected {rps} reads per spot");
                 Some(rps)
             }
             Err(e) => {

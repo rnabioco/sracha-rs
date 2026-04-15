@@ -369,7 +369,7 @@ impl SdlClient {
             .filter_map(|v| v.as_str().map(|s| s.to_string()))
             .collect();
 
-        tracing::info!("{accession}: ESearch found {} SRA UIDs", uids.len());
+        tracing::debug!("{accession}: ESearch found {} SRA UIDs", uids.len());
 
         // Step 2: EFetch RunInfo CSV in batches to get run accessions.
         let mut run_accessions = Vec::new();
@@ -487,7 +487,7 @@ fn parse_run_info_csv_multi(body: &str) -> HashMap<String, RunInfo> {
             *last += avg_length - used;
         }
 
-        tracing::info!(
+        tracing::debug!(
             "{accession}: EUtils RunInfo: layout={layout}, avgLength={avg_length}, \
              nreads={nreads}, per_read_len={avg_read_len:?}",
         );
