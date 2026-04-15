@@ -192,7 +192,8 @@ impl OutputWriter {
 /// Legacy sequencing platforms with complex read structures that sracha
 /// does not support. Modern short-read (Illumina, BGISEQ, DNBSEQ, Element,
 /// Ultima) and long-read (PacBio, Nanopore) platforms are allowed.
-pub const UNSUPPORTED_PLATFORMS: &[&str] = &["LS454", "ABI_SOLID", "ION_TORRENT", "HELICOS", "CAPILLARY"];
+pub const UNSUPPORTED_PLATFORMS: &[&str] =
+    &["LS454", "ABI_SOLID", "ION_TORRENT", "HELICOS", "CAPILLARY"];
 
 pub fn is_unsupported_platform(platform: &str) -> bool {
     UNSUPPORTED_PLATFORMS.contains(&platform)
@@ -474,10 +475,10 @@ fn decode_blob_to_fastq(
             // Some blobs (e.g., PacBio) store repeated rows once with
             // data_runs > 1; the decompressed data only contains unique
             // rows and must be expanded to match the total base count.
-            if let Some(ref pm) = qpage_map {
-                if !pm.data_runs.is_empty() {
-                    qdata = pm.expand_variable_data_runs(&qdata);
-                }
+            if let Some(ref pm) = qpage_map
+                && !pm.data_runs.is_empty()
+            {
+                qdata = pm.expand_variable_data_runs(&qdata);
             }
             qdata
         } else {

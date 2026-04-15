@@ -73,6 +73,7 @@ impl VdbCursor {
         sra_path: &std::path::Path,
     ) -> Result<Self> {
         let seq_col_base = find_sequence_col_base(archive)?;
+        reject_if_csra(archive, &seq_col_base)?;
 
         // Parse table metadata (md/cur) to extract reads_per_spot and
         // platform for SRA-lite files that lack physical READ_LEN/NREADS columns.
@@ -573,6 +574,37 @@ fn find_sequence_col_base<R: Read + Seek>(archive: &KarArchive<R>) -> Result<Str
     Err(Error::Vdb(
         "SEQUENCE table not found in KAR archive (tried database and flat-table layouts)".into(),
     ))
+}
+
+/// Reject cSRA (aligned/reference-compressed) archives.
+///
+/// cSRA files store reads as diffs against a reference genome (like CRAM).
+/// They have `CMP_READ` instead of `READ` in the SEQUENCE table, plus
+/// `PRIMARY_ALIGNMENT` and `REFERENCE` tables.  We detect either indicator
+/// and return `UnsupportedFormat` with an actionable message.
+fn reject_if_csra<R: Read + Seek>(archive: &KarArchive<R>, seq_col_base: &str) -> Result<()> {
+    let cmp_read_prefix = format!("{seq_col_base}/CMP_READ");
+
+    let has_cmp_read = archive
+        .entries()
+        .keys()
+        .any(|p| p == &cmp_read_prefix || p.starts_with(&format!("{cmp_read_prefix}/")));
+
+    let has_primary_alignment = archive
+        .entries()
+        .keys()
+        .any(|p| p == "tbl/PRIMARY_ALIGNMENT" || p.contains("/tbl/PRIMARY_ALIGNMENT"));
+
+    if has_cmp_read || has_primary_alignment {
+        return Err(Error::UnsupportedFormat {
+            format: "aligned SRA (cSRA)".into(),
+            hint: "reads are reference-compressed and cannot be directly converted. \
+                   Use fasterq-dump from sra-tools instead."
+                .into(),
+        });
+    }
+
+    Ok(())
 }
 
 // ---------------------------------------------------------------------------
