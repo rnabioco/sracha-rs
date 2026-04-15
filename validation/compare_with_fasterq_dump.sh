@@ -1,16 +1,31 @@
 #!/usr/bin/env bash
+#SBATCH --job-name=sracha-validate
+#SBATCH --output=validation/validate_%j.log
+#SBATCH --cpus-per-task=8
+#SBATCH --mem=16G
+#SBATCH --time=1:00:00
 #
 # Compare sracha output against fasterq-dump across split modes and formats.
 #
-# Usage: bash validation/compare_with_fasterq_dump.sh
+# Usage:
+#   bash validation/compare_with_fasterq_dump.sh              # all tests
+#   bash validation/compare_with_fasterq_dump.sh 6 7          # by number
+#   bash validation/compare_with_fasterq_dump.sh sralite      # by name
+#   sbatch validation/compare_with_fasterq_dump.sh            # via Slurm
 #
 # Requires: SRR28588231.sra in crates/sracha-core/tests/fixtures/
 #           (auto-downloaded by the Rust integration tests)
 
 set -uo pipefail
 
-SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-ROOT_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
+# Under Slurm, BASH_SOURCE points to the spool copy; use SLURM_SUBMIT_DIR.
+if [[ -n "${SLURM_SUBMIT_DIR:-}" ]]; then
+    ROOT_DIR="$SLURM_SUBMIT_DIR"
+    SCRIPT_DIR="$ROOT_DIR/validation"
+else
+    SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+    ROOT_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
+fi
 
 SRA_FILE="$ROOT_DIR/crates/sracha-core/tests/fixtures/SRR28588231.sra"
 ACCESSION="SRR28588231"
@@ -39,10 +54,12 @@ skip() { echo -e "  ${YELLOW}SKIP${RESET} $1"; SKIP_COUNT=$((SKIP_COUNT + 1)); R
 
 # Compare two files by md5. If they differ, run compare_fastq.py for details.
 # If md5 differs but seq/qual are identical (defline-only diff), still counts as PASS.
+# Optional 4th arg: "true" to allow N-masking diffs in FASTQ comparison.
 compare_files() {
     local file_a="$1"
     local file_b="$2"
     local label="$3"
+    local allow_n_masking="${4:-false}"
 
     if [[ ! -f "$file_a" ]]; then
         fail "$label — sracha output missing: $(basename "$file_a")"
@@ -70,7 +87,11 @@ compare_files() {
     local ext="${file_a##*.}"
     if [[ "$ext" == "fastq" ]]; then
         echo "  Checking sequence/quality identity with compare_fastq.py..."
-        if python3 "$COMPARE_PY" "$file_a" "$file_b"; then
+        local py_args=("$file_a" "$file_b")
+        if [[ "$allow_n_masking" == "true" ]]; then
+            py_args+=(--allow-n-masking)
+        fi
+        if python3 "$COMPARE_PY" "${py_args[@]}"; then
             pass "$label — content-identical (deflines differ)"
             echo "  Showing defline difference (first record):"
             echo "    sracha:      $(head -1 "$file_a")"
@@ -128,6 +149,282 @@ print(f'{total} {n_mask} {other} {n_positions}')
     fi
 }
 
+# ---------- sralite fixture ----------
+
+SRA_LITE_FILE=""
+PREFETCH=""
+
+ensure_sralite_fixture() {
+    local lite_file="$SCRIPT_DIR/${ACCESSION}.sralite"
+
+    if [[ -f "$lite_file" ]]; then
+        SRA_LITE_FILE="$lite_file"
+        echo "  sralite fixture: $lite_file (cached, $(du -h "$lite_file" | awk '{print $1}'))"
+        return 0
+    fi
+
+    if [[ -z "$PREFETCH" ]]; then
+        echo "  WARNING: prefetch not available — cannot download sralite fixture"
+        return 1
+    fi
+
+    log "Downloading sralite fixture via prefetch --eliminate-quals..."
+    local prefetch_out="$TMPDIR_BASE/prefetch_sralite"
+    mkdir -p "$prefetch_out"
+
+    if ! "$PREFETCH" "$ACCESSION" --eliminate-quals -O "$prefetch_out" -f yes 2>&1; then
+        echo "  WARNING: prefetch failed to download sralite"
+        return 1
+    fi
+
+    # prefetch writes to $out/$ACCESSION/$ACCESSION.sralite
+    local downloaded
+    downloaded=$(find "$prefetch_out" -type f \( -name "*.sralite" -o -name "*.sra" \) | head -1)
+
+    if [[ -n "$downloaded" && -f "$downloaded" ]]; then
+        cp "$downloaded" "$lite_file"
+        SRA_LITE_FILE="$lite_file"
+        echo "  sralite fixture saved: $lite_file ($(du -h "$lite_file" | awk '{print $1}'))"
+        return 0
+    fi
+
+    echo "  WARNING: sralite file not found after prefetch"
+    return 1
+}
+
+# ---------- test registry ----------
+
+declare -A TEST_FUNCS=(
+    [1]="test_1_split3_fastq"
+    [2]="test_2_splitspot_fastq"
+    [3]="test_3_splitfiles_fastq"
+    [4]="test_4_split3_fasta"
+    [5]="test_5_splitspot_fasta"
+    [6]="test_6_sralite_split3"
+    [7]="test_7_sralite_splitspot"
+)
+declare -A TEST_LABELS=(
+    [1]="split-3 (FASTQ, paired-end)"
+    [2]="split-spot (FASTQ)"
+    [3]="split-files (FASTQ)"
+    [4]="split-3 (FASTA, paired-end)"
+    [5]="split-spot (FASTA)"
+    [6]="sralite split-3 (FASTQ)"
+    [7]="sralite split-spot (FASTQ)"
+)
+ALL_TEST_NUMS=(1 2 3 4 5 6 7)
+
+# ---------- test functions ----------
+
+test_1_split3_fastq() {
+    log "Test 1: split-3 (FASTQ, paired-end)"
+
+    local sracha_out="$TMPDIR_BASE/test1_sracha"
+    local fasterq_out="$TMPDIR_BASE/test1_fasterq"
+    mkdir -p "$sracha_out" "$fasterq_out"
+
+    "$SRACHA" fastq "$SRA_FILE" --split split-3 --no-gzip -O "$sracha_out" -f --no-progress 2>&1 | tail -2
+    "$FASTERQ_DUMP" "$SRA_FILE" --split-3 -O "$fasterq_out" -f 2>&1 | tail -2
+
+    echo "  sracha files:      $(ls "$sracha_out"/)"
+    echo "  fasterq-dump files: $(ls "$fasterq_out"/)"
+
+    compare_files "$sracha_out/${ACCESSION}_1.fastq" "$fasterq_out/${ACCESSION}_1.fastq" "split-3 read 1"
+    compare_files "$sracha_out/${ACCESSION}_2.fastq" "$fasterq_out/${ACCESSION}_2.fastq" "split-3 read 2"
+    echo
+}
+
+test_2_splitspot_fastq() {
+    log "Test 2: split-spot (FASTQ)"
+
+    local sracha_out="$TMPDIR_BASE/test2_sracha"
+    local fasterq_out="$TMPDIR_BASE/test2_fasterq"
+    mkdir -p "$sracha_out" "$fasterq_out"
+
+    "$SRACHA" fastq "$SRA_FILE" --split split-spot --no-gzip -O "$sracha_out" -f --no-progress 2>&1 | tail -2
+    "$FASTERQ_DUMP" "$SRA_FILE" --split-spot -O "$fasterq_out" -f 2>&1 | tail -2
+
+    echo "  sracha files:      $(ls "$sracha_out"/)"
+    echo "  fasterq-dump files: $(ls "$fasterq_out"/)"
+
+    compare_files "$sracha_out/${ACCESSION}.fastq" "$fasterq_out/${ACCESSION}.fastq" "split-spot"
+    echo
+}
+
+test_3_splitfiles_fastq() {
+    log "Test 3: split-files (FASTQ)"
+
+    local sracha_out="$TMPDIR_BASE/test3_sracha"
+    local fasterq_out="$TMPDIR_BASE/test3_fasterq"
+    mkdir -p "$sracha_out" "$fasterq_out"
+
+    "$SRACHA" fastq "$SRA_FILE" --split split-files --no-gzip -O "$sracha_out" -f --no-progress 2>&1 | tail -2
+    "$FASTERQ_DUMP" "$SRA_FILE" --split-files -O "$fasterq_out" -f 2>&1 | tail -2
+
+    echo "  sracha files:      $(ls "$sracha_out"/)"
+    echo "  fasterq-dump files: $(ls "$fasterq_out"/)"
+
+    # split-files for 2-read paired data should produce _1 and _2
+    for suffix in _1 _2; do
+        local sf="$sracha_out/${ACCESSION}${suffix}.fastq"
+        local ff="$fasterq_out/${ACCESSION}${suffix}.fastq"
+        if [[ -f "$sf" && -f "$ff" ]]; then
+            compare_files "$sf" "$ff" "split-files ${suffix}"
+        elif [[ -f "$sf" ]]; then
+            fail "split-files ${suffix} — fasterq-dump did not produce ${suffix}.fastq"
+        elif [[ -f "$ff" ]]; then
+            fail "split-files ${suffix} — sracha did not produce ${suffix}.fastq"
+        fi
+    done
+    echo
+}
+
+test_4_split3_fasta() {
+    log "Test 4: split-3 (FASTA, paired-end)"
+
+    local sracha_out="$TMPDIR_BASE/test4_sracha"
+    local fasterq_out="$TMPDIR_BASE/test4_fasterq"
+    mkdir -p "$sracha_out" "$fasterq_out"
+
+    "$SRACHA" fastq "$SRA_FILE" --split split-3 --no-gzip --fasta -O "$sracha_out" -f --no-progress 2>&1 | tail -2
+    "$FASTERQ_DUMP" "$SRA_FILE" --split-3 --fasta -O "$fasterq_out" -f 2>&1 | tail -2
+
+    echo "  sracha files:      $(ls "$sracha_out"/)"
+    echo "  fasterq-dump files: $(ls "$fasterq_out"/)"
+
+    compare_files "$sracha_out/${ACCESSION}_1.fasta" "$fasterq_out/${ACCESSION}_1.fasta" "FASTA split-3 read 1"
+    compare_files "$sracha_out/${ACCESSION}_2.fasta" "$fasterq_out/${ACCESSION}_2.fasta" "FASTA split-3 read 2"
+    echo
+}
+
+test_5_splitspot_fasta() {
+    log "Test 5: split-spot (FASTA)"
+
+    local sracha_out="$TMPDIR_BASE/test5_sracha"
+    local fasterq_out="$TMPDIR_BASE/test5_fasterq"
+    mkdir -p "$sracha_out" "$fasterq_out"
+
+    "$SRACHA" fastq "$SRA_FILE" --split split-spot --no-gzip --fasta -O "$sracha_out" -f --no-progress 2>&1 | tail -2
+    "$FASTERQ_DUMP" "$SRA_FILE" --split-spot --fasta -O "$fasterq_out" -f 2>&1 | tail -2
+
+    echo "  sracha files:      $(ls "$sracha_out"/)"
+    echo "  fasterq-dump files: $(ls "$fasterq_out"/)"
+
+    compare_files "$sracha_out/${ACCESSION}.fasta" "$fasterq_out/${ACCESSION}.fasta" "FASTA split-spot"
+    echo
+}
+
+test_6_sralite_split3() {
+    log "Test 6: sralite split-3 (FASTQ)"
+
+    if ! ensure_sralite_fixture; then
+        skip "sralite split-3 read 1 — fixture not available"
+        skip "sralite split-3 read 2 — fixture not available"
+        echo
+        return
+    fi
+
+    local sracha_out="$TMPDIR_BASE/test6_sracha"
+    local fasterq_out="$TMPDIR_BASE/test6_fasterq"
+    mkdir -p "$sracha_out" "$fasterq_out"
+
+    "$SRACHA" fastq "$SRA_LITE_FILE" --split split-3 --no-gzip -O "$sracha_out" -f --no-progress 2>&1 | tail -2
+    "$FASTERQ_DUMP" "$SRA_LITE_FILE" --split-3 -O "$fasterq_out" -f 2>&1 | tail -2
+
+    echo "  sracha files:      $(ls "$sracha_out"/)"
+    echo "  fasterq-dump files: $(ls "$fasterq_out"/)"
+
+    compare_files "$sracha_out/${ACCESSION}_1.fastq" "$fasterq_out/${ACCESSION}_1.fastq" "sralite split-3 read 1" "true"
+    compare_files "$sracha_out/${ACCESSION}_2.fastq" "$fasterq_out/${ACCESSION}_2.fastq" "sralite split-3 read 2" "true"
+    echo
+}
+
+test_7_sralite_splitspot() {
+    log "Test 7: sralite split-spot (FASTQ)"
+
+    if ! ensure_sralite_fixture; then
+        skip "sralite split-spot — fixture not available"
+        echo
+        return
+    fi
+
+    local sracha_out="$TMPDIR_BASE/test7_sracha"
+    local fasterq_out="$TMPDIR_BASE/test7_fasterq"
+    mkdir -p "$sracha_out" "$fasterq_out"
+
+    "$SRACHA" fastq "$SRA_LITE_FILE" --split split-spot --no-gzip -O "$sracha_out" -f --no-progress 2>&1 | tail -2
+    "$FASTERQ_DUMP" "$SRA_LITE_FILE" --split-spot -O "$fasterq_out" -f 2>&1 | tail -2
+
+    echo "  sracha files:      $(ls "$sracha_out"/)"
+    echo "  fasterq-dump files: $(ls "$fasterq_out"/)"
+
+    compare_files "$sracha_out/${ACCESSION}.fastq" "$fasterq_out/${ACCESSION}.fastq" "sralite split-spot" "true"
+    echo
+}
+
+# ---------- argument parsing ----------
+
+parse_test_args() {
+    SELECTED_TESTS=()
+
+    if [[ $# -eq 0 ]]; then
+        SELECTED_TESTS=("${ALL_TEST_NUMS[@]}")
+        return
+    fi
+
+    for arg in "$@"; do
+        case "$arg" in
+            -h|--help)
+                echo "Usage: $0 [test-selector ...]"
+                echo
+                echo "Available tests:"
+                for num in "${ALL_TEST_NUMS[@]}"; do
+                    echo "  $num  ${TEST_LABELS[$num]}"
+                done
+                echo
+                echo "Examples:"
+                echo "  $0              # run all tests"
+                echo "  $0 6 7          # run tests 6 and 7"
+                echo "  $0 sralite      # run tests matching 'sralite'"
+                exit 0
+                ;;
+            [1-9]|[1-9][0-9])
+                if [[ -n "${TEST_FUNCS[$arg]+x}" ]]; then
+                    SELECTED_TESTS+=("$arg")
+                else
+                    echo "ERROR: unknown test number: $arg"; exit 1
+                fi
+                ;;
+            *)
+                # Name fragment match (case-insensitive)
+                local matched=false
+                for num in "${ALL_TEST_NUMS[@]}"; do
+                    if [[ "${TEST_LABELS[$num],,}" == *"${arg,,}"* ]]; then
+                        SELECTED_TESTS+=("$num")
+                        matched=true
+                    fi
+                done
+                if [[ "$matched" == false ]]; then
+                    echo "ERROR: no tests match '$arg'"; exit 1
+                fi
+                ;;
+        esac
+    done
+
+    # Deduplicate preserving order
+    local -A seen=()
+    local deduped=()
+    for t in "${SELECTED_TESTS[@]}"; do
+        if [[ -z "${seen[$t]+x}" ]]; then
+            seen[$t]=1
+            deduped+=("$t")
+        fi
+    done
+    SELECTED_TESTS=("${deduped[@]}")
+}
+
+parse_test_args "$@"
+
 # ---------- preflight ----------
 
 log "Checking prerequisites..."
@@ -178,117 +475,37 @@ if [[ -z "$FASTERQ_DUMP" ]]; then
     fi
 fi
 
+# Discover prefetch (for sralite fixture download)
+if compgen -G "$SRATOOLS_DIR/sratoolkit.*/bin/prefetch" > /dev/null 2>&1; then
+    PREFETCH=$(ls "$SRATOOLS_DIR"/sratoolkit.*/bin/prefetch | head -1)
+elif command -v prefetch &>/dev/null; then
+    PREFETCH=$(command -v prefetch)
+fi
+
 echo "  fasterq-dump: $("$FASTERQ_DUMP" --version 2>&1 | head -1 || echo 'unknown version')"
+if [[ -n "$PREFETCH" ]]; then
+    echo "  prefetch: $("$PREFETCH" --version 2>&1 | head -1 || echo 'unknown version')"
+else
+    echo "  prefetch: not found (sralite tests will be skipped)"
+fi
 
 # ---------- setup temp dir ----------
 
 TMPDIR_BASE=$(mktemp -d "${TMPDIR:-/tmp}/sracha-compare.XXXXXX")
 trap 'rm -rf "$TMPDIR_BASE"' EXIT
 echo "  Temp dir: $TMPDIR_BASE"
+
+echo
+echo "  Running tests: ${SELECTED_TESTS[*]}"
 echo
 
 # =====================================================================
-# TEST 1: split-3 (paired-end, default)
+# RUN SELECTED TESTS
 # =====================================================================
-log "Test 1: split-3 (FASTQ, paired-end)"
 
-SRACHA_OUT="$TMPDIR_BASE/test1_sracha"
-FASTERQ_OUT="$TMPDIR_BASE/test1_fasterq"
-mkdir -p "$SRACHA_OUT" "$FASTERQ_OUT"
-
-"$SRACHA" fastq "$SRA_FILE" --split split-3 --no-gzip -O "$SRACHA_OUT" -f --no-progress 2>&1 | tail -2
-"$FASTERQ_DUMP" "$SRA_FILE" --split-3 -O "$FASTERQ_OUT" -f 2>&1 | tail -2
-
-echo "  sracha files:      $(ls "$SRACHA_OUT"/)"
-echo "  fasterq-dump files: $(ls "$FASTERQ_OUT"/)"
-
-compare_files "$SRACHA_OUT/${ACCESSION}_1.fastq" "$FASTERQ_OUT/${ACCESSION}_1.fastq" "split-3 read 1"
-compare_files "$SRACHA_OUT/${ACCESSION}_2.fastq" "$FASTERQ_OUT/${ACCESSION}_2.fastq" "split-3 read 2"
-echo
-
-# =====================================================================
-# TEST 2: split-spot
-# =====================================================================
-log "Test 2: split-spot (FASTQ)"
-
-SRACHA_OUT="$TMPDIR_BASE/test2_sracha"
-FASTERQ_OUT="$TMPDIR_BASE/test2_fasterq"
-mkdir -p "$SRACHA_OUT" "$FASTERQ_OUT"
-
-"$SRACHA" fastq "$SRA_FILE" --split split-spot --no-gzip -O "$SRACHA_OUT" -f --no-progress 2>&1 | tail -2
-"$FASTERQ_DUMP" "$SRA_FILE" --split-spot -O "$FASTERQ_OUT" -f 2>&1 | tail -2
-
-echo "  sracha files:      $(ls "$SRACHA_OUT"/)"
-echo "  fasterq-dump files: $(ls "$FASTERQ_OUT"/)"
-
-compare_files "$SRACHA_OUT/${ACCESSION}.fastq" "$FASTERQ_OUT/${ACCESSION}.fastq" "split-spot"
-echo
-
-# =====================================================================
-# TEST 3: split-files
-# =====================================================================
-log "Test 3: split-files (FASTQ)"
-
-SRACHA_OUT="$TMPDIR_BASE/test3_sracha"
-FASTERQ_OUT="$TMPDIR_BASE/test3_fasterq"
-mkdir -p "$SRACHA_OUT" "$FASTERQ_OUT"
-
-"$SRACHA" fastq "$SRA_FILE" --split split-files --no-gzip -O "$SRACHA_OUT" -f --no-progress 2>&1 | tail -2
-"$FASTERQ_DUMP" "$SRA_FILE" --split-files -O "$FASTERQ_OUT" -f 2>&1 | tail -2
-
-echo "  sracha files:      $(ls "$SRACHA_OUT"/)"
-echo "  fasterq-dump files: $(ls "$FASTERQ_OUT"/)"
-
-# split-files for 2-read paired data should produce _1 and _2
-for suffix in _1 _2; do
-    sf="$SRACHA_OUT/${ACCESSION}${suffix}.fastq"
-    ff="$FASTERQ_OUT/${ACCESSION}${suffix}.fastq"
-    if [[ -f "$sf" && -f "$ff" ]]; then
-        compare_files "$sf" "$ff" "split-files ${suffix}"
-    elif [[ -f "$sf" ]]; then
-        fail "split-files ${suffix} — fasterq-dump did not produce ${suffix}.fastq"
-    elif [[ -f "$ff" ]]; then
-        fail "split-files ${suffix} — sracha did not produce ${suffix}.fastq"
-    fi
+for test_num in "${SELECTED_TESTS[@]}"; do
+    "${TEST_FUNCS[$test_num]}"
 done
-echo
-
-# =====================================================================
-# TEST 4: FASTA split-3
-# =====================================================================
-log "Test 4: split-3 (FASTA, paired-end)"
-
-SRACHA_OUT="$TMPDIR_BASE/test4_sracha"
-FASTERQ_OUT="$TMPDIR_BASE/test4_fasterq"
-mkdir -p "$SRACHA_OUT" "$FASTERQ_OUT"
-
-"$SRACHA" fastq "$SRA_FILE" --split split-3 --no-gzip --fasta -O "$SRACHA_OUT" -f --no-progress 2>&1 | tail -2
-"$FASTERQ_DUMP" "$SRA_FILE" --split-3 --fasta -O "$FASTERQ_OUT" -f 2>&1 | tail -2
-
-echo "  sracha files:      $(ls "$SRACHA_OUT"/)"
-echo "  fasterq-dump files: $(ls "$FASTERQ_OUT"/)"
-
-compare_files "$SRACHA_OUT/${ACCESSION}_1.fasta" "$FASTERQ_OUT/${ACCESSION}_1.fasta" "FASTA split-3 read 1"
-compare_files "$SRACHA_OUT/${ACCESSION}_2.fasta" "$FASTERQ_OUT/${ACCESSION}_2.fasta" "FASTA split-3 read 2"
-echo
-
-# =====================================================================
-# TEST 5: FASTA split-spot
-# =====================================================================
-log "Test 5: split-spot (FASTA)"
-
-SRACHA_OUT="$TMPDIR_BASE/test5_sracha"
-FASTERQ_OUT="$TMPDIR_BASE/test5_fasterq"
-mkdir -p "$SRACHA_OUT" "$FASTERQ_OUT"
-
-"$SRACHA" fastq "$SRA_FILE" --split split-spot --no-gzip --fasta -O "$SRACHA_OUT" -f --no-progress 2>&1 | tail -2
-"$FASTERQ_DUMP" "$SRA_FILE" --split-spot --fasta -O "$FASTERQ_OUT" -f 2>&1 | tail -2
-
-echo "  sracha files:      $(ls "$SRACHA_OUT"/)"
-echo "  fasterq-dump files: $(ls "$FASTERQ_OUT"/)"
-
-compare_files "$SRACHA_OUT/${ACCESSION}.fasta" "$FASTERQ_OUT/${ACCESSION}.fasta" "FASTA split-spot"
-echo
 
 # =====================================================================
 # SUMMARY
