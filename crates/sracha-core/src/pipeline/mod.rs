@@ -195,7 +195,7 @@ impl OutputWriter {
 pub const UNSUPPORTED_PLATFORMS: &[&str] = &["LS454", "ABI_SOLID", "ION_TORRENT", "HELICOS", "CAPILLARY"];
 
 pub fn is_unsupported_platform(platform: &str) -> bool {
-    UNSUPPORTED_PLATFORMS.iter().any(|&p| p == platform)
+    UNSUPPORTED_PLATFORMS.contains(&platform)
 }
 
 /// Select the best mirror URL for downloading.
@@ -1053,12 +1053,12 @@ fn decode_and_write(
     let cursor = VdbCursor::open(&mut archive, sra_path)?;
 
     // Check platform — reject legacy platforms with complex read structures.
-    if let Some(platform) = cursor.platform() {
-        if is_unsupported_platform(platform) {
-            return Err(Error::UnsupportedPlatform {
-                platform: platform.to_string(),
-            });
-        }
+    if let Some(platform) = cursor.platform()
+        && is_unsupported_platform(platform)
+    {
+        return Err(Error::UnsupportedPlatform {
+            platform: platform.to_string(),
+        });
     }
 
     // Load Illumina name format templates from skey index.

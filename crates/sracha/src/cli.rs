@@ -12,7 +12,7 @@ const STYLES: Styles = Styles::styled()
 #[derive(Parser)]
 #[command(
     name = "sracha",
-    version,
+    version = env!("SRACHA_VERSION"),
     about = "Fast SRA downloader and FASTQ converter",
     styles = STYLES,
     after_help = "\

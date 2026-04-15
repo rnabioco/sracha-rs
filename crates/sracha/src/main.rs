@@ -204,16 +204,15 @@ async fn main() -> Result<()> {
 
             // Check platform — reject legacy platforms with complex read structures.
             for resolved in &resolved_all {
-                if let Some(ref ri) = resolved.run_info {
-                    if let Some(ref platform) = ri.platform {
-                        if sracha_core::pipeline::is_unsupported_platform(platform) {
-                            anyhow::bail!(
-                                "{}: unsupported platform '{}' — sracha does not support legacy sequencing platforms",
-                                resolved.accession,
-                                platform
-                            );
-                        }
-                    }
+                if let Some(ref ri) = resolved.run_info
+                    && let Some(ref platform) = ri.platform
+                    && sracha_core::pipeline::is_unsupported_platform(platform)
+                {
+                    anyhow::bail!(
+                        "{}: unsupported platform '{}' — sracha does not support legacy sequencing platforms",
+                        resolved.accession,
+                        platform
+                    );
                 }
             }
 
