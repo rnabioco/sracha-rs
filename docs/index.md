@@ -1,4 +1,4 @@
-# sracha
+# 🌶️ sracha 🌶️
 
 Fast SRA downloader and FASTQ converter, written in pure Rust.
 
