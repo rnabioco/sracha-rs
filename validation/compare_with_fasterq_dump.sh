@@ -202,6 +202,8 @@ declare -A TEST_FUNCS=(
     [5]="test_5_splitspot_fasta"
     [6]="test_6_sralite_split3"
     [7]="test_7_sralite_splitspot"
+    [8]="test_8_interleaved"
+    [9]="test_9_gzip_roundtrip"
 )
 declare -A TEST_LABELS=(
     [1]="split-3 (FASTQ, paired-end)"
@@ -211,8 +213,10 @@ declare -A TEST_LABELS=(
     [5]="split-spot (FASTA)"
     [6]="sralite split-3 (FASTQ)"
     [7]="sralite split-spot (FASTQ)"
+    [8]="interleaved (FASTQ, paired-end)"
+    [9]="gzip round-trip (FASTQ, split-3)"
 )
-ALL_TEST_NUMS=(1 2 3 4 5 6 7)
+ALL_TEST_NUMS=(1 2 3 4 5 6 7 8 9)
 
 # ---------- test functions ----------
 
@@ -359,6 +363,56 @@ test_7_sralite_splitspot() {
     echo "  fasterq-dump files: $(ls "$fasterq_out"/)"
 
     compare_files "$sracha_out/${ACCESSION}.fastq" "$fasterq_out/${ACCESSION}.fastq" "sralite split-spot" "true"
+    echo
+}
+
+test_8_interleaved() {
+    log "Test 8: interleaved (FASTQ, paired-end)"
+
+    # sracha's interleaved mode currently produces _1/_2 files (same routing
+    # as split-3; the writer doesn't merge into one stream yet). Verify that
+    # the content matches fasterq-dump split-3 output.
+    local sracha_out="$TMPDIR_BASE/test8_sracha"
+    local fasterq_out="$TMPDIR_BASE/test8_fasterq"
+    mkdir -p "$sracha_out" "$fasterq_out"
+
+    "$SRACHA" fastq "$SRA_FILE" --split interleaved --no-gzip -O "$sracha_out" -f --no-progress 2>&1 | tail -2
+    "$FASTERQ_DUMP" "$SRA_FILE" --split-3 -O "$fasterq_out" -f 2>&1 | tail -2
+
+    echo "  sracha files:      $(ls "$sracha_out"/)"
+    echo "  fasterq-dump files: $(ls "$fasterq_out"/)"
+
+    compare_files "$sracha_out/${ACCESSION}_1.fastq" "$fasterq_out/${ACCESSION}_1.fastq" "interleaved read 1"
+    compare_files "$sracha_out/${ACCESSION}_2.fastq" "$fasterq_out/${ACCESSION}_2.fastq" "interleaved read 2"
+    echo
+}
+
+test_9_gzip_roundtrip() {
+    log "Test 9: gzip round-trip (FASTQ, split-3)"
+
+    local sracha_out="$TMPDIR_BASE/test9_sracha"
+    local fasterq_out="$TMPDIR_BASE/test9_fasterq"
+    local decompressed="$TMPDIR_BASE/test9_decompressed"
+    mkdir -p "$sracha_out" "$fasterq_out" "$decompressed"
+
+    # sracha with gzip (default)
+    "$SRACHA" fastq "$SRA_FILE" --split split-3 -O "$sracha_out" -f --no-progress 2>&1 | tail -2
+    # fasterq-dump uncompressed (reference)
+    "$FASTERQ_DUMP" "$SRA_FILE" --split-3 -O "$fasterq_out" -f 2>&1 | tail -2
+
+    echo "  sracha files:      $(ls "$sracha_out"/)"
+    echo "  fasterq-dump files: $(ls "$fasterq_out"/)"
+
+    # Decompress sracha gzip output
+    for gz in "$sracha_out"/*.fastq.gz; do
+        base=$(basename "$gz" .gz)
+        gunzip -c "$gz" > "$decompressed/$base"
+    done
+
+    echo "  decompressed files: $(ls "$decompressed"/)"
+
+    compare_files "$decompressed/${ACCESSION}_1.fastq" "$fasterq_out/${ACCESSION}_1.fastq" "gzip round-trip read 1"
+    compare_files "$decompressed/${ACCESSION}_2.fastq" "$fasterq_out/${ACCESSION}_2.fastq" "gzip round-trip read 2"
     echo
 }
 
