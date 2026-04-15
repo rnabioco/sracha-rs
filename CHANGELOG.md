@@ -2,6 +2,16 @@
 
 ## Unreleased
 
+## 0.1.7 (2026-04-15)
+
+### Fixed
+
+- **PacBio sequence accuracy**: Replace quality-based N-masking with ALTREAD
+  4na ambiguity merge, matching the VDB schema's `bit_or(2na, .ALTREAD)`
+  derivation. PacBio SRR38107137 drops from 680 to 0 sequence mismatches and
+  9,324 to 0 quality mismatches vs fasterq-dump. Illumina output remains
+  byte-identical. Closes #4.
+
 ## 0.1.6 (2026-04-15)
 
 ### Added
