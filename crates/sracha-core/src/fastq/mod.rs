@@ -170,22 +170,9 @@ pub fn format_read(
         quality
     };
 
-    // Replace bases with N where quality <= Phred 2 (ASCII '#', ordinal 35).
-    // In 2na encoding, N bases are stored as arbitrary A/C/G/T values;
-    // Illumina uses quality score 2 as the no-call indicator.
-    const NOCALL_QUAL_BYTE: u8 = 35; // Phred 2 + 33 offset = ASCII '#'
-    let seq_corrected: Vec<u8>;
-    let sequence: &[u8] = if quality.len() == len && quality.iter().any(|&q| q <= NOCALL_QUAL_BYTE)
-    {
-        seq_corrected = sequence
-            .iter()
-            .zip(quality.iter())
-            .map(|(&base, &qual)| if qual <= NOCALL_QUAL_BYTE { b'N' } else { base })
-            .collect();
-        &seq_corrected
-    } else {
-        sequence
-    };
+    // N-masking is handled upstream in the pipeline layer: ALTREAD ambiguity
+    // merge when available, quality-based fallback otherwise.  By the time
+    // bases reach format_read() they already have correct N positions.
 
     // Description part of the defline: original name if available, else spot number.
     let description = original_name.unwrap_or(spot_number);
@@ -698,10 +685,11 @@ mod tests {
             r1,
             "@SRR1.10 10 length=4\nAACC\n+SRR1.10 10 length=4\nIIII\n"
         );
-        // R2 has quality '!!!!' (Phred 0) → all bases become N
+        // N-masking is now handled in the pipeline layer, not format_read.
+        // Bases pass through unchanged regardless of quality.
         assert_eq!(
             r2,
-            "@SRR1.10 10 length=4\nNNNN\n+SRR1.10 10 length=4\n!!!!\n"
+            "@SRR1.10 10 length=4\nGGTT\n+SRR1.10 10 length=4\n!!!!\n"
         );
     }
 
@@ -1165,24 +1153,17 @@ mod tests {
     }
 
     #[test]
-    fn format_read_n_masking_from_quality() {
-        // Quality '#' is Phred 2 (no-call threshold) → base should become N
-        // Quality '!' is Phred 0 → also becomes N
+    fn format_read_no_n_masking() {
+        // N-masking is now handled upstream in the pipeline layer.
+        // format_read() should pass bases through unchanged regardless of quality.
         let rec = format_read("RUN", b"1", None, b"ACGT", b"#I#I");
         let text = std::str::from_utf8(&rec.data).unwrap();
         let lines: Vec<&str> = text.lines().collect();
-        assert_eq!(lines[1], "NCNT"); // positions with quality <= '#' become N
+        assert_eq!(lines[1], "ACGT"); // bases pass through unchanged
 
-        // Phred 0 also triggers N
         let rec2 = format_read("RUN", b"1", None, b"ACGT", b"!I!I");
         let text2 = std::str::from_utf8(&rec2.data).unwrap();
         let lines2: Vec<&str> = text2.lines().collect();
-        assert_eq!(lines2[1], "NCNT");
-
-        // Phred 3 ('$') does NOT trigger N
-        let rec3 = format_read("RUN", b"1", None, b"ACGT", b"$I$I");
-        let text3 = std::str::from_utf8(&rec3.data).unwrap();
-        let lines3: Vec<&str> = text3.lines().collect();
-        assert_eq!(lines3[1], "ACGT");
+        assert_eq!(lines2[1], "ACGT");
     }
 }

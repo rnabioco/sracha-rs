@@ -410,8 +410,14 @@ struct RawBlobData<'a> {
     has_name: bool,
     /// Whether there is a READ_TYPE column at all.
     has_read_type: bool,
-    /// ALTREAD column raw bytes (unused directly, but triggers name reconstruction).
+    /// ALTREAD column raw bytes (4na ambiguity mask; also used for name reconstruction detection).
     altread_raw: &'a [u8],
+    /// Row count for the ALTREAD blob (0 if absent).
+    altread_id_range: u64,
+    /// Checksum type for the ALTREAD column.
+    altread_cs: u8,
+    /// Whether the ALTREAD column exists (independent of Illumina name parts).
+    has_altread: bool,
     /// X column raw bytes.
     x_raw: &'a [u8],
     x_id_range: u64,
@@ -458,7 +464,7 @@ fn decode_blob_to_fastq(
     let total_bits = read_decoded.data.len() * 8;
     let adjust = read_decoded.adjust as usize;
     let actual_bases = (total_bits.saturating_sub(adjust)) / 2;
-    let read_data = crate::vdb::encoding::unpack_2na(&read_decoded.data, actual_bases);
+    let mut read_data = crate::vdb::encoding::unpack_2na(&read_decoded.data, actual_bases);
     let read_page_map = read_decoded.page_map;
 
     // ------------------------------------------------------------------
@@ -501,6 +507,34 @@ fn decode_blob_to_fastq(
 
         (all, is_empty)
     };
+
+    // ------------------------------------------------------------------
+    // N-masking: ALTREAD ambiguity merge (preferred) or quality fallback.
+    //
+    // When ALTREAD + X + Y columns are all present (Illumina), ALTREAD
+    // stores ASCII name templates, not 4na ambiguity data — skip merge.
+    // When ALTREAD is present WITHOUT Illumina name parts, it contains
+    // the 4na ambiguity mask used by the VDB schema's bit_or operation.
+    // ------------------------------------------------------------------
+    if raw.has_altread && !raw.has_illumina_name_parts && !raw.altread_raw.is_empty() {
+        let alt_decoded = decode_raw(raw.altread_raw, raw.altread_cs, raw.altread_id_range)?;
+        let alt_page_map = alt_decoded.page_map.clone();
+        let mut altread_data = decode_zip_encoding(&alt_decoded);
+        if let Some(ref pm) = alt_page_map
+            && !pm.data_runs.is_empty()
+        {
+            altread_data = pm.expand_variable_data_runs(&altread_data);
+        }
+        crate::vdb::encoding::merge_altread(&mut read_data, &altread_data, actual_bases);
+    } else if !quality_is_empty && quality_all.len() == read_data.len() {
+        // Fallback: quality-based N-masking (Phred <= 2 → N).
+        const NOCALL_QUAL_BYTE: u8 = 35; // Phred 2 + 33 offset = ASCII '#'
+        for (base, &qual) in read_data.iter_mut().zip(quality_all.iter()) {
+            if qual <= NOCALL_QUAL_BYTE {
+                *base = b'N';
+            }
+        }
+    }
 
     // Quality fallback buffer for SRA-lite / empty quality.  Only allocated
     // when quality is actually missing; the quality-overrun fallback path
@@ -1153,9 +1187,10 @@ fn decode_and_write(
     let read_type_blob_count = cursor.read_type_col().map_or(0, |c| c.blob_count());
     let read_type_cs = cursor.read_type_col().map_or(0, |c| c.meta().checksum_type);
 
+    let has_altread = cursor.altread_col().is_some();
     let has_illumina_name_parts = cursor.has_illumina_name_parts();
     let altread_blob_count = cursor.altread_col().map_or(0, |c| c.blob_count());
-    let _altread_cs = cursor.altread_col().map_or(0, |c| c.meta().checksum_type);
+    let altread_cs = cursor.altread_col().map_or(0, |c| c.meta().checksum_type);
     let x_blob_count = cursor.x_col().map_or(0, |c| c.blob_count());
     let x_cs = cursor.x_col().map_or(0, |c| c.meta().checksum_type);
     let y_blob_count = cursor.y_col().map_or(0, |c| c.blob_count());
@@ -1371,14 +1406,19 @@ fn decode_and_write(
                                 (&[], 0)
                             };
 
-                        // Illumina name columns (ALTREAD templates + X + Y coords).
-                        let alt_raw: &[u8] = if has_illumina_name_parts && bi < altread_blob_count {
-                            let col = cursor.altread_col().unwrap();
-                            let blob = &col.blobs()[bi];
-                            col.read_raw_blob_slice(blob.start_id)?
-                        } else {
-                            &[]
-                        };
+                        // ALTREAD column: 4na ambiguity mask (also triggers
+                        // Illumina name reconstruction when X + Y present).
+                        let (alt_raw, alt_id_range): (&[u8], u64) =
+                            if has_altread && bi < altread_blob_count {
+                                let col = cursor.altread_col().unwrap();
+                                let blob = &col.blobs()[bi];
+                                (
+                                    col.read_raw_blob_slice(blob.start_id)?,
+                                    blob.id_range as u64,
+                                )
+                            } else {
+                                (&[], 0)
+                            };
                         let (xr, xi): (&[u8], u64) = if has_illumina_name_parts && bi < x_blob_count
                         {
                             let col = cursor.x_col().unwrap();
@@ -1418,6 +1458,9 @@ fn decode_and_write(
                             read_type_id_range: rt_id_range,
                             read_type_cs,
                             altread_raw: alt_raw,
+                            altread_id_range: alt_id_range,
+                            altread_cs,
+                            has_altread,
                             x_raw: xr,
                             x_id_range: xi,
                             x_cs,

@@ -153,6 +153,52 @@ pub fn unpack_4na(packed: &[u8], num_bases: usize) -> Vec<u8> {
 }
 
 // ---------------------------------------------------------------------------
+// Public API — ALTREAD ambiguity merge
+// ---------------------------------------------------------------------------
+
+/// Reverse map from ASCII base to 4na code.
+/// Only valid DNA bases are populated: A=1, C=2, G=4, T=8, N=15.
+const ASCII_TO_4NA: [u8; 256] = {
+    let mut lut = [0u8; 256];
+    lut[b'A' as usize] = 1;
+    lut[b'C' as usize] = 2;
+    lut[b'G' as usize] = 4;
+    lut[b'T' as usize] = 8;
+    lut[b'N' as usize] = 15;
+    lut
+};
+
+/// Merge 2na-decoded ASCII bases with the ALTREAD 4na ambiguity mask.
+///
+/// Reproduces the VDB schema's `bit_or(out_2na_4na_bin, .ALTREAD)` followed
+/// by `map<4na→text>`. For each position the ASCII base is converted to its
+/// 4na code, OR'd with the ALTREAD nibble, and mapped back to ASCII via
+/// [`DNA_4NA`].
+///
+/// `altread_packed` is 4na-packed (2 bases per byte, high nibble first).
+/// `num_bases` is the number of meaningful base positions.
+pub fn merge_altread(bases: &mut [u8], altread_packed: &[u8], num_bases: usize) {
+    let count = bases.len().min(num_bases);
+    for i in 0..count {
+        let byte_idx = i / 2;
+        if byte_idx >= altread_packed.len() {
+            break;
+        }
+        let nibble = if i % 2 == 0 {
+            altread_packed[byte_idx] >> 4
+        } else {
+            altread_packed[byte_idx] & 0x0F
+        };
+        if nibble == 0 {
+            continue;
+        }
+        let base_4na = ASCII_TO_4NA[bases[i] as usize];
+        let merged = base_4na | nibble;
+        bases[i] = DNA_4NA[(merged & 0x0F) as usize];
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Public API — Quality scores
 // ---------------------------------------------------------------------------
 
@@ -412,5 +458,62 @@ mod tests {
         // Double-check the expected ASCII characters.
         assert_eq!(SRA_LITE_PASS_QUAL + QUAL_PHRED_OFFSET, b'?');
         assert_eq!(SRA_LITE_REJECT_QUAL + QUAL_PHRED_OFFSET, b'$');
+    }
+
+    // -----------------------------------------------------------------------
+    // merge_altread tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn merge_altread_no_ambiguity() {
+        // ALTREAD all zeros → bases unchanged.
+        let mut bases = b"ACGT".to_vec();
+        let altread = [0x00, 0x00]; // 4 nibbles, all 0
+        merge_altread(&mut bases, &altread, 4);
+        assert_eq!(bases, b"ACGT");
+    }
+
+    #[test]
+    fn merge_altread_all_n() {
+        // ALTREAD all 0xF (15) → every base becomes N.
+        let mut bases = b"ACGT".to_vec();
+        let altread = [0xFF, 0xFF]; // nibbles: 15, 15, 15, 15
+        merge_altread(&mut bases, &altread, 4);
+        assert_eq!(bases, b"NNNN");
+    }
+
+    #[test]
+    fn merge_altread_selective() {
+        // Mark positions 0 and 2 as N, leave 1 and 3 unchanged.
+        // Packed: pos0=0xF, pos1=0x0, pos2=0xF, pos3=0x0
+        let mut bases = b"ACGT".to_vec();
+        let altread = [0xF0, 0xF0]; // high nibbles = 15, low nibbles = 0
+        merge_altread(&mut bases, &altread, 4);
+        assert_eq!(bases, b"NCNT");
+    }
+
+    #[test]
+    fn merge_altread_partial_ambiguity() {
+        // A (4na=1) | G (4na=4) = 5 → R (purine ambiguity).
+        let mut bases = b"A".to_vec();
+        let altread = [0x40]; // high nibble = 4 (G)
+        merge_altread(&mut bases, &altread, 1);
+        assert_eq!(bases, b"R");
+    }
+
+    #[test]
+    fn merge_altread_empty() {
+        let mut bases = b"ACGT".to_vec();
+        merge_altread(&mut bases, &[], 4);
+        assert_eq!(bases, b"ACGT");
+    }
+
+    #[test]
+    fn merge_altread_odd_bases() {
+        // 3 bases: last byte only uses high nibble.
+        let mut bases = b"ACG".to_vec();
+        let altread = [0x00, 0xF0]; // pos0=0, pos1=0, pos2=F (high nibble of byte1)
+        merge_altread(&mut bases, &altread, 3);
+        assert_eq!(bases, b"ACN");
     }
 }
