@@ -53,6 +53,9 @@ pub struct DownloadResult {
     pub size: u64,
     /// MD5 hex digest (if validation was performed).
     pub md5: Option<String>,
+    /// Bytes actually transferred over the network this session.
+    /// Zero when the file was already complete (skipped).
+    pub bytes_transferred: u64,
 }
 
 /// Information gathered from probing the server.
@@ -408,6 +411,7 @@ pub async fn download_file(
                             path: output_path.to_path_buf(),
                             size: existing_size,
                             md5: Some(computed),
+                            bytes_transferred: 0,
                         });
                     }
                     tracing::warn!(
@@ -422,6 +426,7 @@ pub async fn download_file(
                         path: output_path.to_path_buf(),
                         size: existing_size,
                         md5: None,
+                        bytes_transferred: 0,
                     });
                 }
             }
@@ -468,6 +473,8 @@ pub async fn download_file(
     } else {
         config.connections
     };
+
+    let bytes_transferred: u64;
 
     if use_parallel {
         // --- Parallel chunked download (with resume support) ---
@@ -532,6 +539,7 @@ pub async fn download_file(
 
         if chunks_to_download.is_empty() {
             tracing::info!("all chunks already downloaded — verifying");
+            bytes_transferred = 0;
         } else {
             let already_done = progress.completed_chunks.len();
             tracing::debug!(
@@ -544,6 +552,7 @@ pub async fn download_file(
 
             // Calculate bytes remaining for progress bar.
             let bytes_remaining: u64 = chunks_to_download.iter().map(|(_, c)| c.len()).sum();
+            bytes_transferred = bytes_remaining;
 
             let pb: Option<std::sync::Arc<indicatif::ProgressBar>> = if config.progress {
                 let pb = std::sync::Arc::new(make_progress_bar(bytes_remaining));
@@ -640,7 +649,13 @@ pub async fn download_file(
             let _ = progress_saver.await;
 
             if let Some(pb) = &pb {
-                pb.finish_with_message("download complete");
+                if already_done > 0 {
+                    pb.finish_with_message(format!(
+                        "download complete (resumed, {already_done}/{total_chunks} cached)"
+                    ));
+                } else {
+                    pb.finish_with_message("download complete");
+                }
             }
 
             if let Some(e) = first_error {
@@ -664,6 +679,7 @@ pub async fn download_file(
         };
 
         let bytes_remaining = file_size.saturating_sub(existing_size);
+        bytes_transferred = bytes_remaining;
 
         let pb: Option<std::sync::Arc<indicatif::ProgressBar>> = if config.progress {
             Some(std::sync::Arc::new(make_progress_bar(bytes_remaining)))
@@ -729,7 +745,14 @@ pub async fn download_file(
         }
 
         if let Some(pb) = &pb {
-            pb.finish_with_message("download complete");
+            if existing_size > 0 {
+                pb.finish_with_message(format!(
+                    "download complete (resumed from {})",
+                    crate::util::format_size(existing_size),
+                ));
+            } else {
+                pb.finish_with_message("download complete");
+            }
         }
     }
 
@@ -758,6 +781,7 @@ pub async fn download_file(
         path: output_path.to_path_buf(),
         size: metadata.len(),
         md5: md5_hex,
+        bytes_transferred,
     })
 }
 

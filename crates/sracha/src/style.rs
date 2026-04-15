@@ -28,11 +28,6 @@ pub fn path<T: Display>(s: T) -> String {
     format!("{}", s.cyan())
 }
 
-/// Style for percentages
-pub fn percentage<T: Display>(s: T) -> String {
-    format!("{}", s.cyan())
-}
-
 /// Style for error prefix "error:"
 pub fn error_label<T: Display>(s: T) -> String {
     format!("{}", s.red().bold())

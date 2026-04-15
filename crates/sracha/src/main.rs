@@ -71,6 +71,10 @@ async fn main() -> Result<()> {
             let raw = collect_accessions(&args.accessions, args.accession_list.as_deref())?;
             let client = SdlClient::new();
             let run_accessions = resolve_to_runs(&raw, &client).await?;
+            eprintln!(
+                "Resolving {} accession(s)...",
+                style::count(run_accessions.len()),
+            );
             let resolved_all =
                 resolve_accessions(&run_accessions, &client, args.prefer_sdl, false).await?;
             check_download_size(&resolved_all, args.yes)?;
@@ -190,6 +194,10 @@ async fn main() -> Result<()> {
             let raw = collect_accessions(&args.accessions, args.accession_list.as_deref())?;
             let sdl_client = SdlClient::new();
             let run_accessions = resolve_to_runs(&raw, &sdl_client).await?;
+            eprintln!(
+                "Resolving {} accession(s)...",
+                style::count(run_accessions.len()),
+            );
             let resolved_all =
                 resolve_accessions(&run_accessions, &sdl_client, args.prefer_sdl, true).await?;
             check_download_size(&resolved_all, args.yes)?;
@@ -343,20 +351,31 @@ async fn main() -> Result<()> {
                     sracha_core::pipeline::decode_sra(&downloaded, &pipeline_config)
                 }) {
                     Ok(stats) => {
-                        let pct = if stats.total_sra_size > 0 {
-                            stats.bytes_downloaded as f64 / stats.total_sra_size as f64 * 100.0
+                        if stats.bytes_transferred == 0 {
+                            eprintln!(
+                                "{}: {} spots, {} reads written (cached, no download needed)",
+                                style::header(&stats.accession),
+                                style::count(stats.spots_read),
+                                style::count(stats.reads_written),
+                            );
+                        } else if stats.bytes_transferred < stats.total_sra_size {
+                            eprintln!(
+                                "{}: {} spots, {} reads written, {} of {} transferred (resumed)",
+                                style::header(&stats.accession),
+                                style::count(stats.spots_read),
+                                style::count(stats.reads_written),
+                                style::value(format_size(stats.bytes_transferred)),
+                                style::value(format_size(stats.total_sra_size)),
+                            );
                         } else {
-                            100.0
-                        };
-                        eprintln!(
-                            "{}: {} spots, {} reads written, {} downloaded ({} of {})",
-                            style::header(&stats.accession),
-                            style::count(stats.spots_read),
-                            style::count(stats.reads_written),
-                            style::value(format_size(stats.bytes_downloaded)),
-                            style::percentage(format!("{pct:.1}%")),
-                            style::value(format_size(stats.total_sra_size)),
-                        );
+                            eprintln!(
+                                "{}: {} spots, {} reads written, {} downloaded",
+                                style::header(&stats.accession),
+                                style::count(stats.spots_read),
+                                style::count(stats.reads_written),
+                                style::value(format_size(stats.total_sra_size)),
+                            );
+                        }
                         for path in &stats.output_files {
                             eprintln!("  -> {}", style::path(path.display()));
                         }
