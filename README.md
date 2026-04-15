@@ -1,5 +1,7 @@
 # 🌶️ sracha 🌶️
 
+[![Bioconda](https://anaconda.org/bioconda/sracha/badges/version.svg)](https://anaconda.org/bioconda/sracha)
+
 Fast SRA downloader and FASTQ converter, written in pure Rust.
 
 ## Features
@@ -98,7 +100,13 @@ See `validation/benchmark.sh` to reproduce.
 
 ## Installation
 
-Download pre-built binaries from the
+Install via [Bioconda](https://bioconda.github.io/):
+
+```bash
+pixi add --channel bioconda sracha
+```
+
+Or download pre-built binaries from the
 [releases page](https://github.com/rnabioco/sracha-rs/releases),
 or install from source:
 
