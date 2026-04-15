@@ -468,7 +468,18 @@ fn decode_blob_to_fastq(
     } else {
         let quality_data: Vec<u8> = if !raw.quality_raw.is_empty() {
             let qdecoded = decode_raw(raw.quality_raw, raw.quality_cs, raw.quality_id_range)?;
-            decode_zip_encoding(&qdecoded)
+            let qpage_map = qdecoded.page_map.clone();
+            let mut qdata = decode_zip_encoding(&qdecoded);
+            // Expand quality data via page map data_runs if present.
+            // Some blobs (e.g., PacBio) store repeated rows once with
+            // data_runs > 1; the decompressed data only contains unique
+            // rows and must be expanded to match the total base count.
+            if let Some(ref pm) = qpage_map {
+                if !pm.data_runs.is_empty() {
+                    qdata = pm.expand_variable_data_runs(&qdata);
+                }
+            }
+            qdata
         } else {
             Vec::new()
         };

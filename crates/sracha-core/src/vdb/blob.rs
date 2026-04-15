@@ -175,6 +175,83 @@ impl PageMap {
         expanded
     }
 
+    /// Compute per-data-record byte lengths from the page map.
+    ///
+    /// The page map stores `lengths` (unique length values) and `leng_runs`
+    /// (how many consecutive rows share each length). This function expands
+    /// to one length per data record (not per logical row — data_runs are
+    /// NOT applied here).
+    fn data_record_lengths(&self) -> Vec<u32> {
+        if self.data_runs.is_empty() {
+            // No data_runs: data_recs == total_rows, expand leng_runs directly
+            let mut row_lens = Vec::with_capacity(self.data_recs as usize);
+            for (length, &run) in self.lengths.iter().zip(self.leng_runs.iter()) {
+                for _ in 0..run {
+                    row_lens.push(*length);
+                }
+            }
+            return row_lens;
+        }
+
+        // With data_runs: expand leng_runs to get per-logical-row lengths,
+        // then collapse back to per-data-record lengths by skipping repeated rows.
+        let mut logical_lens = Vec::with_capacity(self.total_rows() as usize);
+        for (length, &run) in self.lengths.iter().zip(self.leng_runs.iter()) {
+            for _ in 0..run {
+                logical_lens.push(*length);
+            }
+        }
+
+        let mut record_lens = Vec::with_capacity(self.data_recs as usize);
+        let mut row = 0usize;
+        for i in 0..self.data_recs as usize {
+            let repeat = self.data_runs.get(i).copied().unwrap_or(1) as usize;
+            if row < logical_lens.len() {
+                record_lens.push(logical_lens[row]);
+            }
+            row += repeat;
+        }
+        record_lens
+    }
+
+    /// Expand variable-length data via data_runs.
+    ///
+    /// Unlike [`expand_data_runs_bytes`](Self::expand_data_runs_bytes) which
+    /// handles fixed-size elements, this handles variable-length rows (e.g.,
+    /// quality data where each row has a different number of bytes).
+    ///
+    /// Returns the expanded data, or the input unchanged if no expansion needed.
+    pub fn expand_variable_data_runs(&self, data: &[u8]) -> Vec<u8> {
+        if self.data_runs.is_empty() {
+            return data.to_vec();
+        }
+
+        let record_lens = self.data_record_lengths();
+
+        // Compute byte offsets for each data record.
+        let mut offsets = Vec::with_capacity(record_lens.len() + 1);
+        offsets.push(0usize);
+        for &len in &record_lens {
+            offsets.push(offsets.last().unwrap() + len as usize);
+        }
+
+        // Expand: for each data record, repeat its bytes data_runs[i] times.
+        let mut expanded = Vec::with_capacity(data.len() * 2); // rough estimate
+        for (i, &len) in record_lens.iter().enumerate() {
+            let repeat = self.data_runs.get(i).copied().unwrap_or(1) as usize;
+            let start = offsets[i];
+            let end = start + len as usize;
+            if end <= data.len() {
+                let chunk = &data[start..end];
+                for _ in 0..repeat {
+                    expanded.extend_from_slice(chunk);
+                }
+            }
+        }
+
+        expanded
+    }
+
     /// Expand run-length-encoded byte data to full row data.
     ///
     /// Like [`expand_data_runs`](Self::expand_data_runs), but operates on
