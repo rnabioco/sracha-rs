@@ -79,3 +79,19 @@ cargo install --git https://github.com/rnabioco/sracha-rs sracha
 ```bash
 pixi add --channel bioconda sracha
 ```
+
+## Acknowledgments
+
+sracha builds on the [Sequence Read Archive](https://www.ncbi.nlm.nih.gov/sra),
+maintained by the [National Center for Biotechnology Information](https://www.ncbi.nlm.nih.gov/)
+at the National Library of Medicine. The SRA and its
+[toolchain](https://github.com/ncbi/sra-tools) are public-domain software
+developed by U.S. government employees — our tax dollars at work. Special
+thanks to Kenneth Durbrow ([@durbrow](https://github.com/durbrow)) and the
+SRA Toolkit team for building and maintaining the infrastructure that makes
+projects like this possible.
+
+This project wouldn't exist without NCBI's open infrastructure: the
+VDB/KAR format, the SDL locate API, EUtils, and public S3 hosting of
+sequencing data. sracha aims to make it easier for the community to
+build on that foundation.
