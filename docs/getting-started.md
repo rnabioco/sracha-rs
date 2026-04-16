@@ -177,7 +177,7 @@ a fresh download:
 sracha fetch SRR28588231 --no-resume
 ```
 
-For very large downloads (>500 GiB), sracha prompts for confirmation.
+For project downloads and large downloads (>100 GiB), sracha prompts for confirmation.
 Skip it with `-y`:
 
 ```bash

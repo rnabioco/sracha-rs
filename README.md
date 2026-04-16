@@ -17,6 +17,7 @@ Fast SRA downloader and FASTQ converter, written in pure Rust.
 - **Split modes** -- split-3, split-files, split-spot, interleaved
 - **Platform support** -- Illumina, BGISEQ/DNBSEQ, Element, Ultima, PacBio, Nanopore (legacy platforms like 454 and Ion Torrent are not supported)
 - **Resumable downloads** -- picks up where it left off on interruption
+- **Stdout streaming** -- pipe interleaved FASTQ to downstream tools with `-Z`
 - **File validation** -- verify SRA file integrity
 
 ## Quick start

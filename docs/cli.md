@@ -96,7 +96,7 @@ sracha get [OPTIONS] [ACCESSION]...
 | Option | Default | Description |
 |--------|---------|-------------|
 | `--no-resume` | | Disable download resume (re-download from scratch) |
-| `-y, --yes` | | Skip confirmation prompt for large downloads (>500 GiB) |
+| `-y, --yes` | | Confirm project downloads and large downloads (>100 GiB) |
 | `--prefer-sdl` | | Skip direct S3 and resolve via the SDL API |
 | `--no-runinfo` | | Skip EUtils RunInfo API call (derive read structure from VDB metadata) |
 | `--no-progress` | | Disable progress bar |
@@ -128,7 +128,7 @@ sracha fetch [OPTIONS] [ACCESSION]...
 | `--validate` | | Verify MD5 after download |
 | `-f, --force` | | Overwrite existing files |
 | `--no-resume` | | Disable download resume (re-download from scratch) |
-| `-y, --yes` | | Skip confirmation prompt for large downloads (>500 GiB) |
+| `-y, --yes` | | Confirm project downloads and large downloads (>100 GiB) |
 | `--prefer-sdl` | | Skip direct S3 and resolve via the SDL API |
 | `--no-progress` | | Disable progress bar |
 

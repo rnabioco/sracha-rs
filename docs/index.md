@@ -15,6 +15,7 @@ Fast SRA downloader and FASTQ converter, written in pure Rust.
 - **FASTA output** -- drop quality scores with `--fasta`
 - **SRA and SRA-lite** -- full quality or simplified quality scores
 - **Split modes** -- split-3, split-files, split-spot, interleaved
+- **Stdout streaming** -- pipe interleaved FASTQ to downstream tools with `-Z`
 - **Resumable downloads** -- automatically resumes interrupted transfers
 - **File validation** -- verify SRA file integrity with `sracha validate`
 
