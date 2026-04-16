@@ -225,6 +225,10 @@ pub struct GetArgs {
     #[arg(long)]
     pub include_technical: bool,
 
+    /// Write to stdout (stream interleaved FASTQ, auto-delete temp SRA)
+    #[arg(short = 'Z', long)]
+    pub stdout: bool,
+
     /// Overwrite existing files
     #[arg(short, long)]
     pub force: bool,

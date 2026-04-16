@@ -59,6 +59,8 @@ pub struct PipelineConfig {
     pub fasta: bool,
     /// Allow resuming partial downloads.
     pub resume: bool,
+    /// Write output to stdout instead of files.
+    pub stdout: bool,
     /// Flag for graceful cancellation (e.g. Ctrl-C).
     pub cancelled: Option<Arc<AtomicBool>>,
 }
@@ -153,11 +155,12 @@ pub(crate) fn make_styled_pb(total: u64, template: &str) -> indicatif::ProgressB
 // Output writer
 // ---------------------------------------------------------------------------
 
-/// An output writer that handles gzip, zstd, or plain output.
+/// An output writer that handles gzip, zstd, plain, or stdout output.
 enum OutputWriter {
     Gz(ParGzWriter<std::io::BufWriter<std::fs::File>>),
     Zstd(zstd::stream::write::Encoder<'static, std::io::BufWriter<std::fs::File>>),
     Plain(std::io::BufWriter<std::fs::File>),
+    Stdout(std::io::BufWriter<std::io::Stdout>),
 }
 
 impl OutputWriter {
@@ -166,6 +169,7 @@ impl OutputWriter {
             OutputWriter::Gz(w) => w.write_all(data),
             OutputWriter::Zstd(w) => w.write_all(data),
             OutputWriter::Plain(w) => w.write_all(data),
+            OutputWriter::Stdout(w) => w.write_all(data),
         }
     }
 
@@ -180,6 +184,10 @@ impl OutputWriter {
                 Ok(())
             }
             OutputWriter::Plain(mut w) => {
+                w.flush()?;
+                Ok(())
+            }
+            OutputWriter::Stdout(mut w) => {
                 w.flush()?;
                 Ok(())
             }
@@ -1167,12 +1175,25 @@ fn decode_and_write(
         fasta: config.fasta,
     };
 
-    // Create output directory.
-    std::fs::create_dir_all(&config.output_dir)?;
+    // Create output directory (not needed for stdout mode).
+    if !config.stdout {
+        std::fs::create_dir_all(&config.output_dir)?;
+    }
 
     // Lazily create output writers as we encounter different output slots.
     let mut writers: HashMap<OutputSlot, OutputWriter> = HashMap::new();
     let mut output_files: Vec<PathBuf> = Vec::new();
+
+    // For stdout mode, create a single writer up front. All output slots
+    // write to this shared writer (interleaved, uncompressed).
+    let mut stdout_writer: Option<OutputWriter> = if config.stdout {
+        Some(OutputWriter::Stdout(std::io::BufWriter::with_capacity(
+            256 * 1024,
+            std::io::stdout(),
+        )))
+    } else {
+        None
+    };
 
     let spots_read = std::sync::atomic::AtomicU64::new(0);
     let mut reads_written: u64 = 0;
@@ -1285,40 +1306,45 @@ fn decode_and_write(
                     let (records, num_spots) = result?;
 
                     for (slot, record) in &records {
-                        let writer = writers.entry(*slot).or_insert_with(|| {
-                            let filename = output_filename(
-                                accession,
-                                *slot,
-                                config.fasta,
-                                &config.compression,
-                            );
-                            let path = config.output_dir.join(&filename);
-                            output_files.push(path.clone());
+                        let writer = if let Some(ref mut sw) = stdout_writer {
+                            sw
+                        } else {
+                            writers.entry(*slot).or_insert_with(|| {
+                                let filename = output_filename(
+                                    accession,
+                                    *slot,
+                                    config.fasta,
+                                    &config.compression,
+                                );
+                                let path = config.output_dir.join(&filename);
+                                output_files.push(path.clone());
 
-                            let file =
-                                std::fs::File::create(&path).expect("failed to create output file");
-                            let buf = std::io::BufWriter::with_capacity(256 * 1024, file);
+                                let file = std::fs::File::create(&path)
+                                    .expect("failed to create output file");
+                                let buf = std::io::BufWriter::with_capacity(256 * 1024, file);
 
-                            match config.compression {
-                                CompressionMode::Gzip { level } => {
-                                    OutputWriter::Gz(ParGzWriter::new(
-                                        buf,
-                                        level,
-                                        DEFAULT_BLOCK_SIZE,
-                                        compress_pool.clone().expect("gzip pool must exist"),
-                                    ))
+                                match config.compression {
+                                    CompressionMode::Gzip { level } => {
+                                        OutputWriter::Gz(ParGzWriter::new(
+                                            buf,
+                                            level,
+                                            DEFAULT_BLOCK_SIZE,
+                                            compress_pool.clone().expect("gzip pool must exist"),
+                                        ))
+                                    }
+                                    CompressionMode::Zstd { level, threads } => {
+                                        let mut encoder =
+                                            zstd::stream::write::Encoder::new(buf, level)
+                                                .expect("failed to create zstd encoder");
+                                        encoder
+                                            .multithread(threads)
+                                            .expect("failed to set zstd threads");
+                                        OutputWriter::Zstd(encoder)
+                                    }
+                                    CompressionMode::None => OutputWriter::Plain(buf),
                                 }
-                                CompressionMode::Zstd { level, threads } => {
-                                    let mut encoder = zstd::stream::write::Encoder::new(buf, level)
-                                        .expect("failed to create zstd encoder");
-                                    encoder
-                                        .multithread(threads)
-                                        .expect("failed to set zstd threads");
-                                    OutputWriter::Zstd(encoder)
-                                }
-                                CompressionMode::None => OutputWriter::Plain(buf),
-                            }
-                        });
+                            })
+                        };
 
                         writer.write_all(&record.data).map_err(Error::Io)?;
                         reads_written += 1;
@@ -1543,6 +1569,9 @@ fn decode_and_write(
     );
 
     // Finish all writers.
+    if let Some(sw) = stdout_writer {
+        sw.finish().map_err(Error::Io)?;
+    }
     for (_, writer) in writers {
         writer.finish().map_err(Error::Io)?;
     }

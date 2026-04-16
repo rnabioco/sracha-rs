@@ -66,6 +66,9 @@ Home = "index.md"
 "Getting Started" = "getting-started.md"
 
 [[project.nav]]
+"Streaming Alignment" = "alignment.md"
+
+[[project.nav]]
 "CLI Reference" = "cli.md"
 
 [[project.nav]]
