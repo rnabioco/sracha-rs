@@ -440,7 +440,22 @@ async fn main() -> Result<()> {
             Ok(())
         }
         Command::Validate(args) => {
+            use tabled::builder::Builder;
+            use tabled::settings::object::{Columns, Rows};
+            use tabled::settings::{Alignment, Color, Modify, Style};
+
             let mut all_valid = true;
+
+            struct ValidateRow {
+                label: String,
+                valid: bool,
+                spots: String,
+                blobs: String,
+                columns: String,
+                errors: Vec<String>,
+            }
+
+            let mut rows: Vec<ValidateRow> = Vec::new();
 
             for input in &args.inputs {
                 let sra_path = std::path::Path::new(input);
@@ -457,25 +472,59 @@ async fn main() -> Result<()> {
                 let result =
                     sracha_core::pipeline::run_validate(sra_path, args.threads, !args.no_progress);
 
-                if result.valid {
-                    eprintln!(
-                        "{}: {} -- {} spots, {} blobs, columns: [{}]",
-                        style::header(&result.label),
-                        style::value("ok"),
-                        style::count(result.spots_validated),
-                        style::count(result.blobs_validated),
-                        result.columns_found.join(", "),
-                    );
-                } else {
+                if !result.valid {
                     all_valid = false;
-                    eprintln!(
-                        "{}: {} -- {} error(s)",
-                        style::header(&result.label),
-                        style::error_label("FAILED"),
-                        style::count(result.errors.len()),
-                    );
-                    for err in &result.errors {
-                        eprintln!("  {err}");
+                }
+
+                rows.push(ValidateRow {
+                    label: result.label,
+                    valid: result.valid,
+                    spots: result.spots_validated.to_string(),
+                    blobs: result.blobs_validated.to_string(),
+                    columns: result.columns_found.join(", "),
+                    errors: result.errors,
+                });
+            }
+
+            if !rows.is_empty() {
+                let mut builder = Builder::new();
+                builder.push_record(["File", "Status", "Spots", "Blobs", "Columns"]);
+
+                for row in &rows {
+                    let status = if row.valid {
+                        style::value("ok")
+                    } else {
+                        style::error_label("FAILED")
+                    };
+                    builder.push_record([
+                        row.label.clone(),
+                        status,
+                        row.spots.clone(),
+                        row.blobs.clone(),
+                        row.columns.clone(),
+                    ]);
+                }
+
+                let mut table = builder.build();
+                table
+                    .with(Style::rounded())
+                    .with(Modify::new(Rows::first()).with(Color::new("\x1b[1m", "\x1b[22m")))
+                    .with(Modify::new(Columns::new(2..=2)).with(Alignment::right()))
+                    .with(Modify::new(Columns::new(3..=3)).with(Alignment::right()));
+
+                eprintln!("{table}");
+
+                // Print error details for failed files below the table.
+                for row in &rows {
+                    if !row.errors.is_empty() {
+                        eprintln!(
+                            "\n{}: {} error(s)",
+                            style::header(&row.label),
+                            style::count(row.errors.len()),
+                        );
+                        for err in &row.errors {
+                            eprintln!("  {err}");
+                        }
                     }
                 }
             }
@@ -600,17 +649,15 @@ fn print_resolved(resolved: &ResolvedAccession) {
 
 /// Print a compact table for multiple resolved accessions (project view).
 fn print_info_table(resolved: &[ResolvedAccession]) {
-    // Header
-    println!(
-        "  {:<14} {:>10}  {:>6}  {}",
-        style::label("Accession"),
-        style::label("Size"),
-        style::label("Layout"),
-        style::label("Lite"),
-    );
-    println!("  {}", "-".repeat(50));
+    use tabled::builder::Builder;
+    use tabled::settings::object::{Columns, Rows};
+    use tabled::settings::style::HorizontalLine;
+    use tabled::settings::{Alignment, Color, Modify, Panel, Style};
 
     let mut total_size: u64 = 0;
+    let mut builder = Builder::new();
+
+    builder.push_record(["Accession", "Size", "Layout", "Lite"]);
 
     for r in resolved {
         let layout = r
@@ -621,22 +668,32 @@ fn print_info_table(resolved: &[ResolvedAccession]) {
         let lite = if r.sra_file.is_lite { "yes" } else { "no" };
         total_size += r.sra_file.size;
 
-        println!(
-            "  {:<14} {:>10}  {:>6}  {}",
-            r.accession,
+        builder.push_record([
+            r.accession.clone(),
             format_size(r.sra_file.size),
-            layout,
-            lite,
-        );
+            layout.to_string(),
+            lite.to_string(),
+        ]);
     }
 
-    println!("  {}", "-".repeat(50));
-    println!(
-        "  {} {} across {} run(s)",
-        style::label("Total:"),
+    let summary = format!(
+        "Total: {} across {} run(s)",
         style::value(format_size(total_size)),
         style::count(resolved.len()),
     );
+
+    let footer_line = resolved.len() + 1;
+    let mut table = builder.build();
+    table
+        .with(Panel::footer(summary))
+        .with(Style::rounded().horizontals([
+            (1, HorizontalLine::full('─', '┼', '├', '┤')),
+            (footer_line, HorizontalLine::full('─', '┴', '├', '┤')),
+        ]))
+        .with(Modify::new(Rows::first()).with(Color::new("\x1b[1m", "\x1b[22m")))
+        .with(Modify::new(Columns::new(1..=1)).with(Alignment::right()));
+
+    println!("{table}");
 }
 
 /// Size threshold (in bytes) above which downloads require `--yes` confirmation.

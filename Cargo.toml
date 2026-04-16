@@ -47,6 +47,7 @@ memmap2 = "0.9"
 
 # Styling
 owo-colors = "4"
+tabled = { version = "0.20", features = ["ansi"] }
 
 # Utils
 url = "2"
