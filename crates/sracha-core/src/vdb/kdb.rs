@@ -554,30 +554,26 @@ fn update_meta_from_idx_file(meta: &mut ColumnMeta, buf: &[u8]) {
     // v2/v3 layout in idx file:
     //   KDBHdr(8) + data_eof(8) + idx2_eof(8) + [idx0_count(4) for v3] + num_blocks(4) + page_size(4) + checksum(1)
     match version {
-        2 => {
-            if buf.len() >= 36 {
-                meta.data_eof = read_u64(8);
-                meta.idx2_eof = read_u64(16);
-                meta.num_blocks = read_u32(24);
-                meta.page_size = read_u32(28);
-                if meta.page_size == 0 {
-                    meta.page_size = 1;
-                }
-                meta.checksum_type = buf[32];
+        2 if buf.len() >= 36 => {
+            meta.data_eof = read_u64(8);
+            meta.idx2_eof = read_u64(16);
+            meta.num_blocks = read_u32(24);
+            meta.page_size = read_u32(28);
+            if meta.page_size == 0 {
+                meta.page_size = 1;
             }
+            meta.checksum_type = buf[32];
         }
-        3 | 4 => {
-            if buf.len() >= 40 {
-                meta.data_eof = read_u64(8);
-                meta.idx2_eof = read_u64(16);
-                // idx0_count at 24
-                meta.num_blocks = read_u32(28);
-                meta.page_size = read_u32(32);
-                if meta.page_size == 0 {
-                    meta.page_size = 1;
-                }
-                meta.checksum_type = buf[36];
+        3 | 4 if buf.len() >= 40 => {
+            meta.data_eof = read_u64(8);
+            meta.idx2_eof = read_u64(16);
+            // idx0_count at 24
+            meta.num_blocks = read_u32(28);
+            meta.page_size = read_u32(32);
+            if meta.page_size == 0 {
+                meta.page_size = 1;
             }
+            meta.checksum_type = buf[36];
         }
         _ => {}
     }

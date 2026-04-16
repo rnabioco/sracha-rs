@@ -727,11 +727,10 @@ fn decode_blob_to_fastq(
         let ndecoded = decode_raw(raw.name_raw, raw.name_cs, raw.name_id_range)?;
         let name_bytes = decode_zip_encoding(&ndecoded);
 
-        let num_spots = if reads_per_spot > 0 {
-            read_lengths.len() / reads_per_spot
-        } else {
-            read_lengths.len()
-        };
+        let num_spots = read_lengths
+            .len()
+            .checked_div(reads_per_spot)
+            .unwrap_or(read_lengths.len());
 
         if let Some(ref pm) = ndecoded.page_map {
             let mut names = Vec::with_capacity(num_spots);
@@ -804,11 +803,10 @@ fn decode_blob_to_fastq(
         // ALTREAD is a per-spot ASCII template (may vary per tile).
         // Parse templates: each spot's template is stored as a fixed-length or
         // page-map-delineated string.
-        let num_spots = if reads_per_spot > 0 {
-            read_lengths.len() / reads_per_spot
-        } else {
-            read_lengths.len()
-        };
+        let num_spots = read_lengths
+            .len()
+            .checked_div(reads_per_spot)
+            .unwrap_or(read_lengths.len());
 
         // The skey index maps spot ranges to name templates. Each blob covers
         // a contiguous spot range corresponding to one tile. Use the ALTREAD
