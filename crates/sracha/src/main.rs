@@ -142,7 +142,8 @@ async fn main() -> Result<()> {
                 args.inputs.len()
             );
 
-            let split_mode = cli::resolve_split_mode(args.split, args.stdout);
+            let split_mode =
+                cli::resolve_split_mode(args.split, args.stdout).map_err(|e| anyhow::anyhow!(e))?;
             let compression = cli::resolve_compression(
                 args.stdout,
                 args.zstd,
@@ -206,6 +207,9 @@ async fn main() -> Result<()> {
             Ok(())
         }
         Command::Get(args) => {
+            let split_mode =
+                cli::resolve_split_mode(args.split, args.stdout).map_err(|e| anyhow::anyhow!(e))?;
+
             let raw = collect_accessions(&args.accessions, args.accession_list.as_deref())?;
             let sdl_client = SdlClient::new();
             let (run_accessions, has_projects) = resolve_to_runs(&raw, &sdl_client).await?;
@@ -244,7 +248,6 @@ async fn main() -> Result<()> {
                 resolved_all.len()
             );
 
-            let split_mode = cli::resolve_split_mode(args.split, args.stdout);
             let compression = cli::resolve_compression(
                 args.stdout,
                 args.zstd,

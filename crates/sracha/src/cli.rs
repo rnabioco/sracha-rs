@@ -146,20 +146,38 @@ pub struct FastqArgs {
     pub force: bool,
 
     /// Disable gzip compression (compressed by default)
-    #[arg(long, conflicts_with = "zstd", help_heading = "Compression")]
+    #[arg(
+        long,
+        conflicts_with_all = ["stdout", "zstd", "zstd_level", "gzip_level"],
+        help_heading = "Compression",
+    )]
     pub no_gzip: bool,
 
-    /// Gzip compression level
-    #[arg(long, default_value_t = 6, value_parser = clap::value_parser!(u32).range(1..=9), help_heading = "Compression")]
-    pub gzip_level: u32,
+    /// Gzip compression level [default: 6]
+    #[arg(
+        long,
+        value_parser = clap::value_parser!(u32).range(1..=9),
+        conflicts_with_all = ["stdout", "no_gzip", "zstd", "zstd_level"],
+        help_heading = "Compression",
+    )]
+    pub gzip_level: Option<u32>,
 
     /// Use zstd compression instead of gzip
-    #[arg(long, conflicts_with = "no_gzip", help_heading = "Compression")]
+    #[arg(
+        long,
+        conflicts_with_all = ["stdout", "no_gzip", "gzip_level"],
+        help_heading = "Compression",
+    )]
     pub zstd: bool,
 
-    /// Zstd compression level (1-22)
-    #[arg(long, default_value_t = 3, value_parser = clap::value_parser!(i32).range(1..=22), help_heading = "Compression")]
-    pub zstd_level: i32,
+    /// Zstd compression level (1-22) [default: 3]
+    #[arg(
+        long,
+        value_parser = clap::value_parser!(i32).range(1..=22),
+        conflicts_with_all = ["stdout", "no_gzip", "gzip_level"],
+        help_heading = "Compression",
+    )]
+    pub zstd_level: Option<i32>,
 
     /// Minimum read length
     #[arg(long, help_heading = "Filtering")]
@@ -208,20 +226,38 @@ pub struct GetArgs {
     pub force: bool,
 
     /// Disable gzip compression (compressed by default)
-    #[arg(long, conflicts_with = "zstd", help_heading = "Compression")]
+    #[arg(
+        long,
+        conflicts_with_all = ["stdout", "zstd", "zstd_level", "gzip_level"],
+        help_heading = "Compression",
+    )]
     pub no_gzip: bool,
 
-    /// Gzip compression level
-    #[arg(long, default_value_t = 6, value_parser = clap::value_parser!(u32).range(1..=9), help_heading = "Compression")]
-    pub gzip_level: u32,
+    /// Gzip compression level [default: 6]
+    #[arg(
+        long,
+        value_parser = clap::value_parser!(u32).range(1..=9),
+        conflicts_with_all = ["stdout", "no_gzip", "zstd", "zstd_level"],
+        help_heading = "Compression",
+    )]
+    pub gzip_level: Option<u32>,
 
     /// Use zstd compression instead of gzip
-    #[arg(long, conflicts_with = "no_gzip", help_heading = "Compression")]
+    #[arg(
+        long,
+        conflicts_with_all = ["stdout", "no_gzip", "gzip_level"],
+        help_heading = "Compression",
+    )]
     pub zstd: bool,
 
-    /// Zstd compression level (1-22)
-    #[arg(long, default_value_t = 3, value_parser = clap::value_parser!(i32).range(1..=22), help_heading = "Compression")]
-    pub zstd_level: i32,
+    /// Zstd compression level (1-22) [default: 3]
+    #[arg(
+        long,
+        value_parser = clap::value_parser!(i32).range(1..=22),
+        conflicts_with_all = ["stdout", "no_gzip", "gzip_level"],
+        help_heading = "Compression",
+    )]
+    pub zstd_level: Option<i32>,
 
     /// Minimum read length
     #[arg(long, help_heading = "Filtering")]
@@ -333,32 +369,39 @@ impl From<SplitMode> for fastq::SplitMode {
     }
 }
 
-/// Resolve the effective split mode, forcing interleaved when writing to stdout.
-pub fn resolve_split_mode(split: SplitMode, stdout: bool) -> fastq::SplitMode {
-    if stdout {
-        fastq::SplitMode::Interleaved
-    } else {
-        split.into()
+/// Resolve the effective split mode. `--stdout/-Z` requires `--split interleaved`.
+pub fn resolve_split_mode(split: SplitMode, stdout: bool) -> Result<fastq::SplitMode, String> {
+    if stdout && !matches!(split, SplitMode::Interleaved) {
+        return Err(
+            "--stdout/-Z only supports --split interleaved (stdout streams a single FASTQ stream)"
+                .into(),
+        );
     }
+    Ok(split.into())
 }
 
 /// Resolve the effective compression mode from CLI flags.
+///
+/// Clap's `conflicts_with_all` rejects incompatible combinations at parse time, so this
+/// function only handles the remaining implication: `--zstd-level N` alone implies `--zstd`.
 pub fn resolve_compression(
     stdout: bool,
     zstd: bool,
-    zstd_level: i32,
+    zstd_level: Option<i32>,
     threads: usize,
     no_gzip: bool,
-    gzip_level: u32,
+    gzip_level: Option<u32>,
 ) -> CompressionMode {
     if stdout || no_gzip {
         CompressionMode::None
-    } else if zstd {
+    } else if zstd || zstd_level.is_some() {
         CompressionMode::Zstd {
-            level: zstd_level,
+            level: zstd_level.unwrap_or(3),
             threads: threads as u32,
         }
     } else {
-        CompressionMode::Gzip { level: gzip_level }
+        CompressionMode::Gzip {
+            level: gzip_level.unwrap_or(6),
+        }
     }
 }
