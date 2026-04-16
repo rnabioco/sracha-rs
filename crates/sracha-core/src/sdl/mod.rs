@@ -164,8 +164,7 @@ impl SdlClient {
             url.query_pairs_mut().append_pair("acc", acc);
         }
         if format == FormatPreference::Sralite {
-            url.query_pairs_mut()
-                .append_pair("capability", "zqa:z");
+            url.query_pairs_mut().append_pair("capability", "zqa:z");
         }
 
         tracing::debug!("SDL request: {url}");
