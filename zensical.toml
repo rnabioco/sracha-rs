@@ -14,13 +14,13 @@ name = "material"
 
 [[project.theme.palette]]
 scheme = "default"
-primary = "deep purple"
+primary = "deep orange"
 accent = "amber"
 toggle = { icon = "lucide/moon", name = "Switch to dark mode" }
 
 [[project.theme.palette]]
 scheme = "slate"
-primary = "deep purple"
+primary = "deep orange"
 accent = "amber"
 toggle = { icon = "lucide/sun", name = "Switch to light mode" }
 
