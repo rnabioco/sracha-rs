@@ -1050,7 +1050,7 @@ fn decode_blob_to_fastq(
             };
 
             match config.split_mode {
-                SplitMode::Split3 | SplitMode::Interleaved => {
+                SplitMode::Split3 => {
                     if segments.len() == 2 {
                         records.push((OutputSlot::Read1, fmt(&segments[0])));
                         records.push((OutputSlot::Read2, fmt(&segments[1])));
@@ -1058,6 +1058,11 @@ fn decode_blob_to_fastq(
                         for seg in &segments {
                             records.push((OutputSlot::Unpaired, fmt(seg)));
                         }
+                    }
+                }
+                SplitMode::Interleaved => {
+                    for seg in &segments {
+                        records.push((OutputSlot::Single, fmt(seg)));
                     }
                 }
                 SplitMode::SplitFiles => {

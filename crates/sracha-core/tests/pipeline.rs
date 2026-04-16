@@ -428,14 +428,15 @@ fn run_fastq_min_read_len_filter() {
     let sra_path = ensure_srr28588231();
     let tmp = tempfile::tempdir().unwrap();
     let mut config = test_config(tmp.path(), SplitMode::SplitSpot, CompressionMode::None);
-    // SRR28588231 has 151bp reads. Setting min_read_len to 200 should filter all.
-    config.min_read_len = Some(200);
+    // SRR28588231 has 301bp reads (no READ_LEN column; 602bp spot / 2 reads).
+    // Setting min_read_len to 400 should filter all.
+    config.min_read_len = Some(400);
 
     let stats = sracha_core::pipeline::run_fastq(&sra_path, Some("SRR28588231"), &config).unwrap();
 
     assert_eq!(
         stats.reads_written, 0,
-        "min_read_len=200 should filter all 151bp reads"
+        "min_read_len=400 should filter all 301bp reads"
     );
 }
 

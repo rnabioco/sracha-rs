@@ -37,8 +37,7 @@ pub enum SplitMode {
     SplitFiles,
     /// All reads from a spot go to a single file.
     SplitSpot,
-    /// R1/R2 alternate in a single file (same routing as Split3, but the
-    /// consumer merges Read1/Read2 into one stream).
+    /// R1/R2 alternate in a single file.
     Interleaved,
 }
 
@@ -281,7 +280,7 @@ struct ReadSegment<'a> {
 /// - **Split3**: 2 biological reads -> `Read1` + `Read2`; otherwise each to `Unpaired`.
 /// - **SplitFiles**: Nth surviving read -> `ReadN(N)` (0-indexed).
 /// - **SplitSpot**: all reads -> `Single`.
-/// - **Interleaved**: same routing as Split3 (consumer writes Read1/Read2 to one stream).
+/// - **Interleaved**: all reads -> `Single` (R1/R2 alternating in one file).
 pub fn format_spot(
     spot: &SpotRecord,
     run_name: &str,
@@ -333,7 +332,7 @@ pub fn format_spot(
     let mut results = Vec::with_capacity(segments.len());
 
     match config.split_mode {
-        SplitMode::Split3 | SplitMode::Interleaved => {
+        SplitMode::Split3 => {
             if segments.len() == 2 {
                 let r1 = format_read(
                     run_name,
@@ -356,6 +355,12 @@ pub fn format_spot(
                     let rec = format_read(run_name, &spot.name, None, seg.sequence, seg.quality);
                     results.push((OutputSlot::Unpaired, rec));
                 }
+            }
+        }
+        SplitMode::Interleaved => {
+            for seg in &segments {
+                let rec = format_read(run_name, &spot.name, None, seg.sequence, seg.quality);
+                results.push((OutputSlot::Single, rec));
             }
         }
         SplitMode::SplitFiles => {
@@ -596,7 +601,7 @@ mod tests {
     }
 
     #[test]
-    fn single_read_routes_to_unpaired_in_interleaved() {
+    fn single_read_routes_to_single_in_interleaved() {
         let spot = single_read_spot(b"1", b"ACGT", b"????");
         let config = FastqConfig {
             split_mode: SplitMode::Interleaved,
@@ -605,7 +610,7 @@ mod tests {
         let results = format_spot(&spot, "SRR1", &config);
 
         assert_eq!(results.len(), 1);
-        assert_eq!(results[0].0, OutputSlot::Unpaired);
+        assert_eq!(results[0].0, OutputSlot::Single);
     }
 
     // -----------------------------------------------------------------------
@@ -627,7 +632,7 @@ mod tests {
     }
 
     #[test]
-    fn paired_read_routes_to_read1_read2_in_interleaved() {
+    fn paired_read_routes_to_single_in_interleaved() {
         let spot = paired_read_spot(b"1", b"AAAA", b"????", b"CCCC", b"????");
         let config = FastqConfig {
             split_mode: SplitMode::Interleaved,
@@ -636,8 +641,8 @@ mod tests {
         let results = format_spot(&spot, "SRR1", &config);
 
         assert_eq!(results.len(), 2);
-        assert_eq!(results[0].0, OutputSlot::Read1);
-        assert_eq!(results[1].0, OutputSlot::Read2);
+        assert_eq!(results[0].0, OutputSlot::Single);
+        assert_eq!(results[1].0, OutputSlot::Single);
     }
 
     #[test]
