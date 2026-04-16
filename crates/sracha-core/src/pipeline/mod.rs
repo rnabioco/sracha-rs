@@ -11,9 +11,11 @@
 
 use std::collections::HashMap;
 use std::io::Write;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
+
+use serde::{Deserialize, Serialize};
 
 use crate::compress::{DEFAULT_BLOCK_SIZE, ParGzWriter};
 use crate::download::{DownloadConfig, download_file};
@@ -83,6 +85,146 @@ pub struct PipelineStats {
     pub total_sra_size: u64,
     /// Paths of all output files created.
     pub output_files: Vec<PathBuf>,
+}
+
+// ---------------------------------------------------------------------------
+// Completion marker — skip re-decode when output files already exist.
+// ---------------------------------------------------------------------------
+
+/// Marker format version. Bump this when the marker schema changes to
+/// invalidate all existing markers (forcing a clean re-decode).
+const MARKER_VERSION: u32 = 1;
+
+/// Completion marker written after a successful decode.
+///
+/// Stored as `.sracha-done-{accession}` in the output directory. On re-run,
+/// the marker is loaded and validated: if all recorded output files still
+/// exist at the expected sizes and the decode parameters match, the decode
+/// (and the download) are skipped entirely.
+#[derive(Debug, Serialize, Deserialize)]
+struct CompletionMarker {
+    version: u32,
+    accession: String,
+    sra_md5: Option<String>,
+    sra_size: u64,
+    split_mode: String,
+    compression: String,
+    fasta: bool,
+    skip_technical: bool,
+    min_read_len: Option<u32>,
+    output_files: Vec<(String, u64)>,
+}
+
+fn marker_path(output_dir: &Path, accession: &str) -> PathBuf {
+    output_dir.join(format!(".sracha-done-{accession}"))
+}
+
+/// Serialise `CompressionMode` to a stable string for the marker.
+fn compression_key(c: &crate::fastq::CompressionMode) -> String {
+    match c {
+        crate::fastq::CompressionMode::None => "none".into(),
+        crate::fastq::CompressionMode::Gzip { level } => format!("gzip:{level}"),
+        crate::fastq::CompressionMode::Zstd { level, threads } => {
+            format!("zstd:{level}:{threads}")
+        }
+    }
+}
+
+fn write_completion_marker(
+    output_dir: &Path,
+    accession: &str,
+    sra_md5: Option<&str>,
+    sra_size: u64,
+    config: &PipelineConfig,
+    output_files: &[PathBuf],
+) -> Result<()> {
+    let file_entries: Vec<(String, u64)> = output_files
+        .iter()
+        .filter_map(|p| {
+            let name = p.file_name()?.to_str()?.to_string();
+            let size = std::fs::metadata(p).ok()?.len();
+            Some((name, size))
+        })
+        .collect();
+
+    let marker = CompletionMarker {
+        version: MARKER_VERSION,
+        accession: accession.to_string(),
+        sra_md5: sra_md5.map(String::from),
+        sra_size,
+        split_mode: config.split_mode.to_string(),
+        compression: compression_key(&config.compression),
+        fasta: config.fasta,
+        skip_technical: config.skip_technical,
+        min_read_len: config.min_read_len,
+        output_files: file_entries,
+    };
+
+    let path = marker_path(output_dir, accession);
+    let json =
+        serde_json::to_string_pretty(&marker).map_err(|e| Error::Io(std::io::Error::other(e)))?;
+    std::fs::write(&path, json)?;
+    Ok(())
+}
+
+/// Check if decode can be skipped for this accession.
+///
+/// Returns `Some(output_files)` if the completion marker is valid and all
+/// output files exist at the recorded sizes. Returns `None` otherwise.
+fn check_completion_marker(
+    output_dir: &Path,
+    accession: &str,
+    config: &PipelineConfig,
+    sra_size: u64,
+) -> Option<Vec<PathBuf>> {
+    let path = marker_path(output_dir, accession);
+    let content = std::fs::read_to_string(&path).ok()?;
+    let marker: CompletionMarker = serde_json::from_str(&content).ok()?;
+
+    if marker.version != MARKER_VERSION {
+        return None;
+    }
+    if marker.accession != accession {
+        return None;
+    }
+    if marker.sra_size != sra_size {
+        return None;
+    }
+    if marker.split_mode != config.split_mode.to_string() {
+        return None;
+    }
+    if marker.compression != compression_key(&config.compression) {
+        return None;
+    }
+    if marker.fasta != config.fasta {
+        return None;
+    }
+    if marker.skip_technical != config.skip_technical {
+        return None;
+    }
+    if marker.min_read_len != config.min_read_len {
+        return None;
+    }
+
+    // Verify all output files exist at recorded sizes.
+    let mut output_paths = Vec::new();
+    for (name, expected_size) in &marker.output_files {
+        let file_path = output_dir.join(name);
+        let meta = std::fs::metadata(&file_path).ok()?;
+        if meta.len() != *expected_size {
+            return None;
+        }
+        output_paths.push(file_path);
+    }
+
+    // Temp SRA file must be absent (confirms prior decode completed).
+    let temp_filename = format!(".sracha-tmp-{accession}.sra");
+    let temp_path = output_dir.join(temp_filename);
+    if temp_path.exists() {
+        return None;
+    }
+
+    Some(output_paths)
 }
 
 // ---------------------------------------------------------------------------
@@ -1875,6 +2017,8 @@ pub struct DownloadedSra {
     pub is_lite: bool,
     /// The accession string.
     pub accession: String,
+    /// MD5 of the SRA file (computed or verified during download).
+    pub sra_md5: Option<String>,
 }
 
 /// Download an SRA file to a temporary location.
@@ -1888,6 +2032,30 @@ pub async fn download_sra(
 ) -> Result<DownloadedSra> {
     let accession = &resolved.accession;
     let total_sra_size = resolved.sra_file.size;
+
+    // Delete completion marker when --force is used.
+    if config.force {
+        let _ = std::fs::remove_file(marker_path(&config.output_dir, accession));
+    }
+
+    // If outputs already exist (validated via completion marker), skip entirely.
+    if !config.force
+        && !config.stdout
+        && check_completion_marker(&config.output_dir, accession, config, total_sra_size).is_some()
+    {
+        tracing::info!("{accession}: outputs already exist, skipping download");
+        let temp_filename = format!(".sracha-tmp-{accession}.sra");
+        let temp_path = config.output_dir.join(&temp_filename);
+        return Ok(DownloadedSra {
+            temp_path,
+            bytes_transferred: 0,
+            total_sra_size,
+            is_lite: resolved.sra_file.is_lite,
+            accession: accession.clone(),
+            sra_md5: resolved.sra_file.md5.clone(),
+        });
+    }
+
     let url = select_mirror(resolved)?;
     let urls = vec![url.clone()];
 
@@ -1901,8 +2069,8 @@ pub async fn download_sra(
     let dl_config = DownloadConfig {
         connections: config.connections,
         chunk_size: 0,
-        force: false,
-        validate: false,
+        force: config.force,
+        validate: true,
         progress: config.progress,
         resume: config.resume,
     };
@@ -1948,6 +2116,7 @@ pub async fn download_sra(
         total_sra_size,
         is_lite: resolved.sra_file.is_lite,
         accession: accession.clone(),
+        sra_md5: dl_result.md5,
     })
 }
 
@@ -1966,6 +2135,37 @@ async fn poll_cancelled(flag: Arc<AtomicBool>) {
 /// This is the decode phase of `run_get`. Call from within
 /// `tokio::task::block_in_place` or a blocking thread.
 pub fn decode_sra(downloaded: &DownloadedSra, config: &PipelineConfig) -> Result<PipelineStats> {
+    // Check if decode can be skipped (unless --force or stdout mode).
+    if let Some(output_files) = (!config.force && !config.stdout)
+        .then(|| {
+            check_completion_marker(
+                &config.output_dir,
+                &downloaded.accession,
+                config,
+                downloaded.total_sra_size,
+            )
+        })
+        .flatten()
+    {
+        tracing::info!(
+            "{}: output files already exist and match, skipping decode",
+            downloaded.accession,
+        );
+        // Clean up temp SRA if the download produced one (cache hit path).
+        let _ = std::fs::remove_file(&downloaded.temp_path);
+        let sidecar = crate::download::progress_path(&downloaded.temp_path);
+        let _ = std::fs::remove_file(&sidecar);
+
+        return Ok(PipelineStats {
+            accession: downloaded.accession.clone(),
+            spots_read: 0,
+            reads_written: 0,
+            bytes_transferred: downloaded.bytes_transferred,
+            total_sra_size: downloaded.total_sra_size,
+            output_files,
+        });
+    }
+
     let (spots_read, reads_written, output_files) = match decode_and_write(
         &downloaded.temp_path,
         &downloaded.accession,
@@ -1974,6 +2174,8 @@ pub fn decode_sra(downloaded: &DownloadedSra, config: &PipelineConfig) -> Result
     ) {
         Ok(result) => result,
         Err(Error::Cancelled { output_files }) => {
+            // Delete completion marker (may not exist yet).
+            let _ = std::fs::remove_file(marker_path(&config.output_dir, &downloaded.accession));
             // Delete partial FASTQ output files.
             for path in &output_files {
                 if let Err(e) = std::fs::remove_file(path) {
@@ -2015,6 +2217,23 @@ pub fn decode_sra(downloaded: &DownloadedSra, config: &PipelineConfig) -> Result
             "{}: failed to remove temp file {}: {e}",
             downloaded.accession,
             downloaded.temp_path.display(),
+        );
+    }
+
+    // Write completion marker so future runs can skip this accession.
+    if !config.stdout
+        && let Err(e) = write_completion_marker(
+            &config.output_dir,
+            &downloaded.accession,
+            downloaded.sra_md5.as_deref(),
+            downloaded.total_sra_size,
+            config,
+            &output_files,
+        )
+    {
+        tracing::warn!(
+            "{}: failed to write completion marker: {e}",
+            downloaded.accession,
         );
     }
 

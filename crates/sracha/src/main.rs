@@ -356,7 +356,12 @@ async fn main() -> Result<()> {
                     sracha_core::pipeline::decode_sra(&downloaded, &pipeline_config)
                 }) {
                     Ok(stats) => {
-                        if stats.bytes_transferred == 0 {
+                        if stats.spots_read == 0 && stats.bytes_transferred == 0 {
+                            eprintln!(
+                                "{}: outputs already exist, skipped (use --force to re-process)",
+                                style::header(&stats.accession),
+                            );
+                        } else if stats.bytes_transferred == 0 {
                             eprintln!(
                                 "{}: {} spots, {} reads written (cached, no download needed)",
                                 style::header(&stats.accession),
@@ -792,6 +797,38 @@ async fn resolve_accessions(
     }
 
     let mut resolved: Vec<ResolvedAccession> = resolved.into_iter().flatten().collect();
+
+    // Phase 2.5: Supplement S3-resolved accessions missing MD5 via SDL.
+    // Large SRA files use S3 multipart uploads whose ETags are not MD5s.
+    // We keep the fast S3 download URL but get the authoritative MD5 from SDL.
+    let md5_needed: Vec<String> = resolved
+        .iter()
+        .filter(|r| r.sra_file.md5.is_none())
+        .map(|r| r.accession.clone())
+        .collect();
+    if !md5_needed.is_empty() {
+        tracing::info!(
+            "fetching MD5 from SDL for {} accession(s) (S3 multipart ETag)",
+            md5_needed.len()
+        );
+        let sdl_results = client.resolve_many(&md5_needed, format).await?;
+        let md5_map: std::collections::HashMap<String, String> = sdl_results
+            .into_iter()
+            .filter_map(|r| r.ok())
+            .filter_map(|r| {
+                let md5 = r.sra_file.md5.clone()?;
+                Some((r.accession.clone(), md5))
+            })
+            .collect();
+        for r in &mut resolved {
+            if r.sra_file.md5.is_none()
+                && let Some(md5) = md5_map.get(&r.accession)
+            {
+                tracing::debug!("{}: supplemented MD5 from SDL: {md5}", r.accession);
+                r.sra_file.md5 = Some(md5.clone());
+            }
+        }
+    }
 
     // Phase 3: Fetch run_info if needed (for FASTQ conversion).
     if need_run_info {
