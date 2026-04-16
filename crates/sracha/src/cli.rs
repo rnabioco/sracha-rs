@@ -169,7 +169,7 @@ pub struct FastqArgs {
     #[arg(long, help_heading = "Filtering")]
     pub include_technical: bool,
 
-    /// Number of threads for decode [default: 8]
+    /// Number of threads for decode
     #[arg(short, long, default_value_t = 8)]
     pub threads: usize,
 
@@ -231,7 +231,7 @@ pub struct GetArgs {
     #[arg(long, help_heading = "Filtering")]
     pub include_technical: bool,
 
-    /// Number of threads for decode [default: 8]
+    /// Number of threads for decode
     #[arg(short, long, default_value_t = 8)]
     pub threads: usize,
 
