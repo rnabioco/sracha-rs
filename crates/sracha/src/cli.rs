@@ -252,6 +252,11 @@ pub struct GetArgs {
     /// Skip direct S3 and resolve via the SDL API
     #[arg(long)]
     pub prefer_sdl: bool,
+
+    /// Skip the EUtils RunInfo API call (read structure will be derived
+    /// from VDB file metadata instead).
+    #[arg(long)]
+    pub no_runinfo: bool,
 }
 
 #[derive(Args)]

@@ -8,6 +8,7 @@ use std::io::{Read, Seek};
 use crate::error::{Error, Result};
 use crate::vdb::kar::KarArchive;
 use crate::vdb::kdb::ColumnReader;
+use crate::vdb::metadata::ReadDescriptor;
 
 // ---------------------------------------------------------------------------
 // Column names within the SEQUENCE table
@@ -52,9 +53,9 @@ pub struct VdbCursor {
     y_col: Option<ColumnReader>,
     first_row: i64,
     row_count: u64,
-    /// Reads per spot inferred from table metadata (used when READ_LEN
+    /// Read descriptors inferred from table metadata (used when READ_LEN
     /// column is absent, e.g. SRA-lite files).
-    metadata_reads_per_spot: Option<usize>,
+    metadata_read_descs: Option<Vec<ReadDescriptor>>,
     /// Sequencing platform detected from VDB schema metadata.
     platform: Option<String>,
 }
@@ -77,7 +78,7 @@ impl VdbCursor {
 
         // Parse table metadata (md/cur) to extract reads_per_spot and
         // platform for SRA-lite files that lack physical READ_LEN/NREADS columns.
-        let (metadata_reads_per_spot, platform) = Self::detect_metadata(archive);
+        let (metadata_read_descs, platform) = Self::detect_metadata(archive);
 
         // READ is required.
         let read_col = ColumnReader::open(archive, &format!("{seq_col_base}/{COL_READ}"), sra_path)
@@ -157,7 +158,7 @@ impl VdbCursor {
             y_col,
             first_row,
             row_count,
-            metadata_reads_per_spot,
+            metadata_read_descs,
             platform,
         })
     }
@@ -240,7 +241,20 @@ impl VdbCursor {
     /// absent (e.g. SRA-lite files). Returns `None` when the metadata
     /// doesn't provide enough info to determine the read structure.
     pub fn metadata_reads_per_spot(&self) -> Option<usize> {
-        self.metadata_reads_per_spot
+        self.metadata_read_descs.as_ref().map(|d| d.len())
+    }
+
+    /// Per-read lengths from VDB metadata, if available.
+    ///
+    /// Returns `Some` only when all read descriptors have a known
+    /// non-zero length. Returns `None` if any length is 0 (variable/unknown).
+    pub fn metadata_read_lengths(&self) -> Option<Vec<u32>> {
+        let descs = self.metadata_read_descs.as_ref()?;
+        if descs.iter().all(|d| d.read_len > 0) {
+            Some(descs.iter().map(|d| d.read_len).collect())
+        } else {
+            None
+        }
     }
 
     /// Sequencing platform detected from VDB schema metadata.
@@ -471,7 +485,7 @@ impl VdbCursor {
     /// Detect reads_per_spot and platform from the table metadata (`md/cur`).
     fn detect_metadata<R: Read + Seek>(
         archive: &mut KarArchive<R>,
-    ) -> (Option<usize>, Option<String>) {
+    ) -> (Option<Vec<ReadDescriptor>>, Option<String>) {
         // Try table-level metadata first, then database-level.
         let md_bytes = match archive.read_file("md/cur") {
             Ok(b) => b,
@@ -493,9 +507,8 @@ impl VdbCursor {
 
         let rps = match crate::vdb::metadata::parse_read_structure(tree_data) {
             Ok(descs) => {
-                let rps = descs.len();
-                tracing::debug!("metadata: detected {rps} reads per spot");
-                Some(rps)
+                tracing::debug!("metadata: detected {} reads per spot", descs.len());
+                Some(descs)
             }
             Err(e) => {
                 tracing::debug!("metadata: could not determine read structure: {e}");
