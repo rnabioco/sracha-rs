@@ -436,9 +436,9 @@ struct RawBlobData<'a> {
     metadata_reads_per_spot: Option<usize>,
     /// Fixed spot length in bases (from READ column page_size).
     fixed_spot_len: Option<u32>,
-    /// Per-read lengths from NCBI EUtils API (authoritative, preferred over
-    /// metadata heuristics when READ_LEN is absent).
-    api_read_lengths: Option<Vec<u32>>,
+    /// Per-read lengths from NCBI EUtils API or VDB metadata (used as
+    /// fallback when READ_LEN column is absent).
+    fallback_read_lengths: Option<Vec<u32>>,
 }
 
 /// Decode a single blob and produce FASTQ records directly.
@@ -582,10 +582,10 @@ fn decode_blob_to_fastq(
 
         (lengths, rps)
     } else if !raw.has_read_len {
-        // No READ_LEN column. Prefer API-derived read structure
-        // (authoritative) over VDB metadata heuristics.
-        if let Some(ref api_lens) = raw.api_read_lengths {
-            // API-derived: we know the exact per-read lengths.
+        // No READ_LEN column. Use fallback read structure from API or
+        // VDB metadata.
+        if let Some(ref api_lens) = raw.fallback_read_lengths {
+            // Fallback: we know the exact per-read lengths.
             let rps = api_lens.len();
             let spot_len: u32 = api_lens.iter().sum();
             let total_bases = read_data.len() as u32;
@@ -593,7 +593,7 @@ fn decode_blob_to_fastq(
 
             if blob_idx == 0 {
                 tracing::debug!(
-                    "using EUtils API read lengths: {:?}, spot_len={}, n_spots={}",
+                    "using fallback read lengths: {:?}, spot_len={}, n_spots={}",
                     api_lens,
                     spot_len,
                     n_spots,
@@ -1107,6 +1107,10 @@ fn decode_and_write(
         });
     }
 
+    // Detect SRA-lite from actual file: if QUALITY column is absent,
+    // treat as lite regardless of what the SDL API reported.
+    let is_lite = is_lite || !cursor.has_quality();
+
     // Load Illumina name format templates from skey index.
     let (name_templates, name_spot_starts): (Vec<Vec<u8>>, Vec<i64>) =
         if cursor.has_illumina_name_parts() {
@@ -1221,11 +1225,12 @@ fn decode_and_write(
         tracing::debug!("fixed_spot_len={fsl} (from blob 0)");
     }
 
-    // API-derived per-read lengths (from NCBI EUtils). Only used when
-    // READ_LEN column is absent. Cloned once here so rayon closures can
-    // borrow it without moving the config.
-    let api_read_lengths: Option<Vec<u32>> = if !has_read_len {
+    // Fallback per-read lengths (from NCBI EUtils API or VDB metadata).
+    // Only used when READ_LEN column is absent. Cloned once here so rayon
+    // closures can borrow it without moving the config.
+    let fallback_read_lengths: Option<Vec<u32>> = if !has_read_len {
         config.run_info.as_ref().map(|ri| ri.avg_read_len.clone())
+            .or_else(|| cursor.metadata_read_lengths())
     } else {
         None
     };
@@ -1234,7 +1239,7 @@ fn decode_and_write(
         "{accession}: has_read_len={has_read_len} (blobs={read_len_blob_count}), \
          has_read_type={has_read_type} (blobs={read_type_blob_count}), \
          has_name={has_name}, has_quality={has_quality}, \
-         metadata_rps={metadata_reads_per_spot:?}, api_read_lengths={api_read_lengths:?}",
+         metadata_rps={metadata_reads_per_spot:?}, fallback_read_lengths={fallback_read_lengths:?}",
     );
     tracing::debug!("{accession}: streaming decode of {num_blobs} blobs (batch-parallel)",);
 
@@ -1475,7 +1480,7 @@ fn decode_and_write(
                             has_read_type,
                             metadata_reads_per_spot,
                             fixed_spot_len,
-                            api_read_lengths: api_read_lengths.clone(),
+                            fallback_read_lengths: fallback_read_lengths.clone(),
                         };
 
                         decode_blob_to_fastq(

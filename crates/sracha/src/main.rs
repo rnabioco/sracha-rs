@@ -200,7 +200,7 @@ async fn main() -> Result<()> {
                 style::count(run_accessions.len()),
             );
             let resolved_all =
-                resolve_accessions(&run_accessions, &sdl_client, args.prefer_sdl, true).await?;
+                resolve_accessions(&run_accessions, &sdl_client, args.prefer_sdl, !args.no_runinfo).await?;
             check_download_confirmation(&resolved_all, args.yes, has_projects)?;
             check_disk_space(&resolved_all, &args.output_dir)?;
 
