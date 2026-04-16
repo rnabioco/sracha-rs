@@ -5,19 +5,20 @@ intermediate files and reducing disk I/O.
 
 ## Prerequisites
 
-Install bwa and samtools:
+Install bwa, samtools, and ucsc-twobittofa:
 
 ```bash
-pixi add bwa samtools
-# or: conda install -c bioconda bwa samtools
+pixi add bwa samtools ucsc-twobittofa
+# or: conda install -c bioconda bwa samtools ucsc-twobittofa
 ```
 
 ## Quick start: align to chr22
 
-Download and index chr22 from hs1 (T2T-CHM13v2.0):
+Stream chr22 from the hs1 (T2T-CHM13v2.0) 2bit file, gzip it, and index:
 
 ```bash
-wget https://hgdownload.soe.ucsc.edu/goldenPath/hs1/chromosomes/chr22.fa.gz
+twoBitToFa -seq=chr22 https://hgdownload.soe.ucsc.edu/goldenPath/hs1/bigZips/hs1.2bit stdout \
+  | gzip > chr22.fa.gz
 bwa index chr22.fa.gz
 ```
 
