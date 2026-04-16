@@ -27,6 +27,10 @@ Fast SRA downloader and FASTQ converter, written in pure Rust.
 3. **Parse** -- reads the KAR archive and decodes VDB columns (READ, QUALITY, READ_LEN, NAME)
 4. **Output** -- formats FASTQ (or FASTA) records and compresses with parallel gzip/zstd
 
+## Demo
+
+![sracha get](images/get.gif)
+
 ## Quick start
 
 ```bash

@@ -9,6 +9,7 @@ platforms = ["linux-64", "osx-arm64"]
 rust = ">=1.92"
 python = ">=3.14.4,<3.15"
 sra-tools = ">=3.4.1,<4"
+vhs = ">=0.11.0,<0.12"
 
 [pypi-dependencies]
 zensical = "*"
@@ -26,3 +27,4 @@ clean = "cargo clean"
 doc = "cargo doc --no-deps --open"
 docs-serve = "zensical serve"
 docs-build = "zensical build"
+tapes = { cmd = "docs/tapes/generate.sh", depends-on = ["release"] }
