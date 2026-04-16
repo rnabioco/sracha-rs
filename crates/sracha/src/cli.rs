@@ -2,6 +2,8 @@ use std::path::PathBuf;
 
 use clap::builder::styling::{AnsiColor, Effects, Styles};
 use clap::{Args, Parser, Subcommand, ValueEnum};
+use sracha_core::fastq::{self, CompressionMode};
+use sracha_core::sdl::FormatPreference;
 
 const STYLES: Styles = Styles::styled()
     .header(AnsiColor::Yellow.on_default().effects(Effects::BOLD))
@@ -73,7 +75,6 @@ pub enum Command {
 
 #[derive(Args)]
 pub struct FetchArgs {
-
     /// SRA accession(s) to download (run, study, or BioProject)
     pub accessions: Vec<String>,
 
@@ -120,7 +121,6 @@ pub struct FetchArgs {
 
 #[derive(Args)]
 pub struct FastqArgs {
-
     /// SRA file path(s) (.sra files from `sracha fetch`)
     #[arg(required = true)]
     pub inputs: Vec<String>,
@@ -180,7 +180,6 @@ pub struct FastqArgs {
 
 #[derive(Args)]
 pub struct GetArgs {
-
     /// SRA accession(s) to download and convert (run, study, or BioProject)
     pub accessions: Vec<String>,
 
@@ -299,6 +298,15 @@ pub enum SraFormat {
     Sralite,
 }
 
+impl From<SraFormat> for FormatPreference {
+    fn from(f: SraFormat) -> Self {
+        match f {
+            SraFormat::Sra => FormatPreference::Sra,
+            SraFormat::Sralite => FormatPreference::Sralite,
+        }
+    }
+}
+
 #[derive(Clone, Copy, ValueEnum)]
 pub enum SplitMode {
     /// Paired reads to _1/_2, unpaired to _0
@@ -312,4 +320,45 @@ pub enum SplitMode {
     SplitSpot,
     /// R1/R2 interleaved in one file
     Interleaved,
+}
+
+impl From<SplitMode> for fastq::SplitMode {
+    fn from(m: SplitMode) -> Self {
+        match m {
+            SplitMode::Split3 => fastq::SplitMode::Split3,
+            SplitMode::SplitFiles => fastq::SplitMode::SplitFiles,
+            SplitMode::SplitSpot => fastq::SplitMode::SplitSpot,
+            SplitMode::Interleaved => fastq::SplitMode::Interleaved,
+        }
+    }
+}
+
+/// Resolve the effective split mode, forcing interleaved when writing to stdout.
+pub fn resolve_split_mode(split: SplitMode, stdout: bool) -> fastq::SplitMode {
+    if stdout {
+        fastq::SplitMode::Interleaved
+    } else {
+        split.into()
+    }
+}
+
+/// Resolve the effective compression mode from CLI flags.
+pub fn resolve_compression(
+    stdout: bool,
+    zstd: bool,
+    zstd_level: i32,
+    threads: usize,
+    no_gzip: bool,
+    gzip_level: u32,
+) -> CompressionMode {
+    if stdout || no_gzip {
+        CompressionMode::None
+    } else if zstd {
+        CompressionMode::Zstd {
+            level: zstd_level,
+            threads: threads as u32,
+        }
+    } else {
+        CompressionMode::Gzip { level: gzip_level }
+    }
 }

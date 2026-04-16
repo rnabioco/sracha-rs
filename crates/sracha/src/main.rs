@@ -42,8 +42,7 @@ where
 
 use cli::{Cli, Command};
 use sracha_core::accession::{self, InputAccession};
-use sracha_core::fastq::CompressionMode;
-use sracha_core::sdl::{FormatPreference, ResolvedAccession, SdlClient};
+use sracha_core::sdl::{ResolvedAccession, SdlClient};
 use sracha_core::util::format_size;
 
 #[tokio::main]
@@ -82,10 +81,14 @@ async fn main() -> Result<()> {
                 "Resolving {} accession(s)...",
                 style::count(run_accessions.len()),
             );
-            let format = format_preference(args.format);
-            let resolved_all =
-                resolve_accessions(&run_accessions, &client, args.prefer_sdl, false, format)
-                    .await?;
+            let resolved_all = resolve_accessions(
+                &run_accessions,
+                &client,
+                args.prefer_sdl,
+                false,
+                args.format.into(),
+            )
+            .await?;
             check_download_confirmation(&resolved_all, args.yes, has_projects)?;
             check_disk_space(&resolved_all, &args.output_dir)?;
 
@@ -139,31 +142,15 @@ async fn main() -> Result<()> {
                 args.inputs.len()
             );
 
-            let split_mode = if args.stdout {
-                sracha_core::fastq::SplitMode::Interleaved
-            } else {
-                match args.split {
-                    cli::SplitMode::Split3 => sracha_core::fastq::SplitMode::Split3,
-                    cli::SplitMode::SplitFiles => sracha_core::fastq::SplitMode::SplitFiles,
-                    cli::SplitMode::SplitSpot => sracha_core::fastq::SplitMode::SplitSpot,
-                    cli::SplitMode::Interleaved => sracha_core::fastq::SplitMode::Interleaved,
-                }
-            };
-
-            let compression = if args.stdout {
-                CompressionMode::None
-            } else if args.zstd {
-                CompressionMode::Zstd {
-                    level: args.zstd_level,
-                    threads: args.threads as u32,
-                }
-            } else if args.no_gzip {
-                CompressionMode::None
-            } else {
-                CompressionMode::Gzip {
-                    level: args.gzip_level,
-                }
-            };
+            let split_mode = cli::resolve_split_mode(args.split, args.stdout);
+            let compression = cli::resolve_compression(
+                args.stdout,
+                args.zstd,
+                args.zstd_level,
+                args.threads,
+                args.no_gzip,
+                args.gzip_level,
+            );
 
             for input in &args.inputs {
                 let sra_path = std::path::Path::new(input);
@@ -226,13 +213,12 @@ async fn main() -> Result<()> {
                 "Resolving {} accession(s)...",
                 style::count(run_accessions.len()),
             );
-            let format = format_preference(args.format);
             let resolved_all = resolve_accessions(
                 &run_accessions,
                 &sdl_client,
                 args.prefer_sdl,
                 !args.no_runinfo,
-                format,
+                args.format.into(),
             )
             .await?;
             check_download_confirmation(&resolved_all, args.yes, has_projects)?;
@@ -258,31 +244,15 @@ async fn main() -> Result<()> {
                 resolved_all.len()
             );
 
-            let split_mode = if args.stdout {
-                sracha_core::fastq::SplitMode::Interleaved
-            } else {
-                match args.split {
-                    cli::SplitMode::Split3 => sracha_core::fastq::SplitMode::Split3,
-                    cli::SplitMode::SplitFiles => sracha_core::fastq::SplitMode::SplitFiles,
-                    cli::SplitMode::SplitSpot => sracha_core::fastq::SplitMode::SplitSpot,
-                    cli::SplitMode::Interleaved => sracha_core::fastq::SplitMode::Interleaved,
-                }
-            };
-
-            let compression = if args.stdout {
-                CompressionMode::None
-            } else if args.zstd {
-                CompressionMode::Zstd {
-                    level: args.zstd_level,
-                    threads: args.threads as u32,
-                }
-            } else if args.no_gzip {
-                CompressionMode::None
-            } else {
-                CompressionMode::Gzip {
-                    level: args.gzip_level,
-                }
-            };
+            let split_mode = cli::resolve_split_mode(args.split, args.stdout);
+            let compression = cli::resolve_compression(
+                args.stdout,
+                args.zstd,
+                args.zstd_level,
+                args.threads,
+                args.no_gzip,
+                args.gzip_level,
+            );
 
             let progress = !args.no_progress && !args.stdout;
 
@@ -319,12 +289,8 @@ async fn main() -> Result<()> {
                 >,
             > = None;
 
-            for (i, resolved) in resolved_all.iter().enumerate() {
-                if cancelled.load(Ordering::Relaxed) {
-                    break;
-                }
-
-                let pipeline_config = sracha_core::pipeline::PipelineConfig {
+            let make_config =
+                |resolved: &ResolvedAccession| sracha_core::pipeline::PipelineConfig {
                     output_dir: args.output_dir.clone(),
                     split_mode,
                     compression,
@@ -340,6 +306,13 @@ async fn main() -> Result<()> {
                     stdout: args.stdout,
                     cancelled: Some(cancelled.clone()),
                 };
+
+            for (i, resolved) in resolved_all.iter().enumerate() {
+                if cancelled.load(Ordering::Relaxed) {
+                    break;
+                }
+
+                let pipeline_config = make_config(resolved);
 
                 // Await this accession's download (prefetched or fresh).
                 let downloaded = if let Some(handle) = pending_download.take() {
@@ -372,22 +345,7 @@ async fn main() -> Result<()> {
                 // Start prefetching the next accession's download.
                 if i + 1 < resolved_all.len() && !cancelled.load(Ordering::Relaxed) {
                     let next_resolved = resolved_all[i + 1].clone();
-                    let next_config = sracha_core::pipeline::PipelineConfig {
-                        output_dir: args.output_dir.clone(),
-                        split_mode,
-                        compression,
-                        threads: args.threads,
-                        connections: args.connections,
-                        skip_technical: !args.include_technical,
-                        min_read_len: args.min_read_len,
-                        force: args.force,
-                        progress,
-                        run_info: next_resolved.run_info.clone(),
-                        fasta: args.fasta,
-                        resume: !args.no_resume,
-                        stdout: args.stdout,
-                        cancelled: Some(cancelled.clone()),
-                    };
+                    let next_config = make_config(&next_resolved);
                     pending_download = Some(tokio::spawn(async move {
                         sracha_core::pipeline::download_sra(&next_resolved, &next_config).await
                     }));
@@ -751,14 +709,6 @@ fn print_info_table(resolved: &[ResolvedAccession]) {
         .with(Modify::new(Columns::new(1..=1)).with(Alignment::right()));
 
     println!("{table}");
-}
-
-/// Convert CLI format enum to core format preference.
-fn format_preference(format: cli::SraFormat) -> FormatPreference {
-    match format {
-        cli::SraFormat::Sra => FormatPreference::Sra,
-        cli::SraFormat::Sralite => FormatPreference::Sralite,
-    }
 }
 
 /// Size threshold (in bytes) above which downloads require `--yes` confirmation.
