@@ -80,6 +80,7 @@ fn test_config(
         run_info: None,
         fasta: false,
         resume: true,
+        stdout: false,
         cancelled: None,
     }
 }

@@ -48,6 +48,13 @@ use sracha_core::util::format_size;
 
 #[tokio::main]
 async fn main() -> Result<()> {
+    // Reset SIGPIPE to default so piping to `head` etc. exits cleanly
+    // instead of printing a BrokenPipe error.
+    #[cfg(unix)]
+    unsafe {
+        libc::signal(libc::SIGPIPE, libc::SIG_DFL);
+    }
+
     let cli = Cli::parse();
 
     // Set up tracing
@@ -130,14 +137,20 @@ async fn main() -> Result<()> {
                 args.inputs.len()
             );
 
-            let split_mode = match args.split {
-                cli::SplitMode::Split3 => sracha_core::fastq::SplitMode::Split3,
-                cli::SplitMode::SplitFiles => sracha_core::fastq::SplitMode::SplitFiles,
-                cli::SplitMode::SplitSpot => sracha_core::fastq::SplitMode::SplitSpot,
-                cli::SplitMode::Interleaved => sracha_core::fastq::SplitMode::Interleaved,
+            let split_mode = if args.stdout {
+                sracha_core::fastq::SplitMode::Interleaved
+            } else {
+                match args.split {
+                    cli::SplitMode::Split3 => sracha_core::fastq::SplitMode::Split3,
+                    cli::SplitMode::SplitFiles => sracha_core::fastq::SplitMode::SplitFiles,
+                    cli::SplitMode::SplitSpot => sracha_core::fastq::SplitMode::SplitSpot,
+                    cli::SplitMode::Interleaved => sracha_core::fastq::SplitMode::Interleaved,
+                }
             };
 
-            let compression = if args.zstd {
+            let compression = if args.stdout {
+                CompressionMode::None
+            } else if args.zstd {
                 CompressionMode::Zstd {
                     level: args.zstd_level,
                     threads: args.threads as u32,
@@ -170,10 +183,11 @@ async fn main() -> Result<()> {
                     skip_technical: !args.include_technical,
                     min_read_len: args.min_read_len,
                     force: args.force,
-                    progress: !args.no_progress,
+                    progress: !args.no_progress && !args.stdout,
                     run_info: None,
                     fasta: args.fasta,
                     resume: true,
+                    stdout: args.stdout,
                     cancelled: None,
                 };
 
@@ -185,8 +199,10 @@ async fn main() -> Result<()> {
                     style::count(stats.spots_read),
                     style::count(stats.reads_written),
                 );
-                for path in &stats.output_files {
-                    eprintln!("  -> {}", style::path(path.display()));
+                if !args.stdout {
+                    for path in &stats.output_files {
+                        eprintln!("  -> {}", style::path(path.display()));
+                    }
                 }
             }
 
@@ -230,14 +246,20 @@ async fn main() -> Result<()> {
                 resolved_all.len()
             );
 
-            let split_mode = match args.split {
-                cli::SplitMode::Split3 => sracha_core::fastq::SplitMode::Split3,
-                cli::SplitMode::SplitFiles => sracha_core::fastq::SplitMode::SplitFiles,
-                cli::SplitMode::SplitSpot => sracha_core::fastq::SplitMode::SplitSpot,
-                cli::SplitMode::Interleaved => sracha_core::fastq::SplitMode::Interleaved,
+            let split_mode = if args.stdout {
+                sracha_core::fastq::SplitMode::Interleaved
+            } else {
+                match args.split {
+                    cli::SplitMode::Split3 => sracha_core::fastq::SplitMode::Split3,
+                    cli::SplitMode::SplitFiles => sracha_core::fastq::SplitMode::SplitFiles,
+                    cli::SplitMode::SplitSpot => sracha_core::fastq::SplitMode::SplitSpot,
+                    cli::SplitMode::Interleaved => sracha_core::fastq::SplitMode::Interleaved,
+                }
             };
 
-            let compression = if args.zstd {
+            let compression = if args.stdout {
+                CompressionMode::None
+            } else if args.zstd {
                 CompressionMode::Zstd {
                     level: args.zstd_level,
                     threads: args.threads as u32,
@@ -249,6 +271,8 @@ async fn main() -> Result<()> {
                     level: args.gzip_level,
                 }
             };
+
+            let progress = !args.no_progress && !args.stdout;
 
             // -- Ctrl-C signal handling --
             use std::sync::Arc;
@@ -297,10 +321,11 @@ async fn main() -> Result<()> {
                     skip_technical: !args.include_technical,
                     min_read_len: args.min_read_len,
                     force: args.force,
-                    progress: !args.no_progress,
+                    progress,
                     run_info: resolved.run_info.clone(),
                     fasta: args.fasta,
                     resume: !args.no_resume,
+                    stdout: args.stdout,
                     cancelled: Some(cancelled.clone()),
                 };
 
@@ -344,10 +369,11 @@ async fn main() -> Result<()> {
                         skip_technical: !args.include_technical,
                         min_read_len: args.min_read_len,
                         force: args.force,
-                        progress: !args.no_progress,
+                        progress,
                         run_info: next_resolved.run_info.clone(),
                         fasta: args.fasta,
                         resume: !args.no_resume,
+                        stdout: args.stdout,
                         cancelled: Some(cancelled.clone()),
                     };
                     pending_download = Some(tokio::spawn(async move {
@@ -385,8 +411,10 @@ async fn main() -> Result<()> {
                                 style::value(format_size(stats.total_sra_size)),
                             );
                         }
-                        for path in &stats.output_files {
-                            eprintln!("  -> {}", style::path(path.display()));
+                        if !args.stdout {
+                            for path in &stats.output_files {
+                                eprintln!("  -> {}", style::path(path.display()));
+                            }
                         }
                         completed_accessions.push(resolved.accession.clone());
                     }

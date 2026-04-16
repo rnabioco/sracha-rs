@@ -132,8 +132,11 @@ Use `-Z` to write interleaved output to stdout, useful for piping
 into other tools:
 
 ```bash
-sracha fastq SRR28588231.sra --split interleaved -Z | bwa mem -p ref.fa -
+sracha get SRR28588231 -Z | bwa mem -p ref.fa -
 ```
+
+See [Streaming Alignment](alignment.md) for a complete walkthrough
+with bwa and samtools.
 
 ## Validating files
 
