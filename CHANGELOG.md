@@ -2,6 +2,33 @@
 
 ## Unreleased
 
+## 0.1.10 (2026-04-16)
+
+### Added
+
+- **Completion markers**: `get` writes `.sracha-done` markers so a second
+  invocation with the same output skips re-download and re-decode.
+- **`--format sra|sralite`**: Select full SRA or SRA-lite encoding via the
+  SDL capability parameter.
+
+### Changed
+
+- **CLI reorganization**: Commands and flags grouped semantically under
+  help headings for clearer `--help` output.
+- **Strict flag validation**: Contradictory CLI flag combinations now error
+  out instead of silently picking one.
+
+### Fixed
+
+- **Ctrl-C cleanup in stdout mode**: Interrupting `-Z` streaming now
+  deletes the temp SRA file and prints the correct cancellation message.
+- **Version string**: Release builds between tags now include the git SHA.
+- **`--threads` help text**: Remove doubled `[default: 8]`.
+- **Docs**: Size-gate threshold updated to 100 GiB; stdout streaming
+  feature documented.
+- **`fastq` / `get` help text**: Clarify accession wording in `fastq`
+  subcommand; mention `-Z` in `get` docs.
+
 ## 0.1.9 (2026-04-16)
 
 ### Added
