@@ -818,7 +818,8 @@ fn available_space(path: &Path) -> Option<u64> {
     if ret != 0 {
         return None;
     }
-    Some(stat.f_bavail * stat.f_frsize)
+    #[allow(clippy::unnecessary_cast)]
+    Some(stat.f_bavail as u64 * stat.f_frsize as u64)
 }
 
 #[cfg(not(unix))]
