@@ -143,6 +143,7 @@ pub fn convert_sra_to_parquet(
     let quality_cs = cursor.quality_col().map_or(0, |c| c.meta().checksum_type);
     let read_len_cs = cursor.read_len_col().map_or(0, |c| c.meta().checksum_type);
     let name_cs = cursor.name_col().map_or(0, |c| c.meta().checksum_type);
+    let metadata_rps = cursor.metadata_reads_per_spot();
 
     let mut stats = ConvertStats {
         spots: 0,
@@ -191,6 +192,7 @@ pub fn convert_sra_to_parquet(
             read_len_cs,
             name_raw,
             name_cs,
+            metadata_rps,
         )?;
 
         let n_spots = decoded.spot_count();
@@ -446,6 +448,7 @@ pub(crate) fn decode_one_blob(
     read_len_cs: u8,
     name_raw: &[u8],
     name_cs: u8,
+    metadata_reads_per_spot: Option<usize>,
 ) -> Result<DecodedBlob> {
     // READ
     let read_decoded = decode_raw(read_raw, read_cs, id_range)?;
@@ -490,7 +493,21 @@ pub(crate) fn decode_one_blob(
             .collect();
         (lengths, rps.max(1))
     } else {
-        (vec![bases.len() as u32], 1)
+        // No READ_LEN column. The blob's `id_range` is the authoritative
+        // spot count; derive spot_len by dividing total bases by that, then
+        // split each spot into `reads_per_spot` equal-size reads when
+        // metadata tells us there's more than one read per spot.
+        let rps = metadata_reads_per_spot.unwrap_or(1).max(1);
+        let n_spots = id_range as usize;
+        let spot_len = bases.len().checked_div(n_spots).unwrap_or(bases.len()) as u32;
+        let read_len = (spot_len / rps as u32).max(1);
+        let mut lengths = Vec::with_capacity(n_spots * rps);
+        for _ in 0..n_spots {
+            for _ in 0..rps {
+                lengths.push(read_len);
+            }
+        }
+        (lengths, rps)
     };
 
     // NAME (from page_map: variable-width strings)

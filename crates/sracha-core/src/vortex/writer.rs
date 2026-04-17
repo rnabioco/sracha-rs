@@ -123,6 +123,7 @@ fn collect_record_batches(
     let quality_cs = cursor.quality_col().map_or(0, |c| c.meta().checksum_type);
     let read_len_cs = cursor.read_len_col().map_or(0, |c| c.meta().checksum_type);
     let name_cs = cursor.name_col().map_or(0, |c| c.meta().checksum_type);
+    let metadata_rps = cursor.metadata_reads_per_spot();
 
     let mut spot_id_acc: u64 = cursor.first_row().max(1) as u64;
     let mut batch_builder = BatchBuilder::new(schema, length_mode, pack_dna);
@@ -162,6 +163,7 @@ fn collect_record_batches(
             read_len_cs,
             name_raw,
             name_cs,
+            metadata_rps,
         )?;
 
         let n_spots = decoded.spot_count();
