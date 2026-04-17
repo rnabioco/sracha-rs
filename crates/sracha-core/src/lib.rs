@@ -9,3 +9,4 @@ pub mod s3;
 pub mod sdl;
 pub mod util;
 pub mod vdb;
+pub mod vortex;

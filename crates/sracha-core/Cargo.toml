@@ -32,6 +32,8 @@ bytes.workspace = true
 tracing.workspace = true
 arrow.workspace = true
 parquet.workspace = true
+vortex.workspace = true
+futures.workspace = true
 
 [dev-dependencies]
 reqwest = { workspace = true, features = ["blocking"] }

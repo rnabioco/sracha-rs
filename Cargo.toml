@@ -53,6 +53,10 @@ tabled = { version = "0.20", features = ["ansi"] }
 arrow = { version = "58", default-features = false }
 parquet = { version = "58", default-features = false, features = ["arrow", "zstd", "snap"] }
 
+# Columnar / Vortex
+vortex = { version = "0.68", features = ["files", "tokio"] }
+futures = "0.3"
+
 # Utils
 url = "2"
 tempfile = "3"

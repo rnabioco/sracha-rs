@@ -82,13 +82,18 @@ pub struct ConvertArgs {
     #[arg(required = true)]
     pub inputs: Vec<String>,
 
-    /// Output directory (one .parquet file per input)
+    /// Output directory (one file per input; extension reflects `--format`)
     #[arg(short = 'O', long, default_value = ".", help_heading = "Output")]
     pub output_dir: PathBuf,
 
     /// Force-overwrite existing output files
     #[arg(short, long, help_heading = "Output")]
     pub force: bool,
+
+    /// Output format. Parquet writes `.parquet` with user-selectable compression;
+    /// Vortex writes `.vortex` with its own encoding cascade (Vortex picks).
+    #[arg(long, default_value = "parquet", help_heading = "Output")]
+    pub format: ConvertFormat,
 
     /// DNA encoding for the `sequence` column
     #[arg(long, default_value = "two-na", help_heading = "Encoding")]
@@ -98,11 +103,11 @@ pub struct ConvertArgs {
     #[arg(long, default_value = "auto", help_heading = "Encoding")]
     pub length_mode: LengthMode,
 
-    /// Page-level compression codec
+    /// Page-level compression codec (parquet only; ignored for vortex)
     #[arg(long, default_value = "zstd", help_heading = "Compression")]
     pub compression: ParquetCodec,
 
-    /// Zstd compression level (1-22), only when `--compression zstd`
+    /// Zstd compression level (1-22), only when `--compression zstd` (parquet only)
     #[arg(
         long,
         value_parser = clap::value_parser!(i32).range(1..=22),
@@ -111,9 +116,17 @@ pub struct ConvertArgs {
     )]
     pub zstd_level: i32,
 
-    /// Target row-group size in MiB
+    /// Target row-group size in MiB (parquet only)
     #[arg(long, default_value_t = 256, help_heading = "Advanced")]
     pub row_group_mib: usize,
+}
+
+#[derive(Clone, Copy, ValueEnum)]
+pub enum ConvertFormat {
+    /// Apache Parquet (`.parquet`) — user-selectable compression.
+    Parquet,
+    /// Vortex (`.vortex`) — SpiralDB columnar, encoding cascade picked automatically.
+    Vortex,
 }
 
 #[derive(Clone, Copy, ValueEnum)]

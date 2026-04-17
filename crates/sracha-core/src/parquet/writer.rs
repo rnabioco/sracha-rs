@@ -239,7 +239,10 @@ pub fn convert_sra_to_parquet(
 // Length-mode resolution
 // ---------------------------------------------------------------------------
 
-fn resolve_length_mode(cursor: &VdbCursor, choice: LengthModeChoice) -> Result<LengthMode> {
+pub(crate) fn resolve_length_mode(
+    cursor: &VdbCursor,
+    choice: LengthModeChoice,
+) -> Result<LengthMode> {
     let detected = detect_length_mode(cursor);
     match (choice, detected) {
         (LengthModeChoice::Auto, mode) => Ok(mode),
@@ -303,25 +306,25 @@ fn build_writer_properties(config: &ConvertConfig) -> WriterProperties {
 // Per-blob decode (minimal: READ, QUALITY, READ_LEN, NAME)
 // ---------------------------------------------------------------------------
 
-struct DecodedBlob {
+pub(crate) struct DecodedBlob {
     /// Concatenated bases for all spots in the blob (ASCII).
-    bases: Vec<u8>,
+    pub(crate) bases: Vec<u8>,
     /// Concatenated quality (Phred+33 ASCII). Empty if QUALITY column absent.
-    quality: Vec<u8>,
+    pub(crate) quality: Vec<u8>,
     /// Per-read lengths, flat, length = total reads in blob.
-    read_lengths: Vec<u32>,
+    pub(crate) read_lengths: Vec<u32>,
     /// Reads per spot (uniform across the blob).
-    reads_per_spot: usize,
+    pub(crate) reads_per_spot: usize,
     /// Per-spot names, length = spot count. Empty placeholder if NAME absent.
-    names: Vec<Vec<u8>>,
+    pub(crate) names: Vec<Vec<u8>>,
 }
 
 impl DecodedBlob {
-    fn spot_count(&self) -> usize {
+    pub(crate) fn spot_count(&self) -> usize {
         self.read_lengths.len() / self.reads_per_spot.max(1)
     }
 
-    fn iter_spots(&self) -> SpotIter<'_> {
+    pub(crate) fn iter_spots(&self) -> SpotIter<'_> {
         SpotIter {
             blob: self,
             spot_idx: 0,
@@ -330,22 +333,22 @@ impl DecodedBlob {
     }
 }
 
-struct SpotIter<'a> {
+pub(crate) struct SpotIter<'a> {
     blob: &'a DecodedBlob,
     spot_idx: usize,
     base_offset: usize,
 }
 
-struct SpotView<'a> {
-    name: &'a [u8],
+pub(crate) struct SpotView<'a> {
+    pub(crate) name: &'a [u8],
     bases: &'a [u8],
     quality: &'a [u8],
     read_lengths: &'a [u32],
 }
 
-struct ReadView<'a> {
-    sequence: &'a [u8],
-    quality: &'a [u8],
+pub(crate) struct ReadView<'a> {
+    pub(crate) sequence: &'a [u8],
+    pub(crate) quality: &'a [u8],
 }
 
 impl<'a> Iterator for SpotIter<'a> {
@@ -388,7 +391,7 @@ impl<'a> Iterator for SpotIter<'a> {
 }
 
 impl<'a> SpotView<'a> {
-    fn iter_reads(&self) -> ReadIter<'a> {
+    pub(crate) fn iter_reads(&self) -> ReadIter<'a> {
         ReadIter {
             spot: SpotView {
                 name: self.name,
@@ -402,7 +405,7 @@ impl<'a> SpotView<'a> {
     }
 }
 
-struct ReadIter<'a> {
+pub(crate) struct ReadIter<'a> {
     spot: SpotView<'a>,
     read_idx: usize,
     base_offset: usize,
@@ -433,7 +436,7 @@ impl<'a> Iterator for ReadIter<'a> {
 }
 
 #[allow(clippy::too_many_arguments)]
-fn decode_one_blob(
+pub(crate) fn decode_one_blob(
     read_raw: &[u8],
     read_cs: u8,
     id_range: u64,
@@ -525,7 +528,7 @@ fn decode_one_blob(
 // Arrow batch builder
 // ---------------------------------------------------------------------------
 
-struct BatchBuilder {
+pub(crate) struct BatchBuilder {
     schema: Arc<arrow::datatypes::Schema>,
     length_mode: LengthMode,
     pack_dna: DnaPacking,
@@ -542,7 +545,7 @@ struct BatchBuilder {
 }
 
 impl BatchBuilder {
-    fn new(
+    pub(crate) fn new(
         schema: Arc<arrow::datatypes::Schema>,
         length_mode: LengthMode,
         pack_dna: DnaPacking,
@@ -573,15 +576,15 @@ impl BatchBuilder {
         }
     }
 
-    fn len(&self) -> usize {
+    pub(crate) fn len(&self) -> usize {
         self.rows
     }
 
-    fn is_empty(&self) -> bool {
+    pub(crate) fn is_empty(&self) -> bool {
         self.rows == 0
     }
 
-    fn push(
+    pub(crate) fn push(
         &mut self,
         spot_id: u64,
         read_num: u8,
@@ -644,7 +647,7 @@ impl BatchBuilder {
         self.rows += 1;
     }
 
-    fn finish(&mut self) -> Result<RecordBatch> {
+    pub(crate) fn finish(&mut self) -> Result<RecordBatch> {
         let mut cols: Vec<ArrayRef> = Vec::with_capacity(6);
         cols.push(Arc::new(self.spot_id.finish()));
         cols.push(Arc::new(self.read_num.finish()));

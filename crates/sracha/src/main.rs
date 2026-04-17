@@ -213,6 +213,7 @@ async fn main() -> Result<()> {
         }
         Command::Convert(args) => {
             use sracha_core::parquet::{ConvertConfig, ParquetCompression, convert_sra_to_parquet};
+            use sracha_core::vortex::{VortexConvertConfig, convert_sra_to_vortex};
 
             std::fs::create_dir_all(&args.output_dir)?;
 
@@ -220,6 +221,11 @@ async fn main() -> Result<()> {
                 cli::ParquetCodec::None => ParquetCompression::None,
                 cli::ParquetCodec::Snappy => ParquetCompression::Snappy,
                 cli::ParquetCodec::Zstd => ParquetCompression::Zstd(args.zstd_level),
+            };
+
+            let ext = match args.format {
+                cli::ConvertFormat::Parquet => "parquet",
+                cli::ConvertFormat::Vortex => "vortex",
             };
 
             for input in &args.inputs {
@@ -237,7 +243,7 @@ async fn main() -> Result<()> {
                     .file_stem()
                     .and_then(|s| s.to_str())
                     .unwrap_or("output");
-                let out_path = args.output_dir.join(format!("{stem}.parquet"));
+                let out_path = args.output_dir.join(format!("{stem}.{ext}"));
                 if out_path.exists() && !args.force {
                     eprintln!(
                         "{} {} already exists (use --force to overwrite)",
@@ -247,34 +253,68 @@ async fn main() -> Result<()> {
                     continue;
                 }
 
-                let config = ConvertConfig {
-                    compression,
-                    pack_dna: args.pack_dna.into(),
-                    row_group_mib: args.row_group_mib,
-                    length_mode: args.length_mode.into(),
-                    blobs_per_batch: 64,
-                };
+                let (input_bytes, output_bytes, spots, reads, length_mode, dna_packing) =
+                    match args.format {
+                        cli::ConvertFormat::Parquet => {
+                            let config = ConvertConfig {
+                                compression,
+                                pack_dna: args.pack_dna.into(),
+                                row_group_mib: args.row_group_mib,
+                                length_mode: args.length_mode.into(),
+                                blobs_per_batch: 64,
+                            };
+                            let stats = convert_sra_to_parquet(sra_path, &out_path, &config)?;
+                            (
+                                stats.input_bytes,
+                                stats.output_bytes,
+                                stats.spots,
+                                stats.reads,
+                                format!("{:?}", stats.length_mode),
+                                format!("{:?}", stats.dna_packing),
+                            )
+                        }
+                        cli::ConvertFormat::Vortex => {
+                            let config = VortexConvertConfig {
+                                pack_dna: args.pack_dna.into(),
+                                length_mode: args.length_mode.into(),
+                                blobs_per_batch: 64,
+                            };
+                            let stats = convert_sra_to_vortex(sra_path, &out_path, &config)?;
+                            (
+                                stats.input_bytes,
+                                stats.output_bytes,
+                                stats.spots,
+                                stats.reads,
+                                format!("{:?}", stats.length_mode),
+                                format!("{:?}", stats.dna_packing),
+                            )
+                        }
+                    };
 
-                let stats = convert_sra_to_parquet(sra_path, &out_path, &config)?;
-
-                let ratio = if stats.input_bytes > 0 {
-                    stats.output_bytes as f64 / stats.input_bytes as f64 * 100.0
+                let ratio = if input_bytes > 0 {
+                    output_bytes as f64 / input_bytes as f64 * 100.0
                 } else {
                     0.0
                 };
                 eprintln!(
                     "{}: {} spots, {} reads, {} -> {} ({:.1}% of input)",
                     style::header(stem),
-                    style::count(stats.spots),
-                    style::count(stats.reads),
-                    format_size(stats.input_bytes),
-                    format_size(stats.output_bytes),
+                    style::count(spots),
+                    style::count(reads),
+                    format_size(input_bytes),
+                    format_size(output_bytes),
                     ratio,
                 );
-                eprintln!(
-                    "  length_mode={:?}, dna_packing={:?}, compression={:?}",
-                    stats.length_mode, stats.dna_packing, compression
-                );
+                match args.format {
+                    cli::ConvertFormat::Parquet => eprintln!(
+                        "  length_mode={}, dna_packing={}, compression={:?}",
+                        length_mode, dna_packing, compression
+                    ),
+                    cli::ConvertFormat::Vortex => eprintln!(
+                        "  length_mode={}, dna_packing={} (vortex picks its own encoding)",
+                        length_mode, dna_packing
+                    ),
+                }
                 eprintln!("  -> {}", style::path(out_path.display()));
             }
 
