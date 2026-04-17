@@ -735,7 +735,7 @@ impl BatchBuilder {
     }
 }
 
-fn pack_sequence(ascii: &[u8], packing: DnaPacking) -> Vec<u8> {
+pub(crate) fn pack_sequence(ascii: &[u8], packing: DnaPacking) -> Vec<u8> {
     match packing {
         DnaPacking::Ascii => ascii.to_vec(),
         DnaPacking::TwoNa => {

@@ -7,12 +7,19 @@
 //! `concat_batches` + Utf8-reinterpret round-trip the Arrow path needed.
 //!
 //! Schema (per-read, all columns always present):
-//! - `spot_id`    : `u64`, non-nullable
-//! - `read_num`   : `u8`, non-nullable
-//! - `name`       : Utf8, nullable
-//! - `read_len`   : `u32`, non-nullable
-//! - `sequence`   : Utf8 when `pack_dna == Ascii`, else Binary; non-nullable
-//! - `quality`    : Utf8, nullable
+//!
+//! - `spot_id`: `u64`, non-nullable
+//! - `read_num`: `u8`, non-nullable
+//! - `name`: Utf8, nullable
+//! - `read_len`: `u32`, non-nullable
+//! - `sequence`: Utf8 when `pack_dna == Ascii`, else Binary; non-nullable.
+//!   Note: Vortex 0.68 hardcodes `VarBinView(Binary)` to bypass every
+//!   compression scheme (see the `Canonical::VarBinView` arm in
+//!   `vortex-compressor::CascadingCompressor`), so the 2na/4na-packed
+//!   sequence is written uncompressed. Until that upstream restriction is
+//!   lifted, prefer `--pack-dna ascii` for the smallest Vortex file —
+//!   BtrBlocks' FSST cascade trains on the 4-letter alphabet effectively.
+//! - `quality`: Utf8, nullable
 
 use std::sync::Arc;
 
