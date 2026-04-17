@@ -22,7 +22,6 @@ indicatif.workspace = true
 thiserror.workspace = true
 anyhow.workspace = true
 md-5.workspace = true
-crc32fast.workspace = true
 byteorder.workspace = true
 itoa.workspace = true
 memmap2.workspace = true

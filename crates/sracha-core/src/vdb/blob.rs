@@ -42,6 +42,42 @@ fn hex16(bytes: &[u8]) -> String {
     s
 }
 
+// CRC32 as used by ncbi-vdb column blobs: MSB-first, polynomial 0x04C11DB7,
+// init=0, no reflection, no final XOR. This does NOT match CRC-32/ISO-HDLC
+// (the `crc32fast` crate) — they share a polynomial but differ on reflection
+// and seed. Source: ncbi-vdb/libs/klib/crc32.c.
+const fn build_crc32_table() -> [u32; 256] {
+    let mut t = [0u32; 256];
+    let poly: u32 = 0x04C11DB7;
+    let mut i = 0;
+    while i < 256 {
+        let mut c: u32 = (i as u32) << 24;
+        let mut j = 0;
+        while j < 8 {
+            c = if c & 0x8000_0000 != 0 {
+                (c << 1) ^ poly
+            } else {
+                c << 1
+            };
+            j += 1;
+        }
+        t[i] = c;
+        i += 1;
+    }
+    t
+}
+
+static NCBI_CRC32_TABLE: [u32; 256] = build_crc32_table();
+
+pub(crate) fn ncbi_crc32(data: &[u8]) -> u32 {
+    let mut crc: u32 = 0;
+    for &b in data {
+        let idx = ((crc >> 24) as u8) ^ b;
+        crc = (crc << 8) ^ NCBI_CRC32_TABLE[idx as usize];
+    }
+    crc
+}
+
 // ---------------------------------------------------------------------------
 // Variable-length integer encoding (vlen)
 // ---------------------------------------------------------------------------
@@ -833,7 +869,7 @@ pub fn decode_blob<'a>(
             raw[raw.len() - 2],
             raw[raw.len() - 1],
         ]);
-        let computed_crc = crc32fast::hash(blob_data);
+        let computed_crc = ncbi_crc32(blob_data);
         if stored_crc != computed_crc {
             return Err(Error::Vdb(format!(
                 "CRC32 mismatch: stored={stored_crc:#010x}, computed={computed_crc:#010x}"
@@ -2293,7 +2329,7 @@ mod tests {
         blob.extend_from_slice(&[0xAA, 0xBB]); // data
 
         // Compute CRC32 of the blob content.
-        let crc = crc32fast::hash(&blob);
+        let crc = ncbi_crc32(&blob);
         blob.extend_from_slice(&crc.to_le_bytes());
 
         let decoded = decode_blob(&blob, 1, 1, 8).unwrap();
@@ -2305,6 +2341,12 @@ mod tests {
         let mut blob = vec![0x61u8, 0xAA, 0xBB];
         blob.extend_from_slice(&[0x00, 0x00, 0x00, 0x00]); // wrong CRC
         assert!(decode_blob(&blob, 1, 1, 8).is_err());
+    }
+
+    #[test]
+    fn ncbi_crc32_empty_is_zero() {
+        // init=0, no xorout — empty input must yield 0.
+        assert_eq!(ncbi_crc32(b""), 0);
     }
 
     #[test]
