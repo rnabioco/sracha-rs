@@ -3,6 +3,7 @@ pub mod compress;
 pub mod download;
 pub mod error;
 pub mod fastq;
+pub mod parquet;
 pub mod pipeline;
 pub mod s3;
 pub mod sdl;
