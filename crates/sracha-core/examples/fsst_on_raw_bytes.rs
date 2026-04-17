@@ -102,7 +102,9 @@ fn pack_2na(ascii: &[u8]) -> Vec<u8> {
 
 fn make_random_dna(len: usize, seed: u64) -> Vec<u8> {
     // Trivial xorshift → pseudorandom ACGT.
-    let mut s = seed.wrapping_mul(2862933555777941757).wrapping_add(3037000493);
+    let mut s = seed
+        .wrapping_mul(2862933555777941757)
+        .wrapping_add(3037000493);
     let alphabet = b"ACGT";
     (0..len)
         .map(|_| {
@@ -118,11 +120,8 @@ fn build_local_write_strategy() -> Arc<dyn LayoutStrategy> {
     let flat: Arc<dyn LayoutStrategy> = Arc::new(FlatLayoutStrategy::default());
     let chunked = ChunkedLayoutStrategy::new(Arc::clone(&flat));
     let buffered = BufferedStrategy::new(chunked, 2 * (1 << 20));
-    let data_compressor: Arc<dyn CompressorPlugin> = Arc::new(
-        BtrBlocksCompressorBuilder::default()
-            .with_compact()
-            .build(),
-    );
+    let data_compressor: Arc<dyn CompressorPlugin> =
+        Arc::new(BtrBlocksCompressorBuilder::default().with_compact().build());
     let compressing = CompressingStrategy::new(buffered, Arc::clone(&data_compressor));
     let coalescing = RepartitionStrategy::new(
         compressing,
