@@ -1,33 +1,30 @@
 //! Convert an SRA file into a Vortex file.
 //!
-//! Same Arrow `RecordBatch` stream the Parquet writer produces; only the sink
-//! differs. Vortex picks its own encoding cascade — there is no `compression`
-//! knob here, by design (Issue #9).
+//! Vortex-first: builds native Vortex arrays directly from decoded VDB blobs
+//! (see `crate::vortex::builder::VortexRowBuilder`), no Arrow `RecordBatch`
+//! intermediate. The per-blob decode is reused from `crate::parquet::writer`.
 //!
-//! v1 scope: bulk columns only (READ, QUALITY, READ_LEN, NAME). Matches the
-//! Parquet v1 schema so file sizes are directly comparable.
+//! v1 scope: bulk columns only (READ, QUALITY, READ_LEN, NAME). The
+//! fasterq-dump-equivalent edge cases (ALTREAD ambiguity merge, Illumina name
+//! reconstruction from skey, SRA-lite synthetic quality, technical-read
+//! filtering) are deliberately skipped.
 
 use std::fs::File;
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
 
-use arrow::array::{Array, ArrayRef as ArrowArrayRef, BinaryArray, RecordBatch, StringArray};
-use arrow::datatypes::{DataType, Field, Schema as ArrowSchema};
 use tokio::runtime::Builder as RuntimeBuilder;
 
 use vortex::VortexSessionDefault;
 use vortex::array::ArrayRef;
-use vortex::array::arrow::FromArrowArray;
 use vortex::file::WriteOptionsSessionExt;
 use vortex::session::VortexSession;
 
 use crate::error::{Error, Result};
-use crate::parquet::schema::{DnaPacking, LengthMode, build_per_read_schema};
-use crate::parquet::writer::{
-    BatchBuilder, LengthModeChoice, decode_one_blob, resolve_length_mode,
-};
+use crate::parquet::schema::{DnaPacking, LengthMode};
+use crate::parquet::writer::{LengthModeChoice, decode_one_blob, resolve_length_mode};
 use crate::vdb::cursor::VdbCursor;
 use crate::vdb::kar::KarArchive;
+use crate::vortex::builder::VortexRowBuilder;
 
 // ---------------------------------------------------------------------------
 // Public configuration
@@ -37,7 +34,9 @@ use crate::vdb::kar::KarArchive;
 pub struct VortexConvertConfig {
     pub pack_dna: DnaPacking,
     pub length_mode: LengthModeChoice,
-    /// Number of blobs to decode per Arrow `RecordBatch`.
+    /// Number of blobs to accumulate before starting a new row-builder.
+    /// Unused in the current serial implementation but kept for API parity
+    /// with the parquet config — reserved for future parallelism.
     pub blobs_per_batch: usize,
 }
 
@@ -80,7 +79,6 @@ pub fn convert_sra_to_vortex(
 
     let length_mode = resolve_length_mode(&cursor, config.length_mode)?;
     let pack_dna = config.pack_dna;
-    let schema = build_per_read_schema(length_mode, pack_dna);
 
     tracing::debug!(
         "vortex: length_mode={:?}, pack_dna={:?}",
@@ -88,12 +86,9 @@ pub fn convert_sra_to_vortex(
         pack_dna
     );
 
-    // ---- per-blob iteration into RecordBatches -----------------------------
-    let batches = collect_record_batches(&cursor, schema.clone(), length_mode, pack_dna, config)?;
-    let (spots, reads) = count_spots_and_reads(&batches);
+    let (array, spots, reads) = build_struct_array(&cursor, pack_dna)?;
 
-    // ---- write out via Vortex ---------------------------------------------
-    write_batches_to_vortex(output_path, schema, batches)?;
+    write_struct_array(output_path, array)?;
 
     let output_bytes = std::fs::metadata(output_path)?.len();
     Ok(VortexConvertStats {
@@ -111,13 +106,10 @@ pub fn convert_sra_to_vortex(
 // Internals
 // ---------------------------------------------------------------------------
 
-fn collect_record_batches(
-    cursor: &VdbCursor,
-    schema: Arc<arrow::datatypes::Schema>,
-    length_mode: LengthMode,
-    pack_dna: DnaPacking,
-    config: &VortexConvertConfig,
-) -> Result<Vec<RecordBatch>> {
+/// Decode every blob and push rows into a single Vortex `StructArray`.
+///
+/// Returns the finished array plus `(spots, reads)` counts.
+fn build_struct_array(cursor: &VdbCursor, pack_dna: DnaPacking) -> Result<(ArrayRef, u64, u64)> {
     let read_cs = cursor.read_col().meta().checksum_type;
     let blob_infos = cursor.read_col().blobs().to_vec();
     let quality_cs = cursor.quality_col().map_or(0, |c| c.meta().checksum_type);
@@ -125,9 +117,18 @@ fn collect_record_batches(
     let name_cs = cursor.name_col().map_or(0, |c| c.meta().checksum_type);
     let metadata_rps = cursor.metadata_reads_per_spot();
 
+    // Ballpark capacity so VarBinView buffers don't thrash. Sum blob id_range
+    // × max reads-per-spot; metadata_rps fallback = 1 is fine if unknown.
+    let capacity: usize = blob_infos
+        .iter()
+        .map(|b| b.id_range as usize)
+        .sum::<usize>()
+        .saturating_mul(metadata_rps.unwrap_or(1).max(1));
+
+    let mut builder = VortexRowBuilder::with_capacity(pack_dna, capacity);
     let mut spot_id_acc: u64 = cursor.first_row().max(1) as u64;
-    let mut batch_builder = BatchBuilder::new(schema, length_mode, pack_dna);
-    let mut out: Vec<RecordBatch> = Vec::new();
+    let mut total_spots: u64 = 0;
+    let mut total_reads: u64 = 0;
 
     for (blob_idx, blob_info) in blob_infos.iter().enumerate() {
         let start_row = blob_info.start_id;
@@ -170,77 +171,35 @@ fn collect_record_batches(
         for (spot_offset, spot) in decoded.iter_spots().enumerate() {
             let spot_id = spot_id_acc + spot_offset as u64;
             for (read_num, read) in spot.iter_reads().enumerate() {
-                batch_builder.push(
+                builder.push(
                     spot_id,
                     read_num as u8,
                     spot.name,
                     read.sequence,
                     read.quality,
                 );
+                total_reads += 1;
             }
         }
+        total_spots += n_spots as u64;
         spot_id_acc += n_spots as u64;
-
-        if batch_builder.len() >= config.blobs_per_batch * 1024 {
-            out.push(batch_builder.finish()?);
-        }
     }
 
-    if !batch_builder.is_empty() {
-        out.push(batch_builder.finish()?);
+    if builder.is_empty() {
+        return Err(Error::Vdb("vortex: no rows to write".into()));
     }
 
-    Ok(out)
+    let array = builder.finish()?;
+    Ok((array, total_spots, total_reads))
 }
 
-fn count_spots_and_reads(batches: &[RecordBatch]) -> (u64, u64) {
-    let reads: u64 = batches.iter().map(|b| b.num_rows() as u64).sum();
-    let mut spots: u64 = 0;
-    for b in batches {
-        if let Some(col) = b.column_by_name("spot_id")
-            && let Some(arr) = col.as_any().downcast_ref::<arrow::array::UInt64Array>()
-        {
-            let mut prev: Option<u64> = None;
-            for i in 0..arr.len() {
-                let v = arr.value(i);
-                if Some(v) != prev {
-                    spots += 1;
-                    prev = Some(v);
-                }
-            }
-        }
-    }
-    (spots, reads)
-}
-
-fn write_batches_to_vortex(
-    output_path: &Path,
-    schema: Arc<arrow::datatypes::Schema>,
-    batches: Vec<RecordBatch>,
-) -> Result<()> {
-    if batches.is_empty() {
-        return Err(Error::Vdb("vortex: no batches to write".into()));
-    }
-    // Concatenate all RecordBatches into a single batch, then convert to a
-    // single Vortex StructArray. Vortex's default BtrBlocks cascade only
-    // applies FSST/dict to Utf8 columns, so we reinterpret Binary columns as
-    // Utf8 where the bytes happen to be valid UTF-8 (true for ASCII sequence
-    // and for all quality values). For 2na/4na-packed sequence the bytes
-    // aren't valid UTF-8, so those stay Binary (and uncompressed — but
-    // already dense).
-    let batch_refs: Vec<&RecordBatch> = batches.iter().collect();
-    let concat = arrow::compute::concat_batches(&schema, batch_refs)
-        .map_err(|e| Error::Vdb(format!("arrow concat_batches: {e}")))?;
-    let concat = reinterpret_binary_as_utf8_where_possible(&concat)?;
-
-    let array: ArrayRef = ArrayRef::from_arrow(concat, /* nullable = */ false)
-        .map_err(|e| Error::Vdb(format!("vortex from_arrow: {e}")))?;
-
+/// Write a finalized Vortex `StructArray` to disk.
+///
+/// Vortex's write API is async; sracha's CLI is `#[tokio::main]`, so
+/// `block_on` on the ambient runtime panics. Spawn a dedicated std thread
+/// with its own current-thread runtime to keep the caller sync.
+fn write_struct_array(output_path: &Path, array: ArrayRef) -> Result<()> {
     let output_path = output_path.to_path_buf();
-    // Vortex's write API is async; we may be called from within a tokio
-    // runtime already (sracha's CLI is #[tokio::main]), so `block_on` on an
-    // ambient runtime panics. Spawn a dedicated std thread with its own
-    // current-thread runtime to keep the writer sync from the caller's POV.
     std::thread::spawn(move || {
         let runtime = RuntimeBuilder::new_current_thread()
             .enable_all()
@@ -263,64 +222,6 @@ fn write_batches_to_vortex(
     .map_err(|_| Error::Vdb("vortex writer thread panicked".into()))?
 }
 
-/// Rewrite a RecordBatch so every `Binary` column whose rows are all valid
-/// UTF-8 becomes a `Utf8` column. This lets Vortex's BtrBlocks cascade apply
-/// FSST/dict compression (it gates on `DType::Utf8`).
-fn reinterpret_binary_as_utf8_where_possible(batch: &RecordBatch) -> Result<RecordBatch> {
-    let old_schema = batch.schema();
-    let n = batch.num_columns();
-    let mut new_fields: Vec<Field> = Vec::with_capacity(n);
-    let mut new_cols: Vec<ArrowArrayRef> = Vec::with_capacity(n);
-
-    for (i, field) in old_schema.fields().iter().enumerate() {
-        let col = batch.column(i);
-        match (
-            field.data_type(),
-            col.as_any().downcast_ref::<BinaryArray>(),
-        ) {
-            (DataType::Binary, Some(bin)) if all_rows_valid_utf8(bin) => {
-                let mut b =
-                    arrow::array::StringBuilder::with_capacity(bin.len(), bin.value_data().len());
-                for row in 0..bin.len() {
-                    if bin.is_null(row) {
-                        b.append_null();
-                    } else {
-                        // Safety check above guarantees valid UTF-8.
-                        b.append_value(std::str::from_utf8(bin.value(row)).unwrap());
-                    }
-                }
-                let s: StringArray = b.finish();
-                new_cols.push(std::sync::Arc::new(s) as ArrowArrayRef);
-                new_fields.push(Field::new(
-                    field.name(),
-                    DataType::Utf8,
-                    field.is_nullable(),
-                ));
-            }
-            _ => {
-                new_cols.push(col.clone());
-                new_fields.push(field.as_ref().clone());
-            }
-        }
-    }
-
-    let new_schema = std::sync::Arc::new(ArrowSchema::new(new_fields));
-    RecordBatch::try_new(new_schema, new_cols)
-        .map_err(|e| Error::Vdb(format!("vortex rewrite batch: {e}")))
-}
-
-fn all_rows_valid_utf8(arr: &BinaryArray) -> bool {
-    for i in 0..arr.len() {
-        if arr.is_null(i) {
-            continue;
-        }
-        if std::str::from_utf8(arr.value(i)).is_err() {
-            return false;
-        }
-    }
-    true
-}
-
 // ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
@@ -328,53 +229,44 @@ fn all_rows_valid_utf8(arr: &BinaryArray) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use arrow::array::{
-        ArrayRef as ArrowArrayRef, BinaryArray, StringArray, UInt8Array, UInt32Array, UInt64Array,
-    };
-    use arrow::datatypes::{DataType, Field, Schema};
-    use std::sync::Arc;
+    use vortex::array::arrays::StructArray;
+    use vortex::array::builders::{ArrayBuilder, PrimitiveBuilder, VarBinViewBuilder};
+    use vortex::array::{Canonical, IntoArray};
+    use vortex::dtype::{DType, Nullability};
 
-    fn build_sample_batch() -> RecordBatch {
-        let schema = Arc::new(Schema::new(vec![
-            Field::new("spot_id", DataType::UInt64, false),
-            Field::new("read_num", DataType::UInt8, false),
-            Field::new("name", DataType::Utf8, true),
-            Field::new("read_len", DataType::UInt32, false),
-            Field::new("sequence", DataType::Binary, false),
-            Field::new("quality", DataType::Binary, true),
-        ]));
-        let spot_ids = Arc::new(UInt64Array::from(vec![1u64, 2, 3])) as ArrowArrayRef;
-        let read_nums = Arc::new(UInt8Array::from(vec![0u8, 0, 0])) as ArrowArrayRef;
-        let names =
-            Arc::new(StringArray::from(vec![Some("a"), Some("b"), Some("c")])) as ArrowArrayRef;
-        let read_lens = Arc::new(UInt32Array::from(vec![4u32, 4, 4])) as ArrowArrayRef;
-        let seqs = Arc::new(BinaryArray::from(vec![
-            b"ACGT".as_ref(),
-            b"TGCA".as_ref(),
-            b"AAAA".as_ref(),
-        ])) as ArrowArrayRef;
-        let quals = Arc::new(BinaryArray::from(vec![
-            Some(b"IIII".as_ref()),
-            Some(b"IIII".as_ref()),
-            None,
-        ])) as ArrowArrayRef;
-        RecordBatch::try_new(
-            schema,
-            vec![spot_ids, read_nums, names, read_lens, seqs, quals],
-        )
-        .unwrap()
-    }
-
+    /// Build a tiny 3-row StructArray natively, write it, read it back.
+    /// Verifies the async write + sync wrap still round-trip.
     #[test]
-    fn roundtrip_small_batch() {
+    fn roundtrip_small_native_struct() {
         let tmp = tempfile::tempdir().unwrap();
         let path = tmp.path().join("sample.vortex");
-        let batch = build_sample_batch();
-        let schema = batch.schema();
-        write_batches_to_vortex(&path, schema, vec![batch]).unwrap();
 
+        let mut spot_id = PrimitiveBuilder::<u64>::with_capacity(Nullability::NonNullable, 3);
+        spot_id.append_value(1);
+        spot_id.append_value(2);
+        spot_id.append_value(3);
+
+        let mut name = VarBinViewBuilder::with_capacity(DType::Utf8(Nullability::Nullable), 3);
+        name.append_value("a");
+        name.append_value("b");
+        name.append_null();
+
+        let mut seq = VarBinViewBuilder::with_capacity(DType::Utf8(Nullability::NonNullable), 3);
+        seq.append_value("ACGT");
+        seq.append_value("TGCA");
+        seq.append_value("AAAA");
+
+        let fields: Vec<(std::sync::Arc<str>, ArrayRef)> = vec![
+            (std::sync::Arc::from("spot_id"), spot_id.finish()),
+            (std::sync::Arc::from("name"), name.finish()),
+            (std::sync::Arc::from("sequence"), seq.finish()),
+        ];
+        let struct_arr = StructArray::try_from_iter(fields).unwrap();
+        let array: ArrayRef = struct_arr.into_array();
+
+        write_struct_array(&path, array).unwrap();
         let bytes = std::fs::metadata(&path).unwrap().len();
-        assert!(bytes > 0, "vortex file should be non-empty");
+        assert!(bytes > 0);
 
         let runtime = RuntimeBuilder::new_current_thread()
             .enable_all()
@@ -391,6 +283,8 @@ mod tests {
             while let Some(chunk) = stream.next().await {
                 n += chunk.unwrap().len();
             }
+            // Silence unused-import lint if Canonical isn't referenced elsewhere.
+            let _ = std::marker::PhantomData::<Canonical>;
             n
         });
         assert_eq!(n_rows, 3);
