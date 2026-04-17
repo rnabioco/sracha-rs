@@ -180,6 +180,65 @@ sracha fastq [OPTIONS] <INPUT>...
 
 ---
 
+## sracha convert
+
+Convert SRA file(s) to columnar formats — Apache Parquet or Vortex.
+Experimental; aimed at storage benchmarking and downstream analytics
+workflows. See [Columnar Formats](columnar.md) for format trade-offs,
+DNA packing options, and benchmark numbers.
+
+```
+sracha convert [OPTIONS] <INPUT>...
+```
+
+!!! note
+    `sracha convert` is only available when the binary is built with the
+    `parquet` and/or `vortex` Cargo features. Both are enabled by default
+    (release binaries, bioconda). A `--no-default-features` build must
+    opt in.
+
+### Arguments
+
+| Argument | Description |
+|----------|-------------|
+| `INPUT` | Local `.sra` file path(s) (from `sracha fetch`) |
+
+### Options
+
+**Output**
+
+| Option | Default | Description |
+|--------|---------|-------------|
+| `--format <FORMAT>` | `parquet` | Output format: `parquet` (`.parquet`) or `vortex` (`.vortex`) |
+| `-O, --output-dir <DIR>` | `.` | Output directory |
+| `-f, --force` | | Overwrite existing files |
+
+**Encoding**
+
+| Option | Default | Description |
+|--------|---------|-------------|
+| `--pack-dna <MODE>` | format-dependent | DNA packing: `ascii`, `two-na`, `four-na` (default: `two-na` for parquet, `ascii` for vortex) |
+| `--length-mode <MODE>` | `auto` | Read-length schema: `auto` (detect from data), `fixed` (force FixedSizeBinary), `variable` (force variable-length) |
+
+**Compression** (parquet only)
+
+| Option | Default | Description |
+|--------|---------|-------------|
+| `--compression <CODEC>` | `zstd` | Page-level codec: `none`, `snappy`, `zstd` |
+| `--zstd-level <N>` | `22` | Zstd level (1-22), used when `--compression zstd` |
+
+**Advanced** (parquet only)
+
+| Option | Default | Description |
+|--------|---------|-------------|
+| `--row-group-mib <N>` | `256` | Target row-group size in MiB |
+
+The parquet-only flags are accepted but unused when `--format vortex`.
+Vortex picks its own encoding cascade — there are no compression knobs
+to turn.
+
+---
+
 ## sracha info
 
 Show accession metadata.

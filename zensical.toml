@@ -71,6 +71,9 @@ Home = "index.md"
 "Streaming Alignment" = "alignment.md"
 
 [[project.nav]]
+"Columnar Formats" = "columnar.md"
+
+[[project.nav]]
 "CLI Reference" = "cli.md"
 
 [[project.nav]]
