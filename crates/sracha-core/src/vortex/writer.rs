@@ -33,8 +33,6 @@ use vortex::layout::layouts::repartition::{RepartitionStrategy, RepartitionWrite
 use vortex::layout::layouts::table::TableStrategy;
 use vortex::layout::layouts::zoned::writer::{ZonedLayoutOptions, ZonedStrategy};
 use vortex::session::VortexSession;
-use vortex_btrblocks::SchemeExt;
-use vortex_btrblocks::schemes::integer::IntDictScheme;
 
 use crate::convert::decode::{DecodedBlob, decode_one_blob, resolve_length_mode};
 use crate::convert::schema::{DnaPacking, LengthMode, LengthModeChoice};
@@ -331,9 +329,14 @@ fn build_local_write_strategy() -> Arc<dyn LayoutStrategy> {
     let chunked = ChunkedLayoutStrategy::new(Arc::clone(&flat));
     let buffered = BufferedStrategy::new(chunked, 2 * (1 << 20));
 
-    let btrblocks_builder = BtrBlocksCompressorBuilder::default()
-        .with_compact()
-        .exclude_schemes([IntDictScheme.id()]);
+    // `.with_compact()` adds ZstdScheme (and Pco for numerics, since the
+    // `pco` feature is enabled on vortex-btrblocks). IntDictScheme is left in
+    // — BtrBlocks' cascading compressor picks the winning scheme per-column
+    // by estimated ratio, so including it only helps: wins on low-cardinality
+    // columns (`read_num`, often-constant `read_len`) and loses harmlessly on
+    // high-cardinality ones (`spot_id`). It was previously excluded without a
+    // recorded reason; benchmarks showed no regression from putting it back.
+    let btrblocks_builder = BtrBlocksCompressorBuilder::default().with_compact();
     let data_compressor: Arc<dyn CompressorPlugin> = Arc::new(btrblocks_builder.build());
     let compressing = CompressingStrategy::new(buffered, Arc::clone(&data_compressor));
 
@@ -449,5 +452,79 @@ mod tests {
             n
         });
         assert_eq!(n_rows, 3);
+    }
+
+    /// Round-trip a full-shape builder (including the new packed-sequence
+    /// `List<u8>` column) and verify every row survives encoding + decoding
+    /// through Vortex's compression cascade. Quality stays as `Utf8`
+    /// (FSST beats the numeric cascade for Phred data — see builder docs).
+    #[test]
+    fn roundtrip_rowbuilder_list_u8_sequence() {
+        use crate::convert::schema::DnaPacking;
+        use crate::vortex::builder::{VortexRowBuilder, list_u8_element_dtype};
+        use vortex::array::arrays::listview::ListViewArrayExt;
+        use vortex::array::arrays::struct_::StructArrayExt;
+
+        // Pack sequence as 2na → sequence column becomes `List<u8>`.
+        let mut builder = VortexRowBuilder::with_capacity(DnaPacking::TwoNa, 3);
+        builder.push(10, 0, b"r0/1", b"ACGT", b"IIII");
+        builder.push(10, 1, b"r0/2", b"TTTT", b"!!!!");
+        builder.push(11, 0, b"", b"AAAA", b"");
+        let array = builder.finish().unwrap();
+
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("rowbuilder.vortex");
+        write_struct_array(&path, array).unwrap();
+
+        let runtime = RuntimeBuilder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        runtime.block_on(async {
+            use futures::StreamExt;
+            use vortex::file::OpenOptionsSessionExt;
+
+            let session = VortexSession::default();
+            let file = session.open_options().open_path(&path).await.unwrap();
+            let mut stream = file.scan().unwrap().into_array_stream().unwrap();
+
+            let mut total_rows = 0usize;
+            let mut observed_sequence: Vec<Vec<u8>> = Vec::new();
+            while let Some(chunk) = stream.next().await {
+                let chunk = chunk.unwrap();
+                total_rows += chunk.len();
+                let struct_arr = chunk.to_canonical().unwrap().into_struct();
+                let sequence = struct_arr.unmasked_field_by_name("sequence").unwrap();
+
+                assert_eq!(
+                    sequence.dtype(),
+                    &DType::List(
+                        std::sync::Arc::new(list_u8_element_dtype()),
+                        Nullability::NonNullable
+                    )
+                );
+
+                let slist = sequence.to_canonical().unwrap().into_listview();
+                let s_elems = slist
+                    .elements()
+                    .clone()
+                    .to_canonical()
+                    .unwrap()
+                    .into_primitive();
+                let s_bytes = s_elems.as_slice::<u8>();
+                for i in 0..slist.len() {
+                    let off = slist.offset_at(i);
+                    let sz = slist.size_at(i);
+                    observed_sequence.push(s_bytes[off..off + sz].to_vec());
+                }
+            }
+
+            assert_eq!(total_rows, 3);
+            // 2na pack: A=0, C=1, G=2, T=3 packed high-nibble-first into a
+            // byte → ACGT = 0b00_01_10_11 = 0x1B, TTTT = 0xFF, AAAA = 0x00.
+            assert_eq!(observed_sequence[0], vec![0x1B]);
+            assert_eq!(observed_sequence[1], vec![0xFF]);
+            assert_eq!(observed_sequence[2], vec![0x00]);
+        });
     }
 }
