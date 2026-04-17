@@ -33,6 +33,7 @@ tracing.workspace = true
 arrow.workspace = true
 parquet.workspace = true
 vortex.workspace = true
+vortex-btrblocks.workspace = true
 futures.workspace = true
 
 [dev-dependencies]

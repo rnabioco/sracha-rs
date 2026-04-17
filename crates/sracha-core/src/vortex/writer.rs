@@ -14,28 +14,71 @@ use std::path::{Path, PathBuf};
 
 use tokio::runtime::Builder as RuntimeBuilder;
 
+use std::sync::Arc;
+
 use rayon::prelude::*;
 
 use vortex::VortexSessionDefault;
-use vortex::array::arrays::ChunkedArray;
-use vortex::array::{ArrayRef, IntoArray};
+use vortex::array::ArrayRef;
 use vortex::compressor::BtrBlocksCompressorBuilder;
-use vortex::file::{WriteOptionsSessionExt, WriteStrategyBuilder};
+use vortex::file::WriteOptionsSessionExt;
+use vortex::layout::LayoutStrategy;
+use vortex::layout::layouts::buffered::BufferedStrategy;
+use vortex::layout::layouts::chunked::writer::ChunkedLayoutStrategy;
+use vortex::layout::layouts::collect::CollectStrategy;
+use vortex::layout::layouts::compressed::{CompressingStrategy, CompressorPlugin};
+use vortex::layout::layouts::dict::writer::{DictLayoutOptions, DictStrategy};
+use vortex::layout::layouts::flat::writer::FlatLayoutStrategy;
+use vortex::layout::layouts::repartition::{RepartitionStrategy, RepartitionWriterOptions};
+use vortex::layout::layouts::table::TableStrategy;
+use vortex::layout::layouts::zoned::writer::{ZonedLayoutOptions, ZonedStrategy};
 use vortex::session::VortexSession;
+use vortex_btrblocks::SchemeExt;
+use vortex_btrblocks::schemes::integer::IntDictScheme;
 
 use crate::error::{Error, Result};
 use crate::parquet::schema::{DnaPacking, LengthMode};
-use crate::parquet::writer::{LengthModeChoice, decode_one_blob, resolve_length_mode};
+use crate::parquet::writer::{DecodedBlob, LengthModeChoice, decode_one_blob, resolve_length_mode};
 use crate::vdb::cursor::VdbCursor;
 use crate::vdb::kar::KarArchive;
 use crate::vortex::builder::VortexRowBuilder;
 
-/// Row block size for Vortex writes. Each block becomes a BtrBlocks
-/// compression zone — one FSST dictionary, one zstd window, etc. The default
-/// (`8 KiB`) is tuned for random-access datasets; for sequencing data we want
-/// large training windows so a single dictionary/window amortises across many
-/// similar reads.
-const ROW_BLOCK_SIZE: usize = 262_144;
+/// Default row block size for Vortex writes. Each block becomes a BtrBlocks
+/// compression zone — one FSST dictionary, one zstd window, etc.
+///
+/// 524 288 (512 K rows) was the clear winner in a 5×5 grid sweep on two
+/// Illumina fixtures — it gives ~3 compression zones per column on a
+/// ~1.5 M-row run, letting each FSST dictionary train on ~500 K reads
+/// instead of the ~4 K-row zones Vortex's S3-tuned default produces.
+/// Smaller blocks (2 K–8 K rows) are both bigger AND ~3× slower to encode.
+///
+/// Override at runtime with `SRACHA_VORTEX_ROW_BLOCK=<rows>`.
+const DEFAULT_ROW_BLOCK_SIZE: usize = 524_288;
+
+/// Default byte target for the coalescing repartition step. At the chosen
+/// row block size this is dominated by row alignment (512 K rows × 300 B
+/// ≈ 150 MiB already exceeds any reasonable byte target), so the value
+/// barely matters — keep it modest to avoid unnecessary buffering.
+///
+/// Override with `SRACHA_VORTEX_COALESCE_MIB=<mib>`.
+const DEFAULT_COALESCE_MIB: u64 = 16;
+
+fn row_block_size() -> usize {
+    std::env::var("SRACHA_VORTEX_ROW_BLOCK")
+        .ok()
+        .and_then(|v| v.parse::<usize>().ok())
+        .filter(|v| *v > 0)
+        .unwrap_or(DEFAULT_ROW_BLOCK_SIZE)
+}
+
+fn coalesce_bytes() -> u64 {
+    std::env::var("SRACHA_VORTEX_COALESCE_MIB")
+        .ok()
+        .and_then(|v| v.parse::<u64>().ok())
+        .filter(|v| *v > 0)
+        .unwrap_or(DEFAULT_COALESCE_MIB)
+        * (1 << 20)
+}
 
 // ---------------------------------------------------------------------------
 // Public configuration
@@ -117,11 +160,12 @@ pub fn convert_sra_to_vortex(
 // Internals
 // ---------------------------------------------------------------------------
 
-/// Decode every blob into its own `StructArray` in parallel, then combine
-/// them into a single `ChunkedArray` over the struct type.
-///
-/// Blob `start_id` gives each blob its global spot_id origin, so no
-/// sequential accumulator is needed — decode is embarrassingly parallel.
+/// Decode every blob in parallel, then drain all rows into a single
+/// `VortexRowBuilder` and return ONE `StructArray` (no top-level
+/// `ChunkedArray`). One builder → one FSST dictionary per column when the
+/// layout strategy's coalescing block is large enough to encompass the
+/// whole column — otherwise the row-block splits would fragment the dict
+/// anyway.
 fn build_struct_array(cursor: &VdbCursor, pack_dna: DnaPacking) -> Result<(ArrayRef, u64, u64)> {
     let read_cs = cursor.read_col().meta().checksum_type;
     let blob_infos = cursor.read_col().blobs().to_vec();
@@ -137,7 +181,6 @@ fn build_struct_array(cursor: &VdbCursor, pack_dna: DnaPacking) -> Result<(Array
     // are `Send`, so the parallel decode can consume them directly.
     #[derive(Clone, Copy)]
     struct RawBlob<'a> {
-        blob_idx: usize,
         start_id: i64,
         id_range: u64,
         read_raw: &'a [u8],
@@ -171,7 +214,6 @@ fn build_struct_array(cursor: &VdbCursor, pack_dna: DnaPacking) -> Result<(Array
                 .transpose()?
                 .unwrap_or(&[]);
             Ok(RawBlob {
-                blob_idx,
                 start_id: start,
                 id_range: blob.id_range as u64,
                 read_raw,
@@ -182,11 +224,11 @@ fn build_struct_array(cursor: &VdbCursor, pack_dna: DnaPacking) -> Result<(Array
         })
         .collect::<Result<Vec<_>>>()?;
 
-    // Parallel decode. Each blob produces one `StructArray` plus its
-    // contribution to the row count.
-    let per_blob: Vec<(ArrayRef, u64, u64)> = raw_blobs
+    // Parallel decode — the expensive part. Each task emits an owned
+    // `DecodedBlob` plus the blob's global spot-id origin.
+    let decoded_blobs: Vec<(u64, DecodedBlob)> = raw_blobs
         .par_iter()
-        .map(|rb| -> Result<(ArrayRef, u64, u64)> {
+        .map(|rb| -> Result<(u64, DecodedBlob)> {
             let decoded = decode_one_blob(
                 rb.read_raw,
                 read_cs,
@@ -199,56 +241,48 @@ fn build_struct_array(cursor: &VdbCursor, pack_dna: DnaPacking) -> Result<(Array
                 name_cs,
                 metadata_rps,
             )?;
-
-            let n_spots = decoded.spot_count() as u64;
-            let mut reads: u64 = 0;
-            let mut builder = VortexRowBuilder::with_capacity(pack_dna, (n_spots as usize) * rps);
-
             let spot_id_origin = first_row
                 .saturating_add(rb.start_id as u64)
                 .saturating_sub(1);
-            for (spot_offset, spot) in decoded.iter_spots().enumerate() {
-                let spot_id = spot_id_origin + spot_offset as u64;
-                for (read_num, read) in spot.iter_reads().enumerate() {
-                    builder.push(
-                        spot_id,
-                        read_num as u8,
-                        spot.name,
-                        read.sequence,
-                        read.quality,
-                    );
-                    reads += 1;
-                }
-            }
-
-            if builder.is_empty() {
-                return Err(Error::Vdb(format!(
-                    "vortex: blob {} produced no rows",
-                    rb.blob_idx
-                )));
-            }
-            let array = builder.finish()?;
-            Ok((array, n_spots, reads))
+            Ok((spot_id_origin, decoded))
         })
         .collect::<Result<Vec<_>>>()?;
 
-    let mut arrays: Vec<ArrayRef> = Vec::with_capacity(per_blob.len());
+    // Serial merge — drain every decoded blob into one builder. Fast
+    // relative to the parallel decode but critically produces one
+    // StructArray, letting the layout strategy's coalescing form big
+    // compression zones.
+    let total_rows_hint: usize = decoded_blobs
+        .iter()
+        .map(|(_, d)| d.spot_count() * rps)
+        .sum();
+    let mut builder = VortexRowBuilder::with_capacity(pack_dna, total_rows_hint);
     let mut total_spots: u64 = 0;
     let mut total_reads: u64 = 0;
-    for (arr, spots, reads) in per_blob {
-        arrays.push(arr);
-        total_spots += spots;
-        total_reads += reads;
+
+    for (spot_id_origin, decoded) in decoded_blobs {
+        let n_spots = decoded.spot_count() as u64;
+        for (spot_offset, spot) in decoded.iter_spots().enumerate() {
+            let spot_id = spot_id_origin + spot_offset as u64;
+            for (read_num, read) in spot.iter_reads().enumerate() {
+                builder.push(
+                    spot_id,
+                    read_num as u8,
+                    spot.name,
+                    read.sequence,
+                    read.quality,
+                );
+                total_reads += 1;
+            }
+        }
+        total_spots += n_spots;
     }
 
-    if arrays.is_empty() {
+    if builder.is_empty() {
         return Err(Error::Vdb("vortex: no rows to write".into()));
     }
 
-    let dtype = arrays[0].dtype().clone();
-    let chunked = ChunkedArray::try_new(arrays, dtype)
-        .map_err(|e| Error::Vdb(format!("vortex chunked array: {e}")))?;
-    Ok((chunked.into_array(), total_spots, total_reads))
+    Ok((builder.finish()?, total_spots, total_reads))
 }
 
 /// Write a finalized Vortex `StructArray` to disk.
@@ -265,20 +299,7 @@ fn write_struct_array(output_path: &Path, array: ArrayRef) -> Result<()> {
             .map_err(|e| Error::Vdb(format!("vortex tokio runtime: {e}")))?;
         runtime.block_on(async move {
             let session = VortexSession::default();
-            // `with_compact()` registers Zstd (and Pco when available) as
-            // additional schemes on top of the default BtrBlocks cascade —
-            // FSST runs first, but Zstd can now cascade over FSST output or
-            // win outright on compressible strings. Biggest win is on
-            // quality columns (high local repetition, small alphabet).
-            //
-            // `ROW_BLOCK_SIZE` (256 K) lets FSST train one dictionary across
-            // many rows per zone, instead of the 8 K default — large
-            // dictionaries amortise better on repetitive bio data.
-            let btrblocks = BtrBlocksCompressorBuilder::default().with_compact();
-            let strategy = WriteStrategyBuilder::default()
-                .with_btrblocks_builder(btrblocks)
-                .with_row_block_size(ROW_BLOCK_SIZE)
-                .build();
+            let strategy = build_local_write_strategy();
             let mut file = tokio::fs::File::create(&output_path)
                 .await
                 .map_err(|e| Error::Vdb(format!("vortex create {}: {e}", output_path.display())))?;
@@ -293,6 +314,73 @@ fn write_struct_array(output_path: &Path, array: ArrayRef) -> Result<()> {
     })
     .join()
     .map_err(|_| Error::Vdb("vortex writer thread panicked".into()))?
+}
+
+/// Build the full Vortex `LayoutStrategy`. Mirrors
+/// `vortex-file::WriteStrategyBuilder::build()` but with tunable
+/// `row_block_size` + `coalesce_bytes` (both read from env vars — see
+/// `row_block_size()` / `coalesce_bytes()`). Vortex's upstream defaults
+/// are tuned for S3 random-access; for local write-once/read-all workloads
+/// the sweet spot is elsewhere and worth sweeping empirically.
+fn build_local_write_strategy() -> Arc<dyn LayoutStrategy> {
+    let rbs = row_block_size();
+    let coal = coalesce_bytes();
+
+    let flat: Arc<dyn LayoutStrategy> = Arc::new(FlatLayoutStrategy::default());
+
+    let chunked = ChunkedLayoutStrategy::new(Arc::clone(&flat));
+    let buffered = BufferedStrategy::new(chunked, 2 * (1 << 20));
+
+    let btrblocks_builder = BtrBlocksCompressorBuilder::default()
+        .with_compact()
+        .exclude_schemes([IntDictScheme.id()]);
+    let data_compressor: Arc<dyn CompressorPlugin> = Arc::new(btrblocks_builder.build());
+    let compressing = CompressingStrategy::new(buffered, Arc::clone(&data_compressor));
+
+    let coalescing = RepartitionStrategy::new(
+        compressing,
+        RepartitionWriterOptions {
+            block_size_minimum: coal,
+            block_len_multiple: rbs,
+            block_size_target: Some(coal),
+            canonicalize: true,
+        },
+    );
+
+    let stats_compressor: Arc<dyn CompressorPlugin> =
+        Arc::new(BtrBlocksCompressorBuilder::default().with_compact().build());
+    let compress_then_flat = CompressingStrategy::new(Arc::clone(&flat), stats_compressor);
+
+    let dict = DictStrategy::new(
+        coalescing.clone(),
+        compress_then_flat.clone(),
+        coalescing,
+        DictLayoutOptions::default(),
+    );
+
+    let stats = ZonedStrategy::new(
+        dict,
+        compress_then_flat.clone(),
+        ZonedLayoutOptions {
+            block_size: rbs,
+            ..Default::default()
+        },
+    );
+
+    let repartition = RepartitionStrategy::new(
+        stats,
+        RepartitionWriterOptions {
+            block_size_minimum: 0,
+            block_len_multiple: rbs,
+            block_size_target: None,
+            canonicalize: false,
+        },
+    );
+
+    let validity = CollectStrategy::new(compress_then_flat);
+
+    let table = TableStrategy::new(Arc::new(validity), Arc::new(repartition));
+    Arc::new(table)
 }
 
 // ---------------------------------------------------------------------------
