@@ -14,8 +14,11 @@ use std::path::{Path, PathBuf};
 
 use tokio::runtime::Builder as RuntimeBuilder;
 
+use rayon::prelude::*;
+
 use vortex::VortexSessionDefault;
-use vortex::array::ArrayRef;
+use vortex::array::arrays::ChunkedArray;
+use vortex::array::{ArrayRef, IntoArray};
 use vortex::file::WriteOptionsSessionExt;
 use vortex::session::VortexSession;
 
@@ -106,9 +109,11 @@ pub fn convert_sra_to_vortex(
 // Internals
 // ---------------------------------------------------------------------------
 
-/// Decode every blob and push rows into a single Vortex `StructArray`.
+/// Decode every blob into its own `StructArray` in parallel, then combine
+/// them into a single `ChunkedArray` over the struct type.
 ///
-/// Returns the finished array plus `(spots, reads)` counts.
+/// Blob `start_id` gives each blob its global spot_id origin, so no
+/// sequential accumulator is needed — decode is embarrassingly parallel.
 fn build_struct_array(cursor: &VdbCursor, pack_dna: DnaPacking) -> Result<(ArrayRef, u64, u64)> {
     let read_cs = cursor.read_col().meta().checksum_type;
     let blob_infos = cursor.read_col().blobs().to_vec();
@@ -116,81 +121,126 @@ fn build_struct_array(cursor: &VdbCursor, pack_dna: DnaPacking) -> Result<(Array
     let read_len_cs = cursor.read_len_col().map_or(0, |c| c.meta().checksum_type);
     let name_cs = cursor.name_col().map_or(0, |c| c.meta().checksum_type);
     let metadata_rps = cursor.metadata_reads_per_spot();
+    let rps = metadata_rps.unwrap_or(1).max(1);
+    let first_row = cursor.first_row().max(1) as u64;
 
-    // Ballpark capacity so VarBinView buffers don't thrash. Sum blob id_range
-    // × max reads-per-spot; metadata_rps fallback = 1 is fine if unknown.
-    let capacity: usize = blob_infos
-        .iter()
-        .map(|b| b.id_range as usize)
-        .sum::<usize>()
-        .saturating_mul(metadata_rps.unwrap_or(1).max(1));
-
-    let mut builder = VortexRowBuilder::with_capacity(pack_dna, capacity);
-    let mut spot_id_acc: u64 = cursor.first_row().max(1) as u64;
-    let mut total_spots: u64 = 0;
-    let mut total_reads: u64 = 0;
-
-    for (blob_idx, blob_info) in blob_infos.iter().enumerate() {
-        let start_row = blob_info.start_id;
-        let id_range = blob_info.id_range as u64;
-
-        let read_raw = cursor.read_col().read_raw_blob_slice(start_row)?;
-        let quality_raw = cursor
-            .quality_col()
-            .filter(|c| blob_idx < c.blob_count())
-            .map(|c| c.read_raw_blob_slice(start_row))
-            .transpose()?
-            .unwrap_or(&[]);
-        let read_len_raw = cursor
-            .read_len_col()
-            .filter(|c| blob_idx < c.blob_count())
-            .map(|c| c.read_raw_blob_slice(start_row))
-            .transpose()?
-            .unwrap_or(&[]);
-        let name_raw = cursor
-            .name_col()
-            .filter(|c| blob_idx < c.blob_count())
-            .map(|c| c.read_raw_blob_slice(start_row))
-            .transpose()?
-            .unwrap_or(&[]);
-
-        let decoded = decode_one_blob(
-            read_raw,
-            read_cs,
-            id_range,
-            quality_raw,
-            quality_cs,
-            read_len_raw,
-            read_len_cs,
-            name_raw,
-            name_cs,
-            metadata_rps,
-        )?;
-
-        let n_spots = decoded.spot_count();
-        for (spot_offset, spot) in decoded.iter_spots().enumerate() {
-            let spot_id = spot_id_acc + spot_offset as u64;
-            for (read_num, read) in spot.iter_reads().enumerate() {
-                builder.push(
-                    spot_id,
-                    read_num as u8,
-                    spot.name,
-                    read.sequence,
-                    read.quality,
-                );
-                total_reads += 1;
-            }
-        }
-        total_spots += n_spots as u64;
-        spot_id_acc += n_spots as u64;
+    // Pre-slice raw bytes for every blob up-front (serial, but zero-copy:
+    // each slice is just a view into the mmap'd archive). These borrows
+    // are `Send`, so the parallel decode can consume them directly.
+    #[derive(Clone, Copy)]
+    struct RawBlob<'a> {
+        blob_idx: usize,
+        start_id: i64,
+        id_range: u64,
+        read_raw: &'a [u8],
+        quality_raw: &'a [u8],
+        read_len_raw: &'a [u8],
+        name_raw: &'a [u8],
     }
 
-    if builder.is_empty() {
+    let raw_blobs: Vec<RawBlob<'_>> = blob_infos
+        .iter()
+        .enumerate()
+        .map(|(blob_idx, blob)| -> Result<_> {
+            let start = blob.start_id;
+            let read_raw = cursor.read_col().read_raw_blob_slice(start)?;
+            let quality_raw = cursor
+                .quality_col()
+                .filter(|c| blob_idx < c.blob_count())
+                .map(|c| c.read_raw_blob_slice(start))
+                .transpose()?
+                .unwrap_or(&[]);
+            let read_len_raw = cursor
+                .read_len_col()
+                .filter(|c| blob_idx < c.blob_count())
+                .map(|c| c.read_raw_blob_slice(start))
+                .transpose()?
+                .unwrap_or(&[]);
+            let name_raw = cursor
+                .name_col()
+                .filter(|c| blob_idx < c.blob_count())
+                .map(|c| c.read_raw_blob_slice(start))
+                .transpose()?
+                .unwrap_or(&[]);
+            Ok(RawBlob {
+                blob_idx,
+                start_id: start,
+                id_range: blob.id_range as u64,
+                read_raw,
+                quality_raw,
+                read_len_raw,
+                name_raw,
+            })
+        })
+        .collect::<Result<Vec<_>>>()?;
+
+    // Parallel decode. Each blob produces one `StructArray` plus its
+    // contribution to the row count.
+    let per_blob: Vec<(ArrayRef, u64, u64)> = raw_blobs
+        .par_iter()
+        .map(|rb| -> Result<(ArrayRef, u64, u64)> {
+            let decoded = decode_one_blob(
+                rb.read_raw,
+                read_cs,
+                rb.id_range,
+                rb.quality_raw,
+                quality_cs,
+                rb.read_len_raw,
+                read_len_cs,
+                rb.name_raw,
+                name_cs,
+                metadata_rps,
+            )?;
+
+            let n_spots = decoded.spot_count() as u64;
+            let mut reads: u64 = 0;
+            let mut builder = VortexRowBuilder::with_capacity(pack_dna, (n_spots as usize) * rps);
+
+            let spot_id_origin = first_row
+                .saturating_add(rb.start_id as u64)
+                .saturating_sub(1);
+            for (spot_offset, spot) in decoded.iter_spots().enumerate() {
+                let spot_id = spot_id_origin + spot_offset as u64;
+                for (read_num, read) in spot.iter_reads().enumerate() {
+                    builder.push(
+                        spot_id,
+                        read_num as u8,
+                        spot.name,
+                        read.sequence,
+                        read.quality,
+                    );
+                    reads += 1;
+                }
+            }
+
+            if builder.is_empty() {
+                return Err(Error::Vdb(format!(
+                    "vortex: blob {} produced no rows",
+                    rb.blob_idx
+                )));
+            }
+            let array = builder.finish()?;
+            Ok((array, n_spots, reads))
+        })
+        .collect::<Result<Vec<_>>>()?;
+
+    let mut arrays: Vec<ArrayRef> = Vec::with_capacity(per_blob.len());
+    let mut total_spots: u64 = 0;
+    let mut total_reads: u64 = 0;
+    for (arr, spots, reads) in per_blob {
+        arrays.push(arr);
+        total_spots += spots;
+        total_reads += reads;
+    }
+
+    if arrays.is_empty() {
         return Err(Error::Vdb("vortex: no rows to write".into()));
     }
 
-    let array = builder.finish()?;
-    Ok((array, total_spots, total_reads))
+    let dtype = arrays[0].dtype().clone();
+    let chunked = ChunkedArray::try_new(arrays, dtype)
+        .map_err(|e| Error::Vdb(format!("vortex chunked array: {e}")))?;
+    Ok((chunked.into_array(), total_spots, total_reads))
 }
 
 /// Write a finalized Vortex `StructArray` to disk.
