@@ -12,6 +12,8 @@ sra-tools = ">=3.4.1,<4"
 vhs = ">=0.11.0,<0.12"
 bwa = ">=0.7.18"
 samtools = ">=1.21"
+clang = ">=22.1.3,<23"
+libclang = ">=22.1.3,<23"
 
 [pypi-dependencies]
 zensical = "*"
