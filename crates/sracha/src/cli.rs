@@ -66,11 +66,103 @@ pub enum Command {
     /// Convert SRA file(s) to FASTQ
     Fastq(FastqArgs),
 
+    /// Convert SRA file(s) to Parquet (experimental, storage benchmarking)
+    Convert(ConvertArgs),
+
     /// Show accession metadata
     Info(InfoArgs),
 
     /// Validate SRA file integrity
     Validate(ValidateArgs),
+}
+
+#[derive(Args)]
+pub struct ConvertArgs {
+    /// SRA file path(s) (.sra files from `sracha fetch`)
+    #[arg(required = true)]
+    pub inputs: Vec<String>,
+
+    /// Output directory (one .parquet file per input)
+    #[arg(short = 'O', long, default_value = ".", help_heading = "Output")]
+    pub output_dir: PathBuf,
+
+    /// Force-overwrite existing output files
+    #[arg(short, long, help_heading = "Output")]
+    pub force: bool,
+
+    /// DNA encoding for the `sequence` column
+    #[arg(long, default_value = "two-na", help_heading = "Encoding")]
+    pub pack_dna: PackDna,
+
+    /// Read-length mode for the schema
+    #[arg(long, default_value = "auto", help_heading = "Encoding")]
+    pub length_mode: LengthMode,
+
+    /// Page-level compression codec
+    #[arg(long, default_value = "zstd", help_heading = "Compression")]
+    pub compression: ParquetCodec,
+
+    /// Zstd compression level (1-22), only when `--compression zstd`
+    #[arg(
+        long,
+        value_parser = clap::value_parser!(i32).range(1..=22),
+        default_value_t = 22,
+        help_heading = "Compression",
+    )]
+    pub zstd_level: i32,
+
+    /// Target row-group size in MiB
+    #[arg(long, default_value_t = 256, help_heading = "Advanced")]
+    pub row_group_mib: usize,
+}
+
+#[derive(Clone, Copy, ValueEnum)]
+pub enum PackDna {
+    /// One byte per base (A/C/G/T/N/IUPAC)
+    Ascii,
+    /// 2 bits/base, 4× density (auto-falls back to 4na on ambiguity)
+    #[value(name = "two-na")]
+    TwoNa,
+    /// 4 bits/base, preserves IUPAC ambiguity
+    #[value(name = "four-na")]
+    FourNa,
+}
+
+impl From<PackDna> for sracha_core::parquet::DnaPacking {
+    fn from(p: PackDna) -> Self {
+        match p {
+            PackDna::Ascii => Self::Ascii,
+            PackDna::TwoNa => Self::TwoNa,
+            PackDna::FourNa => Self::FourNa,
+        }
+    }
+}
+
+#[derive(Clone, Copy, ValueEnum)]
+pub enum LengthMode {
+    /// Detect from data: fixed if all reads share a length, else variable
+    Auto,
+    /// Force FIXED_LEN_BYTE_ARRAY (errors on length mismatch)
+    Fixed,
+    /// Force variable-length BYTE_ARRAY
+    Variable,
+}
+
+impl From<LengthMode> for sracha_core::parquet::writer::LengthModeChoice {
+    fn from(m: LengthMode) -> Self {
+        match m {
+            LengthMode::Auto => Self::Auto,
+            LengthMode::Fixed => Self::Fixed,
+            LengthMode::Variable => Self::Variable,
+        }
+    }
+}
+
+#[derive(Clone, Copy, ValueEnum)]
+pub enum ParquetCodec {
+    None,
+    Snappy,
+    Zstd,
 }
 
 #[derive(Args)]

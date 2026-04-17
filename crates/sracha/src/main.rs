@@ -211,6 +211,75 @@ async fn main() -> Result<()> {
 
             Ok(())
         }
+        Command::Convert(args) => {
+            use sracha_core::parquet::{ConvertConfig, ParquetCompression, convert_sra_to_parquet};
+
+            std::fs::create_dir_all(&args.output_dir)?;
+
+            let compression = match args.compression {
+                cli::ParquetCodec::None => ParquetCompression::None,
+                cli::ParquetCodec::Snappy => ParquetCompression::Snappy,
+                cli::ParquetCodec::Zstd => ParquetCompression::Zstd(args.zstd_level),
+            };
+
+            for input in &args.inputs {
+                let sra_path = Path::new(input);
+                if !sra_path.exists() {
+                    eprintln!(
+                        "{} file not found: {}",
+                        style::error_label("error:"),
+                        style::path(input)
+                    );
+                    continue;
+                }
+
+                let stem = sra_path
+                    .file_stem()
+                    .and_then(|s| s.to_str())
+                    .unwrap_or("output");
+                let out_path = args.output_dir.join(format!("{stem}.parquet"));
+                if out_path.exists() && !args.force {
+                    eprintln!(
+                        "{} {} already exists (use --force to overwrite)",
+                        style::error_label("error:"),
+                        style::path(out_path.display())
+                    );
+                    continue;
+                }
+
+                let config = ConvertConfig {
+                    compression,
+                    pack_dna: args.pack_dna.into(),
+                    row_group_mib: args.row_group_mib,
+                    length_mode: args.length_mode.into(),
+                    blobs_per_batch: 64,
+                };
+
+                let stats = convert_sra_to_parquet(sra_path, &out_path, &config)?;
+
+                let ratio = if stats.input_bytes > 0 {
+                    stats.output_bytes as f64 / stats.input_bytes as f64 * 100.0
+                } else {
+                    0.0
+                };
+                eprintln!(
+                    "{}: {} spots, {} reads, {} -> {} ({:.1}% of input)",
+                    style::header(stem),
+                    style::count(stats.spots),
+                    style::count(stats.reads),
+                    format_size(stats.input_bytes),
+                    format_size(stats.output_bytes),
+                    ratio,
+                );
+                eprintln!(
+                    "  length_mode={:?}, dna_packing={:?}, compression={:?}",
+                    stats.length_mode, stats.dna_packing, compression
+                );
+                eprintln!("  -> {}", style::path(out_path.display()));
+            }
+
+            Ok(())
+        }
         Command::Get(args) => {
             let split_mode =
                 cli::resolve_split_mode(args.split, args.stdout).map_err(|e| anyhow::anyhow!(e))?;

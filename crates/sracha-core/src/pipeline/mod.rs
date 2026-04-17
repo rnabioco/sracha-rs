@@ -400,7 +400,7 @@ fn select_mirror(resolved: &ResolvedAccession) -> Result<String> {
 /// strip them here before handing the data to [`blob::decode_blob`].
 /// Checksum validation is not performed because the stored CRC covers only
 /// a portion of the blob that doesn't align with the full raw slice.
-fn decode_raw<'a>(
+pub(crate) fn decode_raw<'a>(
     raw: &'a [u8],
     checksum_type: u8,
     row_count: u64,
@@ -419,7 +419,7 @@ fn decode_raw<'a>(
 }
 
 /// Decode irzip-compressed integers from a blob, detecting single vs dual series.
-fn decode_irzip_column(decoded: &blob::DecodedBlob<'_>) -> Vec<u8> {
+pub(crate) fn decode_irzip_column(decoded: &blob::DecodedBlob<'_>) -> Vec<u8> {
     let hdr_version = decoded.headers.first().map(|h| h.version).unwrap_or(0);
     let decoded_ints = if hdr_version >= 1 {
         let hdr = &decoded.headers[0];
@@ -478,7 +478,7 @@ fn expand_via_page_map(decoded_ints: Vec<u8>, page_map: &Option<blob::PageMap>) 
 /// data is already the raw-deflate stream.
 ///
 /// Returns decompressed bytes, or falls back to raw bytes on failure.
-fn decode_zip_encoding(decoded: &blob::DecodedBlob<'_>) -> Vec<u8> {
+pub(crate) fn decode_zip_encoding(decoded: &blob::DecodedBlob<'_>) -> Vec<u8> {
     let hdr_version = decoded.headers.first().map(|h| h.version).unwrap_or(0);
 
     if decoded.data.is_empty() {
