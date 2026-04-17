@@ -19,7 +19,8 @@ use rayon::prelude::*;
 use vortex::VortexSessionDefault;
 use vortex::array::arrays::ChunkedArray;
 use vortex::array::{ArrayRef, IntoArray};
-use vortex::file::WriteOptionsSessionExt;
+use vortex::compressor::BtrBlocksCompressorBuilder;
+use vortex::file::{WriteOptionsSessionExt, WriteStrategyBuilder};
 use vortex::session::VortexSession;
 
 use crate::error::{Error, Result};
@@ -257,11 +258,21 @@ fn write_struct_array(output_path: &Path, array: ArrayRef) -> Result<()> {
             .map_err(|e| Error::Vdb(format!("vortex tokio runtime: {e}")))?;
         runtime.block_on(async move {
             let session = VortexSession::default();
+            // `with_compact()` registers Zstd (and Pco when available) as
+            // additional schemes on top of the default BtrBlocks cascade —
+            // FSST runs first, but Zstd can now cascade over FSST output or
+            // win outright on compressible strings. Biggest win is on
+            // quality columns (high local repetition, small alphabet).
+            let btrblocks = BtrBlocksCompressorBuilder::default().with_compact();
+            let strategy = WriteStrategyBuilder::default()
+                .with_btrblocks_builder(btrblocks)
+                .build();
             let mut file = tokio::fs::File::create(&output_path)
                 .await
                 .map_err(|e| Error::Vdb(format!("vortex create {}: {e}", output_path.display())))?;
             session
                 .write_options()
+                .with_strategy(strategy)
                 .write(&mut file, array.to_array_stream())
                 .await
                 .map_err(|e| Error::Vdb(format!("vortex write: {e}")))?;
