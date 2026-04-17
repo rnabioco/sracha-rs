@@ -451,9 +451,10 @@ async fn main() -> Result<()> {
 
             // Split local file paths from accession strings. A bare file path
             // goes straight to the local-file path; anything else is looked up
-            // via SDL/EUtils.
+            // via SDL/EUtils. `~/` is expanded so users can pass shell paths.
             let (paths, accessions): (Vec<_>, Vec<_>) = raw
                 .into_iter()
+                .map(|s| expand_tilde(&s))
                 .partition(|s| std::path::Path::new(s).is_file());
 
             for p in &paths {
@@ -648,6 +649,15 @@ async fn main() -> Result<()> {
 ///
 /// Lines in the accession list file are trimmed; blank lines and lines
 /// starting with `#` are skipped.
+fn expand_tilde(s: &str) -> String {
+    if let Some(rest) = s.strip_prefix("~/")
+        && let Ok(home) = std::env::var("HOME")
+    {
+        return format!("{home}/{rest}");
+    }
+    s.to_string()
+}
+
 fn collect_accessions(positional: &[String], list_file: Option<&Path>) -> Result<Vec<String>> {
     let mut accessions: Vec<String> = positional.to_vec();
 
