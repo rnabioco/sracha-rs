@@ -30,8 +30,16 @@
 
 set -euo pipefail
 
-SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-ROOT_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
+# Under sbatch the script is copied to SLURM's spool, so BASH_SOURCE resolves
+# to /var/spool/slurmd/... — use SLURM_SUBMIT_DIR to find the real repo root
+# when we're running as a batch job.
+if [[ -n "${SLURM_SUBMIT_DIR:-}" ]]; then
+    ROOT_DIR="$SLURM_SUBMIT_DIR"
+    SCRIPT_DIR="$ROOT_DIR/validation"
+else
+    SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+    ROOT_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
+fi
 
 SRACHA="$ROOT_DIR/target/release/sracha"
 SRATOOLS_DIR="$SCRIPT_DIR/sra-tools"
