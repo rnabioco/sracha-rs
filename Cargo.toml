@@ -66,8 +66,10 @@ chrono = { version = "0.4", default-features = false, features = ["clock"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 
-# Internal
-sracha-core = { path = "crates/sracha-core" }
+# Internal — members declare `default-features = false` and re-enable
+# what they need via feature propagation, so consumers can opt out of
+# the parquet/vortex deps at build time.
+sracha-core = { path = "crates/sracha-core", default-features = false }
 
 # Optimized release build: LTO + single codegen unit for maximum performance
 [profile.release]

@@ -211,124 +211,8 @@ async fn main() -> Result<()> {
 
             Ok(())
         }
-        Command::Convert(args) => {
-            use sracha_core::parquet::{ConvertConfig, ParquetCompression, convert_sra_to_parquet};
-            use sracha_core::vortex::{VortexConvertConfig, convert_sra_to_vortex};
-
-            std::fs::create_dir_all(&args.output_dir)?;
-
-            let compression = match args.compression {
-                cli::ParquetCodec::None => ParquetCompression::None,
-                cli::ParquetCodec::Snappy => ParquetCompression::Snappy,
-                cli::ParquetCodec::Zstd => ParquetCompression::Zstd(args.zstd_level),
-            };
-
-            let ext = match args.format {
-                cli::ConvertFormat::Parquet => "parquet",
-                cli::ConvertFormat::Vortex => "vortex",
-            };
-
-            for input in &args.inputs {
-                let sra_path = Path::new(input);
-                if !sra_path.exists() {
-                    eprintln!(
-                        "{} file not found: {}",
-                        style::error_label("error:"),
-                        style::path(input)
-                    );
-                    continue;
-                }
-
-                let stem = sra_path
-                    .file_stem()
-                    .and_then(|s| s.to_str())
-                    .unwrap_or("output");
-                let out_path = args.output_dir.join(format!("{stem}.{ext}"));
-                if out_path.exists() && !args.force {
-                    eprintln!(
-                        "{} {} already exists (use --force to overwrite)",
-                        style::error_label("error:"),
-                        style::path(out_path.display())
-                    );
-                    continue;
-                }
-
-                // Resolve pack_dna with a format-specific default when the
-                // user didn't override it: two-na for Parquet (pre-packing
-                // wins on zstd'd bytes), ascii for Vortex (the 0.68
-                // compressor skips Binary, so 2na/4na writes uncompressed).
-                let pack_dna: cli::PackDna = args.pack_dna.unwrap_or(match args.format {
-                    cli::ConvertFormat::Parquet => cli::PackDna::TwoNa,
-                    cli::ConvertFormat::Vortex => cli::PackDna::Ascii,
-                });
-
-                let (input_bytes, output_bytes, spots, reads, length_mode, dna_packing) =
-                    match args.format {
-                        cli::ConvertFormat::Parquet => {
-                            let config = ConvertConfig {
-                                compression,
-                                pack_dna: pack_dna.into(),
-                                row_group_mib: args.row_group_mib,
-                                length_mode: args.length_mode.into(),
-                                blobs_per_batch: 64,
-                            };
-                            let stats = convert_sra_to_parquet(sra_path, &out_path, &config)?;
-                            (
-                                stats.input_bytes,
-                                stats.output_bytes,
-                                stats.spots,
-                                stats.reads,
-                                format!("{:?}", stats.length_mode),
-                                format!("{:?}", stats.dna_packing),
-                            )
-                        }
-                        cli::ConvertFormat::Vortex => {
-                            let config = VortexConvertConfig {
-                                pack_dna: pack_dna.into(),
-                                length_mode: args.length_mode.into(),
-                                blobs_per_batch: 64,
-                            };
-                            let stats = convert_sra_to_vortex(sra_path, &out_path, &config)?;
-                            (
-                                stats.input_bytes,
-                                stats.output_bytes,
-                                stats.spots,
-                                stats.reads,
-                                format!("{:?}", stats.length_mode),
-                                format!("{:?}", stats.dna_packing),
-                            )
-                        }
-                    };
-
-                let ratio = if input_bytes > 0 {
-                    output_bytes as f64 / input_bytes as f64 * 100.0
-                } else {
-                    0.0
-                };
-                eprintln!(
-                    "{}: {} spots, {} reads, {} -> {} ({:.1}% of input)",
-                    style::header(stem),
-                    style::count(spots),
-                    style::count(reads),
-                    format_size(input_bytes),
-                    format_size(output_bytes),
-                    ratio,
-                );
-                match args.format {
-                    cli::ConvertFormat::Parquet => eprintln!(
-                        "  length_mode={}, dna_packing={}, compression={:?}",
-                        length_mode, dna_packing, compression
-                    ),
-                    cli::ConvertFormat::Vortex => eprintln!(
-                        "  length_mode={}, dna_packing={} (vortex picks its own encoding)",
-                        length_mode, dna_packing
-                    ),
-                }
-                eprintln!("  -> {}", style::path(out_path.display()));
-            }
-
-            Ok(())
-        }
+        #[cfg(any(feature = "parquet", feature = "vortex"))]
+        Command::Convert(args) => run_convert(args),
         Command::Get(args) => {
             let split_mode =
                 cli::resolve_split_mode(args.split, args.stdout).map_err(|e| anyhow::anyhow!(e))?;
@@ -1187,6 +1071,121 @@ fn available_space(path: &Path) -> Option<u64> {
 #[cfg(not(unix))]
 fn available_space(_path: &Path) -> Option<u64> {
     None
+}
+
+#[cfg(any(feature = "parquet", feature = "vortex"))]
+fn run_convert(args: cli::ConvertArgs) -> Result<()> {
+    std::fs::create_dir_all(&args.output_dir)?;
+
+    for input in &args.inputs {
+        let sra_path = Path::new(input);
+        if !sra_path.exists() {
+            eprintln!(
+                "{} file not found: {}",
+                style::error_label("error:"),
+                style::path(input)
+            );
+            continue;
+        }
+
+        let stem = sra_path
+            .file_stem()
+            .and_then(|s| s.to_str())
+            .unwrap_or("output");
+        let out_path = args.output_dir.join(format!("{stem}.{}", args.format));
+        if out_path.exists() && !args.force {
+            eprintln!(
+                "{} {} already exists (use --force to overwrite)",
+                style::error_label("error:"),
+                style::path(out_path.display())
+            );
+            continue;
+        }
+
+        // Resolve pack_dna with a format-specific default when the user
+        // didn't override it: two-na for Parquet (pre-packing wins on
+        // zstd'd bytes), ascii for Vortex (the 0.68 compressor skips
+        // Binary, so 2na/4na writes uncompressed).
+        let pack_dna: cli::PackDna = args.pack_dna.unwrap_or(match args.format {
+            #[cfg(feature = "parquet")]
+            cli::ConvertFormat::Parquet => cli::PackDna::TwoNa,
+            #[cfg(feature = "vortex")]
+            cli::ConvertFormat::Vortex => cli::PackDna::Ascii,
+        });
+
+        let (input_bytes, output_bytes, spots, reads, length_mode, dna_packing, extras) =
+            match args.format {
+                #[cfg(feature = "parquet")]
+                cli::ConvertFormat::Parquet => {
+                    use sracha_core::parquet::{
+                        ConvertConfig, ParquetCompression, convert_sra_to_parquet,
+                    };
+                    let compression = match args.compression {
+                        cli::ParquetCodec::None => ParquetCompression::None,
+                        cli::ParquetCodec::Snappy => ParquetCompression::Snappy,
+                        cli::ParquetCodec::Zstd => ParquetCompression::Zstd(args.zstd_level),
+                    };
+                    let config = ConvertConfig {
+                        compression,
+                        pack_dna: pack_dna.into(),
+                        row_group_mib: args.row_group_mib,
+                        length_mode: args.length_mode.into(),
+                        blobs_per_batch: 64,
+                    };
+                    let stats = convert_sra_to_parquet(sra_path, &out_path, &config)?;
+                    (
+                        stats.input_bytes,
+                        stats.output_bytes,
+                        stats.spots,
+                        stats.reads,
+                        format!("{:?}", stats.length_mode),
+                        format!("{:?}", stats.dna_packing),
+                        format!(", compression={compression:?}"),
+                    )
+                }
+                #[cfg(feature = "vortex")]
+                cli::ConvertFormat::Vortex => {
+                    use sracha_core::vortex::{VortexConvertConfig, convert_sra_to_vortex};
+                    let config = VortexConvertConfig {
+                        pack_dna: pack_dna.into(),
+                        length_mode: args.length_mode.into(),
+                        blobs_per_batch: 64,
+                    };
+                    let stats = convert_sra_to_vortex(sra_path, &out_path, &config)?;
+                    (
+                        stats.input_bytes,
+                        stats.output_bytes,
+                        stats.spots,
+                        stats.reads,
+                        format!("{:?}", stats.length_mode),
+                        format!("{:?}", stats.dna_packing),
+                        " (vortex picks its own encoding)".to_string(),
+                    )
+                }
+            };
+
+        let ratio = if input_bytes > 0 {
+            output_bytes as f64 / input_bytes as f64 * 100.0
+        } else {
+            0.0
+        };
+        eprintln!(
+            "{}: {} spots, {} reads, {} -> {} ({:.1}% of input)",
+            style::header(stem),
+            style::count(spots),
+            style::count(reads),
+            format_size(input_bytes),
+            format_size(output_bytes),
+            ratio,
+        );
+        eprintln!(
+            "  length_mode={}, dna_packing={}{}",
+            length_mode, dna_packing, extras
+        );
+        eprintln!("  -> {}", style::path(out_path.display()));
+    }
+
+    Ok(())
 }
 
 #[cfg(test)]

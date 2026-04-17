@@ -66,7 +66,9 @@ pub enum Command {
     /// Convert SRA file(s) to FASTQ
     Fastq(FastqArgs),
 
-    /// Convert SRA file(s) to Parquet (experimental, storage benchmarking)
+    /// Convert SRA file(s) to Parquet or Vortex (experimental,
+    /// storage benchmarking)
+    #[cfg(any(feature = "parquet", feature = "vortex"))]
     Convert(ConvertArgs),
 
     /// Show accession metadata
@@ -76,6 +78,7 @@ pub enum Command {
     Validate(ValidateArgs),
 }
 
+#[cfg(any(feature = "parquet", feature = "vortex"))]
 #[derive(Args)]
 pub struct ConvertArgs {
     /// SRA file path(s) (.sra files from `sracha fetch`)
@@ -92,7 +95,7 @@ pub struct ConvertArgs {
 
     /// Output format. Parquet writes `.parquet` with user-selectable compression;
     /// Vortex writes `.vortex` with its own encoding cascade (Vortex picks).
-    #[arg(long, default_value = "parquet", help_heading = "Output")]
+    #[arg(long, default_value_t = ConvertFormat::default(), help_heading = "Output")]
     pub format: ConvertFormat,
 
     /// DNA encoding for the `sequence` column.
@@ -110,10 +113,12 @@ pub struct ConvertArgs {
     pub length_mode: LengthMode,
 
     /// Page-level compression codec (parquet only; ignored for vortex)
+    #[cfg(feature = "parquet")]
     #[arg(long, default_value = "zstd", help_heading = "Compression")]
     pub compression: ParquetCodec,
 
     /// Zstd compression level (1-22), only when `--compression zstd` (parquet only)
+    #[cfg(feature = "parquet")]
     #[arg(
         long,
         value_parser = clap::value_parser!(i32).range(1..=22),
@@ -123,18 +128,52 @@ pub struct ConvertArgs {
     pub zstd_level: i32,
 
     /// Target row-group size in MiB (parquet only)
+    #[cfg(feature = "parquet")]
     #[arg(long, default_value_t = 256, help_heading = "Advanced")]
     pub row_group_mib: usize,
 }
 
+#[cfg(any(feature = "parquet", feature = "vortex"))]
 #[derive(Clone, Copy, ValueEnum)]
 pub enum ConvertFormat {
     /// Apache Parquet (`.parquet`) — user-selectable compression.
+    #[cfg(feature = "parquet")]
     Parquet,
     /// Vortex (`.vortex`) — SpiralDB columnar, encoding cascade picked automatically.
+    #[cfg(feature = "vortex")]
     Vortex,
 }
 
+#[cfg(any(feature = "parquet", feature = "vortex"))]
+impl ConvertFormat {
+    /// Default-feature-aware default: prefer parquet when both are enabled
+    /// (matches the historical `default_value = "parquet"`), else fall
+    /// back to whichever format is compiled in.
+    pub fn default() -> Self {
+        #[cfg(feature = "parquet")]
+        {
+            Self::Parquet
+        }
+        #[cfg(all(not(feature = "parquet"), feature = "vortex"))]
+        {
+            Self::Vortex
+        }
+    }
+}
+
+#[cfg(any(feature = "parquet", feature = "vortex"))]
+impl std::fmt::Display for ConvertFormat {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            #[cfg(feature = "parquet")]
+            Self::Parquet => "parquet",
+            #[cfg(feature = "vortex")]
+            Self::Vortex => "vortex",
+        })
+    }
+}
+
+#[cfg(any(feature = "parquet", feature = "vortex"))]
 #[derive(Clone, Copy, ValueEnum)]
 pub enum PackDna {
     /// One byte per base (A/C/G/T/N/IUPAC)
@@ -147,7 +186,8 @@ pub enum PackDna {
     FourNa,
 }
 
-impl From<PackDna> for sracha_core::parquet::DnaPacking {
+#[cfg(any(feature = "parquet", feature = "vortex"))]
+impl From<PackDna> for sracha_core::convert::schema::DnaPacking {
     fn from(p: PackDna) -> Self {
         match p {
             PackDna::Ascii => Self::Ascii,
@@ -157,6 +197,7 @@ impl From<PackDna> for sracha_core::parquet::DnaPacking {
     }
 }
 
+#[cfg(any(feature = "parquet", feature = "vortex"))]
 #[derive(Clone, Copy, ValueEnum)]
 pub enum LengthMode {
     /// Detect from data: fixed if all reads share a length, else variable
@@ -167,7 +208,8 @@ pub enum LengthMode {
     Variable,
 }
 
-impl From<LengthMode> for sracha_core::parquet::writer::LengthModeChoice {
+#[cfg(any(feature = "parquet", feature = "vortex"))]
+impl From<LengthMode> for sracha_core::convert::schema::LengthModeChoice {
     fn from(m: LengthMode) -> Self {
         match m {
             LengthMode::Auto => Self::Auto,
@@ -177,6 +219,7 @@ impl From<LengthMode> for sracha_core::parquet::writer::LengthModeChoice {
     }
 }
 
+#[cfg(feature = "parquet")]
 #[derive(Clone, Copy, ValueEnum)]
 pub enum ParquetCodec {
     None,

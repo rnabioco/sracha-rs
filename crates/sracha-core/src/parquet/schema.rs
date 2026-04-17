@@ -1,5 +1,9 @@
 //! Arrow schema construction for SRA → Parquet output.
 //!
+//! The choice of DNA packing and length mode lives in
+//! [`crate::convert::schema`]; this module maps those choices to an actual
+//! Arrow `Schema` that Parquet's `ArrowWriter` understands.
+//!
 //! Two schema variants are supported, chosen at runtime from the data:
 //!
 //! * [`LengthMode::Fixed`] — every read in the run has the same length, so
@@ -12,38 +16,7 @@ use std::sync::Arc;
 
 use arrow::datatypes::{DataType, Field, Schema, SchemaRef};
 
-/// How DNA bases are stored in the `sequence` column.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum DnaPacking {
-    /// One byte per base (`A`, `C`, `G`, `T`, `N`, IUPAC).
-    Ascii,
-    /// 2 bits per base (4 bases per byte). Lossy for non-ACGT — caller must
-    /// verify with [`super::encoding::is_pure_acgt`] before choosing this.
-    TwoNa,
-    /// 4 bits per base (2 bases per byte). Preserves IUPAC ambiguity codes.
-    FourNa,
-}
-
-impl DnaPacking {
-    /// Bytes required to encode `n_bases` bases under this packing.
-    pub fn packed_len(self, n_bases: u32) -> u32 {
-        match self {
-            DnaPacking::Ascii => n_bases,
-            DnaPacking::TwoNa => n_bases.div_ceil(4),
-            DnaPacking::FourNa => n_bases.div_ceil(2),
-        }
-    }
-}
-
-/// Whether read lengths are uniform across the run.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum LengthMode {
-    /// All reads have the same length. Allows `FIXED_LEN_BYTE_ARRAY`.
-    Fixed { read_len: u32 },
-    /// Read lengths vary; use variable-length `BYTE_ARRAY` and emit a
-    /// per-row `read_len` column.
-    Variable,
-}
+use crate::convert::schema::{DnaPacking, LengthMode};
 
 /// Build the per-read Arrow schema for the chosen length mode and DNA packing.
 ///
@@ -111,7 +84,6 @@ mod tests {
     fn fixed_2na_uses_packed_width() {
         let schema = build_per_read_schema(LengthMode::Fixed { read_len: 150 }, DnaPacking::TwoNa);
         let seq_field = schema.field_with_name("sequence").unwrap();
-        // 150 bases / 4 = 38 bytes (rounded up).
         assert!(matches!(
             seq_field.data_type(),
             DataType::FixedSizeBinary(38)
@@ -136,16 +108,5 @@ mod tests {
             qual_field.data_type(),
             DataType::FixedSizeBinary(75)
         ));
-    }
-
-    #[test]
-    fn packed_len_rounds_up() {
-        assert_eq!(DnaPacking::Ascii.packed_len(150), 150);
-        assert_eq!(DnaPacking::TwoNa.packed_len(150), 38); // 150/4 = 37.5 → 38
-        assert_eq!(DnaPacking::TwoNa.packed_len(151), 38);
-        assert_eq!(DnaPacking::TwoNa.packed_len(152), 38);
-        assert_eq!(DnaPacking::TwoNa.packed_len(153), 39);
-        assert_eq!(DnaPacking::FourNa.packed_len(150), 75);
-        assert_eq!(DnaPacking::FourNa.packed_len(151), 76);
     }
 }

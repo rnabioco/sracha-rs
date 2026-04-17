@@ -2,7 +2,7 @@
 //!
 //! Vortex-first: builds native Vortex arrays directly from decoded VDB blobs
 //! (see `crate::vortex::builder::VortexRowBuilder`), no Arrow `RecordBatch`
-//! intermediate. The per-blob decode is reused from `crate::parquet::writer`.
+//! intermediate. The per-blob decode is reused from `crate::convert::decode`.
 //!
 //! v1 scope: bulk columns only (READ, QUALITY, READ_LEN, NAME). The
 //! fasterq-dump-equivalent edge cases (ALTREAD ambiguity merge, Illumina name
@@ -36,9 +36,9 @@ use vortex::session::VortexSession;
 use vortex_btrblocks::SchemeExt;
 use vortex_btrblocks::schemes::integer::IntDictScheme;
 
+use crate::convert::decode::{DecodedBlob, decode_one_blob, resolve_length_mode};
+use crate::convert::schema::{DnaPacking, LengthMode, LengthModeChoice};
 use crate::error::{Error, Result};
-use crate::parquet::schema::{DnaPacking, LengthMode};
-use crate::parquet::writer::{DecodedBlob, LengthModeChoice, decode_one_blob, resolve_length_mode};
 use crate::vdb::cursor::VdbCursor;
 use crate::vdb::kar::KarArchive;
 use crate::vortex::builder::VortexRowBuilder;

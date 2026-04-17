@@ -1,12 +1,15 @@
 pub mod accession;
 pub mod compress;
+pub mod convert;
 pub mod download;
 pub mod error;
 pub mod fastq;
+#[cfg(feature = "parquet")]
 pub mod parquet;
 pub mod pipeline;
 pub mod s3;
 pub mod sdl;
 pub mod util;
 pub mod vdb;
+#[cfg(feature = "vortex")]
 pub mod vortex;

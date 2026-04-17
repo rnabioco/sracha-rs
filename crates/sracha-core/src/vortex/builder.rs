@@ -28,9 +28,9 @@ use vortex::array::builders::{ArrayBuilder, PrimitiveBuilder, VarBinViewBuilder}
 use vortex::array::{ArrayRef, IntoArray};
 use vortex::dtype::{DType, Nullability};
 
+use crate::convert::decode::pack_sequence;
+use crate::convert::schema::DnaPacking;
 use crate::error::{Error, Result};
-use crate::parquet::schema::DnaPacking;
-use crate::parquet::writer::pack_sequence;
 
 pub(crate) struct VortexRowBuilder {
     spot_id: PrimitiveBuilder<u64>,

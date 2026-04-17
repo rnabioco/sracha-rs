@@ -11,6 +11,11 @@ description = "Fast SRA downloader and FASTQ converter"
 name = "sracha"
 path = "src/main.rs"
 
+[features]
+default = ["parquet", "vortex"]
+parquet = ["sracha-core/parquet"]
+vortex = ["sracha-core/vortex"]
+
 [dependencies]
 sracha-core.workspace = true
 chrono.workspace = true

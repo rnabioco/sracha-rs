@@ -7,6 +7,13 @@ license.workspace = true
 repository.workspace = true
 description = "Core library for sracha SRA tools"
 
+[features]
+default = ["parquet", "vortex"]
+# Enable SRA -> Parquet conversion (pulls arrow + parquet crates).
+parquet = ["dep:arrow", "dep:parquet"]
+# Enable SRA -> Vortex conversion (pulls vortex + vortex-btrblocks + futures).
+vortex = ["dep:vortex", "dep:vortex-btrblocks", "dep:futures"]
+
 [dependencies]
 tokio.workspace = true
 reqwest.workspace = true
@@ -30,11 +37,13 @@ url.workspace = true
 tempfile.workspace = true
 bytes.workspace = true
 tracing.workspace = true
-arrow.workspace = true
-parquet.workspace = true
-vortex.workspace = true
-vortex-btrblocks.workspace = true
-futures.workspace = true
+# Optional — gated behind `parquet` feature.
+arrow = { workspace = true, optional = true }
+parquet = { workspace = true, optional = true }
+# Optional — gated behind `vortex` feature.
+vortex = { workspace = true, optional = true }
+vortex-btrblocks = { workspace = true, optional = true }
+futures = { workspace = true, optional = true }
 
 [dev-dependencies]
 reqwest = { workspace = true, features = ["blocking"] }
