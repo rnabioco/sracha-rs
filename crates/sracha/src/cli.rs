@@ -95,9 +95,15 @@ pub struct ConvertArgs {
     #[arg(long, default_value = "parquet", help_heading = "Output")]
     pub format: ConvertFormat,
 
-    /// DNA encoding for the `sequence` column
-    #[arg(long, default_value = "two-na", help_heading = "Encoding")]
-    pub pack_dna: PackDna,
+    /// DNA encoding for the `sequence` column.
+    ///
+    /// Default depends on `--format`: `two-na` for parquet, `ascii` for vortex.
+    /// Vortex defaults to `ascii` because the Vortex 0.68 compressor skips
+    /// every scheme for `Binary`-typed columns, so 2na/4na-packed sequence is
+    /// written uncompressed; `ascii` lets BtrBlocks' FSST cascade fire on the
+    /// 4-letter alphabet.
+    #[arg(long, help_heading = "Encoding")]
+    pub pack_dna: Option<PackDna>,
 
     /// Read-length mode for the schema
     #[arg(long, default_value = "auto", help_heading = "Encoding")]

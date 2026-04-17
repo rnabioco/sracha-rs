@@ -253,12 +253,21 @@ async fn main() -> Result<()> {
                     continue;
                 }
 
+                // Resolve pack_dna with a format-specific default when the
+                // user didn't override it: two-na for Parquet (pre-packing
+                // wins on zstd'd bytes), ascii for Vortex (the 0.68
+                // compressor skips Binary, so 2na/4na writes uncompressed).
+                let pack_dna: cli::PackDna = args.pack_dna.unwrap_or(match args.format {
+                    cli::ConvertFormat::Parquet => cli::PackDna::TwoNa,
+                    cli::ConvertFormat::Vortex => cli::PackDna::Ascii,
+                });
+
                 let (input_bytes, output_bytes, spots, reads, length_mode, dna_packing) =
                     match args.format {
                         cli::ConvertFormat::Parquet => {
                             let config = ConvertConfig {
                                 compression,
-                                pack_dna: args.pack_dna.into(),
+                                pack_dna: pack_dna.into(),
                                 row_group_mib: args.row_group_mib,
                                 length_mode: args.length_mode.into(),
                                 blobs_per_batch: 64,
@@ -275,7 +284,7 @@ async fn main() -> Result<()> {
                         }
                         cli::ConvertFormat::Vortex => {
                             let config = VortexConvertConfig {
-                                pack_dna: args.pack_dna.into(),
+                                pack_dna: pack_dna.into(),
                                 length_mode: args.length_mode.into(),
                                 blobs_per_batch: 64,
                             };
