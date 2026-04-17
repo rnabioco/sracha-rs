@@ -11,6 +11,17 @@ site_dir = "site"
 
 [project.theme]
 name = "material"
+features = [
+    "content.code.copy",
+    "content.code.annotate",
+    "navigation.instant",
+    "navigation.instant.prefetch",
+    "navigation.sections",
+    "navigation.footer",
+    "navigation.top",
+    "search.highlight",
+    "search.suggest",
+]
 
 [[project.theme.palette]]
 scheme = "default"
@@ -24,19 +35,6 @@ primary = "deep orange"
 accent = "amber"
 toggle = { icon = "lucide/sun", name = "Switch to light mode" }
 
-[project.theme.features]
-values = [
-    "content.code.copy",
-    "content.code.annotate",
-    "navigation.instant",
-    "navigation.instant.prefetch",
-    "navigation.sections",
-    "navigation.footer",
-    "navigation.top",
-    "search.highlight",
-    "search.suggest",
-]
-
 [project.markdown_extensions]
 admonition = {}
 attr_list = {}
@@ -49,6 +47,7 @@ tables = {}
 [project.markdown_extensions.pymdownx.highlight]
 anchor_linenums = true
 line_spans = "__span"
+linenums = true
 pygments_lang_class = true
 
 [project.markdown_extensions.pymdownx.inlinehilite]
