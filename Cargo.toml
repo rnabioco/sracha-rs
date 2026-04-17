@@ -55,7 +55,7 @@ parquet = { version = "58", default-features = false, features = ["arrow", "zstd
 
 # Columnar / Vortex
 vortex = { version = "0.68", features = ["files", "tokio"] }
-vortex-btrblocks = "0.68"
+vortex-btrblocks = { version = "0.68", features = ["pco"] }
 futures = "0.3"
 
 # Utils
