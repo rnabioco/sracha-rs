@@ -30,6 +30,13 @@ use crate::vdb::cursor::VdbCursor;
 use crate::vdb::kar::KarArchive;
 use crate::vortex::builder::VortexRowBuilder;
 
+/// Row block size for Vortex writes. Each block becomes a BtrBlocks
+/// compression zone — one FSST dictionary, one zstd window, etc. The default
+/// (`8 KiB`) is tuned for random-access datasets; for sequencing data we want
+/// large training windows so a single dictionary/window amortises across many
+/// similar reads.
+const ROW_BLOCK_SIZE: usize = 262_144;
+
 // ---------------------------------------------------------------------------
 // Public configuration
 // ---------------------------------------------------------------------------
@@ -263,9 +270,14 @@ fn write_struct_array(output_path: &Path, array: ArrayRef) -> Result<()> {
             // FSST runs first, but Zstd can now cascade over FSST output or
             // win outright on compressible strings. Biggest win is on
             // quality columns (high local repetition, small alphabet).
+            //
+            // `ROW_BLOCK_SIZE` (256 K) lets FSST train one dictionary across
+            // many rows per zone, instead of the 8 K default — large
+            // dictionaries amortise better on repetitive bio data.
             let btrblocks = BtrBlocksCompressorBuilder::default().with_compact();
             let strategy = WriteStrategyBuilder::default()
                 .with_btrblocks_builder(btrblocks)
+                .with_row_block_size(ROW_BLOCK_SIZE)
                 .build();
             let mut file = tokio::fs::File::create(&output_path)
                 .await
