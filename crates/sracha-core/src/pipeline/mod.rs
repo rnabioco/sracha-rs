@@ -21,8 +21,8 @@ use crate::compress::{DEFAULT_BLOCK_SIZE, ParGzWriter};
 use crate::download::{DownloadConfig, download_file};
 use crate::error::{Error, Result};
 use crate::fastq::{
-    CompressionMode, FastqConfig, FastqRecord, OutputSlot, SplitMode, format_fasta_read,
-    format_read, output_filename,
+    CompressionMode, FastqConfig, FastqRecord, IntegrityDiag, OutputSlot, SplitMode,
+    format_fasta_read, format_read_with_diag, output_filename,
 };
 use crate::sdl::ResolvedAccession;
 use crate::vdb::blob;
@@ -65,6 +65,10 @@ pub struct PipelineConfig {
     pub stdout: bool,
     /// Flag for graceful cancellation (e.g. Ctrl-C).
     pub cancelled: Option<Arc<AtomicBool>>,
+    /// Strict integrity mode: abort with [`Error::IntegrityFailure`] if any
+    /// quality-length / mate-pair / blob-truncation counter is non-zero at
+    /// the end of decode, instead of merely reporting the counts.
+    pub strict: bool,
 }
 
 // ---------------------------------------------------------------------------
@@ -85,6 +89,9 @@ pub struct PipelineStats {
     pub total_sra_size: u64,
     /// Paths of all output files created.
     pub output_files: Vec<PathBuf>,
+    /// Data-integrity counters captured during decode. Inspect these (or
+    /// run with `--strict`) to detect silent corruption.
+    pub integrity: Arc<IntegrityDiag>,
 }
 
 // ---------------------------------------------------------------------------
@@ -128,6 +135,135 @@ fn compression_key(c: &crate::fastq::CompressionMode) -> String {
             format!("zstd:{level}:{threads}")
         }
     }
+}
+
+/// Path of the shared JSONL stats log (one line per accession).
+///
+/// Using a single append-only file scales to BioProject-sized runs: 200
+/// accessions produce 200 lines, not 200 files. Users can `jq '.integrity
+/// | select(.ok == false)'` to pull just the failures.
+fn stats_path(output_dir: &Path) -> PathBuf {
+    output_dir.join("sracha-stats.jsonl")
+}
+
+/// Inputs for a single `sracha-stats.jsonl` line.
+struct StatsEntry<'a> {
+    output_dir: &'a Path,
+    accession: &'a str,
+    spots_read: u64,
+    reads_written: u64,
+    sra_md5: Option<&'a str>,
+    sra_size: u64,
+    output_files: &'a [PathBuf],
+    diag: &'a IntegrityDiag,
+}
+
+/// Append an integrity summary line to the shared stats JSONL. We record
+/// every accession — passing and failing — so the file doubles as an audit
+/// log that a run happened and which inputs produced which outputs.
+fn write_stats_file(entry: StatsEntry<'_>) -> Result<()> {
+    let StatsEntry {
+        output_dir,
+        accession,
+        spots_read,
+        reads_written,
+        sra_md5,
+        sra_size,
+        output_files,
+        diag,
+    } = entry;
+    use std::io::Write as _;
+    use std::sync::atomic::Ordering;
+    let files: Vec<serde_json::Value> = output_files
+        .iter()
+        .filter_map(|p| {
+            let name = p.file_name()?.to_str()?.to_string();
+            let size = std::fs::metadata(p).ok()?.len();
+            Some(serde_json::json!({ "name": name, "bytes": size }))
+        })
+        .collect();
+    let payload = serde_json::json!({
+        "timestamp": iso8601_now_utc(),
+        "accession": accession,
+        "spots_read": spots_read,
+        "reads_written": reads_written,
+        "sra_md5": sra_md5,
+        "sra_size": sra_size,
+        "output_files": files,
+        "integrity": {
+            "ok": !diag.any(),
+            "quality_length_mismatches": diag.quality_length_mismatches.load(Ordering::Relaxed),
+            "quality_invalid_bytes": diag.quality_invalid_bytes.load(Ordering::Relaxed),
+            "quality_overruns": diag.quality_overruns.load(Ordering::Relaxed),
+            "all_zero_quality_blobs": diag.all_zero_quality_blobs.load(Ordering::Relaxed),
+            "paired_spot_violations": diag.paired_spot_violations.load(Ordering::Relaxed),
+            "truncated_spots": diag.truncated_spots.load(Ordering::Relaxed),
+        },
+    });
+    let line = serde_json::to_string(&payload).map_err(|e| Error::Io(std::io::Error::other(e)))?;
+    let path = stats_path(output_dir);
+    let mut file = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&path)?;
+    writeln!(file, "{line}")?;
+    Ok(())
+}
+
+/// RFC3339 UTC timestamp for audit-log entries. Avoids pulling a dedicated
+/// date-time crate just for this one line.
+fn iso8601_now_utc() -> String {
+    use std::time::{SystemTime, UNIX_EPOCH};
+    let dur = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default();
+    let secs = dur.as_secs() as i64;
+    let days = secs.div_euclid(86_400);
+    let time_of_day = secs.rem_euclid(86_400);
+    let mut y = 1970i64;
+    let mut d = days;
+    loop {
+        let leap = (y % 4 == 0 && y % 100 != 0) || (y % 400 == 0);
+        let yd = if leap { 366 } else { 365 };
+        if d < yd {
+            break;
+        }
+        d -= yd;
+        y += 1;
+    }
+    let leap = (y % 4 == 0 && y % 100 != 0) || (y % 400 == 0);
+    let mdays: [i64; 12] = [
+        31,
+        if leap { 29 } else { 28 },
+        31,
+        30,
+        31,
+        30,
+        31,
+        31,
+        30,
+        31,
+        30,
+        31,
+    ];
+    let mut m = 0usize;
+    while m < 12 && d >= mdays[m] {
+        d -= mdays[m];
+        m += 1;
+    }
+    let day = d + 1;
+    let hour = time_of_day / 3600;
+    let minute = (time_of_day % 3600) / 60;
+    let second = time_of_day % 60;
+    format!(
+        "{:04}-{:02}-{:02}T{:02}:{:02}:{:02}Z",
+        y,
+        m + 1,
+        day,
+        hour,
+        minute,
+        second,
+    )
 }
 
 fn write_completion_marker(
@@ -394,32 +530,23 @@ fn select_mirror(resolved: &ResolvedAccession) -> Result<String> {
 // Phase 2: Parse VDB + output FASTQ
 // ---------------------------------------------------------------------------
 
-/// Decode a raw blob, stripping envelope/headers/page_map.
+/// Decode a raw blob, validating the trailing CRC32/MD5 checksum and
+/// stripping envelope/headers/page_map.
 ///
-/// The blob locator `size` field includes trailing checksum bytes, so we
-/// strip them here before handing the data to [`blob::decode_blob`].
-/// Checksum validation is not performed because the stored CRC covers only
-/// a portion of the blob that doesn't align with the full raw slice.
+/// The blob locator `size` field includes trailing checksum bytes, which
+/// [`blob::decode_blob`] checks against the on-disk data before returning.
+/// A mismatch indicates a corrupt download or truncated blob and surfaces as
+/// [`Error::Vdb`] so callers can abort rather than produce wrong reads.
 fn decode_raw<'a>(
     raw: &'a [u8],
     checksum_type: u8,
     row_count: u64,
 ) -> Result<blob::DecodedBlob<'a>> {
-    let cs_size: usize = match checksum_type {
-        1 => 4,  // CRC32
-        2 => 16, // MD5
-        _ => 0,
-    };
-    let effective = if raw.len() > cs_size {
-        &raw[..raw.len() - cs_size]
-    } else {
-        raw
-    };
-    blob::decode_blob(effective, 0, row_count, 8)
+    blob::decode_blob(raw, checksum_type, row_count, 8)
 }
 
 /// Decode irzip-compressed integers from a blob, detecting single vs dual series.
-fn decode_irzip_column(decoded: &blob::DecodedBlob<'_>) -> Vec<u8> {
+fn decode_irzip_column(decoded: &blob::DecodedBlob<'_>) -> Result<Vec<u8>> {
     let hdr_version = decoded.headers.first().map(|h| h.version).unwrap_or(0);
     let decoded_ints = if hdr_version >= 1 {
         let hdr = &decoded.headers[0];
@@ -432,13 +559,12 @@ fn decode_irzip_column(decoded: &blob::DecodedBlob<'_>) -> Vec<u8> {
             .args
             .get(2)
             .and_then(|&min2| hdr.args.get(3).map(|&slope2| (min2, slope2)));
-        blob::irzip_decode(&decoded.data, 32, num_elems, min, slope, planes, series2)
-            .unwrap_or_default()
+        blob::irzip_decode(&decoded.data, 32, num_elems, min, slope, planes, series2)?
     } else {
         let num_elems = decoded
             .row_length
             .unwrap_or_else(|| (decoded.data.len() as u64 * 8) / 32) as u32;
-        blob::izip_decode(&decoded.data, 32, num_elems).unwrap_or_default()
+        blob::izip_decode(&decoded.data, 32, num_elems)?
     };
     expand_via_page_map(decoded_ints, &decoded.page_map)
 }
@@ -446,52 +572,63 @@ fn decode_irzip_column(decoded: &blob::DecodedBlob<'_>) -> Vec<u8> {
 /// Expand decoded integer data via a page map's data_runs, if present.
 /// For columns like X, Y, and READ_LEN, the irzip/izip decoder produces
 /// unique data entries, and the page map maps each row to its data entry.
-fn expand_via_page_map(decoded_ints: Vec<u8>, page_map: &Option<blob::PageMap>) -> Vec<u8> {
-    if let Some(pm) = page_map {
-        let elem_bytes = 4usize; // u32
-        let row_length = pm.lengths.first().copied().unwrap_or(1) as usize;
-        let entry_bytes = row_length * elem_bytes;
+fn expand_via_page_map(decoded_ints: Vec<u8>, page_map: &Option<blob::PageMap>) -> Result<Vec<u8>> {
+    let Some(pm) = page_map else {
+        return Ok(decoded_ints);
+    };
+    let elem_bytes = 4usize; // u32
+    let row_length = pm.lengths.first().copied().unwrap_or(1) as usize;
+    let entry_bytes = row_length * elem_bytes;
 
-        if !pm.data_runs.is_empty() && pm.data_runs.len() as u64 >= pm.total_rows() {
-            let mut expanded = Vec::with_capacity(pm.data_runs.len() * entry_bytes);
-            for &offset in &pm.data_runs {
-                let start = offset as usize * entry_bytes;
-                let end = start + entry_bytes;
-                if end <= decoded_ints.len() {
-                    expanded.extend_from_slice(&decoded_ints[start..end]);
-                }
+    if !pm.data_runs.is_empty() && pm.data_runs.len() as u64 >= pm.total_rows() {
+        // Random-access variant: data_runs is repurposed as offsets into
+        // the unique decoded entries. A missing/oversized offset means the
+        // page map disagrees with the decoded column — refuse to silently
+        // drop those rows.
+        let mut expanded = Vec::with_capacity(pm.data_runs.len() * entry_bytes);
+        for &offset in &pm.data_runs {
+            let start = offset as usize * entry_bytes;
+            let end = start + entry_bytes;
+            if end > decoded_ints.len() {
+                return Err(Error::Vdb(format!(
+                    "page_map: offset {offset} × {entry_bytes} out of {} decoded bytes",
+                    decoded_ints.len(),
+                )));
             }
-            expanded
-        } else if !pm.data_runs.is_empty() {
-            pm.expand_data_runs_bytes(&decoded_ints, elem_bytes)
-        } else {
-            decoded_ints
+            expanded.extend_from_slice(&decoded_ints[start..end]);
         }
+        Ok(expanded)
+    } else if !pm.data_runs.is_empty() {
+        pm.expand_data_runs_bytes(&decoded_ints, elem_bytes)
     } else {
-        decoded_ints
+        Ok(decoded_ints)
     }
 }
 
 /// Decode a zip_encoding data section: the blob header tells us the
 /// version. Version 1 = raw deflate, byte-aligned output. Version 2 =
 /// raw deflate with trailing-bits argument. No headers (v1 blob) = the
-/// data is already the raw-deflate stream.
+/// data is already the raw-deflate stream or uncompressed.
 ///
-/// Returns decompressed bytes, or falls back to raw bytes on failure.
-fn decode_zip_encoding(decoded: &blob::DecodedBlob<'_>) -> Vec<u8> {
+/// When a compression header is present (hdr_version >= 1), both deflate and
+/// zlib failing is treated as an error — silently returning the still-
+/// compressed bytes would produce corrupt downstream output. For v0 blobs
+/// (no headers), the raw-bytes fallback remains, since those are often
+/// already-uncompressed payloads.
+fn decode_zip_encoding(decoded: &blob::DecodedBlob<'_>) -> Result<Vec<u8>> {
     let hdr_version = decoded.headers.first().map(|h| h.version).unwrap_or(0);
 
     if decoded.data.is_empty() {
-        return Vec::new();
+        return Ok(Vec::new());
     }
 
-    // Estimate output size from header osize, or 4x input as heuristic.
-    let estimated = decoded
+    let osize = decoded
         .headers
         .first()
         .map(|h| h.osize as usize)
-        .filter(|&s| s > 0)
-        .unwrap_or(decoded.data.len() * 4);
+        .filter(|&s| s > 0);
+    // Estimate output size from header osize, or 4x input as heuristic.
+    let estimated = osize.unwrap_or(decoded.data.len() * 4);
 
     // Try raw deflate via libdeflate.
     if let Ok(mut out) = blob::deflate_decompress(&decoded.data, estimated)
@@ -506,18 +643,34 @@ fn decode_zip_encoding(decoded: &blob::DecodedBlob<'_>) -> Vec<u8> {
             let actual_bytes = ((actual_bits + 7) / 8) as usize;
             out.truncate(actual_bytes);
         }
-        return out;
+        if let Some(expected) = osize
+            && out.len() != expected
+        {
+            tracing::debug!(
+                "zip_encoding: decompressed {} bytes, header osize={}",
+                out.len(),
+                expected,
+            );
+        }
+        return Ok(out);
     }
 
     // Fallback: try zlib (with header).
     if let Ok(out2) = blob::zlib_decompress(&decoded.data, estimated)
         && !out2.is_empty()
     {
-        return out2;
+        return Ok(out2);
     }
 
-    // Last resort: return raw bytes (might already be uncompressed).
-    decoded.data.to_vec()
+    if hdr_version >= 1 {
+        return Err(Error::Vdb(format!(
+            "zip_encoding v{hdr_version}: both deflate and zlib failed on {}-byte payload",
+            decoded.data.len(),
+        )));
+    }
+
+    // v0 (no transform header): payload is often raw bytes already.
+    Ok(decoded.data.to_vec())
 }
 
 // ---------------------------------------------------------------------------
@@ -600,15 +753,30 @@ struct RawBlobData<'a> {
 /// only on borrowed data (Send-safe for rayon).
 ///
 /// Returns `(records, num_spots)`.
+/// Per-call immutable context shared across every blob decode of a run.
+/// Replaces the prior 8-argument `decode_blob_to_fastq` signature with a
+/// single `ctx` reference plus per-blob position.
+struct BlobDecodeCtx<'a> {
+    run_name: &'a str,
+    config: &'a FastqConfig,
+    diag: &'a IntegrityDiag,
+    is_lite: bool,
+    read_cs: u8,
+}
+
 fn decode_blob_to_fastq(
     raw: &RawBlobData<'_>,
-    read_cs: u8,
-    is_lite: bool,
+    ctx: &BlobDecodeCtx<'_>,
     blob_idx: usize,
     spots_before: u64,
-    run_name: &str,
-    config: &FastqConfig,
 ) -> Result<(Vec<(OutputSlot, FastqRecord)>, u64)> {
+    let BlobDecodeCtx {
+        run_name,
+        config,
+        diag,
+        is_lite,
+        read_cs,
+    } = *ctx;
     // ------------------------------------------------------------------
     // Decode READ blob -> 2na -> ASCII bases.
     // ------------------------------------------------------------------
@@ -628,7 +796,7 @@ fn decode_blob_to_fastq(
         let quality_data: Vec<u8> = if !raw.quality_raw.is_empty() {
             let qdecoded = decode_raw(raw.quality_raw, raw.quality_cs, raw.quality_id_range)?;
             let qpage_map = qdecoded.page_map.clone();
-            let mut qdata = decode_zip_encoding(&qdecoded);
+            let mut qdata = decode_zip_encoding(&qdecoded)?;
             // Expand quality data via page map data_runs if present.
             // Some blobs (e.g., PacBio) store repeated rows once with
             // data_runs > 1; the decompressed data only contains unique
@@ -636,14 +804,23 @@ fn decode_blob_to_fastq(
             if let Some(ref pm) = qpage_map
                 && !pm.data_runs.is_empty()
             {
-                qdata = pm.expand_variable_data_runs(&qdata);
+                qdata = pm.expand_variable_data_runs(&qdata)?;
             }
             qdata
         } else {
             Vec::new()
         };
 
-        let is_empty = quality_data.is_empty() || quality_data.iter().take(1000).all(|&b| b == 0);
+        let is_empty = quality_data.is_empty() || quality_data.iter().all(|&b| b == 0);
+        if is_empty && !quality_data.is_empty() {
+            diag.all_zero_quality_blobs
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            tracing::warn!(
+                "quality blob {} is all-zero ({} bytes) — synthesizing Phred fallback",
+                blob_idx,
+                quality_data.len(),
+            );
+        }
         let all: Vec<u8> = if !is_empty {
             // Check ALL bytes to decide if data is already Phred+33 ASCII.
             let all_valid_ascii = quality_data.len() == read_data.len()
@@ -671,11 +848,11 @@ fn decode_blob_to_fastq(
     if raw.has_altread && !raw.has_illumina_name_parts && !raw.altread_raw.is_empty() {
         let alt_decoded = decode_raw(raw.altread_raw, raw.altread_cs, raw.altread_id_range)?;
         let alt_page_map = alt_decoded.page_map.clone();
-        let mut altread_data = decode_zip_encoding(&alt_decoded);
+        let mut altread_data = decode_zip_encoding(&alt_decoded)?;
         if let Some(ref pm) = alt_page_map
             && !pm.data_runs.is_empty()
         {
-            altread_data = pm.expand_variable_data_runs(&altread_data);
+            altread_data = pm.expand_variable_data_runs(&altread_data)?;
         }
         crate::vdb::encoding::merge_altread(&mut read_data, &altread_data, actual_bases);
     } else if !quality_is_empty && quality_all.len() == read_data.len() {
@@ -716,7 +893,7 @@ fn decode_blob_to_fastq(
             .and_then(|pm| pm.lengths.first().copied())
             .unwrap_or(1) as usize;
 
-        let rl_bytes = decode_irzip_column(&rldecoded);
+        let rl_bytes = decode_irzip_column(&rldecoded)?;
 
         let lengths: Vec<u32> = rl_bytes
             .chunks_exact(4)
@@ -867,7 +1044,7 @@ fn decode_blob_to_fastq(
     // ------------------------------------------------------------------
     let spot_names: Option<Vec<Vec<u8>>> = if raw.has_name && !raw.name_raw.is_empty() {
         let ndecoded = decode_raw(raw.name_raw, raw.name_cs, raw.name_id_range)?;
-        let name_bytes = decode_zip_encoding(&ndecoded);
+        let name_bytes = decode_zip_encoding(&ndecoded)?;
 
         let num_spots = read_lengths
             .len()
@@ -936,11 +1113,11 @@ fn decode_blob_to_fastq(
 
         // Decode X column → u32 coordinates (irzip/izip encoded integers).
         let x_decoded = decode_raw(raw.x_raw, raw.x_cs, raw.x_id_range)?;
-        let x_bytes = decode_irzip_column(&x_decoded);
+        let x_bytes = decode_irzip_column(&x_decoded)?;
 
         // Decode Y column → u32 coordinates (irzip/izip encoded integers).
         let y_decoded = decode_raw(raw.y_raw, raw.y_cs, raw.y_id_range)?;
-        let y_bytes = decode_irzip_column(&y_decoded);
+        let y_bytes = decode_irzip_column(&y_decoded)?;
 
         // ALTREAD is a per-spot ASCII template (may vary per tile).
         // Parse templates: each spot's template is stored as a fixed-length or
@@ -1040,7 +1217,7 @@ fn decode_blob_to_fastq(
     // ------------------------------------------------------------------
     let read_type_data: Vec<u8> = if raw.has_read_type && !raw.read_type_raw.is_empty() {
         let rtdecoded = decode_raw(raw.read_type_raw, raw.read_type_cs, raw.read_type_id_range)?;
-        let raw_bytes = decode_zip_encoding(&rtdecoded);
+        let raw_bytes = decode_zip_encoding(&rtdecoded)?;
         if !raw_bytes.is_empty() {
             raw_bytes
         } else {
@@ -1073,6 +1250,8 @@ fn decode_blob_to_fastq(
 
         let seq_end = seq_offset + spot_total_bases;
         if seq_end > read_data.len() {
+            diag.truncated_spots
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             tracing::debug!(
                 "blob {blob_idx}, spot {spot_idx_in_blob}: sequence overrun at offset \
                  {seq_offset} + {spot_total_bases} > {}; stopping blob",
@@ -1090,6 +1269,8 @@ fn decode_blob_to_fastq(
         } else {
             let qual_end = qual_offset + spot_total_bases;
             if qual_end > quality_all.len() {
+                diag.quality_overruns
+                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                 tracing::debug!(
                     "blob {blob_idx}, spot {spot_idx_in_blob}: quality overrun at offset \
                      {qual_offset} + {spot_total_bases} > {}; using fallback quality",
@@ -1193,7 +1374,14 @@ fn decode_blob_to_fastq(
                     format_fasta_read(run_name, spot_number, original_name, seq)
                 } else {
                     let qual = &quality[seg.start..seg.start + seg.len];
-                    format_read(run_name, spot_number, original_name, seq, qual)
+                    format_read_with_diag(
+                        run_name,
+                        spot_number,
+                        original_name,
+                        seq,
+                        qual,
+                        Some(diag),
+                    )
                 }
             };
 
@@ -1233,6 +1421,56 @@ fn decode_blob_to_fastq(
     Ok((records, spot_idx_in_blob as u64))
 }
 
+/// Validate that the blob row-id ranges on a column form a contiguous,
+/// monotonic cover of the expected spot range.
+///
+/// Catches corrupt KDB indexes that would otherwise silently skip or
+/// duplicate spots. `expected_spots` is from RunInfo when available; if
+/// absent we only check internal consistency (monotonic, non-overlapping,
+/// non-empty).
+fn validate_blob_ranges(
+    accession: &str,
+    blobs: &[crate::vdb::kdb::BlobLoc],
+    expected_spots: Option<u64>,
+) -> Result<()> {
+    if blobs.is_empty() {
+        return Ok(());
+    }
+
+    let first_id = blobs[0].start_id;
+    let mut prev_end: i64 = first_id;
+    for (i, blob) in blobs.iter().enumerate() {
+        if blob.id_range == 0 {
+            // Synthetic single-blob columns (id_range=0 means "covers all
+            // rows") are legal — skip range bookkeeping for those.
+            continue;
+        }
+        if blob.start_id < prev_end {
+            return Err(Error::Vdb(format!(
+                "{accession}: blob {i} start_id {} overlaps previous end {prev_end}",
+                blob.start_id,
+            )));
+        }
+        if blob.start_id > prev_end {
+            return Err(Error::Vdb(format!(
+                "{accession}: blob {i} start_id {} leaves a gap from {prev_end}",
+                blob.start_id,
+            )));
+        }
+        prev_end = blob.start_id + blob.id_range as i64;
+    }
+
+    let covered = (prev_end - first_id) as u64;
+    if let Some(expected) = expected_spots
+        && covered != expected
+    {
+        return Err(Error::Vdb(format!(
+            "{accession}: blob ranges cover {covered} rows, RunInfo expects {expected}",
+        )));
+    }
+    Ok(())
+}
+
 /// Decode VDB columns from a local SRA file, format FASTQ, and write to
 /// output files.
 ///
@@ -1248,6 +1486,7 @@ fn decode_and_write(
     accession: &str,
     config: &PipelineConfig,
     is_lite: bool,
+    diag: &IntegrityDiag,
 ) -> Result<(u64, u64, Vec<PathBuf>)> {
     let file = std::fs::File::open(sra_path)?;
     let mut archive = KarArchive::open(std::io::BufReader::new(file))?;
@@ -1265,6 +1504,17 @@ fn decode_and_write(
     // Detect SRA-lite from actual file: if QUALITY column is absent,
     // treat as lite regardless of what the SDL API reported.
     let is_lite = is_lite || !cursor.has_quality();
+
+    // Validate blob locator ranges on the authoritative (READ) column before
+    // decoding: row IDs must be monotonic, non-overlapping, and — when
+    // RunInfo is available — cover exactly [first_id, first_id + spots).
+    // A corrupt KDB index is the only way these can fail, and the failure
+    // mode is silent duplication / skipped spots, so catch it up front.
+    validate_blob_ranges(
+        accession,
+        cursor.read_col().blobs(),
+        config.run_info.as_ref().and_then(|ri| ri.spots),
+    )?;
 
     // Load Illumina name format templates from skey index.
     let (name_templates, name_spot_starts): (Vec<Vec<u8>>, Vec<i64>) =
@@ -1321,8 +1571,12 @@ fn decode_and_write(
     }
 
     // Lazily create output writers as we encounter different output slots.
+    // Writers create `<name>.partial` files on disk; only after the full
+    // decode + integrity checks pass do we atomically rename them to their
+    // final `<name>` so consumers never see a half-written FASTQ file.
     let mut writers: HashMap<OutputSlot, OutputWriter> = HashMap::new();
-    let mut output_files: Vec<PathBuf> = Vec::new();
+    // (final_path, tmp_path). `tmp_path` is what's on disk during writing.
+    let mut output_paths: Vec<(PathBuf, PathBuf)> = Vec::new();
 
     // For stdout mode, create a single writer up front. All output slots
     // write to this shared writer (interleaved, uncompressed).
@@ -1337,6 +1591,8 @@ fn decode_and_write(
 
     let spots_read = std::sync::atomic::AtomicU64::new(0);
     let mut reads_written: u64 = 0;
+    let mut per_slot_counts: std::collections::HashMap<OutputSlot, u64> =
+        std::collections::HashMap::new();
 
     // Capture column metadata before the batch loop. These are Copy/Clone
     // types that can be shared with rayon closures.
@@ -1456,10 +1712,12 @@ fn decode_and_write(
                                     config.fasta,
                                     &config.compression,
                                 );
-                                let path = config.output_dir.join(&filename);
-                                output_files.push(path.clone());
+                                let final_path = config.output_dir.join(&filename);
+                                let tmp_path =
+                                    config.output_dir.join(format!("{filename}.partial"));
+                                output_paths.push((final_path, tmp_path.clone()));
 
-                                let file = std::fs::File::create(&path)
+                                let file = std::fs::File::create(&tmp_path)
                                     .expect("failed to create output file");
                                 let buf = std::io::BufWriter::with_capacity(256 * 1024, file);
 
@@ -1488,6 +1746,7 @@ fn decode_and_write(
 
                         writer.write_all(&record.data).map_err(Error::Io)?;
                         reads_written += 1;
+                        *per_slot_counts.entry(*slot).or_insert(0) += 1;
                     }
 
                     spots_read.fetch_add(num_spots, std::sync::atomic::Ordering::Relaxed);
@@ -1508,6 +1767,15 @@ fn decode_and_write(
             }
             Ok(())
         });
+
+        // Per-call immutable context reused across every blob decode.
+        let decode_ctx = BlobDecodeCtx {
+            run_name: accession,
+            config: &fastq_config,
+            diag,
+            is_lite,
+            read_cs,
+        };
 
         // ---- Decode loop (main thread) ----
         let mut blob_idx: usize = 0;
@@ -1659,15 +1927,7 @@ fn decode_and_write(
                             fallback_read_lengths: fallback_read_lengths.clone(),
                         };
 
-                        decode_blob_to_fastq(
-                            &raw,
-                            read_cs,
-                            is_lite,
-                            bi,
-                            spots_before_per_blob[i],
-                            accession,
-                            &fastq_config,
-                        )
+                        decode_blob_to_fastq(&raw, &decode_ctx, bi, spots_before_per_blob[i])
                     })
                     .collect()
             });
@@ -1685,6 +1945,9 @@ fn decode_and_write(
         writer_handle.join().unwrap()
     });
 
+    let tmp_paths: Vec<PathBuf> = output_paths.iter().map(|(_, t)| t.clone()).collect();
+    let final_paths: Vec<PathBuf> = output_paths.iter().map(|(f, _)| f.clone()).collect();
+
     write_result?;
 
     // If cancelled, drop writers without finalizing and return Cancelled
@@ -1696,7 +1959,9 @@ fn decode_and_write(
             pb.finish_and_clear();
         }
         drop(writers);
-        return Err(Error::Cancelled { output_files });
+        return Err(Error::Cancelled {
+            output_files: tmp_paths,
+        });
     }
 
     if let Some(pb) = decode_pb {
@@ -1714,11 +1979,34 @@ fn decode_and_write(
     if let Some(expected) = config.run_info.as_ref().and_then(|ri| ri.spots)
         && expected != total_spots
     {
+        // Don't rename partials into place if the spot count is wrong —
+        // leave the `.partial` files so the user can inspect them but so
+        // that no tool sees a superficially-complete FASTQ.
         return Err(Error::SpotCountMismatch {
             accession: accession.to_string(),
             expected,
             actual: total_spots,
         });
+    }
+
+    // Paired-split invariant: every record routed to Read1 should have a
+    // mate in Read2. This cannot drift by construction (both are emitted
+    // in the same iteration of decode_blob_to_fastq), but a mismatch would
+    // indicate a filter/routing bug and must not ship silently.
+    let r1 = per_slot_counts
+        .get(&OutputSlot::Read1)
+        .copied()
+        .unwrap_or(0);
+    let r2 = per_slot_counts
+        .get(&OutputSlot::Read2)
+        .copied()
+        .unwrap_or(0);
+    if r1 != r2 {
+        diag.paired_spot_violations
+            .fetch_add(r1.abs_diff(r2), std::sync::atomic::Ordering::Relaxed);
+        tracing::warn!(
+            "{accession}: Read1 count ({r1}) != Read2 count ({r2}) — paired-split invariant violated",
+        );
     }
 
     // Finish all writers.
@@ -1729,7 +2017,16 @@ fn decode_and_write(
         writer.finish().map_err(Error::Io)?;
     }
 
-    Ok((total_spots, reads_written, output_files))
+    // Atomic promotion: rename each `.partial` to its final name. Do this
+    // last so a crash mid-decode leaves `.partial` files rather than a
+    // truncated FASTQ that looks valid to downstream tools.
+    if !config.stdout {
+        for (final_path, tmp_path) in &output_paths {
+            std::fs::rename(tmp_path, final_path).map_err(Error::Io)?;
+        }
+    }
+
+    Ok((total_spots, reads_written, final_paths))
 }
 
 // ---------------------------------------------------------------------------
@@ -1907,7 +2204,12 @@ pub fn run_validate(
                                 let q_id = qblob.id_range as u64;
                                 match decode_raw(q_raw, quality_cs, q_id) {
                                     Ok(qd) => {
-                                        decode_zip_encoding(&qd);
+                                        if let Err(e) = decode_zip_encoding(&qd) {
+                                            return Some((
+                                                bi,
+                                                format!("QUALITY blob {bi} unzip: {e}"),
+                                            ));
+                                        }
                                     }
                                     Err(e) => {
                                         return Some((
@@ -2010,6 +2312,8 @@ pub struct FastqStats {
     pub reads_written: u64,
     /// Paths of all output files created.
     pub output_files: Vec<PathBuf>,
+    /// Data-integrity counters captured during decode.
+    pub integrity: Arc<IntegrityDiag>,
 }
 
 /// Convert a local SRA file to FASTQ without downloading.
@@ -2035,14 +2339,43 @@ pub fn run_fastq(
     // absence gracefully via sra_lite_quality fallback.
     let is_lite = false;
 
+    let diag = Arc::new(IntegrityDiag::default());
     let (spots_read, reads_written, output_files) =
-        decode_and_write(sra_path, &acc, config, is_lite)?;
+        decode_and_write(sra_path, &acc, config, is_lite, &diag)?;
+
+    if !config.stdout
+        && let Err(e) = write_stats_file(StatsEntry {
+            output_dir: &config.output_dir,
+            accession: &acc,
+            spots_read,
+            reads_written,
+            sra_md5: None,
+            sra_size: 0,
+            output_files: &output_files,
+            diag: &diag,
+        })
+    {
+        tracing::warn!("{acc}: failed to append to sracha-stats.jsonl: {e}");
+    }
+
+    if diag.any() {
+        let summary = diag.summary();
+        if config.strict {
+            return Err(Error::IntegrityFailure {
+                accession: acc,
+                summary,
+            });
+        } else {
+            tracing::warn!("{acc}: integrity counters non-zero — {summary}");
+        }
+    }
 
     Ok(FastqStats {
         accession: acc,
         spots_read,
         reads_written,
         output_files,
+        integrity: diag,
     })
 }
 
@@ -2204,14 +2537,17 @@ pub fn decode_sra(downloaded: &DownloadedSra, config: &PipelineConfig) -> Result
             bytes_transferred: downloaded.bytes_transferred,
             total_sra_size: downloaded.total_sra_size,
             output_files,
+            integrity: Arc::new(IntegrityDiag::default()),
         });
     }
 
+    let diag = Arc::new(IntegrityDiag::default());
     let (spots_read, reads_written, output_files) = match decode_and_write(
         &downloaded.temp_path,
         &downloaded.accession,
         config,
         downloaded.is_lite,
+        &diag,
     ) {
         Ok(result) => result,
         Err(Error::Cancelled { output_files }) => {
@@ -2278,12 +2614,48 @@ pub fn decode_sra(downloaded: &DownloadedSra, config: &PipelineConfig) -> Result
         );
     }
 
+    // Append one JSONL line per accession (passing or failing) to the
+    // shared `sracha-stats.jsonl`. For a BioProject-scale run this yields
+    // a single grep-able audit log instead of one file per accession.
+    if !config.stdout
+        && let Err(e) = write_stats_file(StatsEntry {
+            output_dir: &config.output_dir,
+            accession: &downloaded.accession,
+            spots_read,
+            reads_written,
+            sra_md5: downloaded.sra_md5.as_deref(),
+            sra_size: downloaded.total_sra_size,
+            output_files: &output_files,
+            diag: &diag,
+        })
+    {
+        tracing::warn!(
+            "{}: failed to append to sracha-stats.jsonl: {e}",
+            downloaded.accession,
+        );
+    }
+
     tracing::info!(
         "{}: done -- {spots_read} spots, {reads_written} reads written, \
          {} transferred",
         downloaded.accession,
         crate::util::format_size(downloaded.bytes_transferred),
     );
+
+    if diag.any() {
+        let summary = diag.summary();
+        if config.strict {
+            return Err(Error::IntegrityFailure {
+                accession: downloaded.accession.clone(),
+                summary,
+            });
+        } else {
+            tracing::warn!(
+                "{}: integrity counters non-zero — {summary}",
+                downloaded.accession,
+            );
+        }
+    }
 
     Ok(PipelineStats {
         accession: downloaded.accession.clone(),
@@ -2292,6 +2664,7 @@ pub fn decode_sra(downloaded: &DownloadedSra, config: &PipelineConfig) -> Result
         bytes_transferred: downloaded.bytes_transferred,
         total_sra_size: downloaded.total_sra_size,
         output_files,
+        integrity: diag,
     })
 }
 
@@ -2443,7 +2816,7 @@ mod tests {
     #[test]
     fn expand_no_page_map_returns_input() {
         let data = vec![1, 0, 0, 0, 2, 0, 0, 0]; // two u32s
-        let result = expand_via_page_map(data.clone(), &None);
+        let result = expand_via_page_map(data.clone(), &None).unwrap();
         assert_eq!(result, data);
     }
 
@@ -2456,7 +2829,7 @@ mod tests {
             leng_runs: vec![2],
             data_runs: vec![],
         };
-        let result = expand_via_page_map(data.clone(), &Some(pm));
+        let result = expand_via_page_map(data.clone(), &Some(pm)).unwrap();
         assert_eq!(result, data);
     }
 
@@ -2475,7 +2848,7 @@ mod tests {
             leng_runs: vec![4],
             data_runs: vec![0, 2, 1, 0], // rows → entries: 0,2,1,0
         };
-        let result = expand_via_page_map(data, &Some(pm));
+        let result = expand_via_page_map(data, &Some(pm)).unwrap();
         assert_eq!(
             result,
             vec![
@@ -2487,36 +2860,166 @@ mod tests {
         );
     }
 
+    #[test]
+    fn expand_data_runs_direct_offset_rejects_oob() {
+        // Only 2 entries in data (8 bytes = 2 u32s), but offset 5 points past.
+        let data = vec![10, 0, 0, 0, 20, 0, 0, 0];
+        let pm = blob::PageMap {
+            data_recs: 2,
+            lengths: vec![1],
+            leng_runs: vec![3],
+            data_runs: vec![0, 5, 1],
+        };
+        assert!(expand_via_page_map(data, &Some(pm)).is_err());
+    }
+
     // -----------------------------------------------------------------------
     // decode_raw
     // -----------------------------------------------------------------------
 
     #[test]
-    fn decode_raw_strips_crc32() {
-        // A minimal blob: just the data + 4 trailing CRC32 bytes.
-        // decode_blob will try to parse the header from `effective`, so
-        // use a 0-row blob to exercise the checksum-stripping path.
-        let mut raw = vec![0u8; 8]; // some bytes
-        raw.extend_from_slice(&[0xDE, 0xAD, 0xBE, 0xEF]); // fake CRC32
-        let result = decode_raw(&raw, 1, 0);
-        // Should not panic; the CRC bytes should be stripped.
-        // The blob parse may fail on the remaining data, which is fine.
-        // We just verify it doesn't include the trailing 4 bytes.
-        assert!(result.is_ok() || result.is_err());
+    fn decode_raw_rejects_bad_crc32() {
+        // Fabricate a minimally-plausible v1 blob (high bit clear) plus an
+        // intentionally wrong CRC32 trailer; decode_raw must surface this as
+        // an error rather than silently returning bogus data.
+        let blob_body: Vec<u8> = vec![0u8; 8];
+        let mut raw = blob_body.clone();
+        raw.extend_from_slice(&[0xDE, 0xAD, 0xBE, 0xEF]);
+        assert!(decode_raw(&raw, 1, 0).is_err());
     }
 
     #[test]
-    fn decode_raw_strips_md5() {
-        let mut raw = vec![0u8; 20]; // some bytes
-        raw.extend_from_slice(&[0u8; 16]); // fake MD5
-        let result = decode_raw(&raw, 2, 0);
-        assert!(result.is_ok() || result.is_err());
+    fn decode_raw_rejects_bad_md5() {
+        let blob_body: Vec<u8> = vec![0u8; 20];
+        let mut raw = blob_body.clone();
+        raw.extend_from_slice(&[0u8; 16]);
+        assert!(decode_raw(&raw, 2, 0).is_err());
+    }
+
+    // -----------------------------------------------------------------------
+    // validate_blob_ranges
+    // -----------------------------------------------------------------------
+
+    fn loc(start_id: i64, id_range: u32) -> crate::vdb::kdb::BlobLoc {
+        crate::vdb::kdb::BlobLoc {
+            pg: 0,
+            size: 0,
+            id_range,
+            start_id,
+        }
     }
 
     #[test]
-    fn decode_raw_no_checksum() {
-        let raw = vec![0u8; 8];
-        let result = decode_raw(&raw, 0, 0);
-        assert!(result.is_ok() || result.is_err());
+    fn validate_blob_ranges_accepts_contiguous() {
+        let blobs = vec![loc(1, 10), loc(11, 10), loc(21, 5)];
+        assert!(validate_blob_ranges("ACC", &blobs, Some(25)).is_ok());
+    }
+
+    #[test]
+    fn validate_blob_ranges_accepts_no_expected() {
+        let blobs = vec![loc(1, 10), loc(11, 10)];
+        assert!(validate_blob_ranges("ACC", &blobs, None).is_ok());
+    }
+
+    #[test]
+    fn validate_blob_ranges_rejects_gap() {
+        // 1..11 then 12..17 leaves row 11 uncovered.
+        let blobs = vec![loc(1, 10), loc(12, 5)];
+        let err = validate_blob_ranges("ACC", &blobs, None).unwrap_err();
+        let msg = format!("{err}");
+        assert!(msg.contains("gap"), "unexpected error: {msg}");
+    }
+
+    #[test]
+    fn validate_blob_ranges_rejects_overlap() {
+        let blobs = vec![loc(1, 10), loc(5, 10)];
+        let err = validate_blob_ranges("ACC", &blobs, None).unwrap_err();
+        let msg = format!("{err}");
+        assert!(msg.contains("overlap"), "unexpected error: {msg}");
+    }
+
+    #[test]
+    fn validate_blob_ranges_rejects_runinfo_mismatch() {
+        let blobs = vec![loc(1, 10), loc(11, 10)];
+        let err = validate_blob_ranges("ACC", &blobs, Some(100)).unwrap_err();
+        let msg = format!("{err}");
+        assert!(msg.contains("expects 100"), "unexpected error: {msg}");
+    }
+
+    #[test]
+    fn validate_blob_ranges_skips_synthetic_single_blob() {
+        // id_range == 0 signals "covers all rows" — treat as synthetic.
+        let blobs = vec![loc(1, 0)];
+        assert!(validate_blob_ranges("ACC", &blobs, None).is_ok());
+    }
+
+    // -----------------------------------------------------------------------
+    // sracha-stats.jsonl plumbing
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn write_stats_file_appends_one_jsonl_line_per_call() {
+        let tmp = tempfile::tempdir().unwrap();
+        let diag = IntegrityDiag::default();
+        diag.quality_overruns
+            .fetch_add(3, std::sync::atomic::Ordering::Relaxed);
+
+        write_stats_file(StatsEntry {
+            output_dir: tmp.path(),
+            accession: "SRR1",
+            spots_read: 42,
+            reads_written: 84,
+            sra_md5: Some("abc123"),
+            sra_size: 999,
+            output_files: &[],
+            diag: &diag,
+        })
+        .unwrap();
+
+        write_stats_file(StatsEntry {
+            output_dir: tmp.path(),
+            accession: "SRR2",
+            spots_read: 0,
+            reads_written: 0,
+            sra_md5: None,
+            sra_size: 0,
+            output_files: &[],
+            diag: &IntegrityDiag::default(),
+        })
+        .unwrap();
+
+        let text = std::fs::read_to_string(stats_path(tmp.path())).unwrap();
+        let lines: Vec<&str> = text.lines().collect();
+        assert_eq!(
+            lines.len(),
+            2,
+            "expected two JSONL lines, got {}",
+            lines.len()
+        );
+
+        let v0: serde_json::Value = serde_json::from_str(lines[0]).unwrap();
+        assert_eq!(v0["accession"], "SRR1");
+        assert_eq!(v0["integrity"]["ok"], false);
+        assert_eq!(v0["integrity"]["quality_overruns"], 3);
+
+        let v1: serde_json::Value = serde_json::from_str(lines[1]).unwrap();
+        assert_eq!(v1["accession"], "SRR2");
+        assert_eq!(v1["integrity"]["ok"], true);
+    }
+
+    #[test]
+    fn iso8601_now_utc_has_expected_shape() {
+        let s = iso8601_now_utc();
+        // YYYY-MM-DDTHH:MM:SSZ = 20 chars.
+        assert_eq!(s.len(), 20, "got {s:?}");
+        assert!(s.ends_with('Z'));
+        assert_eq!(&s[4..5], "-");
+        assert_eq!(&s[7..8], "-");
+        assert_eq!(&s[10..11], "T");
+        assert_eq!(&s[13..14], ":");
+        assert_eq!(&s[16..17], ":");
+        // Year should be plausible (>= 2025).
+        let year: i64 = s[..4].parse().unwrap();
+        assert!(year >= 2025, "year parsed as {year}");
     }
 }

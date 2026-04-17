@@ -192,6 +192,7 @@ async fn main() -> Result<()> {
                     resume: true,
                     stdout: args.stdout,
                     cancelled: None,
+                    strict: args.strict,
                 };
 
                 let stats = sracha_core::pipeline::run_fastq(sra_path, None, &pipeline_config)?;
@@ -317,6 +318,7 @@ async fn main() -> Result<()> {
                     resume: !args.no_resume,
                     stdout: args.stdout,
                     cancelled: Some(cancelled.clone()),
+                    strict: args.strict,
                 };
 
             for (i, resolved) in resolved_all.iter().enumerate() {

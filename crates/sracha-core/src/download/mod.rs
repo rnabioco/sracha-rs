@@ -317,6 +317,11 @@ struct DownloadProgress {
     total_chunks: usize,
     /// Indices of chunks that completed successfully.
     completed_chunks: HashSet<usize>,
+    /// Expected MD5 digest of the completed file, when known. Refusing to
+    /// resume when this changes prevents concatenating bytes from two
+    /// different server-side objects (re-uploaded SRA, etc.).
+    #[serde(default)]
+    expected_md5: Option<String>,
 }
 
 /// Compute the path of the progress sidecar file.
@@ -490,9 +495,26 @@ pub async fn download_file(
             None
         };
 
+        // Track whether we have a prior-MD5 mismatch so we also wipe the
+        // partial file, not just the sidecar.
+        let mut force_wipe_partial = false;
         let (chunks_to_download, mut progress): (Vec<(usize, ChunkRange)>, DownloadProgress) =
             if let Some(prev) = prev_progress {
-                if prev.expected_size == file_size
+                let md5_changed = match (prev.expected_md5.as_deref(), expected_md5) {
+                    (Some(a), Some(b)) => a != b,
+                    _ => false,
+                };
+                if md5_changed {
+                    tracing::warn!(
+                        "progress sidecar MD5 {} != remote MD5 {} — restarting download",
+                        prev.expected_md5.as_deref().unwrap_or("<none>"),
+                        expected_md5.unwrap_or("<none>"),
+                    );
+                    force_wipe_partial = true;
+                }
+
+                if !md5_changed
+                    && prev.expected_size == file_size
                     && prev.chunk_size == chunk_size
                     && prev.url == *url
                     && prev.total_chunks == total_chunks
@@ -521,6 +543,7 @@ pub async fn download_file(
                         chunk_size,
                         total_chunks,
                         completed_chunks: HashSet::new(),
+                        expected_md5: expected_md5.map(String::from),
                     };
                     (indexed, progress)
                 }
@@ -533,9 +556,15 @@ pub async fn download_file(
                     chunk_size,
                     total_chunks,
                     completed_chunks: HashSet::new(),
+                    expected_md5: expected_md5.map(String::from),
                 };
                 (indexed, progress)
             };
+
+        if force_wipe_partial {
+            let _ = tokio::fs::remove_file(output_path).await;
+            delete_progress(&prog_path);
+        }
 
         if chunks_to_download.is_empty() {
             tracing::info!("all chunks already downloaded — verifying");
@@ -707,6 +736,46 @@ pub async fn download_file(
                     accession: String::new(),
                     message: format!("Range resume request failed with HTTP {status}"),
                 });
+            }
+
+            // Defend against a server that silently returns the entire file
+            // (status 200) when asked for a byte range: verify Content-Range
+            // names exactly the bytes we asked for. If the header is missing
+            // and the status isn't 206, refuse to append — otherwise the
+            // tail would be concatenated onto the already-downloaded head
+            // and the final MD5 check would flag it only at the very end.
+            let content_range = response
+                .headers()
+                .get(reqwest::header::CONTENT_RANGE)
+                .and_then(|v| v.to_str().ok())
+                .map(String::from);
+            let expected_end = file_size.saturating_sub(1);
+            let expected_prefix = format!("bytes {existing_size}-{expected_end}/");
+            match (status, content_range.as_deref()) {
+                (reqwest::StatusCode::PARTIAL_CONTENT, Some(cr)) => {
+                    if !cr.starts_with(&expected_prefix) {
+                        return Err(Error::Download {
+                            accession: String::new(),
+                            message: format!(
+                                "resume server returned Content-Range {cr:?}, expected prefix {expected_prefix:?}",
+                            ),
+                        });
+                    }
+                }
+                (reqwest::StatusCode::PARTIAL_CONTENT, None) => {
+                    return Err(Error::Download {
+                        accession: String::new(),
+                        message: "resume response is 206 but missing Content-Range header".into(),
+                    });
+                }
+                _ => {
+                    return Err(Error::Download {
+                        accession: String::new(),
+                        message: format!(
+                            "resume server ignored Range header (status {status}); refusing to append full file to partial",
+                        ),
+                    });
+                }
             }
 
             let mut file = tokio::fs::OpenOptions::new()
@@ -896,6 +965,7 @@ mod tests {
             chunk_size: 8192,
             total_chunks: 128,
             completed_chunks: completed,
+            expected_md5: Some("d41d8cd98f00b204e9800998ecf8427e".into()),
         };
 
         let json = serde_json::to_string(&progress).unwrap();
@@ -923,6 +993,7 @@ mod tests {
             chunk_size: 100,
             total_chunks: 10,
             completed_chunks: completed,
+            expected_md5: None,
         };
 
         save_progress(&prog_file, &progress).unwrap();

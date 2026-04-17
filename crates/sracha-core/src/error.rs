@@ -61,6 +61,9 @@ pub enum Error {
         /// Partial output files created before cancellation (for cleanup).
         output_files: Vec<PathBuf>,
     },
+
+    #[error("integrity check failed for {accession}: {summary}")]
+    IntegrityFailure { accession: String, summary: String },
 }
 
 pub type Result<T> = std::result::Result<T, Error>;

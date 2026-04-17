@@ -5,6 +5,59 @@
 //! split mode.
 
 use std::fmt;
+use std::sync::atomic::{AtomicU64, Ordering};
+
+/// Aggregated data-integrity counters captured during FASTQ formatting.
+///
+/// Populated by [`format_read`] / [`format_spot`] and aggregated upstream by
+/// the pipeline. A non-zero count indicates that the run produced output that
+/// had to be repaired (quality padded, invalid bytes coerced to Q30, mate
+/// invariants violated, etc.); surface these to the user and, in
+/// `--strict` mode, treat any non-zero count as a hard failure.
+#[derive(Default, Debug)]
+pub struct IntegrityDiag {
+    /// Reads whose quality length did not match their sequence length.
+    pub quality_length_mismatches: AtomicU64,
+    /// Reads containing Phred+33 bytes outside `[33, 126]`.
+    pub quality_invalid_bytes: AtomicU64,
+    /// Blobs where the decoded quality stream ran short of the sequence
+    /// stream, forcing per-spot synthesized quality fallback.
+    pub quality_overruns: AtomicU64,
+    /// Blobs whose full quality payload was all-zero (SRA-lite style) and
+    /// was replaced with a uniform Phred fallback.
+    pub all_zero_quality_blobs: AtomicU64,
+    /// Paired-end spots (Split3) that did not yield exactly two biological
+    /// reads. Typically indicates READ_LEN / READ_TYPE disagreement.
+    pub paired_spot_violations: AtomicU64,
+    /// Spots whose READ_LEN values would extend past the decoded sequence.
+    pub truncated_spots: AtomicU64,
+}
+
+impl IntegrityDiag {
+    /// Return `true` if any counter is non-zero.
+    pub fn any(&self) -> bool {
+        self.quality_length_mismatches.load(Ordering::Relaxed) != 0
+            || self.quality_invalid_bytes.load(Ordering::Relaxed) != 0
+            || self.quality_overruns.load(Ordering::Relaxed) != 0
+            || self.all_zero_quality_blobs.load(Ordering::Relaxed) != 0
+            || self.paired_spot_violations.load(Ordering::Relaxed) != 0
+            || self.truncated_spots.load(Ordering::Relaxed) != 0
+    }
+
+    /// Human-readable summary used by pipeline stats and stats.json.
+    pub fn summary(&self) -> String {
+        format!(
+            "quality_length_mismatches={}, quality_invalid_bytes={}, quality_overruns={}, \
+             all_zero_quality_blobs={}, paired_spot_violations={}, truncated_spots={}",
+            self.quality_length_mismatches.load(Ordering::Relaxed),
+            self.quality_invalid_bytes.load(Ordering::Relaxed),
+            self.quality_overruns.load(Ordering::Relaxed),
+            self.all_zero_quality_blobs.load(Ordering::Relaxed),
+            self.paired_spot_violations.load(Ordering::Relaxed),
+            self.truncated_spots.load(Ordering::Relaxed),
+        )
+    }
+}
 
 // ---------------------------------------------------------------------------
 // Data model
@@ -129,6 +182,28 @@ pub fn format_read(
     sequence: &[u8],
     quality: &[u8],
 ) -> FastqRecord {
+    format_read_with_diag(
+        run_name,
+        spot_number,
+        original_name,
+        sequence,
+        quality,
+        None,
+    )
+}
+
+/// Variant of [`format_read`] that increments counters on a shared
+/// [`IntegrityDiag`] instead of emitting per-event tracing warnings. The
+/// pipeline uses this on the hot path to avoid log spam while still surfacing
+/// exact counts to the user at run completion.
+pub fn format_read_with_diag(
+    run_name: &str,
+    spot_number: &[u8],
+    original_name: Option<&[u8]>,
+    sequence: &[u8],
+    quality: &[u8],
+    diag: Option<&IntegrityDiag>,
+) -> FastqRecord {
     let len = sequence.len();
 
     // Validate quality. Only allocate a corrected copy when something is wrong;
@@ -141,11 +216,15 @@ pub fn format_read(
 
     let qual_corrected: Vec<u8>;
     let quality: &[u8] = if needs_pad {
-        tracing::warn!(
-            "quality length ({}) != sequence length ({}) for spot; padding/truncating",
-            quality.len(),
-            len,
-        );
+        if let Some(d) = diag {
+            d.quality_length_mismatches.fetch_add(1, Ordering::Relaxed);
+        } else {
+            tracing::warn!(
+                "quality length ({}) != sequence length ({}) for spot; padding/truncating",
+                quality.len(),
+                len,
+            );
+        }
         qual_corrected = {
             let mut q = quality[..quality.len().min(len)].to_vec();
             q.resize(len, FALLBACK_QUAL_BYTE);
@@ -153,7 +232,11 @@ pub fn format_read(
         };
         &qual_corrected
     } else if needs_sanitize {
-        tracing::warn!("quality contains invalid bytes outside [33, 126] range; sanitizing");
+        if let Some(d) = diag {
+            d.quality_invalid_bytes.fetch_add(1, Ordering::Relaxed);
+        } else {
+            tracing::warn!("quality contains invalid bytes outside [33, 126] range; sanitizing");
+        }
         qual_corrected = quality
             .iter()
             .map(|&b| {
@@ -1170,5 +1253,78 @@ mod tests {
         let text2 = std::str::from_utf8(&rec2.data).unwrap();
         let lines2: Vec<&str> = text2.lines().collect();
         assert_eq!(lines2[1], "ACGT");
+    }
+
+    // -----------------------------------------------------------------------
+    // IntegrityDiag + format_read_with_diag counter plumbing
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn integrity_diag_default_is_clean() {
+        let d = IntegrityDiag::default();
+        assert!(!d.any());
+        assert!(d.summary().contains("quality_length_mismatches=0"));
+        assert!(d.summary().contains("truncated_spots=0"));
+    }
+
+    #[test]
+    fn integrity_diag_any_fires_on_any_counter() {
+        let d = IntegrityDiag::default();
+        assert!(!d.any());
+        d.quality_overruns.fetch_add(1, Ordering::Relaxed);
+        assert!(d.any());
+        let s = d.summary();
+        assert!(s.contains("quality_overruns=1"), "summary was: {s}");
+    }
+
+    #[test]
+    fn format_read_with_diag_counts_length_mismatch() {
+        let diag = IntegrityDiag::default();
+        // sequence 4 bytes, quality 2 bytes → pad path, mismatch counter bumps.
+        let _ = format_read_with_diag("RUN", b"1", None, b"ACGT", b"II", Some(&diag));
+        assert_eq!(
+            diag.quality_length_mismatches.load(Ordering::Relaxed),
+            1,
+            "expected one quality-length-mismatch count"
+        );
+        assert_eq!(diag.quality_invalid_bytes.load(Ordering::Relaxed), 0);
+    }
+
+    #[test]
+    fn format_read_with_diag_counts_invalid_bytes() {
+        let diag = IntegrityDiag::default();
+        // sequence 4 bytes, quality 4 bytes but contains invalid 0x00 / 0x0a.
+        let _ = format_read_with_diag(
+            "RUN",
+            b"1",
+            None,
+            b"ACGT",
+            &[b'I', 10u8, 0u8, b'I'],
+            Some(&diag),
+        );
+        assert_eq!(diag.quality_length_mismatches.load(Ordering::Relaxed), 0);
+        assert_eq!(
+            diag.quality_invalid_bytes.load(Ordering::Relaxed),
+            1,
+            "expected one quality-invalid-bytes count"
+        );
+    }
+
+    #[test]
+    fn format_read_with_diag_clean_path_bumps_nothing() {
+        let diag = IntegrityDiag::default();
+        let _ = format_read_with_diag("RUN", b"1", None, b"ACGT", b"IIII", Some(&diag));
+        assert!(!diag.any(), "clean call must not mutate counters");
+    }
+
+    #[test]
+    fn format_read_without_diag_falls_back_to_tracing() {
+        // With diag=None, format_read_with_diag must still produce a
+        // correctly padded record (the pre-existing tracing::warn path).
+        let rec = format_read_with_diag("RUN", b"1", None, b"ACGT", b"II", None);
+        let text = std::str::from_utf8(&rec.data).unwrap();
+        let lines: Vec<&str> = text.lines().collect();
+        assert_eq!(lines[1].len(), lines[3].len());
+        assert_eq!(lines[1], "ACGT");
     }
 }

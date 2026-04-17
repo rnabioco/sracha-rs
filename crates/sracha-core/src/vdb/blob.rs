@@ -231,54 +231,96 @@ impl PageMap {
     /// handles fixed-size elements, this handles variable-length rows (e.g.,
     /// quality data where each row has a different number of bytes).
     ///
-    /// Returns the expanded data, or the input unchanged if no expansion needed.
-    pub fn expand_variable_data_runs(&self, data: &[u8]) -> Vec<u8> {
+    /// Fails if `data` is shorter than the sum of record lengths or if
+    /// `data_runs` has fewer entries than there are records — either signals
+    /// a truncated blob or a corrupt page map that would otherwise drop rows
+    /// silently.
+    pub fn expand_variable_data_runs(&self, data: &[u8]) -> Result<Vec<u8>> {
         if self.data_runs.is_empty() {
-            return data.to_vec();
+            return Ok(data.to_vec());
         }
 
         let record_lens = self.data_record_lengths();
 
-        // Compute byte offsets for each data record.
-        let mut offsets = Vec::with_capacity(record_lens.len() + 1);
-        offsets.push(0usize);
-        for &len in &record_lens {
-            offsets.push(offsets.last().unwrap() + len as usize);
+        if self.data_runs.len() < record_lens.len() {
+            return Err(Error::Vdb(format!(
+                "page_map: data_runs has {} entries, expected at least {}",
+                self.data_runs.len(),
+                record_lens.len(),
+            )));
         }
 
-        // Expand: for each data record, repeat its bytes data_runs[i] times.
-        let mut expanded = Vec::with_capacity(data.len() * 2); // rough estimate
+        let total_data: usize = record_lens.iter().map(|&l| l as usize).sum();
+        if data.len() < total_data {
+            return Err(Error::Vdb(format!(
+                "page_map: variable data truncated — have {} bytes, need {}",
+                data.len(),
+                total_data,
+            )));
+        }
+
+        let expected_out: usize = record_lens
+            .iter()
+            .zip(self.data_runs.iter())
+            .map(|(&len, &rep)| len as usize * rep as usize)
+            .sum();
+        let mut expanded = Vec::with_capacity(expected_out);
+        let mut cursor = 0usize;
         for (i, &len) in record_lens.iter().enumerate() {
-            let repeat = self.data_runs.get(i).copied().unwrap_or(1) as usize;
-            let start = offsets[i];
-            let end = start + len as usize;
-            if end <= data.len() {
-                let chunk = &data[start..end];
-                for _ in 0..repeat {
-                    expanded.extend_from_slice(chunk);
-                }
+            let repeat = self.data_runs[i] as usize;
+            let chunk = &data[cursor..cursor + len as usize];
+            for _ in 0..repeat {
+                expanded.extend_from_slice(chunk);
             }
+            cursor += len as usize;
         }
 
-        expanded
+        if expanded.len() != expected_out {
+            return Err(Error::Vdb(format!(
+                "page_map: expanded length {} != expected {}",
+                expanded.len(),
+                expected_out,
+            )));
+        }
+
+        Ok(expanded)
     }
 
     /// Expand run-length-encoded byte data to full row data.
     ///
     /// Like [`expand_data_runs`](Self::expand_data_runs), but operates on
     /// fixed-size elements packed into a byte slice. Each element is
-    /// `elem_bytes` wide. Returns an expanded byte vector.
-    pub fn expand_data_runs_bytes(&self, data: &[u8], elem_bytes: usize) -> Vec<u8> {
+    /// `elem_bytes` wide.
+    ///
+    /// Fails if `data_runs` has fewer entries than the number of elements in
+    /// `data` — missing entries used to default to repeat=1, silently losing
+    /// the intended per-record repeat counts.
+    pub fn expand_data_runs_bytes(&self, data: &[u8], elem_bytes: usize) -> Result<Vec<u8>> {
         if self.data_runs.is_empty() || elem_bytes == 0 {
-            return data.to_vec();
+            return Ok(data.to_vec());
         }
 
-        let total = self.total_rows() as usize;
-        let mut expanded = Vec::with_capacity(total * elem_bytes);
-
         let n = data.len() / elem_bytes;
+        if self.data_runs.len() < n {
+            return Err(Error::Vdb(format!(
+                "page_map: data_runs has {} entries, expected at least {} for {} bytes at {} bytes/elem",
+                self.data_runs.len(),
+                n,
+                data.len(),
+                elem_bytes,
+            )));
+        }
+
+        let expected_out: usize = self
+            .data_runs
+            .iter()
+            .take(n)
+            .map(|&r| r as usize * elem_bytes)
+            .sum();
+        let mut expanded = Vec::with_capacity(expected_out);
+
         for i in 0..n {
-            let repeat = self.data_runs.get(i).copied().unwrap_or(1) as usize;
+            let repeat = self.data_runs[i] as usize;
             let start = i * elem_bytes;
             let end = start + elem_bytes;
             let chunk = &data[start..end];
@@ -287,7 +329,7 @@ impl PageMap {
             }
         }
 
-        expanded
+        Ok(expanded)
     }
 }
 
@@ -2373,7 +2415,7 @@ mod tests {
         data.extend_from_slice(&42u32.to_le_bytes());
         data.extend_from_slice(&99u32.to_le_bytes());
 
-        let expanded = pm.expand_data_runs_bytes(&data, 4);
+        let expanded = pm.expand_data_runs_bytes(&data, 4).unwrap();
         assert_eq!(expanded.len(), 5 * 4); // 5 rows * 4 bytes each
 
         let vals: Vec<u32> = expanded
@@ -2392,8 +2434,34 @@ mod tests {
             data_runs: vec![],
         };
         let data = vec![1, 2, 3, 4, 5, 6, 7, 8];
-        let expanded = pm.expand_data_runs_bytes(&data, 4);
+        let expanded = pm.expand_data_runs_bytes(&data, 4).unwrap();
         assert_eq!(expanded, data);
+    }
+
+    #[test]
+    fn page_map_expand_data_runs_bytes_rejects_short_data_runs() {
+        // data has 3 elements (12 bytes / 4), but data_runs only has 2.
+        let pm = PageMap {
+            data_recs: 2,
+            lengths: vec![4],
+            leng_runs: vec![5],
+            data_runs: vec![2, 3],
+        };
+        let data = vec![1u8, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12];
+        assert!(pm.expand_data_runs_bytes(&data, 4).is_err());
+    }
+
+    #[test]
+    fn page_map_expand_variable_data_runs_rejects_truncated_data() {
+        // record_lens will be [4], needs 4 bytes; give it only 2.
+        let pm = PageMap {
+            data_recs: 1,
+            lengths: vec![4],
+            leng_runs: vec![3],
+            data_runs: vec![3],
+        };
+        let data = vec![1u8, 2];
+        assert!(pm.expand_variable_data_runs(&data).is_err());
     }
 
     // -----------------------------------------------------------------------

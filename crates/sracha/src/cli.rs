@@ -194,6 +194,11 @@ pub struct FastqArgs {
     /// Disable progress bar
     #[arg(long)]
     pub no_progress: bool,
+
+    /// Fail on any data-integrity anomaly (quality length mismatch,
+    /// paired-spot violations, truncated reads). Off by default.
+    #[arg(long, help_heading = "Advanced")]
+    pub strict: bool,
 }
 
 #[derive(Args)]
@@ -299,6 +304,11 @@ pub struct GetArgs {
     /// Skip direct S3 and resolve via the SDL API
     #[arg(long, help_heading = "Advanced")]
     pub prefer_sdl: bool,
+
+    /// Fail on any data-integrity anomaly (quality length mismatch,
+    /// paired-spot violations, truncated reads). Off by default.
+    #[arg(long, help_heading = "Advanced")]
+    pub strict: bool,
 }
 
 #[derive(Args)]

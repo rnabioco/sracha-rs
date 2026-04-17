@@ -82,6 +82,7 @@ fn test_config(
         resume: true,
         stdout: false,
         cancelled: None,
+        strict: false,
     }
 }
 
@@ -466,5 +467,90 @@ fn illumina_paired_byte_identity() {
     assert_eq!(
         md5_2, "d307ea894444f2ede7a1ee51d65c6e04",
         "SRR28588231_2.fastq md5 mismatch — deflines or data differ from fasterq-dump"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Corruption-injection tests: mutate a valid fixture and verify that decode
+// surfaces an error instead of silently producing wrong FASTQ.
+// ---------------------------------------------------------------------------
+
+/// Copy the fixture to a temp path and return the copied path.
+fn clone_fixture(tmp_dir: &std::path::Path, name: &str) -> PathBuf {
+    let src = ensure_srr28588231();
+    let dst = tmp_dir.join(name);
+    std::fs::copy(&src, &dst).unwrap();
+    dst
+}
+
+#[ignore]
+#[test]
+fn corrupt_truncated_sra_fails() {
+    let tmp = tempfile::tempdir().unwrap();
+    let path = clone_fixture(tmp.path(), "truncated.sra");
+    // Truncate to 1 KiB — far smaller than a valid KAR header + TOC. This
+    // path must fail inside `KarArchive::open` before any mmap, so decode
+    // never reaches a point where it could SIGBUS on missing bytes.
+    std::fs::write(&path, [0u8; 1024]).unwrap();
+
+    let out = tempfile::tempdir().unwrap();
+    let config = test_config(out.path(), SplitMode::Split3, CompressionMode::None);
+    let result = sracha_core::pipeline::run_fastq(&path, Some("SRR28588231"), &config);
+    assert!(
+        result.is_err(),
+        "truncated SRA must not decode silently: {:?}",
+        result.as_ref().map(|s| &s.output_files)
+    );
+}
+
+#[ignore]
+#[test]
+fn corrupt_flipped_bytes_trigger_checksum_or_decode_error() {
+    let tmp = tempfile::tempdir().unwrap();
+    let path = clone_fixture(tmp.path(), "flipped.sra");
+    // Corrupt ~1% of the file at three separate positions. One stripe is
+    // almost certain to land inside a column blob rather than padding,
+    // tripping CRC32 / deflate / page-map bounds. Doing three widely-
+    // spaced stripes makes the test robust to fixture layout changes.
+    let mut bytes = std::fs::read(&path).unwrap();
+    let stripe = (bytes.len() / 100).max(8192);
+    for frac in [3, 5, 7] {
+        let start = bytes.len() * frac / 10;
+        let end = (start + stripe).min(bytes.len());
+        for b in &mut bytes[start..end] {
+            *b ^= 0xA5;
+        }
+    }
+    std::fs::write(&path, &bytes).unwrap();
+
+    let out = tempfile::tempdir().unwrap();
+    let config = test_config(out.path(), SplitMode::Split3, CompressionMode::None);
+    let result = sracha_core::pipeline::run_fastq(&path, Some("SRR28588231"), &config);
+    assert!(
+        result.is_err(),
+        "4 KiB mid-file corruption must surface as a decode error: {:?}",
+        result.as_ref().map(|s| &s.output_files)
+    );
+}
+
+#[ignore]
+#[test]
+fn corrupt_kar_magic_fails_fast() {
+    let tmp = tempfile::tempdir().unwrap();
+    let path = clone_fixture(tmp.path(), "badmagic.sra");
+    let mut bytes = std::fs::read(&path).unwrap();
+    // KAR file magic sits at the start; zero it.
+    for b in &mut bytes[..8] {
+        *b = 0;
+    }
+    std::fs::write(&path, &bytes).unwrap();
+
+    let out = tempfile::tempdir().unwrap();
+    let config = test_config(out.path(), SplitMode::Split3, CompressionMode::None);
+    let result = sracha_core::pipeline::run_fastq(&path, Some("SRR28588231"), &config);
+    assert!(
+        result.is_err(),
+        "corrupt KAR header must fail before any decode: {:?}",
+        result.as_ref().map(|s| &s.output_files)
     );
 }
