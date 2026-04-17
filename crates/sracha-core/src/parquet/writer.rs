@@ -259,6 +259,7 @@ pub(crate) fn resolve_length_mode(
 }
 
 fn detect_length_mode(cursor: &VdbCursor) -> LengthMode {
+    // 1. Trust explicit metadata when all read lengths are uniform.
     if let Some(lengths) = cursor.metadata_read_lengths()
         && !lengths.is_empty()
         && lengths.iter().all(|&l| l == lengths[0])
@@ -267,7 +268,55 @@ fn detect_length_mode(cursor: &VdbCursor) -> LengthMode {
             read_len: lengths[0],
         };
     }
-    LengthMode::Variable
+    // 2. Fall back to a data sniff. When the file has no READ_LEN column and
+    //    no metadata read_lengths, it's often because every read is the same
+    //    length (common case: Illumina paired-end). Check that every blob has
+    //    the same (bases_per_blob / id_range / reads_per_spot) ratio and that
+    //    the ratio divides evenly. If so, treat as Fixed.
+    if cursor.read_len_col().is_some() {
+        // Variable-length path exists in the file — don't override it.
+        return LengthMode::Variable;
+    }
+    let rps = cursor.metadata_reads_per_spot().unwrap_or(1).max(1) as u64;
+    let blobs = cursor.read_col().blobs();
+    if blobs.is_empty() {
+        return LengthMode::Variable;
+    }
+
+    let mut inferred_read_len: Option<u32> = None;
+    for blob in blobs {
+        if blob.id_range == 0 {
+            continue;
+        }
+        let Ok(raw) = cursor.read_col().read_raw_blob_slice(blob.start_id) else {
+            return LengthMode::Variable;
+        };
+        let Ok(decoded) = decode_raw(
+            raw,
+            cursor.read_col().meta().checksum_type,
+            blob.id_range as u64,
+        ) else {
+            return LengthMode::Variable;
+        };
+        let total_bits = decoded.data.len() * 8;
+        let adjust = decoded.adjust as usize;
+        let actual_bases = total_bits.saturating_sub(adjust) / 2;
+        let denom = (blob.id_range as u64) * rps;
+        if denom == 0 || !(actual_bases as u64).is_multiple_of(denom) {
+            return LengthMode::Variable;
+        }
+        let read_len = (actual_bases as u64 / denom) as u32;
+        match inferred_read_len {
+            None => inferred_read_len = Some(read_len),
+            Some(existing) if existing == read_len => {}
+            _ => return LengthMode::Variable,
+        }
+    }
+
+    match inferred_read_len {
+        Some(read_len) if read_len > 0 => LengthMode::Fixed { read_len },
+        _ => LengthMode::Variable,
+    }
 }
 
 // ---------------------------------------------------------------------------
