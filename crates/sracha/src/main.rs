@@ -1,4 +1,5 @@
 mod cli;
+mod progress;
 mod style;
 
 use std::path::Path;
@@ -77,10 +78,10 @@ async fn main() -> Result<()> {
             let raw = collect_accessions(&args.accessions, args.accession_list.as_deref())?;
             let client = SdlClient::new();
             let (run_accessions, has_projects) = resolve_to_runs(&raw, &client).await?;
-            eprintln!(
-                "Resolving {} accession(s)...",
+            let sp = progress::Spinner::start(format!(
+                "Resolving {} accession(s)",
                 style::count(run_accessions.len()),
-            );
+            ));
             let resolved_all = resolve_accessions(
                 &run_accessions,
                 &client,
@@ -89,6 +90,10 @@ async fn main() -> Result<()> {
                 args.format.into(),
             )
             .await?;
+            sp.finish(format!(
+                "Resolved {} accession(s)",
+                style::count(resolved_all.len()),
+            ));
             check_download_confirmation(&resolved_all, args.yes, has_projects)?;
             check_disk_space(&resolved_all, &args.output_dir)?;
 
@@ -213,10 +218,10 @@ async fn main() -> Result<()> {
             let raw = collect_accessions(&args.accessions, args.accession_list.as_deref())?;
             let sdl_client = SdlClient::new();
             let (run_accessions, has_projects) = resolve_to_runs(&raw, &sdl_client).await?;
-            eprintln!(
-                "Resolving {} accession(s)...",
+            let sp = progress::Spinner::start(format!(
+                "Resolving {} accession(s)",
                 style::count(run_accessions.len()),
-            );
+            ));
             let resolved_all = resolve_accessions(
                 &run_accessions,
                 &sdl_client,
@@ -225,6 +230,10 @@ async fn main() -> Result<()> {
                 args.format.into(),
             )
             .await?;
+            sp.finish(format!(
+                "Resolved {} accession(s)",
+                style::count(resolved_all.len()),
+            ));
             check_download_confirmation(&resolved_all, args.yes, has_projects)?;
             check_disk_space(&resolved_all, &args.output_dir)?;
 
@@ -440,11 +449,20 @@ async fn main() -> Result<()> {
             let client = SdlClient::new();
             let (run_accessions, _has_projects) = resolve_to_runs(&raw, &client).await?;
 
-            let mut resolved_all = Vec::new();
-            for result in client
+            let sp = progress::Spinner::start(format!(
+                "Resolving {} accession(s)",
+                style::count(run_accessions.len()),
+            ));
+            let resolve_results = client
                 .resolve_many(&run_accessions, Default::default())
-                .await?
-            {
+                .await?;
+            sp.finish(format!(
+                "Resolved {} accession(s)",
+                style::count(resolve_results.len()),
+            ));
+
+            let mut resolved_all = Vec::new();
+            for result in resolve_results {
                 match result {
                     Ok(resolved) => resolved_all.push(resolved),
                     Err(e) => eprintln!("{} {e}", style::error_label("error:")),
@@ -603,16 +621,16 @@ async fn resolve_to_runs(inputs: &[String], client: &SdlClient) -> Result<(Vec<S
             }
             InputAccession::Project(proj) => {
                 has_projects = true;
-                eprintln!(
-                    "{}: resolving project to run accessions...",
+                let sp = progress::Spinner::start(format!(
+                    "{}: resolving project to run accessions",
                     style::header(&proj),
-                );
+                ));
                 let runs = client.resolve_project(&proj).await?;
-                eprintln!(
+                sp.finish(format!(
                     "{}: found {} run(s)",
                     style::header(&proj),
                     style::count(runs.len()),
-                );
+                ));
                 run_accessions.extend(runs);
             }
         }
