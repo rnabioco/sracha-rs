@@ -28,8 +28,19 @@
 //! - [`blob_headers_deserialize`]: Blob header stack deserialization.
 
 use std::borrow::Cow;
+use std::fmt::Write as _;
+
+use md5::{Digest, Md5};
 
 use crate::error::{Error, Result};
+
+fn hex16(bytes: &[u8]) -> String {
+    let mut s = String::with_capacity(bytes.len() * 2);
+    for b in bytes {
+        let _ = write!(s, "{b:02x}");
+    }
+    s
+}
 
 // ---------------------------------------------------------------------------
 // Variable-length integer encoding (vlen)
@@ -784,6 +795,18 @@ pub fn decode_blob<'a>(
         if stored_crc != computed_crc {
             return Err(Error::Vdb(format!(
                 "CRC32 mismatch: stored={stored_crc:#010x}, computed={computed_crc:#010x}"
+            )));
+        }
+    } else if checksum_type == 2 && cs_size == 16 {
+        let stored: [u8; 16] = raw[raw.len() - 16..]
+            .try_into()
+            .expect("slice length is 16");
+        let computed = Md5::digest(blob_data);
+        if stored != computed.as_slice() {
+            return Err(Error::Vdb(format!(
+                "MD5 mismatch: stored={}, computed={}",
+                hex16(&stored),
+                hex16(computed.as_slice()),
             )));
         }
     }
@@ -2240,6 +2263,26 @@ mod tests {
         let mut blob = vec![0x61u8, 0xAA, 0xBB];
         blob.extend_from_slice(&[0x00, 0x00, 0x00, 0x00]); // wrong CRC
         assert!(decode_blob(&blob, 1, 1, 8).is_err());
+    }
+
+    #[test]
+    fn decode_blob_v1_with_md5() {
+        let mut blob = vec![0x61u8];
+        blob.extend_from_slice(&[0xAA, 0xBB]);
+
+        let digest = Md5::digest(&blob);
+        blob.extend_from_slice(digest.as_slice());
+
+        let decoded = decode_blob(&blob, 2, 1, 8).unwrap();
+        assert_eq!(decoded.data, vec![0xAA, 0xBB]);
+    }
+
+    #[test]
+    fn decode_blob_v1_md5_mismatch() {
+        let mut blob = vec![0x61u8, 0xAA, 0xBB];
+        blob.extend_from_slice(&[0u8; 16]); // wrong MD5 (all zeros)
+        let err = decode_blob(&blob, 2, 1, 8).unwrap_err();
+        assert!(err.to_string().contains("MD5 mismatch"));
     }
 
     #[test]

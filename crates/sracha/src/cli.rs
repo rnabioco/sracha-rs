@@ -106,9 +106,9 @@ pub struct FetchArgs {
     #[arg(long)]
     pub no_progress: bool,
 
-    /// Verify MD5 after download
+    /// Skip MD5 verification after download (verification is on by default)
     #[arg(long, help_heading = "Advanced")]
-    pub validate: bool,
+    pub no_validate: bool,
 
     /// Disable download resume (re-download from scratch)
     #[arg(long, help_heading = "Advanced")]
@@ -324,6 +324,15 @@ pub struct ValidateArgs {
     /// Disable progress bar
     #[arg(long)]
     pub no_progress: bool,
+
+    /// Expected MD5 hash (hex). When set, validate fails on mismatch.
+    /// Apply to a single input; with multiple inputs every file must match.
+    #[arg(long)]
+    pub md5: Option<String>,
+
+    /// Skip the SDL lookup for the expected MD5 (offline only)
+    #[arg(long)]
+    pub offline: bool,
 }
 
 #[derive(Clone, Copy, ValueEnum)]

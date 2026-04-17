@@ -17,6 +17,13 @@ pub enum Error {
     #[error("checksum mismatch: expected {expected}, got {actual}")]
     ChecksumMismatch { expected: String, actual: String },
 
+    #[error("spot count mismatch for {accession}: expected {expected}, got {actual}")]
+    SpotCountMismatch {
+        accession: String,
+        expected: u64,
+        actual: u64,
+    },
+
     #[error("invalid KAR archive: {0}")]
     InvalidKar(String),
 

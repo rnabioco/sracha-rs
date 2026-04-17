@@ -1708,6 +1708,19 @@ fn decode_and_write(
         "{accession}: streaming decode complete -- {total_spots} spots, {reads_written} reads written",
     );
 
+    // Reconcile against RunInfo if available. Filters (skip_technical, min_read_len)
+    // operate on reads within a spot, not on spots themselves, so every spot should
+    // still be traversed.
+    if let Some(expected) = config.run_info.as_ref().and_then(|ri| ri.spots)
+        && expected != total_spots
+    {
+        return Err(Error::SpotCountMismatch {
+            accession: accession.to_string(),
+            expected,
+            actual: total_spots,
+        });
+    }
+
     // Finish all writers.
     if let Some(sw) = stdout_writer {
         sw.finish().map_err(Error::Io)?;
@@ -1737,6 +1750,8 @@ pub struct ValidationResult {
     pub columns_found: Vec<String>,
     /// Errors encountered during validation.
     pub errors: Vec<String>,
+    /// MD5 hex digest of the entire SRA file.
+    pub md5: Option<String>,
 }
 
 /// Validate an SRA file by opening as KAR archive, parsing the SEQUENCE
@@ -1767,6 +1782,7 @@ pub fn run_validate(
                 blobs_validated: 0,
                 columns_found,
                 errors,
+                md5: None,
             };
         }
     };
@@ -1782,6 +1798,7 @@ pub fn run_validate(
                 blobs_validated: 0,
                 columns_found,
                 errors,
+                md5: None,
             };
         }
     };
@@ -1798,6 +1815,7 @@ pub fn run_validate(
                 blobs_validated: 0,
                 columns_found,
                 errors,
+                md5: None,
             };
         }
     };
@@ -1839,6 +1857,7 @@ pub fn run_validate(
                 blobs_validated: 0,
                 columns_found,
                 errors,
+                md5: None,
             };
         }
     };
@@ -1949,6 +1968,10 @@ pub fn run_validate(
         ));
     }
 
+    let md5 = compute_file_md5(sra_path)
+        .map_err(|e| errors.push(format!("MD5 compute: {e}")))
+        .ok();
+
     ValidationResult {
         valid: errors.is_empty(),
         label,
@@ -1956,7 +1979,25 @@ pub fn run_validate(
         blobs_validated,
         columns_found,
         errors,
+        md5,
     }
+}
+
+fn compute_file_md5(path: &std::path::Path) -> std::io::Result<String> {
+    use md5::{Digest, Md5};
+    use std::io::Read;
+    let mut file = std::fs::File::open(path)?;
+    let mut hasher = Md5::new();
+    let mut buf = vec![0u8; 64 * 1024];
+    loop {
+        let n = file.read(&mut buf)?;
+        if n == 0 {
+            break;
+        }
+        hasher.update(&buf[..n]);
+    }
+    let digest = hasher.finalize();
+    Ok(digest.iter().map(|b| format!("{b:02x}")).collect())
 }
 
 /// Statistics from a completed fastq conversion (no download).

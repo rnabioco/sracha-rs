@@ -117,7 +117,7 @@ async fn main() -> Result<()> {
                 let dl_config = sracha_core::download::DownloadConfig {
                     connections: args.connections,
                     force: args.force,
-                    validate: args.validate,
+                    validate: !args.no_validate,
                     progress: !args.no_progress,
                     resume: !args.no_resume,
                     ..Default::default()
@@ -497,6 +497,8 @@ async fn main() -> Result<()> {
             Ok(())
         }
         Command::Validate(args) => {
+            use sracha_core::accession;
+            use sracha_core::sdl::FormatPreference;
             use tabled::builder::Builder;
             use tabled::settings::object::{Columns, Rows};
             use tabled::settings::{Alignment, Color, Modify, Style};
@@ -509,10 +511,17 @@ async fn main() -> Result<()> {
                 spots: String,
                 blobs: String,
                 columns: String,
+                md5_status: String,
                 errors: Vec<String>,
             }
 
             let mut rows: Vec<ValidateRow> = Vec::new();
+
+            let sdl = if args.md5.is_none() && !args.offline {
+                Some(SdlClient::new())
+            } else {
+                None
+            };
 
             for input in &args.inputs {
                 let sra_path = std::path::Path::new(input);
@@ -526,8 +535,44 @@ async fn main() -> Result<()> {
                     continue;
                 }
 
-                let result =
+                let mut result =
                     sracha_core::pipeline::run_validate(sra_path, args.threads, !args.no_progress);
+
+                // Determine expected MD5: --md5 > SDL lookup > none.
+                let expected_md5: Option<String> = if let Some(hash) = &args.md5 {
+                    Some(hash.to_lowercase())
+                } else if let Some(client) = &sdl {
+                    let stem = sra_path.file_stem().and_then(|s| s.to_str()).unwrap_or("");
+                    if accession::parse(stem).is_ok() {
+                        match client.resolve_one(stem, FormatPreference::Sra).await {
+                            Ok(r) => r.sra_file.md5.map(|s| s.to_lowercase()),
+                            Err(e) => {
+                                tracing::warn!("{stem}: SDL lookup failed: {e}");
+                                None
+                            }
+                        }
+                    } else {
+                        None
+                    }
+                } else {
+                    None
+                };
+
+                let md5_status = match (result.md5.as_deref(), expected_md5.as_deref()) {
+                    (Some(got), Some(exp)) => {
+                        if got.eq_ignore_ascii_case(exp) {
+                            format!("{} ok", &got[..12])
+                        } else {
+                            result
+                                .errors
+                                .push(format!("MD5 mismatch: expected {exp}, got {got}"));
+                            result.valid = false;
+                            format!("MISMATCH ({})", &got[..12])
+                        }
+                    }
+                    (Some(got), None) => format!("{} (no ref)", &got[..12]),
+                    (None, _) => String::from("-"),
+                };
 
                 if !result.valid {
                     all_valid = false;
@@ -539,13 +584,14 @@ async fn main() -> Result<()> {
                     spots: result.spots_validated.to_string(),
                     blobs: result.blobs_validated.to_string(),
                     columns: result.columns_found.join(", "),
+                    md5_status,
                     errors: result.errors,
                 });
             }
 
             if !rows.is_empty() {
                 let mut builder = Builder::new();
-                builder.push_record(["File", "Status", "Spots", "Blobs", "Columns"]);
+                builder.push_record(["File", "Status", "Spots", "Blobs", "Columns", "MD5"]);
 
                 for row in &rows {
                     let status = if row.valid {
@@ -559,6 +605,7 @@ async fn main() -> Result<()> {
                         row.spots.clone(),
                         row.blobs.clone(),
                         row.columns.clone(),
+                        row.md5_status.clone(),
                     ]);
                 }
 

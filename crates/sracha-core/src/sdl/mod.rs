@@ -114,6 +114,8 @@ pub struct RunInfo {
     pub spot_len: u32,
     /// Sequencing platform (e.g. "ILLUMINA", "LS454", "OXFORD_NANOPORE").
     pub platform: Option<String>,
+    /// Total spot count reported by EUtils RunInfo (None if missing/unparseable).
+    pub spots: Option<u64>,
 }
 
 /// Resolved download information for a single accession.
@@ -476,6 +478,7 @@ fn parse_run_info_csv_multi(body: &str) -> HashMap<String, RunInfo> {
     };
     let run_idx = col("Run");
     let platform_idx = col("Platform");
+    let spots_idx = col("spots");
 
     for data in lines {
         let values: Vec<&str> = data.split(',').collect();
@@ -526,9 +529,11 @@ fn parse_run_info_csv_multi(body: &str) -> HashMap<String, RunInfo> {
             .filter(|s| !s.is_empty())
             .map(String::from);
 
+        let spots = spots_idx.and_then(|i| values.get(i).and_then(|v| v.parse::<u64>().ok()));
+
         tracing::debug!(
             "{accession}: EUtils RunInfo: layout={layout}, avgLength={avg_length}, \
-             nreads={nreads}, per_read_len={avg_read_len:?}, platform={platform:?}",
+             nreads={nreads}, per_read_len={avg_read_len:?}, platform={platform:?}, spots={spots:?}",
         );
 
         result.insert(
@@ -538,6 +543,7 @@ fn parse_run_info_csv_multi(body: &str) -> HashMap<String, RunInfo> {
                 avg_read_len,
                 spot_len: avg_length,
                 platform,
+                spots,
             },
         );
     }
@@ -700,6 +706,14 @@ mod tests {
         assert_eq!(ri.nreads, 2);
         assert_eq!(ri.spot_len, 302);
         assert_eq!(ri.avg_read_len, vec![151, 151]);
+        assert_eq!(ri.spots, Some(506_446_387));
+    }
+
+    #[test]
+    fn parse_run_info_missing_spots_column() {
+        let csv = "Run,avgLength,LibraryLayout\nTEST,150,SINGLE\n";
+        let ri = parse_run_info_csv(csv, "TEST").unwrap();
+        assert_eq!(ri.spots, None);
     }
 
     #[test]
