@@ -50,3 +50,18 @@ reqwest = { workspace = true, features = ["blocking"] }
 flate2.workspace = true
 tempfile.workspace = true
 md-5.workspace = true
+
+# Examples require specific features (they use the format writers'
+# reader API directly). `cargo build --examples` without the feature
+# skips these rather than failing.
+[[example]]
+name = "read_parquet"
+required-features = ["parquet"]
+
+[[example]]
+name = "read_vortex"
+required-features = ["vortex"]
+
+[[example]]
+name = "vortex_inspect"
+required-features = ["vortex"]
