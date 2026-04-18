@@ -779,6 +779,73 @@ fn csra_align_restore_read_row_1() {
 
 #[ignore]
 #[test]
+fn csra_seq_restore_read_row_1() {
+    // End-to-end Phase 2 splice: SEQUENCE row 1 of VDB-3418.
+    //
+    // `vdb-dump -T SEQUENCE -R 1` reports READ_LEN=36185,
+    // READ_TYPE=BIOLOGICAL|REVERSE (0x0A), PRIMARY_ALIGNMENT_ID=1, CMP_READ
+    // empty (single-read fully-aligned spot). So the splice reduces to:
+    // reverse-complement(align_restore_read(alignment row 1)).
+    //
+    // vdb-dump -T SEQUENCE -C READ first 30 chars:
+    //   TCGGTATTACTTCGTTCAGTTACGTATTGCT  (31)
+    // last 31:
+    //   GTTTCCCTAATAACCTTAGCAATACGTAACT
+    use sracha_core::vdb::alignment::AlignmentCursor;
+    use sracha_core::vdb::kar::KarArchive;
+    use sracha_core::vdb::reference::ReferenceCursor;
+    use sracha_core::vdb::restore::{
+        SRA_READ_TYPE_REVERSE, align_restore_read, fourna_to_ascii, seq_restore_read,
+    };
+
+    let path = fixtures_dir().join("VDB-3418.sra");
+    if !path.exists() {
+        eprintln!("skipping: {} not present", path.display());
+        return;
+    }
+
+    let file = std::fs::File::open(&path).unwrap();
+    let mut archive = KarArchive::open(std::io::BufReader::new(file)).unwrap();
+    let align = AlignmentCursor::open(&mut archive, &path).unwrap();
+    let refs = ReferenceCursor::open(&mut archive, &path).unwrap();
+
+    // Hardcoded SEQUENCE row 1 values (see vdb-dump). A SEQUENCE column
+    // reader lands in Phase 3; the splice algorithm is the same either way.
+    let align_ids = [1i64];
+    let read_lens = [36185u32];
+    // SRA_READ_TYPE_BIOLOGICAL (0x08) | SRA_READ_TYPE_REVERSE (0x02) = 0x0A.
+    let read_types = [0x08 | SRA_READ_TYPE_REVERSE];
+    let cmp_rd: Vec<u8> = Vec::new();
+
+    let spot = seq_restore_read(
+        &cmp_rd,
+        &align_ids,
+        &read_lens,
+        &read_types,
+        |alignment_id| {
+            let row = align.read_row(alignment_id)?;
+            let ref_read = refs.fetch_span(row.global_ref_start, row.ref_len)?;
+            align_restore_read(
+                &ref_read,
+                &row.has_mismatch,
+                &row.mismatch,
+                &row.has_ref_offset,
+                &row.ref_offset,
+                row.has_mismatch.len(),
+            )
+        },
+    )
+    .unwrap();
+
+    let ascii = fourna_to_ascii(&spot);
+    let text = std::str::from_utf8(&ascii).unwrap();
+    assert_eq!(text.len(), 36185);
+    assert_eq!(&text[..31], "TCGGTATTACTTCGTTCAGTTACGTATTGCT");
+    assert_eq!(&text[text.len() - 31..], "GTTTCCCTAATAACCTTAGCAATACGTAACT");
+}
+
+#[ignore]
+#[test]
 fn corrupt_kar_magic_fails_fast() {
     let tmp = tempfile::tempdir().unwrap();
     let path = clone_fixture(tmp.path(), "badmagic.sra");

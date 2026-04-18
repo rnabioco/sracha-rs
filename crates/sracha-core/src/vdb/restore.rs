@@ -128,6 +128,98 @@ pub fn fourna_to_ascii(bases: &[u8]) -> Vec<u8> {
     bases.iter().map(|&b| LUT[(b & 0x0F) as usize]).collect()
 }
 
+/// Splice a full SEQUENCE spot's bases together from per-read alignment
+/// lookups plus the spot's CMP_READ (unaligned halves).
+///
+/// Transcribed from `ncbi-vdb/libs/axf/seq-restore-read.c:454-574`.
+///
+/// Inputs are per-spot arrays of length `num_reads` (= SEQUENCE.NREADS):
+/// - `cmp_rd`: 4na-bin bases for the unaligned halves of this spot,
+///   stored contiguously in read order. Consumed sequentially as the
+///   splice walks reads where `align_ids[i] == 0`.
+/// - `align_ids`: PRIMARY_ALIGNMENT row ids, one per read. `0` means
+///   the read is unaligned and bases live in `cmp_rd`.
+/// - `read_lens`: final length in bases of each read in the output.
+/// - `read_types`: per-read bitfield. Only `SRA_READ_TYPE_FORWARD`
+///   (`0x01`) and `SRA_READ_TYPE_REVERSE` (`0x02`) matter for strand;
+///   higher bits are FASTQ formatting flags and are ignored here.
+/// - `fetch_aligned`: closure that, given an alignment row id, returns
+///   the 4na-bin bases in *reference orientation* (what
+///   `align_restore_read` produces). Length must equal the
+///   corresponding `read_lens[i]`; mismatch is an error. The closure is
+///   a callback so the caller controls caching of PRIMARY_ALIGNMENT /
+///   REFERENCE blob reads.
+///
+/// Strand handling follows C source lines 531-546: a read with
+/// `READ_TYPE & FORWARD` copies aligned bases as-is; a read with
+/// `READ_TYPE & REVERSE` reverses and complements them before copying.
+/// Either neither or both unset is an error (bam-load always sets
+/// exactly one).
+///
+/// Returns a fresh `Vec<u8>` of total length `sum(read_lens)` in 4na-bin.
+pub fn seq_restore_read(
+    cmp_rd: &[u8],
+    align_ids: &[i64],
+    read_lens: &[u32],
+    read_types: &[u8],
+    mut fetch_aligned: impl FnMut(i64) -> Result<Vec<u8>>,
+) -> Result<Vec<u8>> {
+    let num_reads = align_ids.len();
+    if read_lens.len() != num_reads || read_types.len() != num_reads {
+        return Err(Error::Vdb(format!(
+            "seq_restore_read: inconsistent per-read arrays — \
+             align_ids.len={num_reads}, read_lens.len={}, read_types.len={}",
+            read_lens.len(),
+            read_types.len(),
+        )));
+    }
+
+    let total: usize = read_lens.iter().map(|&n| n as usize).sum();
+    let mut out = Vec::with_capacity(total);
+    let mut cmp_cursor = 0usize;
+
+    for i in 0..num_reads {
+        let len = read_lens[i] as usize;
+        if align_ids[i] > 0 {
+            let aligned = fetch_aligned(align_ids[i])?;
+            if aligned.len() != len {
+                return Err(Error::Vdb(format!(
+                    "seq_restore_read: alignment {} returned {} bases, expected {}",
+                    align_ids[i],
+                    aligned.len(),
+                    len
+                )));
+            }
+            let rt = read_types[i];
+            if rt & SRA_READ_TYPE_FORWARD != 0 {
+                out.extend_from_slice(&aligned);
+            } else if rt & SRA_READ_TYPE_REVERSE != 0 {
+                // Reverse order AND complement each nibble.
+                for j in (0..len).rev() {
+                    out.push(COMPLEMENT_4NA[(aligned[j] & 0x0F) as usize]);
+                }
+            } else {
+                return Err(Error::Vdb(format!(
+                    "seq_restore_read: read {i} has READ_TYPE={rt:#x} without FORWARD or REVERSE bit"
+                )));
+            }
+        } else {
+            // Unaligned: consume len bases from cmp_rd.
+            let end = cmp_cursor + len;
+            if end > cmp_rd.len() {
+                return Err(Error::Vdb(format!(
+                    "seq_restore_read: read {i} wants {len} unaligned bases at offset {cmp_cursor}, cmp_rd has {}",
+                    cmp_rd.len()
+                )));
+            }
+            out.extend_from_slice(&cmp_rd[cmp_cursor..end]);
+            cmp_cursor = end;
+        }
+    }
+
+    Ok(out)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -163,6 +255,64 @@ mod tests {
         )
         .unwrap();
         assert_eq!(out, [0x1, 0x4, 0x4, 0x1]); // A G G A
+    }
+
+    #[test]
+    fn seq_splice_all_unaligned() {
+        // One-read spot of length 4, no alignment — bases all from cmp_rd.
+        let out = seq_restore_read(
+            &[0x1, 0x2, 0x4, 0x8], // ACGT
+            &[0],
+            &[4],
+            &[SRA_READ_TYPE_FORWARD | 0x08], // BIOLOGICAL|FORWARD
+            |_| panic!("fetch_aligned should not be called for unaligned read"),
+        )
+        .unwrap();
+        assert_eq!(out, [0x1, 0x2, 0x4, 0x8]);
+    }
+
+    #[test]
+    fn seq_splice_aligned_forward_pair_with_unaligned_tail() {
+        // Two-read spot: read 0 aligned (forward), read 1 unaligned.
+        let out = seq_restore_read(
+            &[0x8, 0x1], // TA — unaligned portion for read 1
+            &[42, 0],
+            &[3, 2],
+            &[SRA_READ_TYPE_FORWARD, SRA_READ_TYPE_FORWARD],
+            |id| {
+                assert_eq!(id, 42);
+                Ok(vec![0x1, 0x2, 0x4]) // ACG
+            },
+        )
+        .unwrap();
+        assert_eq!(out, [0x1, 0x2, 0x4, 0x8, 0x1]); // ACG + TA
+    }
+
+    #[test]
+    fn seq_splice_reverse_read_reverse_complements() {
+        // Single aligned read with REVERSE bit set → RC the aligned bases.
+        let out = seq_restore_read(&[], &[7], &[4], &[SRA_READ_TYPE_REVERSE], |id| {
+            assert_eq!(id, 7);
+            Ok(vec![0x1, 0x2, 0x4, 0x8]) // ACGT
+        })
+        .unwrap();
+        // RC(ACGT) = ACGT (palindrome), but let's verify complement order:
+        // reverse(ACGT) = TGCA, complement = ACGT. So RC(ACGT) = ACGT.
+        assert_eq!(out, [0x1, 0x2, 0x4, 0x8]);
+    }
+
+    #[test]
+    fn seq_splice_reverse_non_palindrome() {
+        // Single aligned read, bases "AAAT" → reverse = TAAA, complement = ATTT.
+        let out = seq_restore_read(
+            &[],
+            &[1],
+            &[4],
+            &[SRA_READ_TYPE_REVERSE],
+            |_| Ok(vec![0x1, 0x1, 0x1, 0x8]), // AAAT
+        )
+        .unwrap();
+        assert_eq!(out, [0x1, 0x8, 0x8, 0x8]); // ATTT
     }
 
     #[test]
