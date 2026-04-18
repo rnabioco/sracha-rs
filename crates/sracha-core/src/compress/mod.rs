@@ -268,11 +268,13 @@ fn compress_block(data: &[u8], level: u32) -> Vec<u8> {
 
     use libdeflater::{CompressionLvl, Compressor};
 
-    // Reuse the Compressor and output buffer across calls on the same rayon
-    // worker thread.  Compressor allocates ~300 KiB of internal hash tables;
-    // reusing it avoids thousands of malloc/free cycles per file.
+    // Reuse the Compressor across calls on the same rayon worker thread.
+    // Compressor allocates ~300 KiB of internal hash tables; reusing it
+    // avoids thousands of malloc/free cycles per file. The output buffer
+    // is allocated fresh and returned by value (no extra copy, compared to
+    // an earlier `.to_vec()` approach).
     thread_local! {
-        static TL: RefCell<Option<(i32, Compressor, Vec<u8>)>> = const { RefCell::new(None) };
+        static TL: RefCell<Option<(i32, Compressor)>> = const { RefCell::new(None) };
     }
 
     let lvl_i32 = level.clamp(1, 12) as i32;
@@ -280,23 +282,23 @@ fn compress_block(data: &[u8], level: u32) -> Vec<u8> {
     TL.with(|cell| {
         let mut slot = cell.borrow_mut();
 
-        // Recreate if this is the first call or the level changed.
         if slot
             .as_ref()
-            .is_none_or(|(cached_lvl, _, _)| *cached_lvl != lvl_i32)
+            .is_none_or(|(cached_lvl, _)| *cached_lvl != lvl_i32)
         {
             let lvl = CompressionLvl::new(lvl_i32).expect("valid compression level");
-            *slot = Some((lvl_i32, Compressor::new(lvl), Vec::new()));
+            *slot = Some((lvl_i32, Compressor::new(lvl)));
         }
 
-        let (_, compressor, out_buf) = slot.as_mut().unwrap();
+        let (_, compressor) = slot.as_mut().unwrap();
 
         let max_sz = compressor.gzip_compress_bound(data.len());
-        out_buf.resize(max_sz, 0);
+        let mut out = vec![0u8; max_sz];
         let actual = compressor
-            .gzip_compress(data, out_buf)
+            .gzip_compress(data, &mut out)
             .expect("gzip compression should not fail");
-        out_buf[..actual].to_vec()
+        out.truncate(actual);
+        out
     })
 }
 

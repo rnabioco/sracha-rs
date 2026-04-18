@@ -21,9 +21,18 @@ use crate::compress::{DEFAULT_BLOCK_SIZE, ParGzWriter};
 use crate::download::{DownloadConfig, download_file};
 use crate::error::{Error, Result};
 use crate::fastq::{
-    CompressionMode, FastqConfig, FastqRecord, IntegrityDiag, OutputSlot, SplitMode,
-    format_fasta_read, format_read_with_diag, output_filename,
+    CompressionMode, FastqConfig, IntegrityDiag, OutputSlot, SplitMode, append_fasta_record,
+    append_fastq_record, output_filename,
 };
+
+/// Output bytes for one (blob, slot) pair, plus the number of records the
+/// buffer holds. Returned from `decode_blob_to_fastq` so the writer can do
+/// one `write_all` per slot per blob instead of one per record.
+pub(crate) struct BlobSlotOutput {
+    pub(crate) slot: OutputSlot,
+    pub(crate) bytes: Vec<u8>,
+    pub(crate) records: u64,
+}
 use crate::sdl::ResolvedAccession;
 use crate::vdb::blob;
 use crate::vdb::cursor::VdbCursor;
@@ -763,8 +772,9 @@ struct RawBlobData<'a> {
     /// Fixed spot length in bases (from READ column page_size).
     fixed_spot_len: Option<u32>,
     /// Per-read lengths from NCBI EUtils API or VDB metadata (used as
-    /// fallback when READ_LEN column is absent).
-    fallback_read_lengths: Option<Vec<u32>>,
+    /// fallback when READ_LEN column is absent). Borrowed from the outer
+    /// `decode_and_write` scope so we don't clone a Vec per blob.
+    fallback_read_lengths: Option<&'a [u32]>,
 }
 
 /// Decode a single blob and produce FASTQ records directly.
@@ -790,7 +800,7 @@ fn decode_blob_to_fastq(
     ctx: &BlobDecodeCtx<'_>,
     blob_idx: usize,
     spots_before: u64,
-) -> Result<(Vec<(OutputSlot, FastqRecord)>, u64)> {
+) -> Result<(Vec<BlobSlotOutput>, u64)> {
     let BlobDecodeCtx {
         run_name,
         config,
@@ -1296,7 +1306,11 @@ fn decode_blob_to_fastq(
     // directly into the decoded column data and call format_read.
     // ------------------------------------------------------------------
     let rps = reads_per_spot.max(1);
-    let mut records: Vec<(OutputSlot, FastqRecord)> = Vec::new();
+    // Per-slot output accumulators. At most 2-4 slots in realistic configs
+    // (Split3 -> Read1/Read2/Unpaired, SplitSpot/Interleaved -> Single,
+    // SplitFiles -> ReadN(0..rps)). A linear scan over this small Vec beats
+    // a HashMap lookup in the hot path.
+    let mut records: Vec<BlobSlotOutput> = Vec::with_capacity(4);
     let mut seq_offset: usize = 0;
     let mut qual_offset: usize = 0;
     let mut rt_offset: usize = 0;
@@ -1429,48 +1443,57 @@ fn decode_blob_to_fastq(
         }
 
         if !segments.is_empty() {
-            // Helper: format a single read as FASTQ or FASTA.
-            let fmt = |seg: &ReadSeg| -> FastqRecord {
+            // Append a segment's formatted record to the slot's accumulated
+            // buffer, inserting a new slot on first use.
+            let mut emit = |slot: OutputSlot, seg: &ReadSeg| {
+                let buf = match records.iter_mut().find(|s| s.slot == slot) {
+                    Some(s) => s,
+                    None => {
+                        records.push(BlobSlotOutput {
+                            slot,
+                            bytes: Vec::new(),
+                            records: 0,
+                        });
+                        records.last_mut().unwrap()
+                    }
+                };
                 let seq = &sequence[seg.start..seg.start + seg.len];
                 if config.fasta {
-                    format_fasta_read(run_name, spot_number, original_name, seq)
+                    append_fasta_record(&mut buf.bytes, run_name, spot_number, original_name, seq);
                 } else {
                     let qual = &quality[seg.start..seg.start + seg.len];
-                    format_read_with_diag(
+                    append_fastq_record(
+                        &mut buf.bytes,
                         run_name,
                         spot_number,
                         original_name,
                         seq,
                         qual,
                         Some(diag),
-                    )
+                    );
                 }
+                buf.records += 1;
             };
 
             match config.split_mode {
                 SplitMode::Split3 => {
                     if segments.len() == 2 {
-                        records.push((OutputSlot::Read1, fmt(&segments[0])));
-                        records.push((OutputSlot::Read2, fmt(&segments[1])));
+                        emit(OutputSlot::Read1, &segments[0]);
+                        emit(OutputSlot::Read2, &segments[1]);
                     } else {
                         for seg in &segments {
-                            records.push((OutputSlot::Unpaired, fmt(seg)));
+                            emit(OutputSlot::Unpaired, seg);
                         }
                     }
                 }
-                SplitMode::Interleaved => {
+                SplitMode::Interleaved | SplitMode::SplitSpot => {
                     for seg in &segments {
-                        records.push((OutputSlot::Single, fmt(seg)));
+                        emit(OutputSlot::Single, seg);
                     }
                 }
                 SplitMode::SplitFiles => {
                     for (file_idx, seg) in segments.iter().enumerate() {
-                        records.push((OutputSlot::ReadN(file_idx as u32), fmt(seg)));
-                    }
-                }
-                SplitMode::SplitSpot => {
-                    for seg in &segments {
-                        records.push((OutputSlot::Single, fmt(seg)));
+                        emit(OutputSlot::ReadN(file_idx as u32), seg);
                     }
                 }
             }
@@ -1751,9 +1774,12 @@ fn decode_and_write(
     // write loop (consumer).  While the writer drains batch N, the
     // decode pool is already working on batch N+1.
     // ------------------------------------------------------------------
-    type FormattedBlob = (Vec<(OutputSlot, FastqRecord)>, u64);
-    // Capacity 2: at most 2 decoded batches buffered.
-    let (batch_tx, batch_rx) = crossbeam_channel::bounded::<Vec<Result<FormattedBlob>>>(2);
+    type FormattedBlob = (Vec<BlobSlotOutput>, u64);
+    // Bounded channel gives the decode pool slack when writer batch time
+    // varies. Capacity 4 costs at most 4×BATCH_SIZE formatted blobs of
+    // memory — bounded, and measurably better than 2 on variable-sized
+    // writer work (e.g. gzip vs plain).
+    let (batch_tx, batch_rx) = crossbeam_channel::bounded::<Vec<Result<FormattedBlob>>>(4);
 
     let write_result: Result<()> = std::thread::scope(|scope| {
         // ---- Writer thread ----
@@ -1761,16 +1787,19 @@ fn decode_and_write(
             let mut blob_counter: usize = 0;
             while let Ok(formatted_batches) = batch_rx.recv() {
                 for result in formatted_batches {
-                    let (records, num_spots) = result?;
+                    let (slot_outputs, num_spots) = result?;
 
-                    for (slot, record) in &records {
+                    // One write_all per (slot, blob) instead of per record —
+                    // orders of magnitude fewer write calls, and the Vec<u8>
+                    // allocation happens at most 4× per blob, not per record.
+                    for slot_out in &slot_outputs {
                         let writer = if let Some(ref mut sw) = stdout_writer {
                             sw
                         } else {
-                            writers.entry(*slot).or_insert_with(|| {
+                            writers.entry(slot_out.slot).or_insert_with(|| {
                                 let filename = output_filename(
                                     accession,
-                                    *slot,
+                                    slot_out.slot,
                                     config.fasta,
                                     &config.compression,
                                 );
@@ -1806,9 +1835,9 @@ fn decode_and_write(
                             })
                         };
 
-                        writer.write_all(&record.data).map_err(Error::Io)?;
-                        reads_written += 1;
-                        *per_slot_counts.entry(*slot).or_insert(0) += 1;
+                        writer.write_all(&slot_out.bytes).map_err(Error::Io)?;
+                        reads_written += slot_out.records;
+                        *per_slot_counts.entry(slot_out.slot).or_insert(0) += slot_out.records;
                     }
 
                     spots_read.fetch_add(num_spots, std::sync::atomic::Ordering::Relaxed);
@@ -1986,7 +2015,7 @@ fn decode_and_write(
                             has_read_type,
                             metadata_reads_per_spot,
                             fixed_spot_len,
-                            fallback_read_lengths: fallback_read_lengths.clone(),
+                            fallback_read_lengths: fallback_read_lengths.as_deref(),
                         };
 
                         decode_blob_to_fastq(&raw, &decode_ctx, bi, spots_before_per_blob[i])

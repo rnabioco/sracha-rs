@@ -204,18 +204,74 @@ pub fn format_read_with_diag(
     quality: &[u8],
     diag: Option<&IntegrityDiag>,
 ) -> FastqRecord {
+    let mut data = Vec::new();
+    append_fastq_record(
+        &mut data,
+        run_name,
+        spot_number,
+        original_name,
+        sequence,
+        quality,
+        diag,
+    );
+    FastqRecord { data }
+}
+
+/// Append a FASTQ record to `out` — the hot-path variant that avoids
+/// allocating a fresh `Vec<u8>` per call.
+///
+/// Semantics match [`format_read_with_diag`]. The defline is constructed
+/// once and copied to the `+` line via [`Vec::extend_from_within`], saving
+/// one round of `itoa` + string concatenation per record.
+pub fn append_fastq_record(
+    out: &mut Vec<u8>,
+    run_name: &str,
+    spot_number: &[u8],
+    original_name: Option<&[u8]>,
+    sequence: &[u8],
+    quality: &[u8],
+    diag: Option<&IntegrityDiag>,
+) {
     let len = sequence.len();
+    let description = original_name.unwrap_or(spot_number);
+    let quality = repair_quality(quality, len, diag);
 
-    // Validate quality. Only allocate a corrected copy when something is wrong;
-    // the common case (correct length, all bytes valid) is zero-copy.
-    let needs_pad = quality.len() != len;
-    let needs_sanitize = !needs_pad
-        && quality
-            .iter()
-            .any(|&b| !(MIN_QUAL_BYTE..=MAX_QUAL_BYTE).contains(&b));
+    let mut itoa_buf = itoa::Buffer::new();
+    let len_str = itoa_buf.format(len);
+    let defline_body_len = defline_body_len(run_name, spot_number, description, len_str);
 
-    let qual_corrected: Vec<u8>;
-    let quality: &[u8] = if needs_pad {
+    // Reserve up front: @defline\nseq\n+defline\nqual\n.
+    out.reserve(1 + defline_body_len + 1 + len + 2 + defline_body_len + 1 + len + 1);
+
+    out.push(b'@');
+    let body_start = out.len();
+    append_defline_body(out, run_name, spot_number, description, len_str);
+    let body_end = out.len();
+    out.push(b'\n');
+
+    out.extend_from_slice(sequence);
+    out.push(b'\n');
+
+    // + line repeats defline. Single intra-Vec memcpy, no re-formatting.
+    out.push(b'+');
+    out.extend_from_within(body_start..body_end);
+    out.push(b'\n');
+
+    out.extend_from_slice(&quality);
+    out.push(b'\n');
+}
+
+/// Quality validation: returns the input unchanged on the fast path, or a
+/// corrected owned Vec on pad/sanitize. Keeps [`append_fastq_record`]'s top
+/// level short and lets the hot path `Cow::Borrowed` straight through.
+fn repair_quality<'a>(
+    quality: &'a [u8],
+    len: usize,
+    diag: Option<&IntegrityDiag>,
+) -> std::borrow::Cow<'a, [u8]> {
+    use std::borrow::Cow;
+
+    if quality.len() != len {
         if let Some(d) = diag {
             d.quality_length_mismatches.fetch_add(1, Ordering::Relaxed);
         } else {
@@ -225,19 +281,21 @@ pub fn format_read_with_diag(
                 len,
             );
         }
-        qual_corrected = {
-            let mut q = quality[..quality.len().min(len)].to_vec();
-            q.resize(len, FALLBACK_QUAL_BYTE);
-            q
-        };
-        &qual_corrected
-    } else if needs_sanitize {
+        let mut q = quality[..quality.len().min(len)].to_vec();
+        q.resize(len, FALLBACK_QUAL_BYTE);
+        return Cow::Owned(q);
+    }
+
+    if quality
+        .iter()
+        .any(|&b| !(MIN_QUAL_BYTE..=MAX_QUAL_BYTE).contains(&b))
+    {
         if let Some(d) = diag {
             d.quality_invalid_bytes.fetch_add(1, Ordering::Relaxed);
         } else {
             tracing::warn!("quality contains invalid bytes outside [33, 126] range; sanitizing");
         }
-        qual_corrected = quality
+        let corrected: Vec<u8> = quality
             .iter()
             .map(|&b| {
                 if (MIN_QUAL_BYTE..=MAX_QUAL_BYTE).contains(&b) {
@@ -247,59 +305,38 @@ pub fn format_read_with_diag(
                 }
             })
             .collect();
-        &qual_corrected
-    } else {
-        quality
-    };
+        return Cow::Owned(corrected);
+    }
 
-    // N-masking is handled upstream in the pipeline layer: ALTREAD ambiguity
-    // merge when available, quality-based fallback otherwise.  By the time
-    // bases reach format_read() they already have correct N positions.
+    Cow::Borrowed(quality)
+}
 
-    // Description part of the defline: original name if available, else spot number.
-    let description = original_name.unwrap_or(spot_number);
+/// Shared defline body: `{run}.{spot} {description} length={len}`.
+/// Used by both the `@` line and the `>` line (FASTA).
+fn append_defline_body(
+    out: &mut Vec<u8>,
+    run_name: &str,
+    spot_number: &[u8],
+    description: &[u8],
+    len_str: &str,
+) {
+    out.extend_from_slice(run_name.as_bytes());
+    out.push(b'.');
+    out.extend_from_slice(spot_number);
+    out.push(b' ');
+    out.extend_from_slice(description);
+    out.extend_from_slice(b" length=");
+    out.extend_from_slice(len_str.as_bytes());
+}
 
-    // Build defline bytes: "{run_name}.{spot_number} {description} length={len}"
-    let mut itoa_buf = itoa::Buffer::new();
-    let len_str = itoa_buf.format(len);
-
-    let defline_len =
-        run_name.len() + 1 + spot_number.len() + 1 + description.len() + 8 + len_str.len();
-
-    // Pre-allocate full record: @defline\nseq\n+defline\nqual\n
-    let mut data = Vec::with_capacity(1 + defline_len + 1 + len + 2 + defline_len + 1 + len + 1);
-
-    // @defline
-    data.push(b'@');
-    data.extend_from_slice(run_name.as_bytes());
-    data.push(b'.');
-    data.extend_from_slice(spot_number);
-    data.push(b' ');
-    data.extend_from_slice(description);
-    data.extend_from_slice(b" length=");
-    data.extend_from_slice(len_str.as_bytes());
-    data.push(b'\n');
-
-    // Sequence
-    data.extend_from_slice(sequence);
-    data.push(b'\n');
-
-    // + line repeats defline (matching fasterq-dump)
-    data.push(b'+');
-    data.extend_from_slice(run_name.as_bytes());
-    data.push(b'.');
-    data.extend_from_slice(spot_number);
-    data.push(b' ');
-    data.extend_from_slice(description);
-    data.extend_from_slice(b" length=");
-    data.extend_from_slice(len_str.as_bytes());
-    data.push(b'\n');
-
-    // Quality
-    data.extend_from_slice(quality);
-    data.push(b'\n');
-
-    FastqRecord { data }
+/// Byte length of the defline body (no `@`/`>` prefix, no trailing `\n`).
+fn defline_body_len(
+    run_name: &str,
+    spot_number: &[u8],
+    description: &[u8],
+    len_str: &str,
+) -> usize {
+    run_name.len() + 1 + spot_number.len() + 1 + description.len() + 8 + len_str.len()
 }
 
 /// Format a single read segment into a FASTA record (no quality line).
@@ -314,34 +351,36 @@ pub fn format_fasta_read(
     original_name: Option<&[u8]>,
     sequence: &[u8],
 ) -> FastqRecord {
+    let mut data = Vec::new();
+    append_fasta_record(&mut data, run_name, spot_number, original_name, sequence);
+    FastqRecord { data }
+}
+
+/// Append a FASTA record to `out` — hot-path variant that avoids a
+/// per-record Vec allocation. Semantics match [`format_fasta_read`].
+pub fn append_fasta_record(
+    out: &mut Vec<u8>,
+    run_name: &str,
+    spot_number: &[u8],
+    original_name: Option<&[u8]>,
+    sequence: &[u8],
+) {
     let len = sequence.len();
     let description = original_name.unwrap_or(spot_number);
 
     let mut itoa_buf = itoa::Buffer::new();
     let len_str = itoa_buf.format(len);
+    let defline_body_len = defline_body_len(run_name, spot_number, description, len_str);
 
-    let defline_len =
-        run_name.len() + 1 + spot_number.len() + 1 + description.len() + 8 + len_str.len();
+    // >defline\nseq\n
+    out.reserve(1 + defline_body_len + 1 + len + 1);
 
-    // Pre-allocate: >defline\nsequence\n
-    let mut data = Vec::with_capacity(1 + defline_len + 1 + len + 1);
+    out.push(b'>');
+    append_defline_body(out, run_name, spot_number, description, len_str);
+    out.push(b'\n');
 
-    // >defline
-    data.push(b'>');
-    data.extend_from_slice(run_name.as_bytes());
-    data.push(b'.');
-    data.extend_from_slice(spot_number);
-    data.push(b' ');
-    data.extend_from_slice(description);
-    data.extend_from_slice(b" length=");
-    data.extend_from_slice(len_str.as_bytes());
-    data.push(b'\n');
-
-    // Sequence
-    data.extend_from_slice(sequence);
-    data.push(b'\n');
-
-    FastqRecord { data }
+    out.extend_from_slice(sequence);
+    out.push(b'\n');
 }
 
 /// A read segment extracted from a spot, after filtering.

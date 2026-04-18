@@ -1744,6 +1744,11 @@ pub fn izip_decode(data: &[u8], elem_bits: u32, _num_elements_hint: u32) -> Resu
 }
 
 /// Write a single element value to the output buffer.
+///
+/// `elem_bits` is loop-invariant at every call site. Marked `#[inline(always)]`
+/// so LLVM can collapse the runtime match into the surrounding loop's
+/// monomorphic form after the caller hoists `elem_bits` out.
+#[inline(always)]
 fn write_element(output: &mut [u8], idx: usize, val: i64, elem_bits: u32) {
     match elem_bits {
         8 => {
