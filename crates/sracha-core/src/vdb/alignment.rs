@@ -124,23 +124,12 @@ impl AlignmentCursor {
 
     /// Read a single u64 fixed-length column value for `row_id`.
     fn read_u64(col: &ColumnReader, row_id: i64) -> Result<u64> {
-        let values = decode_u_column(col, row_id, 64)?;
-        let idx = row_offset_in_blob(col, row_id)?;
-        values
-            .get(idx)
-            .copied()
-            .ok_or_else(|| Error::Vdb(format!("row {row_id} out of range in u64 column")))
+        read_scalar_int(col, row_id, 64).map(|v| v as u64)
     }
 
     /// Read a single u32 fixed-length column value for `row_id`.
     fn read_u32(col: &ColumnReader, row_id: i64) -> Result<u32> {
-        let values = decode_u_column(col, row_id, 32)?;
-        let idx = row_offset_in_blob(col, row_id)?;
-        values
-            .get(idx)
-            .copied()
-            .map(|v| v as u32)
-            .ok_or_else(|| Error::Vdb(format!("row {row_id} out of range in u32 column")))
+        read_scalar_int(col, row_id, 32).map(|v| v as u32)
     }
 
     /// Return the alignment row 1's GLOBAL_REF_START — smoke-test hook for
@@ -326,21 +315,17 @@ fn decode_bytes_payload(decoded: &DecodedBlob<'_>) -> Result<Vec<u8>> {
     )))
 }
 
-/// Given a concatenated per-record byte buffer and the page map's per-record
-/// Row's 0-based offset within the decoded blob array for its column.
-fn row_offset_in_blob(col: &ColumnReader, row_id: i64) -> Result<usize> {
+/// Read one scalar (single-value-per-row) integer column value, honouring
+/// the page_map's data_runs compression.
+///
+/// GLOBAL_REF_START / REF_LEN are stored as unique values plus a
+/// `data_runs` RLE (most alignments in a blob share the same length /
+/// chunk, so the 7-row blob's payload holds only the unique values). The
+/// run-length walk mirrors `ReferenceCursor::read_chunk_len`.
+fn read_scalar_int(col: &ColumnReader, row_id: i64, elem_bits: u32) -> Result<i64> {
     let blob = col
         .find_blob(row_id)
-        .ok_or_else(|| Error::Vdb(format!("no blob for row {row_id}")))?;
-    Ok((row_id - blob.start_id) as usize)
-}
-
-/// Decode an integer column's blob that contains `row_id` into a Vec of u64
-/// values. Handles irzip (headers v1+) and izip (v0) decode paths.
-fn decode_u_column(col: &ColumnReader, row_id: i64, elem_bits: u32) -> Result<Vec<u64>> {
-    let blob = col
-        .find_blob(row_id)
-        .ok_or_else(|| Error::Vdb(format!("no blob for row {row_id}")))?;
+        .ok_or_else(|| Error::Vdb(format!("scalar int: no blob for row {row_id}")))?;
     let raw = col.read_raw_blob_slice(row_id)?;
     let decoded = blob::decode_blob(
         raw,
@@ -349,7 +334,66 @@ fn decode_u_column(col: &ColumnReader, row_id: i64, elem_bits: u32) -> Result<Ve
         elem_bits,
     )?;
     let bytes = decode_integer_bytes(&decoded, elem_bits)?;
-    bytes_to_u64_vec(&bytes, elem_bits)
+
+    let logical_offset = (row_id - blob.start_id) as usize;
+    let data_idx = if let Some(pm) = &decoded.page_map
+        && !pm.data_runs.is_empty()
+    {
+        if pm.data_runs.len() as u64 >= pm.total_rows() {
+            *pm.data_runs.get(logical_offset).ok_or_else(|| {
+                Error::Vdb(format!(
+                    "scalar row {row_id}: data_runs[{logical_offset}] missing"
+                ))
+            })? as usize
+        } else {
+            let mut seen = 0u64;
+            let mut chosen: Option<usize> = None;
+            for (i, &repeat) in pm.data_runs.iter().enumerate() {
+                let end = seen + u64::from(repeat);
+                if (logical_offset as u64) < end {
+                    chosen = Some(i);
+                    break;
+                }
+                seen = end;
+            }
+            chosen.ok_or_else(|| {
+                Error::Vdb(format!(
+                    "scalar row {row_id}: logical offset {logical_offset} outside data_runs"
+                ))
+            })?
+        }
+    } else {
+        logical_offset
+    };
+
+    let bytes_per = (elem_bits / 8) as usize;
+    let byte_off = data_idx * bytes_per;
+    if byte_off + bytes_per > bytes.len() {
+        return Err(Error::Vdb(format!(
+            "scalar row {row_id}: byte offset {byte_off} past decoded {}",
+            bytes.len()
+        )));
+    }
+    let val = match elem_bits {
+        32 => i64::from(i32::from_le_bytes([
+            bytes[byte_off],
+            bytes[byte_off + 1],
+            bytes[byte_off + 2],
+            bytes[byte_off + 3],
+        ])),
+        64 => i64::from_le_bytes([
+            bytes[byte_off],
+            bytes[byte_off + 1],
+            bytes[byte_off + 2],
+            bytes[byte_off + 3],
+            bytes[byte_off + 4],
+            bytes[byte_off + 5],
+            bytes[byte_off + 6],
+            bytes[byte_off + 7],
+        ]),
+        _ => return Err(Error::Vdb(format!("unsupported elem_bits {elem_bits}"))),
+    };
+    Ok(val)
 }
 
 /// Interpret a decoded blob's `data` as compressed integers and return the
@@ -410,37 +454,4 @@ fn decode_integer_bytes(decoded: &DecodedBlob<'_>, elem_bits: u32) -> Result<Vec
         "alignment column: no decoder succeeded (elem_bits={elem_bits}, data.len={}, osize={osize})",
         decoded.data.len()
     )))
-}
-
-/// Convert a decoded integer byte buffer (little-endian) into a Vec<u64>.
-fn bytes_to_u64_vec(bytes: &[u8], elem_bits: u32) -> Result<Vec<u64>> {
-    match elem_bits {
-        32 => {
-            if !bytes.len().is_multiple_of(4) {
-                return Err(Error::Vdb(format!(
-                    "expected multiple-of-4 bytes for u32, got {}",
-                    bytes.len()
-                )));
-            }
-            Ok(bytes
-                .chunks_exact(4)
-                .map(|c| u64::from(u32::from_le_bytes([c[0], c[1], c[2], c[3]])))
-                .collect())
-        }
-        64 => {
-            if !bytes.len().is_multiple_of(8) {
-                return Err(Error::Vdb(format!(
-                    "expected multiple-of-8 bytes for u64, got {}",
-                    bytes.len()
-                )));
-            }
-            Ok(bytes
-                .chunks_exact(8)
-                .map(|c| u64::from_le_bytes([c[0], c[1], c[2], c[3], c[4], c[5], c[6], c[7]]))
-                .collect())
-        }
-        _ => Err(Error::Vdb(format!(
-            "unsupported elem_bits {elem_bits} for bytes_to_u64_vec"
-        ))),
-    }
 }

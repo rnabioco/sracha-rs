@@ -34,6 +34,12 @@ pub struct CsraCursor {
     first_row: i64,
 }
 
+/// Summary stats for [`CsraCursor::write_fastq`].
+#[derive(Debug, Clone, Copy)]
+pub struct FastqStats {
+    pub spots: u64,
+}
+
 /// Per-spot decoded values.
 #[derive(Debug, Clone)]
 pub struct SpotRead {
@@ -86,6 +92,55 @@ impl CsraCursor {
 
     pub fn first_row(&self) -> i64 {
         self.first_row
+    }
+
+    /// Write a minimal FASTQ rendering of every spot in the archive to
+    /// `writer`, matching `fasterq-dump --split-files`'s single-file
+    /// default format:
+    ///
+    /// ```text
+    /// @{accession}.{spot_id} {spot_id} length={total_len}
+    /// {bases}
+    /// +{accession}.{spot_id} {spot_id} length={total_len}
+    /// {phred+33 quality}
+    /// ```
+    ///
+    /// This intentionally bypasses the existing FASTQ pipeline for the
+    /// first end-to-end cSRA integration so we can validate byte-parity
+    /// with sra-tools before plumbing into the split / compression /
+    /// naming subsystems in Phase 3c.
+    pub fn write_fastq<W: std::io::Write>(
+        &self,
+        accession: &str,
+        mut writer: W,
+    ) -> Result<FastqStats> {
+        use crate::vdb::restore::fourna_to_ascii;
+        let mut spots = 0u64;
+        for row_id in self.first_row..(self.first_row + self.row_count as i64) {
+            let spot = self.read_spot(row_id)?;
+            let ascii = fourna_to_ascii(&spot.bases);
+            let total: u32 = spot.read_lens.iter().sum();
+            let qual: Vec<u8> = spot.quality.iter().map(|q| q.wrapping_add(33)).collect();
+
+            writeln!(writer, "@{accession}.{row_id} {row_id} length={total}")
+                .map_err(|e| Error::Vdb(format!("fastq write: {e}")))?;
+            writer
+                .write_all(&ascii)
+                .map_err(|e| Error::Vdb(format!("fastq write: {e}")))?;
+            writer
+                .write_all(b"\n")
+                .map_err(|e| Error::Vdb(format!("fastq write: {e}")))?;
+            writeln!(writer, "+{accession}.{row_id} {row_id} length={total}")
+                .map_err(|e| Error::Vdb(format!("fastq write: {e}")))?;
+            writer
+                .write_all(&qual)
+                .map_err(|e| Error::Vdb(format!("fastq write: {e}")))?;
+            writer
+                .write_all(b"\n")
+                .map_err(|e| Error::Vdb(format!("fastq write: {e}")))?;
+            spots += 1;
+        }
+        Ok(FastqStats { spots })
     }
 
     /// Decode one SEQUENCE row's full bases + quality.

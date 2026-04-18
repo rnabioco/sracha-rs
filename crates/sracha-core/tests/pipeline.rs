@@ -889,6 +889,55 @@ fn csra_cursor_read_spot_row_1() {
 
 #[ignore]
 #[test]
+fn csra_full_archive_matches_fasterq_dump() {
+    // Phase 3b end-to-end: decode every spot in VDB-3418 and verify the
+    // resulting FASTQ has the expected shape (985 records, 985 *4 lines).
+    // A byte-identity check against a fasterq-dump reference FASTQ is the
+    // stronger signal and runs when /tmp/csra-ref/VDB-3418.fastq exists
+    // (generate with `fasterq-dump --split-files` into that directory).
+    use sracha_core::vdb::csra::CsraCursor;
+    use sracha_core::vdb::kar::KarArchive;
+
+    let path = fixtures_dir().join("VDB-3418.sra");
+    if !path.exists() {
+        eprintln!("skipping: {} not present", path.display());
+        return;
+    }
+
+    let file = std::fs::File::open(&path).unwrap();
+    let mut archive = KarArchive::open(std::io::BufReader::new(file)).unwrap();
+    let csra = CsraCursor::open(&mut archive, &path).unwrap();
+
+    let tmp = tempfile::tempdir().unwrap();
+    let out_path = tmp.path().join("VDB-3418.fastq");
+    let out_file = std::fs::File::create(&out_path).unwrap();
+    let buf_writer = std::io::BufWriter::new(out_file);
+    let stats = csra.write_fastq("VDB-3418", buf_writer).unwrap();
+    assert_eq!(stats.spots, 985);
+
+    let out_bytes = std::fs::read(&out_path).unwrap();
+    let line_count = out_bytes.iter().filter(|&&b| b == b'\n').count();
+    assert_eq!(line_count, 985 * 4, "expected 985 × 4 FASTQ lines");
+
+    // Byte-identity check against fasterq-dump reference, when present.
+    let ref_path = std::path::Path::new("/tmp/csra-ref/VDB-3418.fastq");
+    if ref_path.exists() {
+        let got = md5_file(&out_path);
+        let want = md5_file(ref_path);
+        assert_eq!(
+            got, want,
+            "cSRA FASTQ diverges from fasterq-dump — got {got}, want {want}"
+        );
+    } else {
+        eprintln!(
+            "fasterq-dump reference not found at {}; skipping md5 check",
+            ref_path.display()
+        );
+    }
+}
+
+#[ignore]
+#[test]
 fn corrupt_kar_magic_fails_fast() {
     let tmp = tempfile::tempdir().unwrap();
     let path = clone_fixture(tmp.path(), "badmagic.sra");
