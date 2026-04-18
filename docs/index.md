@@ -28,6 +28,20 @@ Fast SRA downloader and FASTQ converter, written in pure Rust.
 3. **Parse** -- reads the KAR archive and decodes VDB columns (READ, QUALITY, READ_LEN, NAME)
 4. **Output** -- formats FASTQ (or FASTA) records and compresses with parallel gzip/zstd
 
+## Not yet supported
+
+The following are on the to-be-implemented list. sracha detects each at
+cursor open (or download) and exits with a clear error rather than
+producing bad output, so you can fall back to `fasterq-dump` for these
+specific runs.
+
+- **Aligned SRA / cSRA** — runs built from aligned BAMs (schemas like
+  `NCBI:align:db:alignment_sorted`, or archives with `CMP_READ` /
+  `PRIMARY_ALIGNMENT`). Reads require ncbi-vdb's schema-aware virtual
+  cursor to reconstruct; sracha only reads physical VDB columns. Common
+  in human genomics and re-analyses; most unaligned submissions
+  (latf-load, BGISEQ, Element, PacBio, Nanopore) are unaffected.
+
 ## Demo
 
 ![sracha get](images/get.gif)

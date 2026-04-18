@@ -34,13 +34,16 @@
   final XOR). Previously the mismatch was swallowed; now that it's an
   error, decode would have spuriously rejected real SRA files. Replaced
   with a conforming implementation.
-- **Aligned SRA database hang**: Files with `NCBI:align:db:...` schemas
-  expose physical `SEQUENCE/col/READ` columns but synthesize
-  `READ_LEN`/`READ_TYPE` through ncbi-vdb's schema-aware virtual cursor.
-  sracha's physical-only decode would fall through to fixed-length
-  heuristics and wedge the decode pipeline. Detect the aligned-database
-  schema at cursor open and return `UnsupportedFormat` with guidance to
-  use `fasterq-dump` instead.
+- **Aligned SRA / cSRA hang**: Extended cSRA rejection to cover the
+  `bam-load`-style variant — files with a physical `SEQUENCE/col/READ`
+  column but an `NCBI:align:db:...` schema that synthesizes
+  `READ_LEN`/`READ_TYPE` through ncbi-vdb's schema-aware virtual cursor
+  (e.g. SRR14724462). Without that cursor the decode fell through to
+  fixed-length heuristics and wedged the pipeline. The existing
+  CMP_READ/PRIMARY_ALIGNMENT path and the new schema-based path now
+  return one unified `UnsupportedFormat` error pointing to
+  `fasterq-dump`. A matching "Not yet supported" entry was added to the
+  docs.
 
 ## 0.1.10 (2026-04-16)
 

@@ -75,7 +75,6 @@ impl VdbCursor {
     ) -> Result<Self> {
         let seq_col_base = find_sequence_col_base(archive)?;
         reject_if_csra(archive, &seq_col_base)?;
-        reject_if_aligned_database(archive)?;
 
         // Parse table metadata (md/cur) to extract reads_per_spot and
         // platform for SRA-lite files that lack physical READ_LEN/NREADS columns.
@@ -590,69 +589,74 @@ fn find_sequence_col_base<R: Read + Seek>(archive: &KarArchive<R>) -> Result<Str
     ))
 }
 
-/// Reject alignment-database schemas (e.g. `NCBI:align:db:alignment_sorted`).
+/// Reject cSRA (aligned / reference-compressed) archives.
 ///
-/// These files expose a physical `SEQUENCE/col/READ` column but their
-/// logical read structure (READ_LEN, READ_TYPE) is synthesized by
-/// ncbi-vdb's schema-aware virtual cursor from the alignment
-/// representation. sracha reads physical VDB columns directly and cannot
-/// reconstruct that structure, so decode would otherwise fall through to
-/// fixed-length heuristics and stall. We surface a clear error instead.
-fn reject_if_aligned_database<R: Read + Seek>(archive: &mut KarArchive<R>) -> Result<()> {
-    // Prefer the table-level metadata; fall back to database-level.
-    let md_bytes = match archive.read_file("md/cur") {
-        Ok(b) => b,
-        Err(_) => match archive.read_file("tbl/SEQUENCE/md/cur") {
-            Ok(b) => b,
-            Err(_) => return Ok(()), // no metadata — nothing to check against
-        },
-    };
-    if md_bytes.len() < 8 {
-        return Ok(());
-    }
-    let tree_data = &md_bytes[8..];
-    if let Some(schema_name) = crate::vdb::metadata::schema_attr_name(tree_data)
-        && crate::vdb::metadata::is_aligned_database_schema(&schema_name)
-    {
-        return Err(Error::UnsupportedFormat {
-            format: format!("aligned SRA database (schema={schema_name})"),
-            hint: "sracha reads physical VDB columns directly and does not support schema-aware \
-                   aligned databases. Use fasterq-dump from sra-tools for these files."
-                .into(),
-        });
-    }
-    Ok(())
-}
-
-/// Reject cSRA (aligned/reference-compressed) archives.
+/// cSRA is NCBI's umbrella term for SRA files built from alignments.
+/// Several physical shapes appear in the wild:
 ///
-/// cSRA files store reads as diffs against a reference genome (like CRAM).
-/// They have `CMP_READ` instead of `READ` in the SEQUENCE table, plus
-/// `PRIMARY_ALIGNMENT` and `REFERENCE` tables.  We detect either indicator
-/// and return `UnsupportedFormat` with an actionable message.
-fn reject_if_csra<R: Read + Seek>(archive: &KarArchive<R>, seq_col_base: &str) -> Result<()> {
+/// 1. Classic cSRA: `CMP_READ` instead of `READ` in `SEQUENCE`, plus
+///    `PRIMARY_ALIGNMENT` / `REFERENCE` sibling tables.
+/// 2. `bam-load`-style aligned databases: a physical `READ` column is
+///    present but the database-level schema is `NCBI:align:db:...`.
+///    READ_LEN / READ_TYPE are synthesized by ncbi-vdb's schema-aware
+///    virtual cursor from the alignment representation.
+///
+/// Both shapes need ncbi-vdb's virtual cursor to reconstruct per-spot read
+/// structure — sracha reads physical columns directly and would either
+/// error on the missing column (shape 1) or wedge on fallback heuristics
+/// (shape 2). Detect both and return a single actionable error.
+fn reject_if_csra<R: Read + Seek>(archive: &mut KarArchive<R>, seq_col_base: &str) -> Result<()> {
+    // Structural detection: CMP_READ column or PRIMARY_ALIGNMENT table.
     let cmp_read_prefix = format!("{seq_col_base}/CMP_READ");
-
     let has_cmp_read = archive
         .entries()
         .keys()
         .any(|p| p == &cmp_read_prefix || p.starts_with(&format!("{cmp_read_prefix}/")));
-
     let has_primary_alignment = archive
         .entries()
         .keys()
         .any(|p| p == "tbl/PRIMARY_ALIGNMENT" || p.contains("/tbl/PRIMARY_ALIGNMENT"));
 
-    if has_cmp_read || has_primary_alignment {
+    // Schema-name detection: `NCBI:align:db:...` at table or db level.
+    let has_align_schema = read_aligned_schema_name(archive).is_some();
+
+    if has_cmp_read || has_primary_alignment || has_align_schema {
+        let hint = match read_aligned_schema_name(archive) {
+            Some(name) => format!(
+                "schema={name}. Reads require ncbi-vdb's schema-aware virtual cursor \
+                 to reconstruct; sracha reads physical columns only. Use fasterq-dump \
+                 from sra-tools instead."
+            ),
+            None => "reads are reference-compressed and cannot be directly converted; \
+                     use fasterq-dump from sra-tools instead."
+                .into(),
+        };
         return Err(Error::UnsupportedFormat {
             format: "aligned SRA (cSRA)".into(),
-            hint: "reads are reference-compressed and cannot be directly converted. \
-                   Use fasterq-dump from sra-tools instead."
-                .into(),
+            hint,
         });
     }
 
     Ok(())
+}
+
+/// Probe the table- and db-level `md/cur` trees for a schema attribute that
+/// matches an alignment-database pattern (`NCBI:align:db:...`). Returns the
+/// schema name when matched; `None` otherwise.
+fn read_aligned_schema_name<R: Read + Seek>(archive: &mut KarArchive<R>) -> Option<String> {
+    for path in ["md/cur", "tbl/SEQUENCE/md/cur"] {
+        if let Ok(md_bytes) = archive.read_file(path)
+            && md_bytes.len() >= 8
+        {
+            let tree_data = &md_bytes[8..];
+            if let Some(schema_name) = crate::vdb::metadata::schema_attr_name(tree_data)
+                && crate::vdb::metadata::is_aligned_database_schema(&schema_name)
+            {
+                return Some(schema_name);
+            }
+        }
+    }
+    None
 }
 
 // ---------------------------------------------------------------------------
