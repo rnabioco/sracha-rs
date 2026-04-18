@@ -915,6 +915,16 @@ pub fn run_fastq(
             .to_string()
     });
 
+    // Reference-compressed cSRA dispatch: archives with SEQUENCE.CMP_READ
+    // plus sibling PRIMARY_ALIGNMENT + REFERENCE tables can't decode
+    // through the regular VdbCursor (it reads physical READ only); route
+    // them through CsraCursor's splice. v1 handles one uncompressed output
+    // file and ignores split / compression / stdout flags — a follow-up
+    // will port CsraCursor to the batched pipeline.
+    if crate::vdb::csra::looks_like_decodable_csra(sra_path).unwrap_or(false) {
+        return run_fastq_csra(sra_path, &acc, config);
+    }
+
     // Detect SRA-lite by checking if the quality column is absent.
     // We pass `false` initially; decode_and_write will handle quality
     // absence gracefully via sra_lite_quality fallback.
@@ -973,6 +983,40 @@ pub fn run_fastq(
         reads_written,
         output_files,
         integrity: diag,
+    })
+}
+
+/// Phase-3 cSRA decode path. See `run_fastq` for the dispatch trigger.
+fn run_fastq_csra(
+    sra_path: &std::path::Path,
+    acc: &str,
+    config: &PipelineConfig,
+) -> Result<FastqStats> {
+    use crate::vdb::csra::CsraCursor;
+    use crate::vdb::kar::KarArchive;
+
+    if config.stdout {
+        return Err(Error::Vdb(
+            "cSRA: --stdout not yet supported; output goes to --output-dir".into(),
+        ));
+    }
+
+    let file = std::fs::File::open(sra_path)?;
+    let mut archive = KarArchive::open(std::io::BufReader::new(file))?;
+    let csra = CsraCursor::open(&mut archive, sra_path)?;
+
+    let (out_path, stats) = csra.write_fastq_to_dir(acc, &config.output_dir)?;
+
+    eprintln!(
+        "warning: {acc}: cSRA decode — split/compression flags ignored in v1 (single uncompressed file)"
+    );
+
+    Ok(FastqStats {
+        accession: acc.to_string(),
+        spots_read: stats.spots,
+        reads_written: stats.spots,
+        output_files: vec![out_path],
+        integrity: Arc::new(IntegrityDiag::default()),
     })
 }
 

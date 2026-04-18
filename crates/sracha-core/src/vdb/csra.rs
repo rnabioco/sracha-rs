@@ -19,6 +19,32 @@ use crate::vdb::kdb::ColumnReader;
 use crate::vdb::reference::ReferenceCursor;
 use crate::vdb::restore::{align_restore_read, seq_restore_read};
 
+/// Inspect the KAR archive at `sra_path` and return true if it looks like
+/// a reference-compressed cSRA we can decode via `CsraCursor`: SEQUENCE
+/// has a physical CMP_READ column, PRIMARY_ALIGNMENT table is present,
+/// and REFERENCE table is present. Archives that fail any of these
+/// checks fall through to the regular VDB decode path.
+pub fn looks_like_decodable_csra(sra_path: &Path) -> Result<bool> {
+    let file = std::fs::File::open(sra_path)?;
+    let archive = KarArchive::open(std::io::BufReader::new(file))?;
+    let keys = archive.entries().keys();
+    let mut has_seq_cmp_read = false;
+    let mut has_primary = false;
+    let mut has_reference = false;
+    for k in keys {
+        if k.ends_with("tbl/SEQUENCE/col/CMP_READ") || k.contains("/tbl/SEQUENCE/col/CMP_READ/") {
+            has_seq_cmp_read = true;
+        }
+        if k == "tbl/PRIMARY_ALIGNMENT" || k.ends_with("/tbl/PRIMARY_ALIGNMENT") {
+            has_primary = true;
+        }
+        if k == "tbl/REFERENCE" || k.ends_with("/tbl/REFERENCE") {
+            has_reference = true;
+        }
+    }
+    Ok(has_seq_cmp_read && has_primary && has_reference)
+}
+
 pub struct CsraCursor {
     // SEQUENCE-side columns
     cmp_read: ColumnReader,
@@ -92,6 +118,27 @@ impl CsraCursor {
 
     pub fn first_row(&self) -> i64 {
         self.first_row
+    }
+
+    /// Decode the archive and write a single FASTQ file named
+    /// `{accession}.fastq` into `output_dir`. Returns the output path and
+    /// the number of spots written. For v1 this ignores split / compression
+    /// / stdout config and always writes one uncompressed file; richer
+    /// options land when cSRA moves to the batched pipeline.
+    pub fn write_fastq_to_dir(
+        &self,
+        accession: &str,
+        output_dir: &Path,
+    ) -> Result<(std::path::PathBuf, FastqStats)> {
+        std::fs::create_dir_all(output_dir).map_err(|e| {
+            Error::Vdb(format!("cSRA output: create {}: {e}", output_dir.display()))
+        })?;
+        let out_path = output_dir.join(format!("{accession}.fastq"));
+        let out_file = std::fs::File::create(&out_path)
+            .map_err(|e| Error::Vdb(format!("cSRA output: create {}: {e}", out_path.display())))?;
+        let buf_writer = std::io::BufWriter::new(out_file);
+        let stats = self.write_fastq(accession, buf_writer)?;
+        Ok((out_path, stats))
     }
 
     /// Write a minimal FASTQ rendering of every spot in the archive to
