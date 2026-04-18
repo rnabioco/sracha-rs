@@ -13,6 +13,32 @@ use crate::vdb::inspect;
 use crate::vdb::kar::KarArchive;
 use crate::vdb::kdb::ColumnReader;
 
+/// All per-row fields sracha needs to reconstruct an aligned read.
+///
+/// Byte slices are in the row's own encoding — conversion to the
+/// `align_restore_read` inputs (4na-bin MISMATCH bytes, i32 REF_OFFSET
+/// values) happens at the call site.
+///
+/// REF_ORIENTATION is intentionally absent: `seq_restore_read` takes
+/// strand information from `SEQUENCE.READ_TYPE` (see
+/// `ncbi-vdb/libs/axf/seq-restore-read.c:531`), which bam-load keeps
+/// consistent with the alignment's orientation at load time.
+#[derive(Debug, Clone)]
+pub struct AlignmentRow {
+    pub global_ref_start: u64,
+    pub ref_len: u32,
+    /// One byte per base of the final reconstructed read; `1` at positions
+    /// that differ from the reference, `0` otherwise.
+    pub has_mismatch: Vec<u8>,
+    /// One byte per base of the final reconstructed read; `1` at positions
+    /// where `ref_offset` advances or rewinds the reference cursor (indels).
+    pub has_ref_offset: Vec<u8>,
+    /// 4na-bin bases, length = number of `1`s in `has_mismatch`.
+    pub mismatch: Vec<u8>,
+    /// Signed offsets, length = number of `1`s in `has_ref_offset`.
+    pub ref_offset: Vec<i32>,
+}
+
 /// Handle to the PRIMARY_ALIGNMENT table columns we consume during cSRA decode.
 pub struct AlignmentCursor {
     /// Absolute reference position (across concatenated references) where the
@@ -20,8 +46,6 @@ pub struct AlignmentCursor {
     global_ref_start: ColumnReader,
     /// Number of reference bases covered by the alignment (alignment span).
     ref_len: ColumnReader,
-    /// Packed-bit column: `true` when the read was reverse-aligned.
-    ref_orientation: ColumnReader,
     /// 1 byte per base of the reconstructed read; nonzero means the base
     /// differs from the reference at that position.
     has_mismatch: ColumnReader,
@@ -46,7 +70,6 @@ impl AlignmentCursor {
         };
         let global_ref_start = open(archive, "GLOBAL_REF_START")?;
         let ref_len = open(archive, "REF_LEN")?;
-        let ref_orientation = open(archive, "REF_ORIENTATION")?;
         let has_mismatch = open(archive, "HAS_MISMATCH")?;
         let has_ref_offset = open(archive, "HAS_REF_OFFSET")?;
         let mismatch = open(archive, "MISMATCH")?;
@@ -58,7 +81,6 @@ impl AlignmentCursor {
         Ok(Self {
             global_ref_start,
             ref_len,
-            ref_orientation,
             has_mismatch,
             has_ref_offset,
             mismatch,
@@ -82,10 +104,6 @@ impl AlignmentCursor {
 
     pub fn ref_len_col(&self) -> &ColumnReader {
         &self.ref_len
-    }
-
-    pub fn ref_orientation_col(&self) -> &ColumnReader {
-        &self.ref_orientation
     }
 
     pub fn has_mismatch_col(&self) -> &ColumnReader {
@@ -134,8 +152,181 @@ impl AlignmentCursor {
     pub fn first_ref_len(&self) -> Result<u32> {
         Self::read_u32(&self.ref_len, self.first_row)
     }
+
+    /// Read one alignment row end-to-end: all seven columns' values for
+    /// `row_id`. Re-decodes each column's blob on every call; callers doing
+    /// many sequential reads should add a blob cache. Intended for Phase 1
+    /// / Phase 2 validation before the pipeline integration lands.
+    pub fn read_row(&self, row_id: i64) -> Result<AlignmentRow> {
+        let global_ref_start = Self::read_u64(&self.global_ref_start, row_id)?;
+        let ref_len = Self::read_u32(&self.ref_len, row_id)?;
+        let has_mismatch = read_bool_row_as_bytes(&self.has_mismatch, row_id)?;
+        let has_ref_offset = read_bool_row_as_bytes(&self.has_ref_offset, row_id)?;
+        let mismatch = read_byte_row(&self.mismatch, row_id)?;
+        let ref_offset = read_i32_row(&self.ref_offset, row_id)?;
+
+        Ok(AlignmentRow {
+            global_ref_start,
+            ref_len,
+            has_mismatch,
+            has_ref_offset,
+            mismatch,
+            ref_offset,
+        })
+    }
 }
 
+/// What physical encoding layer wraps a variable-length column's payload.
+#[derive(Clone, Copy)]
+enum VarEncoding {
+    /// `zip_encoding` — HAS_MISMATCH / HAS_REF_OFFSET (bit-packed) and MISMATCH
+    /// (bytes). The element width comes from the column's page_map, not the
+    /// envelope.
+    Zip,
+    /// `irzip` at the given element width — REF_OFFSET (32 bits per value).
+    IrzipAtBitWidth(u32),
+}
+
+/// Open the blob containing `row_id`, decode it with the given encoding, and
+/// hand back the uncompressed payload + page map + row offset within the blob.
+fn read_variable_payload(
+    col: &ColumnReader,
+    row_id: i64,
+    enc: VarEncoding,
+) -> Result<(Vec<u8>, blob::PageMap, usize)> {
+    let blob = col
+        .find_blob(row_id)
+        .ok_or_else(|| Error::Vdb(format!("no blob for row {row_id}")))?;
+    let raw = col.read_raw_blob_slice(row_id)?;
+    let decoded = blob::decode_blob(raw, col.meta().checksum_type, u64::from(blob.id_range), 8)?;
+    let pm = decoded
+        .page_map
+        .clone()
+        .ok_or_else(|| Error::Vdb("variable column: page_map required".into()))?;
+    let bytes = match enc {
+        VarEncoding::Zip => decode_bytes_payload(&decoded)?,
+        VarEncoding::IrzipAtBitWidth(bits) => decode_integer_bytes(&decoded, bits)?,
+    };
+    Ok((bytes, pm, (row_id - blob.start_id) as usize))
+}
+
+/// Read one row of a `bool_encoding` column, returning one byte (0 or 1)
+/// per logical value. The payload is bit-packed (LSB-first), so we unpack
+/// the slice belonging to `row_id` before returning.
+fn read_bool_row_as_bytes(col: &ColumnReader, row_id: i64) -> Result<Vec<u8>> {
+    let (bytes, pm, row_offset) = read_variable_payload(col, row_id, VarEncoding::Zip)?;
+    let record_lens = pm.data_record_lengths();
+
+    // record_lens[i] is in bits; cumulative start in bits then divides to
+    // byte offset since records are stored back-to-back bit-packed.
+    let start_bits: u32 = record_lens
+        .iter()
+        .take(resolve_record_idx(&pm, row_offset, row_id)?)
+        .sum();
+    let rec_idx = resolve_record_idx(&pm, row_offset, row_id)?;
+    let len_bits = record_lens[rec_idx] as usize;
+
+    // B1 bit-packing is MSB-first within each byte (verified by comparing
+    // sracha's unpack output against vdb-dump on HAS_MISMATCH row 1 of
+    // VDB-3418: LSB-first drifts one off in the 1s count, MSB-first matches).
+    let mut out = Vec::with_capacity(len_bits);
+    for i in 0..len_bits {
+        let bit_idx = start_bits as usize + i;
+        let byte = bit_idx / 8;
+        let bit = 7 - (bit_idx % 8);
+        let b = bytes
+            .get(byte)
+            .copied()
+            .ok_or_else(|| Error::Vdb(format!("bool row {row_id}: bit {bit_idx} past payload")))?;
+        out.push((b >> bit) & 1);
+    }
+    Ok(out)
+}
+
+/// Read one row of an ascii/byte column (MISMATCH). Each record length
+/// counts bytes directly.
+fn read_byte_row(col: &ColumnReader, row_id: i64) -> Result<Vec<u8>> {
+    let (bytes, pm, row_offset) = read_variable_payload(col, row_id, VarEncoding::Zip)?;
+    let record_lens = pm.data_record_lengths();
+    let rec_idx = resolve_record_idx(&pm, row_offset, row_id)?;
+
+    let start: usize = record_lens.iter().take(rec_idx).map(|&n| n as usize).sum();
+    let len = record_lens[rec_idx] as usize;
+    let end = start + len;
+    if end > bytes.len() {
+        return Err(Error::Vdb(format!(
+            "byte row {row_id}: slice [{start}..{end}] past payload {}",
+            bytes.len()
+        )));
+    }
+    Ok(bytes[start..end].to_vec())
+}
+
+/// Read one row of a signed-32 column (REF_OFFSET). Each record length
+/// counts i32 elements; multiply by 4 for the byte offset into payload.
+fn read_i32_row(col: &ColumnReader, row_id: i64) -> Result<Vec<i32>> {
+    let (bytes, pm, row_offset) =
+        read_variable_payload(col, row_id, VarEncoding::IrzipAtBitWidth(32))?;
+    let record_lens = pm.data_record_lengths();
+    let rec_idx = resolve_record_idx(&pm, row_offset, row_id)?;
+
+    let start: usize = record_lens
+        .iter()
+        .take(rec_idx)
+        .map(|&n| n as usize * 4)
+        .sum();
+    let len_elems = record_lens[rec_idx] as usize;
+    let end = start + len_elems * 4;
+    if end > bytes.len() {
+        return Err(Error::Vdb(format!(
+            "i32 row {row_id}: slice [{start}..{end}] past payload {}",
+            bytes.len()
+        )));
+    }
+    Ok(bytes[start..end]
+        .chunks_exact(4)
+        .map(|c| i32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+        .collect())
+}
+
+/// Resolve the record index for a logical row offset, honouring `data_runs`.
+fn resolve_record_idx(pm: &blob::PageMap, logical_offset: usize, row_id: i64) -> Result<usize> {
+    if pm.data_runs.is_empty() {
+        return Ok(logical_offset);
+    }
+    let mut seen = 0usize;
+    for (i, &repeat) in pm.data_runs.iter().enumerate() {
+        let end = seen + repeat as usize;
+        if logical_offset < end {
+            return Ok(i);
+        }
+        seen = end;
+    }
+    Err(Error::Vdb(format!(
+        "row {row_id}: logical offset {logical_offset} outside data_runs"
+    )))
+}
+
+/// Decode a zip_encoding payload to raw bytes.
+fn decode_bytes_payload(decoded: &DecodedBlob<'_>) -> Result<Vec<u8>> {
+    let hdr = decoded.headers.first();
+    let osize = hdr.map(|h| h.osize as usize).unwrap_or(decoded.data.len());
+
+    if decoded.data.len() == osize {
+        return Ok(decoded.data.to_vec());
+    }
+    if let Ok(out) = blob::deflate_decompress(&decoded.data, osize)
+        && out.len() == osize
+    {
+        return Ok(out);
+    }
+    Err(Error::Vdb(format!(
+        "byte column: no decoder succeeded (data.len={}, osize={osize})",
+        decoded.data.len()
+    )))
+}
+
+/// Given a concatenated per-record byte buffer and the page map's per-record
 /// Row's 0-based offset within the decoded blob array for its column.
 fn row_offset_in_blob(col: &ColumnReader, row_id: i64) -> Result<usize> {
     let blob = col

@@ -641,7 +641,34 @@ fn csra_alignment_columns_open() {
     let grs = cur.first_global_ref_start().unwrap();
     let rlen = cur.first_ref_len().unwrap();
     eprintln!("row 1: GLOBAL_REF_START={grs} REF_LEN={rlen}");
-    assert!(rlen > 0, "REF_LEN must be positive, got {rlen}");
+    assert_eq!(grs, 2, "expected vdb-dump GLOBAL_REF_START=2");
+    assert_eq!(rlen, 35712, "expected vdb-dump REF_LEN=35712");
+
+    // vdb-dump row 1 reports:
+    //   HAS_MISMATCH length 36185, 2689 ones
+    //   HAS_REF_OFFSET length 36185, 2149 ones
+    //   HAS_MISMATCH first 100 bits: all 1s
+    // Cross-check row 1 against `vdb-dump -T PRIMARY_ALIGNMENT -R 1`:
+    //   HAS_MISMATCH   length 36185, 2689 ones, first 100 bits all-1,
+    //                  last 10 bits "1011111010"
+    //   HAS_REF_OFFSET length 36185, 2149 ones
+    //   REF_OFFSET     first values -260, -1, -1, -1, -1; last value -80
+    let row = cur.read_row(1).unwrap();
+    assert_eq!(row.has_mismatch.len(), 36185);
+    assert_eq!(row.has_ref_offset.len(), 36185);
+    assert_eq!(row.mismatch.len(), 2689);
+    assert_eq!(row.ref_offset.len(), 2149);
+    assert!(row.has_mismatch[..100].iter().all(|&b| b == 1));
+    let tail: Vec<u8> = row.has_mismatch[row.has_mismatch.len() - 10..].to_vec();
+    assert_eq!(tail, vec![1, 0, 1, 1, 1, 1, 1, 0, 1, 0]);
+    assert_eq!(&row.ref_offset[..5], &[-260, -1, -1, -1, -1]);
+    assert_eq!(row.ref_offset.last().copied(), Some(-80));
+
+    // Internal consistency: the invariant align_restore_read relies on.
+    let mm1s = row.has_mismatch.iter().filter(|&&b| b != 0).count();
+    let ro1s = row.has_ref_offset.iter().filter(|&&b| b != 0).count();
+    assert_eq!(mm1s, row.mismatch.len());
+    assert_eq!(ro1s, row.ref_offset.len());
 }
 
 #[ignore]
