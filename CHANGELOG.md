@@ -4,6 +4,18 @@
 
 ### Added
 
+- **Reference-compressed cSRA (aligned SRA) decode**: archives with a
+  physical `SEQUENCE/col/CMP_READ` plus sibling `PRIMARY_ALIGNMENT` +
+  `REFERENCE` tables are now decoded in pure Rust —
+  `NCBI:align:seq_restore_read` and `NCBI:align:align_restore_read`
+  are both reimplemented (see `vdb/restore.rs`). `sracha fastq` on a
+  cSRA file produces output byte-identical to `fasterq-dump`
+  (validated against ncbi-vdb's `VDB-3418.sra` test fixture, 985
+  spots / ~36 Mbp in ~8 s). Platform-agnostic; long-read and short-read
+  aligned archives both work.
+  *v1 caveats*: single uncompressed FASTQ, split / compression /
+  stdout flags ignored on the cSRA path; serial per-spot iteration
+  (rayon batching is a follow-up).
 - **MD5 verification by default**: Downloads verify MD5 against SDL-reported
   hashes, decoded blobs verify per-blob MD5 and CRC32, and spot counts are
   cross-checked against RunInfo. Use `fetch --no-validate` to skip.

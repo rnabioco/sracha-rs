@@ -687,14 +687,22 @@ fn reject_if_csra<R: Read + Seek>(archive: &mut KarArchive<R>, seq_col_base: &st
         return Ok(());
     }
 
+    // `pipeline::run_fastq` routes reference-compressed cSRA (CMP_READ +
+    // PRIMARY_ALIGNMENT + REFERENCE) through `CsraCursor` before this
+    // check fires, so anything arriving here is a rarer aligned-SRA
+    // shape that the VDB-direct decoder can't handle — most commonly
+    // DRR032766-style CMP_BASE_COUNT>0 without the sibling tables.
     let hint = match read_aligned_schema_name(archive) {
         Some(name) => format!(
-            "schema={name}. Reads require ncbi-vdb's schema-aware virtual cursor \
-             to reconstruct; sracha reads physical columns only. Use fasterq-dump \
-             from sra-tools instead."
+            "schema={name}. VDB-direct decode requires a physical READ column. \
+             For reference-compressed cSRA with PRIMARY_ALIGNMENT + REFERENCE \
+             tables, use `sracha fastq`, which dispatches through CsraCursor. \
+             This archive has neither a physical READ nor the alignment+reference \
+             tables we need to reconstruct it."
         ),
-        None => "reads are reference-compressed and cannot be directly converted; \
-                 use fasterq-dump from sra-tools instead."
+        None => "reads are reference-compressed and this archive lacks the \
+                 PRIMARY_ALIGNMENT + REFERENCE tables sracha's cSRA path needs; \
+                 use fasterq-dump from sra-tools for this specific shape."
             .into(),
     };
     Err(Error::UnsupportedFormat {
