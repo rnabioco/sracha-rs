@@ -1,3 +1,4 @@
+pub mod alignment;
 pub mod blob;
 pub mod cursor;
 pub mod encoding;

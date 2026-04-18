@@ -612,6 +612,40 @@ fn corrupt_flipped_bytes_trigger_checksum_or_decode_error() {
 
 #[ignore]
 #[test]
+fn csra_alignment_columns_open() {
+    // Phase 1 smoke test: open the PRIMARY_ALIGNMENT columns of a real
+    // reference-compressed cSRA fixture. VDB-3418 is a 12 MiB BAM-loaded
+    // archive shipped with ncbi-vdb's test suite (schema
+    // `NCBI:align:db:alignment_sorted#1.3`; 985 SEQUENCE / 938 PRIMARY_ALIGNMENT
+    // rows). All we verify here is that the column-opening plumbing works
+    // end-to-end against a real archive; read_row and reconstruction land
+    // in later phases.
+    use sracha_core::vdb::alignment::AlignmentCursor;
+    use sracha_core::vdb::kar::KarArchive;
+
+    let path = fixtures_dir().join("VDB-3418.sra");
+    if !path.exists() {
+        eprintln!(
+            "skipping csra_alignment_columns_open: {} not present",
+            path.display()
+        );
+        return;
+    }
+
+    let file = std::fs::File::open(&path).unwrap();
+    let mut archive = KarArchive::open(std::io::BufReader::new(file)).unwrap();
+    let cur = AlignmentCursor::open(&mut archive, &path).unwrap();
+    assert_eq!(cur.row_count(), 938, "expected 938 PRIMARY_ALIGNMENT rows");
+    assert_eq!(cur.first_row(), 1);
+
+    let grs = cur.first_global_ref_start().unwrap();
+    let rlen = cur.first_ref_len().unwrap();
+    eprintln!("row 1: GLOBAL_REF_START={grs} REF_LEN={rlen}");
+    assert!(rlen > 0, "REF_LEN must be positive, got {rlen}");
+}
+
+#[ignore]
+#[test]
 fn corrupt_kar_magic_fails_fast() {
     let tmp = tempfile::tempdir().unwrap();
     let path = clone_fixture(tmp.path(), "badmagic.sra");
