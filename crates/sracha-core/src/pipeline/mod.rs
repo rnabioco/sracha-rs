@@ -616,6 +616,17 @@ fn decode_and_write(
         };
 
         // ---- Decode loop (main thread) ----
+        //
+        // `cumulative_spots` tracks the total number of spots in blobs 0..blob_idx
+        // so each batch can compute `spots_before_per_blob` deterministically
+        // from blob metadata alone. Reading `spots_read` here would race with
+        // the writer thread on archives with more than `BATCH_SIZE` (1024)
+        // blobs — the bounded channel of capacity 4 lets the decoder queue
+        // four batches ahead of the writer, and the writer's fetch_add on
+        // `spots_read` doesn't happen until it has processed a batch.
+        // DRR045255 (3658 blobs) used to emit `spots_before=0` for batch 2
+        // onwards, resetting the FASTQ defline spot number to 1.
+        let mut cumulative_spots: u64 = 0;
         let mut blob_idx: usize = 0;
         while blob_idx < num_blobs {
             if let Some(ref flag) = config.cancelled
@@ -628,12 +639,9 @@ fn decode_and_write(
             let batch_len = batch_end - blob_idx;
 
             let mut spots_before_per_blob: Vec<u64> = Vec::with_capacity(batch_len);
-            {
-                let mut cumulative = spots_read.load(std::sync::atomic::Ordering::Relaxed);
-                for bi in blob_idx..batch_end {
-                    spots_before_per_blob.push(cumulative);
-                    cumulative += cursor.read_col().blobs()[bi].id_range as u64;
-                }
+            for bi in blob_idx..batch_end {
+                spots_before_per_blob.push(cumulative_spots);
+                cumulative_spots += cursor.read_col().blobs()[bi].id_range as u64;
             }
 
             let formatted_batches: Vec<Result<FormattedBlob>> = pool.install(|| {

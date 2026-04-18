@@ -936,6 +936,83 @@ fn csra_full_archive_matches_fasterq_dump() {
     }
 }
 
+/// Ensure the DRR045255 fixture (Illumina paired, ~246 MB, 3.7M spots,
+/// 3658 blobs). Exercises two pipeline invariants:
+///
+/// - **BATCH_SIZE=1024 cumulative-spots tracking**: the decode loop used
+///   to read `spots_read` atomically, racing with the writer thread
+///   across the bounded channel (capacity 4). For archives with > 1024
+///   blobs the spot-number in FASTQ deflines would reset to 1 at the
+///   1,048,577th spot. The fix tracks `cumulative_spots` locally in
+///   the decode loop; this archive is the smallest known trigger.
+/// - **Adaptive page_map dispatch**: a READ_LEN blob at row ~1M has a
+///   data_runs that only fits the u32-index interpretation, not the
+///   usual entry-index one.
+fn ensure_drr045255() -> PathBuf {
+    static DOWNLOAD: Once = Once::new();
+    let path = fixtures_dir().join("DRR045255.sra");
+
+    DOWNLOAD.call_once(|| {
+        if path.exists() {
+            return;
+        }
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        let url = "https://sra-pub-run-odp.s3.amazonaws.com/sra/DRR045255/DRR045255";
+        eprintln!("downloading DRR045255 fixture from {url} ...");
+        let resp = reqwest::blocking::get(url)
+            .unwrap_or_else(|e| panic!("failed to download DRR045255: {e}"));
+        assert!(
+            resp.status().is_success(),
+            "HTTP {} downloading fixture",
+            resp.status()
+        );
+        let bytes = resp.bytes().unwrap();
+        std::fs::write(&path, &bytes).unwrap();
+    });
+
+    assert!(path.exists(), "fixture not found at {}", path.display());
+    path
+}
+
+#[ignore]
+#[test]
+fn drr045255_cross_batch_spot_numbering() {
+    // Regression: spots_before computation used to reset at each
+    // BATCH_SIZE=1024 boundary, producing `@DRR045255.1` instead of
+    // `@DRR045255.1048577` at spot 1048577. Verified with md5 parity
+    // against `fasterq-dump --split-files`:
+    //   DRR045255_1.fastq  74fd4681aff8fd1cd52140322e86ac45
+    //   DRR045255_2.fastq  ecb11ba74aa9d6d02ff63872d04fc76f
+    // (Recomputed each time the fixture is ensured; values captured
+    // from sra-tools 3.2.1 via `module load sratoolkit/3.2.1 &&
+    // fasterq-dump --split-files DRR045255.sra`.)
+    let sra_path = ensure_drr045255();
+    let tmp = tempfile::tempdir().unwrap();
+    let config = test_config(tmp.path(), SplitMode::Split3, CompressionMode::None);
+
+    let stats = sracha_core::pipeline::run_fastq(&sra_path, Some("DRR045255"), &config).unwrap();
+    assert_eq!(stats.spots_read, 3_745_800);
+    assert_eq!(stats.reads_written, 7_491_600);
+    assert_eq!(stats.output_files.len(), 2);
+
+    // Cheaper than md5 on ~280 MB files: check the defline at record
+    // 1048577 is the correct spot number. The race-condition bug made
+    // sracha emit `@DRR045255.1` here before the fix.
+    let file = std::fs::File::open(&stats.output_files[0]).unwrap();
+    let reader = std::io::BufReader::new(file);
+    use std::io::BufRead;
+    let target_line = (1_048_577 - 1) * 4; // 0-indexed line number of the defline
+    let line = reader
+        .lines()
+        .nth(target_line)
+        .expect("R1 should have >= 1048577 records")
+        .unwrap();
+    assert!(
+        line.starts_with("@DRR045255.1048577 1048577 "),
+        "spot 1048577 defline regressed: {line:?}"
+    );
+}
+
 #[ignore]
 #[test]
 fn corrupt_kar_magic_fails_fast() {
