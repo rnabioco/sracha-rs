@@ -223,6 +223,7 @@ pub fn format_read_with_diag(
 /// Semantics match [`format_read_with_diag`]. The defline is constructed
 /// once and copied to the `+` line via [`Vec::extend_from_within`], saving
 /// one round of `itoa` + string concatenation per record.
+#[inline]
 pub fn append_fastq_record(
     out: &mut Vec<u8>,
     run_name: &str,
@@ -261,6 +262,21 @@ pub fn append_fastq_record(
     out.push(b'\n');
 }
 
+/// Scan `q` for any byte outside `[33, 126]`. Written as a branchless OR
+/// fold so LLVM vectorizes it (the earlier `.iter().any()` short-circuits
+/// on first match, which blocks auto-vectorization and made this the top
+/// self-time hotspot in `append_fastq_record`).
+#[inline]
+fn any_invalid_quality_byte(q: &[u8]) -> bool {
+    // Valid bytes are 33..=126. `b.wrapping_sub(33)` is in 0..=93 iff valid,
+    // so `> 93` flags everything outside the range in one comparison.
+    let mut bad: u8 = 0;
+    for &b in q {
+        bad |= (b.wrapping_sub(MIN_QUAL_BYTE) > (MAX_QUAL_BYTE - MIN_QUAL_BYTE)) as u8;
+    }
+    bad != 0
+}
+
 /// Quality validation: returns the input unchanged on the fast path, or a
 /// corrected owned Vec on pad/sanitize. Keeps [`append_fastq_record`]'s top
 /// level short and lets the hot path `Cow::Borrowed` straight through.
@@ -286,10 +302,7 @@ fn repair_quality<'a>(
         return Cow::Owned(q);
     }
 
-    if quality
-        .iter()
-        .any(|&b| !(MIN_QUAL_BYTE..=MAX_QUAL_BYTE).contains(&b))
-    {
+    if any_invalid_quality_byte(quality) {
         if let Some(d) = diag {
             d.quality_invalid_bytes.fetch_add(1, Ordering::Relaxed);
         } else {
@@ -358,6 +371,7 @@ pub fn format_fasta_read(
 
 /// Append a FASTA record to `out` — hot-path variant that avoids a
 /// per-record Vec allocation. Semantics match [`format_fasta_read`].
+#[inline]
 pub fn append_fasta_record(
     out: &mut Vec<u8>,
     run_name: &str,
