@@ -813,8 +813,8 @@ fn csra_seq_restore_read_row_1() {
     // reader lands in Phase 3; the splice algorithm is the same either way.
     let align_ids = [1i64];
     let read_lens = [36185u32];
-    // SRA_READ_TYPE_BIOLOGICAL (0x08) | SRA_READ_TYPE_REVERSE (0x02) = 0x0A.
-    let read_types = [0x08 | SRA_READ_TYPE_REVERSE];
+    // BIOLOGICAL (0x01) | REVERSE (0x04) = 0x05 per vdb-dump.
+    let read_types = [SRA_READ_TYPE_REVERSE | 0x01];
     let cmp_rd: Vec<u8> = Vec::new();
 
     let spot = seq_restore_read(
@@ -840,6 +840,49 @@ fn csra_seq_restore_read_row_1() {
     let ascii = fourna_to_ascii(&spot);
     let text = std::str::from_utf8(&ascii).unwrap();
     assert_eq!(text.len(), 36185);
+    assert_eq!(&text[..31], "TCGGTATTACTTCGTTCAGTTACGTATTGCT");
+    assert_eq!(&text[text.len() - 31..], "GTTTCCCTAATAACCTTAGCAATACGTAACT");
+}
+
+#[ignore]
+#[test]
+fn csra_cursor_read_spot_row_1() {
+    // Phase 3 entry point: the user-facing CsraCursor opens all six
+    // column readers (SEQUENCE.CMP_READ / PRIMARY_ALIGNMENT_ID /
+    // READ_LEN / READ_TYPE / QUALITY + PRIMARY_ALIGNMENT + REFERENCE)
+    // and decodes one spot's bases + quality in one call. No hardcoded
+    // metadata — everything comes from the archive.
+    //
+    // Cross-checks against vdb-dump on VDB-3418 row 1:
+    //   SEQUENCE.READ first 31: TCGGTATTACTTCGTTCAGTTACGTATTGCT
+    //   SEQUENCE.READ last 31:  GTTTCCCTAATAACCTTAGCAATACGTAACT
+    //   length 36185, single read, paired-end status: n/a (1-read spot)
+    use sracha_core::vdb::csra::CsraCursor;
+    use sracha_core::vdb::kar::KarArchive;
+    use sracha_core::vdb::restore::fourna_to_ascii;
+
+    let path = fixtures_dir().join("VDB-3418.sra");
+    if !path.exists() {
+        eprintln!("skipping: {} not present", path.display());
+        return;
+    }
+
+    let file = std::fs::File::open(&path).unwrap();
+    let mut archive = KarArchive::open(std::io::BufReader::new(file)).unwrap();
+    let csra = CsraCursor::open(&mut archive, &path).unwrap();
+    assert_eq!(csra.row_count(), 985);
+    assert_eq!(csra.first_row(), 1);
+
+    let spot = csra.read_spot(1).unwrap();
+    assert_eq!(spot.read_lens, vec![36185]);
+    assert_eq!(spot.read_types.len(), 1);
+    // BIOLOGICAL (0x01) | REVERSE (0x04) = 0x05 per vdb-dump.
+    assert_eq!(spot.read_types[0] & 0x07, 0x05);
+    assert_eq!(spot.bases.len(), 36185);
+    assert_eq!(spot.quality.len(), 36185);
+
+    let ascii = fourna_to_ascii(&spot.bases);
+    let text = std::str::from_utf8(&ascii).unwrap();
     assert_eq!(&text[..31], "TCGGTATTACTTCGTTCAGTTACGTATTGCT");
     assert_eq!(&text[text.len() - 31..], "GTTTCCCTAATAACCTTAGCAATACGTAACT");
 }

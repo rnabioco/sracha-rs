@@ -22,12 +22,20 @@ use crate::error::{Error, Result};
 /// complement bits.
 pub const COMPLEMENT_4NA: [u8; 16] = [0, 8, 4, 12, 2, 10, 6, 14, 1, 9, 5, 13, 3, 11, 7, 15];
 
-/// READ_TYPE bits consumed by `seq_restore_read` (see
-/// `ncbi-vdb/libs/sra.h` and the C source at
-/// `seq-restore-read.c:531-546`). Only the low two bits affect
-/// reconstruction; higher bits are FASTQ-formatting hints.
-pub const SRA_READ_TYPE_FORWARD: u8 = 0x01;
-pub const SRA_READ_TYPE_REVERSE: u8 = 0x02;
+/// READ_TYPE bit values, verified against
+/// `ncbi-vdb/interfaces/insdc/insdc.h:330-342`:
+///
+/// - `BIOLOGICAL` (bit 0 = `0x01`): biological vs technical read; technical
+///   reads are `0`.
+/// - `FORWARD` (bit 1 = `0x02`): read is in forward orientation (w.r.t. the
+///   sequencing template).
+/// - `REVERSE` (bit 2 = `0x04`): read is reverse-complemented.
+///
+/// `seq_restore_read` consults only `FORWARD` and `REVERSE` (C source at
+/// `seq-restore-read.c:531-546`); `BIOLOGICAL` is a FASTQ-formatting hint.
+pub const SRA_READ_TYPE_BIOLOGICAL: u8 = 0x01;
+pub const SRA_READ_TYPE_FORWARD: u8 = 0x02;
+pub const SRA_READ_TYPE_REVERSE: u8 = 0x04;
 
 /// Build the aligned read's bases in reference orientation.
 ///
