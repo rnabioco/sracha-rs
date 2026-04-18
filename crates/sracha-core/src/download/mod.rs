@@ -3,7 +3,7 @@ use std::path::{Path, PathBuf};
 
 use md5::{Digest, Md5};
 use serde::{Deserialize, Serialize};
-use tokio::io::{AsyncReadExt, AsyncSeekExt, AsyncWriteExt};
+use tokio::io::{AsyncSeekExt, AsyncWriteExt};
 use tokio::sync::Semaphore;
 
 use crate::error::{Error, Result};
@@ -30,6 +30,10 @@ pub struct DownloadConfig {
     pub progress: bool,
     /// Attempt to resume interrupted downloads (default true).
     pub resume: bool,
+    /// Shared HTTP client. When `None`, a fresh client is built per call.
+    /// The orchestrator should pass the same client it uses for SDL/S3 so
+    /// TLS sessions and connection pools are reused.
+    pub client: Option<reqwest::Client>,
 }
 
 impl Default for DownloadConfig {
@@ -41,6 +45,7 @@ impl Default for DownloadConfig {
             validate: true,
             progress: true,
             resume: true,
+            client: None,
         }
     }
 }
@@ -281,21 +286,35 @@ async fn download_single_stream(
 }
 
 /// Compute the MD5 hex digest of a file.
+///
+/// Uses a single mmap pass on a blocking worker. MD5 is inherently
+/// sequential, so we can't hash parallel chunks as they arrive — but we
+/// can avoid the thousands of `tokio::fs` async reads that the previous
+/// 64 KiB-buffer loop required. The downloaded bytes are still in the OS
+/// page cache immediately after writing, so the mmap pass is effectively
+/// a single CPU-bound MD5 over in-memory data.
 async fn compute_md5(path: &Path) -> Result<String> {
-    let mut file = tokio::fs::File::open(path).await?;
-    let mut hasher = Md5::new();
-    let mut buf = vec![0u8; 64 * 1024]; // 64 KiB read buffer
-
-    loop {
-        let n = file.read(&mut buf).await?;
-        if n == 0 {
-            break;
+    let path = path.to_path_buf();
+    tokio::task::spawn_blocking(move || -> Result<String> {
+        let file = std::fs::File::open(&path).map_err(Error::Io)?;
+        let mut hasher = Md5::new();
+        // mmap::map fails on empty files; hash empty input directly.
+        if file.metadata().map_err(Error::Io)?.len() > 0 {
+            // SAFETY: the temp SRA file is owned by this process; nothing
+            // else writes to it while we're hashing. UB on mutation
+            // (concurrent truncate) is acceptable — we already treat such a
+            // case as a fatal I/O error.
+            let mmap = unsafe { memmap2::Mmap::map(&file).map_err(Error::Io)? };
+            hasher.update(&mmap[..]);
         }
-        hasher.update(&buf[..n]);
-    }
-
-    let digest = hasher.finalize();
-    Ok(digest.iter().map(|b| format!("{b:02x}")).collect())
+        let digest = hasher.finalize();
+        Ok(digest.iter().map(|b| format!("{b:02x}")).collect())
+    })
+    .await
+    .map_err(|e| Error::Download {
+        accession: String::new(),
+        message: format!("md5 task panicked: {e}"),
+    })?
 }
 
 // ---------------------------------------------------------------------------
@@ -339,10 +358,10 @@ fn load_progress(path: &Path) -> Option<DownloadProgress> {
     serde_json::from_str(&data).ok()
 }
 
-/// Save progress to the sidecar file.
-fn save_progress(path: &Path, progress: &DownloadProgress) -> std::io::Result<()> {
+/// Save progress to the sidecar file on the tokio runtime.
+async fn save_progress(path: &Path, progress: &DownloadProgress) -> std::io::Result<()> {
     let data = serde_json::to_string(progress)?;
-    std::fs::write(path, data)
+    tokio::fs::write(path, data).await
 }
 
 /// Delete the progress sidecar file.
@@ -447,10 +466,13 @@ pub async fn download_file(
         }
     }
 
-    let client = reqwest::Client::builder()
-        .user_agent(format!("sracha/{}", env!("CARGO_PKG_VERSION")))
-        .http2_adaptive_window(true)
-        .build()?;
+    // Prefer a caller-supplied client so multi-accession runs reuse TLS
+    // sessions and connection pools. Fall back to a fresh client only when
+    // no shared one was provided (e.g. tests, ad-hoc callers).
+    let client = match &config.client {
+        Some(c) => c.clone(),
+        None => crate::http::default_client(),
+    };
 
     // Probe the first URL.
     let url = &urls[0];
@@ -637,20 +659,40 @@ pub async fn download_file(
             // Drop our copy so the channel closes when all tasks finish.
             drop(done_tx);
 
-            // Collect completed chunk indices and periodically save progress.
+            // Collect completed chunk indices and save progress on a timer.
+            // A 2 s interval is plenty for resume granularity on a file that
+            // takes minutes to download, and avoids blocking the runtime on
+            // per-chunk JSON serialization + sync write.
             let prog_path_clone = prog_path.clone();
             let progress_saver = tokio::spawn(async move {
-                let mut count = 0u64;
-                while let Some(idx) = done_rx.recv().await {
-                    progress.completed_chunks.insert(idx);
-                    count += 1;
-                    // Save every 10 chunks.
-                    if count.is_multiple_of(10) {
-                        let _ = save_progress(&prog_path_clone, &progress);
+                let mut flush = tokio::time::interval(std::time::Duration::from_secs(2));
+                flush.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+                // Skip the immediate first tick — nothing to save yet.
+                flush.tick().await;
+                let mut dirty = false;
+
+                loop {
+                    tokio::select! {
+                        biased;
+                        msg = done_rx.recv() => match msg {
+                            Some(idx) => {
+                                progress.completed_chunks.insert(idx);
+                                dirty = true;
+                            }
+                            None => break,
+                        },
+                        _ = flush.tick() => {
+                            if dirty {
+                                let _ = save_progress(&prog_path_clone, &progress).await;
+                                dirty = false;
+                            }
+                        }
                     }
                 }
-                // Final save.
-                let _ = save_progress(&prog_path_clone, &progress);
+                // Final save on channel close.
+                if dirty {
+                    let _ = save_progress(&prog_path_clone, &progress).await;
+                }
             });
 
             // Await all download tasks; collect errors.
@@ -978,8 +1020,8 @@ mod tests {
         assert_eq!(restored.completed_chunks, progress.completed_chunks);
     }
 
-    #[test]
-    fn test_progress_save_load() {
+    #[tokio::test]
+    async fn test_progress_save_load() {
         let tmp = tempfile::tempdir().unwrap();
         let prog_file = tmp.path().join(".test.sracha-progress");
 
@@ -996,7 +1038,7 @@ mod tests {
             expected_md5: None,
         };
 
-        save_progress(&prog_file, &progress).unwrap();
+        save_progress(&prog_file, &progress).await.unwrap();
         let loaded = load_progress(&prog_file).unwrap();
         assert_eq!(loaded.total_chunks, 10);
         assert!(loaded.completed_chunks.contains(&1));

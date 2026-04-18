@@ -122,6 +122,7 @@ fn test_config(
         stdout: false,
         cancelled: None,
         strict: false,
+        http_client: None,
     }
 }
 

@@ -77,7 +77,8 @@ async fn main() -> Result<()> {
     match cli.command {
         Command::Fetch(args) => {
             let raw = collect_accessions(&args.accessions, args.accession_list.as_deref())?;
-            let client = SdlClient::new();
+            let http_client = sracha_core::http::default_client();
+            let client = SdlClient::with_client(http_client.clone());
             let (run_accessions, has_projects) = resolve_to_runs(&raw, &client).await?;
             let sp = progress::Spinner::start(format!(
                 "Resolving {} accession(s)",
@@ -121,6 +122,7 @@ async fn main() -> Result<()> {
                     validate: !args.no_validate,
                     progress: !args.no_progress,
                     resume: !args.no_resume,
+                    client: Some(http_client.clone()),
                     ..Default::default()
                 };
                 tracing::info!(
@@ -193,6 +195,7 @@ async fn main() -> Result<()> {
                     resume: true,
                     stdout: args.stdout,
                     cancelled: None,
+                    http_client: None,
                     strict: args.strict,
                 };
 
@@ -218,7 +221,8 @@ async fn main() -> Result<()> {
                 cli::resolve_split_mode(args.split, args.stdout).map_err(|e| anyhow::anyhow!(e))?;
 
             let raw = collect_accessions(&args.accessions, args.accession_list.as_deref())?;
-            let sdl_client = SdlClient::new();
+            let http_client = sracha_core::http::default_client();
+            let sdl_client = SdlClient::with_client(http_client.clone());
             let (run_accessions, has_projects) = resolve_to_runs(&raw, &sdl_client).await?;
             let sp = progress::Spinner::start(format!(
                 "Resolving {} accession(s)",
@@ -303,8 +307,10 @@ async fn main() -> Result<()> {
                 >,
             > = None;
 
-            let make_config =
-                |resolved: &ResolvedAccession| sracha_core::pipeline::PipelineConfig {
+            let make_config = {
+                let http_client = http_client.clone();
+                let cancelled = cancelled.clone();
+                move |resolved: &ResolvedAccession| sracha_core::pipeline::PipelineConfig {
                     output_dir: args.output_dir.clone(),
                     split_mode,
                     compression,
@@ -320,7 +326,9 @@ async fn main() -> Result<()> {
                     stdout: args.stdout,
                     cancelled: Some(cancelled.clone()),
                     strict: args.strict,
-                };
+                    http_client: Some(http_client.clone()),
+                }
+            };
 
             for (i, resolved) in resolved_all.iter().enumerate() {
                 if cancelled.load(Ordering::Relaxed) {
@@ -466,7 +474,7 @@ async fn main() -> Result<()> {
                 return Ok(());
             }
 
-            let client = SdlClient::new();
+            let client = SdlClient::with_client(sracha_core::http::default_client());
             let (run_accessions, _has_projects) = resolve_to_runs(&accessions, &client).await?;
 
             let sp = progress::Spinner::start(format!(
@@ -534,7 +542,7 @@ async fn main() -> Result<()> {
             let mut rows: Vec<ValidateRow> = Vec::new();
 
             let sdl = if args.md5.is_none() && !args.offline {
-                Some(SdlClient::new())
+                Some(SdlClient::with_client(sracha_core::http::default_client()))
             } else {
                 None
             };

@@ -138,12 +138,15 @@ pub struct SdlClient {
 
 impl SdlClient {
     pub fn new() -> Self {
-        Self {
-            http: reqwest::Client::builder()
-                .user_agent(format!("sracha/{}", env!("CARGO_PKG_VERSION")))
-                .build()
-                .expect("failed to build HTTP client"),
-        }
+        Self::with_client(crate::http::default_client())
+    }
+
+    /// Construct a `SdlClient` that reuses an existing `reqwest::Client`.
+    /// Prefer this when orchestrating multi-accession runs so the same
+    /// connection pool (and TLS sessions) are reused across SDL, S3, and
+    /// SRA downloads.
+    pub fn with_client(http: reqwest::Client) -> Self {
+        Self { http }
     }
 
     /// Access the inner reqwest client (for pipeline reuse).

@@ -55,6 +55,7 @@ fn config(out: &std::path::Path, threads: usize, compression: CompressionMode) -
         stdout: false,
         cancelled: None,
         strict: false,
+        http_client: None,
     }
 }
 

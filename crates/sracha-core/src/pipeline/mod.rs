@@ -78,6 +78,10 @@ pub struct PipelineConfig {
     /// quality-length / mate-pair / blob-truncation counter is non-zero at
     /// the end of decode, instead of merely reporting the counts.
     pub strict: bool,
+    /// Shared HTTP client. When `Some`, `download_sra` threads it into
+    /// [`DownloadConfig`] so TLS sessions and connection pools are reused
+    /// across accessions.
+    pub http_client: Option<reqwest::Client>,
 }
 
 // ---------------------------------------------------------------------------
@@ -2564,6 +2568,7 @@ pub async fn download_sra(
         validate: true,
         progress: config.progress,
         resume: config.resume,
+        client: config.http_client.clone(),
     };
 
     tracing::info!(
