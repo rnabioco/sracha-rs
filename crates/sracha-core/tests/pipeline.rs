@@ -726,6 +726,59 @@ fn csra_reference_fetch_span() {
 
 #[ignore]
 #[test]
+fn csra_align_restore_read_row_1() {
+    // Phase 2 end-to-end: reconstruct PRIMARY_ALIGNMENT row 1's aligned
+    // bases from REFERENCE + HAS_MISMATCH + MISMATCH + HAS_REF_OFFSET +
+    // REF_OFFSET, and verify the ASCII matches `vdb-dump -T PRIMARY_ALIGNMENT
+    // -C READ -R 1`:
+    //   length  36185
+    //   first30 AGTTACGTATTGCTAAGGTTATTAGGGAAA
+    //   last31  AGCAATACGTAACTGAACGAAGTAATACCGA
+    //
+    // `align_restore_read` output is in REFERENCE orientation — vdb-dump's
+    // `PRIMARY_ALIGNMENT.READ` column matches it directly. Strand flip
+    // based on SEQUENCE.READ_TYPE happens one level up in seq_restore_read
+    // when splicing aligned halves into a full spot.
+    use sracha_core::vdb::alignment::AlignmentCursor;
+    use sracha_core::vdb::kar::KarArchive;
+    use sracha_core::vdb::reference::ReferenceCursor;
+    use sracha_core::vdb::restore::{align_restore_read, fourna_to_ascii};
+
+    let path = fixtures_dir().join("VDB-3418.sra");
+    if !path.exists() {
+        eprintln!("skipping: {} not present", path.display());
+        return;
+    }
+
+    let file = std::fs::File::open(&path).unwrap();
+    let mut archive = KarArchive::open(std::io::BufReader::new(file)).unwrap();
+    let align = AlignmentCursor::open(&mut archive, &path).unwrap();
+    let refs = ReferenceCursor::open(&mut archive, &path).unwrap();
+
+    let row = align.read_row(1).unwrap();
+    let read_len = row.has_mismatch.len();
+    assert_eq!(read_len, 36185);
+
+    let ref_read = refs.fetch_span(row.global_ref_start, row.ref_len).unwrap();
+    let bases = align_restore_read(
+        &ref_read,
+        &row.has_mismatch,
+        &row.mismatch,
+        &row.has_ref_offset,
+        &row.ref_offset,
+        read_len,
+    )
+    .unwrap();
+    let ascii = fourna_to_ascii(&bases);
+    let text = std::str::from_utf8(&ascii).unwrap();
+
+    assert_eq!(text.len(), 36185);
+    assert_eq!(&text[..30], "AGTTACGTATTGCTAAGGTTATTAGGGAAA");
+    assert_eq!(&text[text.len() - 31..], "AGCAATACGTAACTGAACGAAGTAATACCGA");
+}
+
+#[ignore]
+#[test]
 fn corrupt_kar_magic_fails_fast() {
     let tmp = tempfile::tempdir().unwrap();
     let path = clone_fixture(tmp.path(), "badmagic.sra");

@@ -7,3 +7,4 @@ pub mod kar;
 pub mod kdb;
 pub mod metadata;
 pub mod reference;
+pub mod restore;
