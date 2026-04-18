@@ -51,8 +51,9 @@ Local SRA-to-FASTQ conversion (no network), uncompressed output,
 
 | File | Size | sracha | fasterq-dump | fastq-dump | Speedup vs fasterq-dump |
 |:---|---:|---:|---:|---:|---:|
-| SRR28588231 | 23 MiB | 0.21 s | 2.39 s | 2.11 s | **11.2x** |
-| SRR2584863 | 288 MiB | 2.01 s | 8.05 s | 13.44 s | **4.0x** |
+| SRR28588231 | 23 MiB | 0.22 s | 1.97 s | 2.22 s | **8.8x** |
+| SRR2584863 | 288 MiB | 2.27 s | 6.37 s | 16.92 s | **2.8x** |
+| ERR1018173 | 1.94 GiB | 14.9 s | 39.9 s | -- | **2.7x** |
 
 Compression adds minimal overhead -- sracha produces gzipped FASTQ by default
 with parallel block compression, so the integrated pipeline
@@ -62,28 +63,35 @@ separate gzip step.
 <details>
 <summary>Full hyperfine output</summary>
 
-**SRR28588231 (23 MiB, 66K spots)**
+**SRR28588231 (23 MiB, 66K spots, Illumina paired)**
 
 | Command | Mean [ms] | Min [ms] | Max [ms] | Relative |
 |:---|---:|---:|---:|---:|
-| `sracha` | 213.2 ± 6.2 | 206.6 | 225.9 | 1.00 |
-| `fasterq-dump` | 2385.4 ± 738.8 | 2036.4 | 3706.2 | 11.19 ± 3.48 |
-| `fastq-dump` | 2109.8 ± 27.6 | 2082.0 | 2154.8 | 9.89 ± 0.32 |
+| `sracha` | 222.5 ± 6.6 | 212.9 | 232.3 | 1.00 |
+| `fasterq-dump` | 1965.6 ± 19.3 | 1945.8 | 1996.0 | 8.83 ± 0.28 |
+| `fastq-dump` | 2217.5 ± 4.6 | 2213.6 | 2224.8 | 9.97 ± 0.30 |
 
-**SRR2584863 (288 MiB)**
+**SRR2584863 (288 MiB, Illumina paired)**
 
 | Command | Mean [s] | Min [s] | Max [s] | Relative |
 |:---|---:|---:|---:|---:|
-| `sracha` | 2.009 ± 0.045 | 1.981 | 2.062 | 1.00 |
-| `fasterq-dump` | 8.052 ± 2.347 | 6.288 | 10.716 | 4.01 ± 1.17 |
-| `fastq-dump` | 13.440 ± 1.762 | 12.398 | 15.475 | 6.69 ± 0.89 |
+| `sracha` | 2.265 ± 0.053 | 2.207 | 2.311 | 1.00 |
+| `fasterq-dump` | 6.373 ± 0.033 | 6.338 | 6.403 | 2.81 ± 0.07 |
+| `fastq-dump` | 16.918 ± 0.650 | 16.486 | 17.666 | 7.47 ± 0.34 |
+
+**ERR1018173 (1.94 GiB, 15.6M spots, Illumina paired, single run)**
+
+| Command | Time [s] |
+|:---|---:|
+| `sracha` | 14.88 |
+| `fasterq-dump` | 39.86 |
 
 **sracha gzip overhead (SRR28588231)**
 
 | Command | Mean [ms] | Min [ms] | Max [ms] | Relative |
 |:---|---:|---:|---:|---:|
-| `sracha (no compression)` | 254.9 ± 86.1 | 212.1 | 430.0 | 1.00 |
-| `sracha (gzip)` | 342.3 ± 11.1 | 327.3 | 362.1 | 1.34 ± 0.46 |
+| `sracha (no compression)` | 221.0 ± 6.1 | 209.1 | 233.5 | 1.00 |
+| `sracha (gzip)` | 427.0 ± 2.9 | 424.3 | 432.4 | 1.93 ± 0.05 |
 
 </details>
 

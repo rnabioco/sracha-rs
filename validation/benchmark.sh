@@ -3,7 +3,7 @@
 #SBATCH --output=validation/benchmark_%A_%a.log
 #SBATCH --partition=normal
 #SBATCH --cpus-per-task=8
-#SBATCH --mem=16G
+#SBATCH --mem=48G
 #SBATCH --time=2:00:00
 #SBATCH --array=0-3
 #
@@ -46,10 +46,11 @@ SRATOOLS_DIR="$SCRIPT_DIR/sra-tools"
 
 SMALL_SRA="$ROOT_DIR/crates/sracha-core/tests/fixtures/SRR28588231.sra"   # 23 MiB
 MEDIUM_SRA="$SCRIPT_DIR/SRR2584863.sra"                                   # 288 MiB
-# NOTE: previously SRR6691717 but that is a cSRA (NCBI:align:db:...) which
-# sracha now rejects. SRR6691717 is a plain Illumina SINGLE 100bp run of
-# comparable size (3.2 GiB).
-LARGE_SRA="$SCRIPT_DIR/SRR6691717.sra"                                    # 3.20 GiB
+# NOTE: previously SRR14724462 and SRR13601556 (both cSRA, now rejected)
+# and SRR6691717 (SINGLE 100bp — unflattering vs fasterq-dump which
+# doesn't have to reassemble pairs). ERR1018173 is a plain Illumina
+# PAIRED run at 1.94 GiB / 15.6M spots, decodes cleanly with sracha.
+LARGE_SRA="$SCRIPT_DIR/ERR1018173.sra"                                   # 1.94 GiB
 
 SKIP_LARGE=false
 ONLY=""
@@ -243,14 +244,14 @@ if should_run medium; then
 fi
 
 # =====================================================================
-# Benchmark: Large file (SRR6691717, 3.20 GiB) — single run
+# Benchmark: Large file (ERR1018173, 1.94 GiB) — single run
 # =====================================================================
 if should_run large && [[ "$SKIP_LARGE" != true ]]; then
     if [[ ! -f "$LARGE_SRA" ]]; then
-        log "Downloading SRR6691717 for large benchmark..."
-        "$SRACHA" fetch SRR6691717 -O "$SCRIPT_DIR" --no-progress
+        log "Downloading ERR1018173 for large benchmark..."
+        "$SRACHA" fetch ERR1018173 -O "$SCRIPT_DIR" --no-progress
     fi
-    log "Benchmark: SRR6691717 (3.20 GiB) — uncompressed FASTQ (single run)"
+    log "Benchmark: ERR1018173 (1.94 GiB) — uncompressed FASTQ (single run)"
     echo "  (fastq-dump skipped for large file — too slow)"
 
     LARGE_OUT="$SCRATCH/large"
@@ -279,7 +280,7 @@ if should_run large && [[ "$SKIP_LARGE" != true ]]; then
         awk '{ printf "| `%s` | %.2f |\n", $1, $2 }' "$TIMING_FILE"
     } > "$OUTDIR/large.md"
 elif should_run large; then
-    log "Benchmark: SRR6691717 SKIPPED (--skip-large)"
+    log "Benchmark: ERR1018173 SKIPPED (--skip-large)"
 fi
 
 # =====================================================================
