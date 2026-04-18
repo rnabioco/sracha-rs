@@ -986,36 +986,149 @@ pub fn run_fastq(
     })
 }
 
-/// Phase-3 cSRA decode path. See `run_fastq` for the dispatch trigger.
+/// cSRA decode path — drives `CsraCursor` through the same FASTQ writer
+/// infrastructure (split modes, compression, stdout) as the regular
+/// pipeline, so all of `PipelineConfig` honours through.
 fn run_fastq_csra(
     sra_path: &std::path::Path,
     acc: &str,
     config: &PipelineConfig,
 ) -> Result<FastqStats> {
+    use crate::fastq::{CompressionMode, FastqConfig, OutputSlot, SpotRecord, output_filename};
     use crate::vdb::csra::CsraCursor;
     use crate::vdb::kar::KarArchive;
-
-    if config.stdout {
-        return Err(Error::Vdb(
-            "cSRA: --stdout not yet supported; output goes to --output-dir".into(),
-        ));
-    }
+    use crate::vdb::restore::fourna_to_ascii;
 
     let file = std::fs::File::open(sra_path)?;
     let mut archive = KarArchive::open(std::io::BufReader::new(file))?;
     let csra = CsraCursor::open(&mut archive, sra_path)?;
 
-    let (out_path, stats) = csra.write_fastq_to_dir(acc, &config.output_dir)?;
+    let fastq_config = FastqConfig {
+        split_mode: config.split_mode,
+        skip_technical: config.skip_technical,
+        min_read_len: config.min_read_len,
+        fasta: config.fasta,
+    };
 
-    eprintln!(
-        "warning: {acc}: cSRA decode — split/compression flags ignored in v1 (single uncompressed file)"
-    );
+    if !config.stdout {
+        std::fs::create_dir_all(&config.output_dir)?;
+    }
+
+    let mut writers: HashMap<OutputSlot, OutputWriter> = HashMap::new();
+    let mut output_paths: Vec<(PathBuf, PathBuf)> = Vec::new();
+    let mut stdout_writer: Option<OutputWriter> = if config.stdout {
+        Some(OutputWriter::Stdout(std::io::BufWriter::with_capacity(
+            256 * 1024,
+            std::io::stdout(),
+        )))
+    } else {
+        None
+    };
+
+    // Gzip pool reused across slot writers when --compress gzip is set.
+    let compress_pool: Option<Arc<rayon::ThreadPool>> = match config.compression {
+        CompressionMode::Gzip { .. } => {
+            let n = config.threads.max(1);
+            Some(Arc::new(
+                rayon::ThreadPoolBuilder::new()
+                    .num_threads(n)
+                    .build()
+                    .map_err(|e| Error::Vdb(format!("gzip threadpool: {e}")))?,
+            ))
+        }
+        _ => None,
+    };
+
+    let mut spots_read = 0u64;
+    let mut reads_written = 0u64;
+
+    // itoa buffer reused per spot for the spot-number string.
+    let mut itoa_buf = itoa::Buffer::new();
+
+    for row_id in csra.first_row()..(csra.first_row() + csra.row_count() as i64) {
+        let s = csra.read_spot(row_id)?;
+        let sequence = fourna_to_ascii(&s.bases);
+        let quality: Vec<u8> = s.quality.iter().map(|q| q.wrapping_add(33)).collect();
+        // SpotRecord.read_types uses 0 = biological, nonzero = technical
+        // (the existing pipeline's convention). cSRA's physical READ_TYPE
+        // is a bitfield: bit 0 = BIOLOGICAL, bit 1 = FORWARD, bit 2 =
+        // REVERSE. Translate by flipping the BIOLOGICAL bit.
+        let read_types: Vec<u8> = s
+            .read_types
+            .iter()
+            .map(|&rt| if rt & 0x01 != 0 { 0 } else { 1 })
+            .collect();
+        // format_spot passes spot.name through as the FASTQ defline's
+        // spot-number field — fasterq-dump deflines are `@{run}.{N} {N}
+        // length={L}`, so we set name = "{row_id}" byte string.
+        let spot_num_str = itoa_buf.format(row_id).to_string();
+        let spot = SpotRecord {
+            name: spot_num_str.as_bytes().to_vec(),
+            sequence,
+            quality,
+            read_lengths: s.read_lens,
+            read_types,
+            read_filter: Vec::new(),
+            spot_group: Vec::new(),
+        };
+
+        for (slot, rec) in crate::fastq::format_spot(&spot, acc, &fastq_config) {
+            let writer = if let Some(ref mut sw) = stdout_writer {
+                sw
+            } else {
+                writers.entry(slot).or_insert_with(|| {
+                    let filename = output_filename(acc, slot, config.fasta, &config.compression);
+                    let final_path = config.output_dir.join(&filename);
+                    let tmp_path = config.output_dir.join(format!("{filename}.partial"));
+                    output_paths.push((final_path, tmp_path.clone()));
+                    let file = std::fs::File::create(&tmp_path)
+                        .expect("failed to create cSRA output file");
+                    let buf = std::io::BufWriter::with_capacity(256 * 1024, file);
+                    match config.compression {
+                        CompressionMode::Gzip { level } => OutputWriter::Gz(ParGzWriter::new(
+                            buf,
+                            level,
+                            DEFAULT_BLOCK_SIZE,
+                            compress_pool.clone().expect("gzip pool must exist"),
+                        )),
+                        CompressionMode::Zstd { level, threads } => {
+                            let mut encoder = zstd::stream::write::Encoder::new(buf, level)
+                                .expect("failed to create zstd encoder");
+                            encoder
+                                .multithread(threads)
+                                .expect("failed to set zstd threads");
+                            OutputWriter::Zstd(encoder)
+                        }
+                        CompressionMode::None => OutputWriter::Plain(buf),
+                    }
+                })
+            };
+            writer.write_all(&rec.data).map_err(Error::Io)?;
+            reads_written += 1;
+        }
+        spots_read += 1;
+    }
+
+    if let Some(sw) = stdout_writer {
+        sw.finish().map_err(Error::Io)?;
+    }
+    for (_, writer) in writers {
+        writer.finish().map_err(Error::Io)?;
+    }
+
+    let mut final_paths = Vec::with_capacity(output_paths.len());
+    if !config.stdout {
+        for (final_path, tmp_path) in &output_paths {
+            std::fs::rename(tmp_path, final_path).map_err(Error::Io)?;
+            final_paths.push(final_path.clone());
+        }
+    }
 
     Ok(FastqStats {
         accession: acc.to_string(),
-        spots_read: stats.spots,
-        reads_written: stats.spots,
-        output_files: vec![out_path],
+        spots_read,
+        reads_written,
+        output_files: final_paths,
         integrity: Arc::new(IntegrityDiag::default()),
     })
 }

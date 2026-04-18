@@ -796,6 +796,14 @@ fn print_local_file_info(path: &std::path::Path) {
             return;
         }
     };
+    // cSRA dispatch: archives we can decode via CsraCursor don't open as
+    // a plain VdbCursor (no physical READ column). Render a cSRA-flavoured
+    // info block instead of surfacing the reject-if-csra error.
+    if sracha_core::vdb::csra::looks_like_decodable_csra(path).unwrap_or(false) {
+        print_local_csra_info(path, &mut archive);
+        return;
+    }
+
     let cursor = match VdbCursor::open(&mut archive, path) {
         Ok(c) => c,
         Err(e) => {
@@ -847,6 +855,44 @@ fn print_local_file_info(path: &std::path::Path) {
         "  {} {}",
         style::label("Columns:"),
         style::value(columns.join(", "))
+    );
+}
+
+fn print_local_csra_info<R: std::io::Read + std::io::Seek>(
+    path: &std::path::Path,
+    archive: &mut sracha_core::vdb::kar::KarArchive<R>,
+) {
+    use sracha_core::vdb::csra::CsraCursor;
+
+    let csra = match CsraCursor::open(archive, path) {
+        Ok(c) => c,
+        Err(e) => {
+            eprintln!("  {} cSRA cursor failed: {e}", style::error_label("error:"));
+            return;
+        }
+    };
+
+    println!(
+        "  {} {}",
+        style::label("Platform:"),
+        style::value("reference-compressed cSRA")
+    );
+    println!(
+        "  {}   {}",
+        style::label("Spots:"),
+        style::count(csra.row_count())
+    );
+    println!(
+        "  {} {}",
+        style::label("Columns:"),
+        style::value(
+            "CMP_READ, PRIMARY_ALIGNMENT_ID, READ_LEN, READ_TYPE, QUALITY (+ PRIMARY_ALIGNMENT + REFERENCE)"
+        )
+    );
+    println!(
+        "  {} {}",
+        style::label("Note:"),
+        style::value("decode via `sracha fastq` (not supported by plain VDB cursor)")
     );
 }
 
