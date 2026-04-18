@@ -681,7 +681,22 @@ fn reject_if_csra<R: Read + Seek>(archive: &mut KarArchive<R>, seq_col_base: &st
     // stale pre-conversion bookkeeping.
     let cmp_base_count = read_cmp_base_count_from_archive(archive);
     let has_unaligned_marker = read_unaligned_marker_from_archive(archive);
-    let has_compressed_bases = cmp_base_count.unwrap_or(0) > 0 && !has_unaligned_marker;
+
+    // When the archive has no CMP_READ, no PRIMARY_ALIGNMENT, and a
+    // physical READ column, the plain VdbCursor path can handle it —
+    // `CMP_BASE_COUNT > 0` on its own is stale pre-conversion metadata
+    // left over from bam-load's compressed stage, not evidence the
+    // physical READ column is residue-only. This covers DRR017176-class
+    // archives (schema NCBI:align:db:alignment_sorted#1.2.1, flat
+    // SEQUENCE table, READ present) that vdb-dump / fasterq-dump decode
+    // cleanly via the physical READ column.
+    let read_col_prefix = format!("{seq_col_base}/READ");
+    let has_physical_read = archive
+        .entries()
+        .keys()
+        .any(|p| p == &read_col_prefix || p.starts_with(&format!("{read_col_prefix}/")));
+    let has_compressed_bases =
+        cmp_base_count.unwrap_or(0) > 0 && !has_unaligned_marker && !has_physical_read;
 
     if !has_cmp_read && !has_primary_alignment && !has_compressed_bases {
         return Ok(());

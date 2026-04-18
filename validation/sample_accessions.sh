@@ -19,15 +19,23 @@ PLATFORM="ILLUMINA"
 MIN_BASES=100000000
 MAX_BASES=3000000000
 POOL=5000
+LIBRARY_STRATEGY=""
+# cSRA probe mode: tightens the ENA query to favour aligned / BAM-loaded
+# submissions (library_strategy=WGS). The final cSRA filter still happens
+# at `sracha fastq` time via CsraCursor's archive-shape check, but this
+# raises the hit rate dramatically over sampling all Illumina runs.
+ALIGNED=0
 
 while [[ $# -gt 0 ]]; do
     case "$1" in
-        -n)           N="$2"; shift 2 ;;
-        -s|--seed)    SEED="$2"; shift 2 ;;
-        -p|--platform) PLATFORM="$2"; shift 2 ;;
-        --min-bases)  MIN_BASES="$2"; shift 2 ;;
-        --max-bases)  MAX_BASES="$2"; shift 2 ;;
-        --pool)       POOL="$2"; shift 2 ;;
+        -n)                   N="$2"; shift 2 ;;
+        -s|--seed)            SEED="$2"; shift 2 ;;
+        -p|--platform)        PLATFORM="$2"; shift 2 ;;
+        --min-bases)          MIN_BASES="$2"; shift 2 ;;
+        --max-bases)          MAX_BASES="$2"; shift 2 ;;
+        --pool)               POOL="$2"; shift 2 ;;
+        --library-strategy)   LIBRARY_STRATEGY="$2"; shift 2 ;;
+        --aligned)            ALIGNED=1; shift ;;
         -h|--help)
             sed -n '3,15p' "$0" | sed 's/^# \{0,1\}//'
             exit 0
@@ -40,10 +48,20 @@ if [[ -z "$SEED" ]]; then
     SEED="$RANDOM$RANDOM"
 fi
 
+# --aligned is a shortcut for library_strategy=WGS, which is BAM-submitted
+# in practice and therefore almost always cSRA. Override with an explicit
+# --library-strategy if needed.
+if [[ "$ALIGNED" == "1" && -z "$LIBRARY_STRATEGY" ]]; then
+    LIBRARY_STRATEGY="WGS"
+fi
+
 if [[ "$PLATFORM" == "all" ]]; then
     QUERY="base_count>=${MIN_BASES} AND base_count<=${MAX_BASES}"
 else
     QUERY="instrument_platform=${PLATFORM} AND base_count>=${MIN_BASES} AND base_count<=${MAX_BASES}"
+fi
+if [[ -n "$LIBRARY_STRATEGY" ]]; then
+    QUERY="${QUERY} AND library_strategy=${LIBRARY_STRATEGY}"
 fi
 
 echo "# sampling N=${N} from ENA pool=${POOL} query=\"${QUERY}\" seed=${SEED}" >&2
