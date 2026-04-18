@@ -673,6 +673,59 @@ fn csra_alignment_columns_open() {
 
 #[ignore]
 #[test]
+fn csra_reference_fetch_span() {
+    // Verify REFERENCE chunk reader against vdb-dump. VDB-3418's REFERENCE
+    // table: 180 chunks, MAX_SEQ_LEN=5000, chromosome "III".
+    // vdb-dump -T REFERENCE -C READ -R 1 first bases: CCCACACACCACACCCACACCACACCCACA...
+    use sracha_core::vdb::kar::KarArchive;
+    use sracha_core::vdb::reference::ReferenceCursor;
+
+    let path = fixtures_dir().join("VDB-3418.sra");
+    if !path.exists() {
+        eprintln!(
+            "skipping csra_reference_fetch_span: {} not present",
+            path.display()
+        );
+        return;
+    }
+
+    let file = std::fs::File::open(&path).unwrap();
+    let mut archive = KarArchive::open(std::io::BufReader::new(file)).unwrap();
+    let refs = ReferenceCursor::open(&mut archive, &path).unwrap();
+    assert_eq!(refs.row_count(), 180);
+    assert_eq!(refs.max_seq_len(), 5000);
+
+    // First 30 bases of chunk 1 (global_ref_start=0): CCCACACACCACACCCACACCACACCCACA
+    let bases = refs.fetch_span(0, 30).unwrap();
+    let expected_text = "CCCACACACCACACCCACACCACACCCACA";
+    let got_text: String = bases
+        .iter()
+        .map(|&b| match b {
+            0x1 => 'A',
+            0x2 => 'C',
+            0x4 => 'G',
+            0x8 => 'T',
+            _ => '?',
+        })
+        .collect();
+    assert_eq!(got_text, expected_text, "first 30 bases mismatch");
+
+    // Cross-chunk span: start at position 4995 (end of chunk 1), length 10,
+    // should straddle into chunk 2. Just assert we get 10 bases back without
+    // error — a stronger check lands once we have a second fixture to
+    // compare against vdb-dump's concatenated output.
+    let bases2 = refs.fetch_span(4995, 10).unwrap();
+    assert_eq!(bases2.len(), 10);
+    for (i, &b) in bases2.iter().enumerate() {
+        assert!(
+            matches!(b, 0x1 | 0x2 | 0x4 | 0x8),
+            "byte {i} of cross-chunk span not a 2na code: {b}"
+        );
+    }
+}
+
+#[ignore]
+#[test]
 fn corrupt_kar_magic_fails_fast() {
     let tmp = tempfile::tempdir().unwrap();
     let path = clone_fixture(tmp.path(), "badmagic.sra");
