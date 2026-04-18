@@ -1039,74 +1039,172 @@ fn run_fastq_csra(
         _ => None,
     };
 
+    // Partition the spot range into chunks of CHUNK_SIZE for parallel
+    // decode. Each rayon worker opens its own CsraCursor (mmap is cheap;
+    // actual I/O happens on-demand), decodes its spot range, returns a
+    // per-slot byte buffer. Main thread writes chunks in order to the
+    // shared writers, preserving spot order across all outputs.
+    //
+    // Opening CsraCursor inside rayon workers means we don't need to
+    // share the top-level one; drop it here to release its file handle
+    // and avoid the small double-open cost on single-threaded paths.
+    let total_spots = csra.row_count();
+    let first_row = csra.first_row();
+    drop(csra);
+    drop(archive);
+
+    // Chunk size picked to (a) amortise per-chunk cursor-open overhead
+    // (each chunk re-mmaps the SEQUENCE / PRIMARY_ALIGNMENT / REFERENCE
+    // columns), and (b) give rayon enough work items that all threads
+    // stay busy — roughly 8 chunks per thread so stragglers in one
+    // thread don't pile up.
+    let num_threads = config.threads.max(1);
+    let chunk_size: u64 = {
+        let target_chunks = (num_threads as u64) * 8;
+        let raw = total_spots.div_ceil(target_chunks.max(1));
+        raw.clamp(32, 1024)
+    };
     let mut spots_read = 0u64;
     let mut reads_written = 0u64;
 
-    // itoa buffer reused per spot for the spot-number string.
-    let mut itoa_buf = itoa::Buffer::new();
+    // When there's only one thread or the archive is tiny, skip the
+    // parallel path — each worker carries ~20 mmap setups of overhead.
+    let use_parallel = num_threads > 1 && total_spots >= chunk_size * 2;
 
-    for row_id in csra.first_row()..(csra.first_row() + csra.row_count() as i64) {
-        let s = csra.read_spot(row_id)?;
-        let sequence = fourna_to_ascii(&s.bases);
-        let quality: Vec<u8> = s.quality.iter().map(|q| q.wrapping_add(33)).collect();
-        // SpotRecord.read_types uses 0 = biological, nonzero = technical
-        // (the existing pipeline's convention). cSRA's physical READ_TYPE
-        // is a bitfield: bit 0 = BIOLOGICAL, bit 1 = FORWARD, bit 2 =
-        // REVERSE. Translate by flipping the BIOLOGICAL bit.
-        let read_types: Vec<u8> = s
-            .read_types
-            .iter()
-            .map(|&rt| if rt & 0x01 != 0 { 0 } else { 1 })
-            .collect();
-        // format_spot passes spot.name through as the FASTQ defline's
-        // spot-number field — fasterq-dump deflines are `@{run}.{N} {N}
-        // length={L}`, so we set name = "{row_id}" byte string.
-        let spot_num_str = itoa_buf.format(row_id).to_string();
-        let spot = SpotRecord {
-            name: spot_num_str.as_bytes().to_vec(),
-            sequence,
-            quality,
-            read_lengths: s.read_lens,
-            read_types,
-            read_filter: Vec::new(),
-            spot_group: Vec::new(),
-        };
-
-        for (slot, rec) in crate::fastq::format_spot(&spot, acc, &fastq_config) {
-            let writer = if let Some(ref mut sw) = stdout_writer {
-                sw
-            } else {
-                writers.entry(slot).or_insert_with(|| {
-                    let filename = output_filename(acc, slot, config.fasta, &config.compression);
-                    let final_path = config.output_dir.join(&filename);
-                    let tmp_path = config.output_dir.join(format!("{filename}.partial"));
-                    output_paths.push((final_path, tmp_path.clone()));
-                    let file = std::fs::File::create(&tmp_path)
-                        .expect("failed to create cSRA output file");
-                    let buf = std::io::BufWriter::with_capacity(256 * 1024, file);
-                    match config.compression {
-                        CompressionMode::Gzip { level } => OutputWriter::Gz(ParGzWriter::new(
-                            buf,
-                            level,
-                            DEFAULT_BLOCK_SIZE,
-                            compress_pool.clone().expect("gzip pool must exist"),
-                        )),
-                        CompressionMode::Zstd { level, threads } => {
-                            let mut encoder = zstd::stream::write::Encoder::new(buf, level)
-                                .expect("failed to create zstd encoder");
-                            encoder
-                                .multithread(threads)
-                                .expect("failed to set zstd threads");
-                            OutputWriter::Zstd(encoder)
-                        }
-                        CompressionMode::None => OutputWriter::Plain(buf),
-                    }
-                })
-            };
-            writer.write_all(&rec.data).map_err(Error::Io)?;
-            reads_written += 1;
+    let chunks: Vec<(i64, i64)> = {
+        let mut out = Vec::new();
+        let mut start = first_row;
+        let end = first_row + total_spots as i64;
+        while start < end {
+            let chunk_end = (start + chunk_size as i64).min(end);
+            out.push((start, chunk_end));
+            start = chunk_end;
         }
-        spots_read += 1;
+        out
+    };
+
+    // Decode each chunk. The worker returns an ordered Vec of
+    // (slot, record-bytes, record-count) so the writer stays sequential.
+    type SlotChunk = (OutputSlot, Vec<u8>, u64);
+    let decode_chunk = |start: i64, end: i64| -> Result<Vec<SlotChunk>> {
+        let file = std::fs::File::open(sra_path)?;
+        let mut archive = KarArchive::open(std::io::BufReader::new(file))?;
+        let csra = CsraCursor::open(&mut archive, sra_path)?;
+        let mut per_slot: HashMap<OutputSlot, (Vec<u8>, u64)> = HashMap::new();
+        let mut itoa_buf = itoa::Buffer::new();
+        for row_id in start..end {
+            let s = csra.read_spot(row_id)?;
+            let sequence = fourna_to_ascii(&s.bases);
+            let quality: Vec<u8> = s.quality.iter().map(|q| q.wrapping_add(33)).collect();
+            let read_types: Vec<u8> = s
+                .read_types
+                .iter()
+                .map(|&rt| if rt & 0x01 != 0 { 0 } else { 1 })
+                .collect();
+            let spot_num_str = itoa_buf.format(row_id).to_string();
+            let spot = SpotRecord {
+                name: spot_num_str.as_bytes().to_vec(),
+                sequence,
+                quality,
+                read_lengths: s.read_lens,
+                read_types,
+                read_filter: Vec::new(),
+                spot_group: Vec::new(),
+            };
+            for (slot, rec) in crate::fastq::format_spot(&spot, acc, &fastq_config) {
+                let entry = per_slot.entry(slot).or_insert_with(|| (Vec::new(), 0));
+                entry.0.extend_from_slice(&rec.data);
+                entry.1 += 1;
+            }
+        }
+        Ok(per_slot
+            .into_iter()
+            .map(|(slot, (bytes, count))| (slot, bytes, count))
+            .collect())
+    };
+
+    // Create a writer for this slot lazily (mirrors the plain path).
+    let get_writer = |slot: OutputSlot,
+                      writers: &mut HashMap<OutputSlot, OutputWriter>,
+                      output_paths: &mut Vec<(PathBuf, PathBuf)>|
+     -> Result<()> {
+        if writers.contains_key(&slot) {
+            return Ok(());
+        }
+        let filename = output_filename(acc, slot, config.fasta, &config.compression);
+        let final_path = config.output_dir.join(&filename);
+        let tmp_path = config.output_dir.join(format!("{filename}.partial"));
+        output_paths.push((final_path, tmp_path.clone()));
+        let file = std::fs::File::create(&tmp_path)?;
+        let buf = std::io::BufWriter::with_capacity(256 * 1024, file);
+        let w = match config.compression {
+            CompressionMode::Gzip { level } => OutputWriter::Gz(ParGzWriter::new(
+                buf,
+                level,
+                DEFAULT_BLOCK_SIZE,
+                compress_pool.clone().expect("gzip pool must exist"),
+            )),
+            CompressionMode::Zstd { level, threads } => {
+                let mut encoder = zstd::stream::write::Encoder::new(buf, level)
+                    .map_err(|e| Error::Vdb(format!("zstd encoder: {e}")))?;
+                encoder
+                    .multithread(threads)
+                    .map_err(|e| Error::Vdb(format!("zstd threads: {e}")))?;
+                OutputWriter::Zstd(encoder)
+            }
+            CompressionMode::None => OutputWriter::Plain(buf),
+        };
+        writers.insert(slot, w);
+        Ok(())
+    };
+
+    if use_parallel {
+        use rayon::prelude::*;
+        let pool = rayon::ThreadPoolBuilder::new()
+            .num_threads(num_threads)
+            .build()
+            .map_err(|e| Error::Vdb(format!("cSRA threadpool: {e}")))?;
+        let results: Vec<Result<Vec<SlotChunk>>> = pool.install(|| {
+            chunks
+                .par_iter()
+                .map(|(s, e)| decode_chunk(*s, *e))
+                .collect()
+        });
+        for (chunk_res, (s, e)) in results.into_iter().zip(chunks.iter()) {
+            let chunk = chunk_res?;
+            spots_read += (e - s) as u64;
+            for (slot, bytes, records) in chunk {
+                if let Some(ref mut sw) = stdout_writer {
+                    sw.write_all(&bytes).map_err(Error::Io)?;
+                } else {
+                    get_writer(slot, &mut writers, &mut output_paths)?;
+                    writers
+                        .get_mut(&slot)
+                        .unwrap()
+                        .write_all(&bytes)
+                        .map_err(Error::Io)?;
+                }
+                reads_written += records;
+            }
+        }
+    } else {
+        for &(s, e) in &chunks {
+            let chunk = decode_chunk(s, e)?;
+            spots_read += (e - s) as u64;
+            for (slot, bytes, records) in chunk {
+                if let Some(ref mut sw) = stdout_writer {
+                    sw.write_all(&bytes).map_err(Error::Io)?;
+                } else {
+                    get_writer(slot, &mut writers, &mut output_paths)?;
+                    writers
+                        .get_mut(&slot)
+                        .unwrap()
+                        .write_all(&bytes)
+                        .map_err(Error::Io)?;
+                }
+                reads_written += records;
+            }
+        }
     }
 
     if let Some(sw) = stdout_writer {
