@@ -298,14 +298,17 @@ async fn main() -> Result<()> {
             let mut completed_accessions: Vec<String> = Vec::new();
             let mut interrupted_accession: Option<String> = None;
 
-            // Process accessions with one-ahead download prefetch: while
-            // decoding accession N, start downloading accession N+1 so that
-            // network and CPU overlap.
-            let mut pending_download: Option<
+            // Process accessions with an N-deep download prefetch queue:
+            // while decoding accession i, keep the next `prefetch_depth`
+            // downloads in flight so slow networks don't stall decode.
+            // Depth 1 matches the old behavior; depth 2+ costs one extra
+            // temp file on disk per step but hides network latency.
+            let prefetch_depth = args.prefetch_depth.max(1);
+            let mut pending_downloads: std::collections::VecDeque<
                 tokio::task::JoinHandle<
                     sracha_core::error::Result<sracha_core::pipeline::DownloadedSra>,
                 >,
-            > = None;
+            > = std::collections::VecDeque::new();
 
             let make_config = {
                 let http_client = http_client.clone();
@@ -330,6 +333,22 @@ async fn main() -> Result<()> {
                 }
             };
 
+            // Spawn a download task for resolved_all[idx].
+            let spawn_download = |idx: usize| {
+                let resolved = resolved_all[idx].clone();
+                let config = make_config(&resolved);
+                tokio::spawn(async move {
+                    sracha_core::pipeline::download_sra(&resolved, &config).await
+                })
+            };
+
+            // Seed the queue with the first `prefetch_depth` downloads so
+            // iteration 0 already has accession 0 in flight (instead of
+            // paying its full download latency serially).
+            for j in 0..prefetch_depth.min(resolved_all.len()) {
+                pending_downloads.push_back(spawn_download(j));
+            }
+
             for (i, resolved) in resolved_all.iter().enumerate() {
                 if cancelled.load(Ordering::Relaxed) {
                     break;
@@ -337,41 +356,29 @@ async fn main() -> Result<()> {
 
                 let pipeline_config = make_config(resolved);
 
-                // Await this accession's download (prefetched or fresh).
-                let downloaded = if let Some(handle) = pending_download.take() {
-                    match handle.await {
-                        Ok(Ok(d)) => d,
-                        Ok(Err(sracha_core::error::Error::Cancelled { .. })) => {
-                            interrupted_accession = Some(resolved.accession.clone());
-                            break;
-                        }
-                        Ok(Err(e)) => return Err(e.into()),
-                        Err(join_err) => {
-                            if cancelled.load(Ordering::Relaxed) {
-                                interrupted_accession = Some(resolved.accession.clone());
-                                break;
-                            }
-                            return Err(anyhow::anyhow!("download task panicked: {join_err}"));
-                        }
+                let handle = pending_downloads
+                    .pop_front()
+                    .expect("queue is pre-seeded and topped up per iteration");
+                let downloaded = match handle.await {
+                    Ok(Ok(d)) => d,
+                    Ok(Err(sracha_core::error::Error::Cancelled { .. })) => {
+                        interrupted_accession = Some(resolved.accession.clone());
+                        break;
                     }
-                } else {
-                    match sracha_core::pipeline::download_sra(resolved, &pipeline_config).await {
-                        Ok(d) => d,
-                        Err(sracha_core::error::Error::Cancelled { .. }) => {
+                    Ok(Err(e)) => return Err(e.into()),
+                    Err(join_err) => {
+                        if cancelled.load(Ordering::Relaxed) {
                             interrupted_accession = Some(resolved.accession.clone());
                             break;
                         }
-                        Err(e) => return Err(e.into()),
+                        return Err(anyhow::anyhow!("download task panicked: {join_err}"));
                     }
                 };
 
-                // Start prefetching the next accession's download.
-                if i + 1 < resolved_all.len() && !cancelled.load(Ordering::Relaxed) {
-                    let next_resolved = resolved_all[i + 1].clone();
-                    let next_config = make_config(&next_resolved);
-                    pending_download = Some(tokio::spawn(async move {
-                        sracha_core::pipeline::download_sra(&next_resolved, &next_config).await
-                    }));
+                // Top up the queue: keep `prefetch_depth` downloads in flight.
+                let next_idx = i + prefetch_depth;
+                if next_idx < resolved_all.len() && !cancelled.load(Ordering::Relaxed) {
+                    pending_downloads.push_back(spawn_download(next_idx));
                 }
 
                 // Decode (CPU-bound) while the next download runs in the background.
@@ -424,9 +431,9 @@ async fn main() -> Result<()> {
                 }
             }
 
-            // Let any in-flight prefetch download detect the cancellation flag
-            // and clean up its temp file gracefully (~100ms).
-            if let Some(handle) = pending_download.take() {
+            // Let any in-flight prefetch downloads detect the cancellation
+            // flag and clean up their temp files gracefully (~100 ms each).
+            while let Some(handle) = pending_downloads.pop_front() {
                 let _ = handle.await;
             }
 
@@ -1008,13 +1015,23 @@ async fn resolve_accessions(
         return Ok(resolved);
     }
 
-    // Phase 1: Try direct S3 for all accessions.
+    // Phase 1 + Phase 3 in parallel: the S3 HEAD storm and the EUtils
+    // RunInfo EFetch are independent. Kicking them off together saves one
+    // round-trip of startup latency (visible mostly on multi-accession
+    // `get` runs).
     tracing::info!(
         "probing direct S3 for {} accession(s)...",
         run_accessions.len()
     );
-    let s3_results =
-        sracha_core::s3::resolve_direct_many(client.http_client(), run_accessions).await;
+    let s3_future = sracha_core::s3::resolve_direct_many(client.http_client(), run_accessions);
+    let run_info_future = async {
+        if need_run_info {
+            Some(client.fetch_run_info_batch(run_accessions).await)
+        } else {
+            None
+        }
+    };
+    let (s3_results, run_info_early) = tokio::join!(s3_future, run_info_future);
 
     let mut resolved: Vec<Option<ResolvedAccession>> = vec![None; run_accessions.len()];
     let mut sdl_needed: Vec<(usize, String)> = Vec::new();
@@ -1091,10 +1108,8 @@ async fn resolve_accessions(
         }
     }
 
-    // Phase 3: Fetch run_info if needed (for FASTQ conversion).
-    if need_run_info {
-        let all_accs: Vec<String> = resolved.iter().map(|r| r.accession.clone()).collect();
-        let run_info_map = client.fetch_run_info_batch(&all_accs).await;
+    // Phase 3: apply RunInfo (already fetched in parallel with Phase 1).
+    if let Some(run_info_map) = run_info_early {
         for r in &mut resolved {
             if r.run_info.is_none() {
                 r.run_info = run_info_map.get(&r.accession).cloned();

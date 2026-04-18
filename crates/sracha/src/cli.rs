@@ -351,6 +351,13 @@ pub struct GetArgs {
     #[arg(long, default_value_t = 8)]
     pub connections: usize,
 
+    /// Number of accessions to download ahead of the decoder. A larger
+    /// value hides slow networks behind decode, at the cost of one extra
+    /// temp SRA file per depth step. Only applies to multi-accession
+    /// `get` runs.
+    #[arg(long, default_value_t = 2, help_heading = "Advanced")]
+    pub prefetch_depth: usize,
+
     /// Confirm project downloads and large downloads (>100 GiB)
     #[arg(short, long)]
     pub yes: bool,
