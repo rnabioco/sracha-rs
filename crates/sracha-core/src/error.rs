@@ -11,6 +11,9 @@ pub enum Error {
     #[error("SDL API error: {message}")]
     Sdl { message: String },
 
+    #[error("ENA API error: {message}")]
+    Ena { message: String },
+
     #[error("download failed for {accession}: {message}")]
     Download { accession: String, message: String },
 

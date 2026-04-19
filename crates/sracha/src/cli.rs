@@ -236,6 +236,11 @@ pub struct FetchArgs {
     /// Skip direct S3 and resolve via the SDL API
     #[arg(long, help_heading = "Advanced")]
     pub prefer_sdl: bool,
+
+    /// Fetch pre-computed FASTQ.gz from ENA instead of the SRA binary.
+    /// Falls back to the NCBI path when ENA has no FASTQ for an accession.
+    #[arg(long, help_heading = "Advanced")]
+    pub prefer_ena: bool,
 }
 
 #[derive(Args)]
@@ -441,6 +446,12 @@ pub struct GetArgs {
     /// to re-run another tool (e.g. `fasterq-dump`) on the same input.
     #[arg(long, help_heading = "Advanced")]
     pub keep_sra: bool,
+
+    /// Try ENA FASTQ mirrors first; fall back to NCBI if ENA has no FASTQ
+    /// or the output config is incompatible. Requires gzip compression and
+    /// split-3 or split-files (Phase 1 scope). Skips VDB decode entirely.
+    #[arg(long, help_heading = "Advanced")]
+    pub prefer_ena: bool,
 }
 
 #[derive(Args)]
@@ -451,6 +462,11 @@ pub struct InfoArgs {
     /// Read accessions from a file (one per line)
     #[arg(long)]
     pub accession_list: Option<PathBuf>,
+
+    /// Query ENA's filereport API and show the FASTQ file listing
+    /// (URLs, sizes, MD5s) alongside NCBI info.
+    #[arg(long)]
+    pub prefer_ena: bool,
 }
 
 #[derive(Args)]

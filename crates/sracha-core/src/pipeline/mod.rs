@@ -1473,6 +1473,91 @@ pub async fn download_sra(
     })
 }
 
+/// Download pre-computed ENA FASTQ.gz files directly — no VDB decode involved.
+///
+/// Each file listed in `ena` is fetched via [`download_file`] (parallel chunked
+/// HTTP + resume + MD5 verify) to its final output path. The caller guarantees
+/// the pipeline config is compatible (gzip + split-3/split-files + no fasta +
+/// no stdout); incompatible configs should be routed to [`download_sra`] +
+/// [`decode_sra`] instead.
+///
+/// On cancellation, any partially-written output files are left on disk so the
+/// `download_file` resume machinery can finish them on the next run.
+pub async fn download_ena_fastq(
+    ena: &crate::ena::EnaResolved,
+    config: &PipelineConfig,
+) -> Result<PipelineStats> {
+    let accession = &ena.accession;
+    tokio::fs::create_dir_all(&config.output_dir).await?;
+
+    let dl_config = DownloadConfig {
+        connections: config.connections,
+        chunk_size: 0,
+        force: config.force,
+        validate: true,
+        progress: config.progress,
+        resume: config.resume,
+        client: config.http_client.clone(),
+    };
+
+    let mut output_files: Vec<PathBuf> = Vec::with_capacity(ena.fastq_files.len());
+    let mut bytes_transferred: u64 = 0;
+
+    for file in &ena.fastq_files {
+        // Honor Ctrl-C between files; download_file itself doesn't poll
+        // `config.cancelled`, so check here and surface partial outputs.
+        if let Some(ref flag) = config.cancelled
+            && flag.load(Ordering::Relaxed)
+        {
+            return Err(Error::Cancelled {
+                output_files: output_files.clone(),
+            });
+        }
+
+        let name = output_filename(accession, file.slot, config.fasta, &config.compression);
+        let target = config.output_dir.join(&name);
+
+        tracing::info!(
+            "{accession}: downloading ENA FASTQ {} ({}) → {}",
+            file.url,
+            crate::util::format_size(file.size),
+            target.display(),
+        );
+
+        let urls = vec![file.url.clone()];
+        let dl_future = download_file(&urls, file.size, Some(&file.md5), &target, &dl_config);
+
+        let dl_result = if let Some(ref flag) = config.cancelled {
+            let flag = flag.clone();
+            tokio::select! {
+                result = dl_future => result?,
+                _ = poll_cancelled(flag) => {
+                    tracing::info!("{accession}: ENA download cancelled");
+                    return Err(Error::Cancelled { output_files });
+                }
+            }
+        } else {
+            dl_future.await?
+        };
+
+        bytes_transferred += dl_result.bytes_transferred;
+        output_files.push(dl_result.path);
+    }
+
+    Ok(PipelineStats {
+        accession: accession.clone(),
+        // Spots/reads are unknown without decoding the gzip stream. Counting
+        // would defeat the point of the fast path, so we report 0 and the CLI
+        // emits an ENA-specific summary line.
+        spots_read: 0,
+        reads_written: 0,
+        bytes_transferred,
+        total_sra_size: ena.total_size,
+        output_files,
+        integrity: Arc::new(IntegrityDiag::default()),
+    })
+}
+
 /// Poll an `AtomicBool` flag until it becomes `true`.
 async fn poll_cancelled(flag: Arc<AtomicBool>) {
     loop {
