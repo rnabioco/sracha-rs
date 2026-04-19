@@ -1220,22 +1220,22 @@ mod tests {
     }
 
     #[test]
-    fn reject_csra_with_nonzero_cmp_base_count() {
-        // Regression for iter-4 cSRA detection: DRR032766-class archives
-        // have aligned schema + non-zero CMP_BASE_COUNT + no `unaligned`
-        // marker — sracha cannot reconstruct reads via seq_restore_read,
-        // so must reject instead of emitting half-length garbage.
+    fn accept_csra_with_nonzero_cmp_base_count_and_physical_read() {
+        // Originally pinned the iter-4 DRR032766-class rejection (aligned
+        // schema + CMP_BASE_COUNT>0 + no unaligned marker → reject). The
+        // real-world follow-up on the csra-support branch showed that
+        // these archives still carry a full physical READ column
+        // (DRR017176 decodes through the plain VdbCursor path and the
+        // output matches fasterq-dump modulo the sracha-wide Q0→N
+        // ALTREAD-merge policy). `reject_if_csra` now allows them
+        // through when a physical READ is present; this test pins the
+        // narrower rejection.
         let archive_bytes = build_align_archive_with_csra_stats(1_000_000, false);
         let sra_path = write_temp_sra(&archive_bytes);
         let mut archive = KarArchive::open(Cursor::new(archive_bytes)).unwrap();
-        let msg = match VdbCursor::open(&mut archive, &sra_path) {
-            Ok(_) => panic!("expected cSRA rejection"),
-            Err(e) => e.to_string(),
-        };
-        assert!(
-            msg.contains("aligned SRA") || msg.contains("cSRA"),
-            "expected cSRA rejection, got: {msg}"
-        );
+        let cursor = VdbCursor::open(&mut archive, &sra_path)
+            .expect("aligned schema + CMP_BASE_COUNT + physical READ should decode");
+        assert_eq!(cursor.spot_count(), 1);
         let _ = std::fs::remove_file(&sra_path);
     }
 
