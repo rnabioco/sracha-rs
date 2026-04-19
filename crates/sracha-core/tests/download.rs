@@ -170,3 +170,100 @@ async fn download_file_empty_url_list_errors_fast() {
         "got {msg}"
     );
 }
+
+#[tokio::test]
+async fn download_file_skips_when_existing_file_matches_md5() {
+    // Resume is about not re-downloading when the local file is already
+    // complete. If an SRA at the expected size with the expected MD5
+    // already exists, download_file must return bytes_transferred=0 and
+    // reuse the file — even if the server would have served something.
+    let server = MockServer::start().await;
+    let payload = b"already downloaded, nothing to do".to_vec();
+
+    Mock::given(method("HEAD"))
+        .and(path("/skip"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .append_header("Accept-Ranges", "bytes")
+                .append_header("Content-Length", payload.len().to_string()),
+        )
+        .mount(&server)
+        .await;
+    // GET registered but should never be hit.
+    Mock::given(method("GET"))
+        .and(path("/skip"))
+        .respond_with(ResponseTemplate::new(500))
+        .mount(&server)
+        .await;
+
+    let url = format!("{}/skip", server.uri());
+    let (_dir, out) = tmp_out("already.sra");
+    std::fs::write(&out, &payload).unwrap();
+    let expected_md5 = md5_hex(&payload);
+
+    let cfg = DownloadConfig {
+        resume: true,
+        ..test_config()
+    };
+    let res = download_file(
+        &[url],
+        payload.len() as u64,
+        Some(&expected_md5),
+        &out,
+        &cfg,
+    )
+    .await
+    .expect("pre-existing file with matching MD5 must not trigger a download");
+    assert_eq!(res.size, payload.len() as u64);
+    assert_eq!(
+        res.bytes_transferred, 0,
+        "bytes_transferred must be 0 when skipping"
+    );
+}
+
+#[tokio::test]
+async fn download_file_force_overwrites_existing_even_when_complete() {
+    // With `force: true`, an existing complete file must be replaced by a
+    // fresh download. The assertion: bytes_transferred > 0.
+    let server = MockServer::start().await;
+    let payload = b"fresh content from server".to_vec();
+
+    Mock::given(method("HEAD"))
+        .and(path("/force"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .append_header("Accept-Ranges", "bytes")
+                .append_header("Content-Length", payload.len().to_string()),
+        )
+        .mount(&server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/force"))
+        .respond_with(ResponseTemplate::new(206).set_body_bytes(payload.clone()))
+        .mount(&server)
+        .await;
+
+    let url = format!("{}/force", server.uri());
+    let (_dir, out) = tmp_out("force.sra");
+    // Pre-populate with the *wrong* content at the right size so a
+    // resume-check would accept it (size-matches heuristic) — --force
+    // must still redownload.
+    let stale = vec![0xAAu8; payload.len()];
+    std::fs::write(&out, &stale).unwrap();
+
+    let cfg = DownloadConfig {
+        force: true,
+        resume: true, // even with resume enabled, force wins
+        ..test_config()
+    };
+    let res = download_file(&[url], payload.len() as u64, None, &out, &cfg)
+        .await
+        .expect("force must re-download");
+    assert_eq!(res.size, payload.len() as u64);
+    assert!(
+        res.bytes_transferred > 0,
+        "force must actually transfer bytes, got {}",
+        res.bytes_transferred
+    );
+    assert_eq!(std::fs::read(&out).unwrap(), payload);
+}

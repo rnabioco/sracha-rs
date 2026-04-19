@@ -1106,6 +1106,43 @@ fn validate_corrupt_kar_magic_reports_invalid_archive() {
 
 #[ignore]
 #[test]
+fn ctrl_c_before_decode_aborts_with_cancelled_error() {
+    // Pre-flipped cancel flag: the batch loop in decode_and_write polls the
+    // flag every iteration, so starting with `cancelled=true` should cause
+    // run_fastq to bail out with Error::Cancelled and drop partial output
+    // files rather than leave half-written `.partial` files behind.
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    let path = ensure_srr28588231();
+    let out = tempfile::tempdir().unwrap();
+    let cancelled = Arc::new(AtomicBool::new(true));
+    let mut config = test_config(out.path(), SplitMode::Split3, CompressionMode::None);
+    config.cancelled = Some(Arc::clone(&cancelled));
+
+    let result = sracha_core::pipeline::run_fastq(&path, Some("SRR28588231"), &config);
+    assert!(
+        matches!(result, Err(sracha_core::error::Error::Cancelled { .. })),
+        "pre-cancelled run must return Error::Cancelled, got {:?}",
+        result.as_ref().map(|s| &s.output_files)
+    );
+    // Any .partial files must have been cleaned up.
+    let partials: Vec<_> = std::fs::read_dir(out.path())
+        .unwrap()
+        .filter_map(|e| e.ok())
+        .filter(|e| e.file_name().to_string_lossy().ends_with(".partial"))
+        .collect();
+    assert!(
+        partials.is_empty(),
+        "cancellation must delete .partial files, found: {:?}",
+        partials.iter().map(|e| e.file_name()).collect::<Vec<_>>()
+    );
+    // Sanity: flag was observed.
+    assert!(cancelled.load(Ordering::Relaxed));
+}
+
+#[ignore]
+#[test]
 fn validate_flipped_bytes_surface_integrity_errors() {
     let tmp = tempfile::tempdir().unwrap();
     let path = clone_fixture(tmp.path(), "flipped-validate.sra");
