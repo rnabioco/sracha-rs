@@ -5,7 +5,7 @@
 #SBATCH --cpus-per-task=8
 #SBATCH --mem=48G
 #SBATCH --time=2:00:00
-#SBATCH --array=0-3
+#SBATCH --array=0-4
 #
 # Benchmark sracha vs fastq-dump vs fasterq-dump.
 #
@@ -21,7 +21,7 @@
 #   # each array task picks its stage from SLURM_ARRAY_TASK_ID and writes
 #   # to validation/bench-results/<stage>.md
 #
-# Stages: small | medium | large | gzip
+# Stages: small | medium | large | gzip | e2e
 #
 # Requires:
 #   - hyperfine
@@ -70,15 +70,15 @@ done
 # Array-job dispatch: SLURM_ARRAY_TASK_ID picks a stage and persistent
 # output dir so all tasks deposit into the same aggregation folder.
 if [[ -n "${SLURM_ARRAY_TASK_ID:-}" ]]; then
-    STAGES=(small medium large gzip)
+    STAGES=(small medium large gzip e2e)
     ONLY="${STAGES[$SLURM_ARRAY_TASK_ID]:?array index out of range}"
     : "${RESULTS_DIR:=$ROOT_DIR/validation/bench-results}"
     echo "=== array task $SLURM_ARRAY_TASK_ID → stage=$ONLY on $(hostname) ==="
 fi
 
 case "$ONLY" in
-    ""|small|medium|large|gzip) ;;
-    *) echo "--only must be one of: small medium large gzip (got $ONLY)" >&2; exit 2 ;;
+    ""|small|medium|large|gzip|e2e) ;;
+    *) echo "--only must be one of: small medium large gzip e2e (got $ONLY)" >&2; exit 2 ;;
 esac
 
 # Returns 0 if the given stage should run in this invocation.
@@ -107,24 +107,27 @@ fi
 
 FASTERQ_DUMP=""
 FASTQ_DUMP=""
+PREFETCH=""
+# Prefer the newest installed sra-tools via version sort; fall back to PATH.
+pick_latest() {
+    ls "$SRATOOLS_DIR"/sratoolkit.*/bin/"$1" 2>/dev/null | sort -V | tail -1
+}
 if compgen -G "$SRATOOLS_DIR/sratoolkit.*/bin/fasterq-dump" > /dev/null 2>&1; then
-    FASTERQ_DUMP=$(ls "$SRATOOLS_DIR"/sratoolkit.*/bin/fasterq-dump | head -1)
-    FASTQ_DUMP=$(ls "$SRATOOLS_DIR"/sratoolkit.*/bin/fastq-dump | head -1)
+    FASTERQ_DUMP=$(pick_latest fasterq-dump)
+    FASTQ_DUMP=$(pick_latest fastq-dump)
+    PREFETCH=$(pick_latest prefetch)
 elif command -v fasterq-dump &>/dev/null; then
     FASTERQ_DUMP=$(command -v fasterq-dump)
     FASTQ_DUMP=$(command -v fastq-dump)
+    PREFETCH=$(command -v prefetch)
 fi
 
 if [[ -z "$FASTERQ_DUMP" ]]; then
-    log "Installing sra-tools to $SRATOOLS_DIR..."
-    mkdir -p "$SRATOOLS_DIR"
-    TARBALL_URL="https://ftp-trace.ncbi.nlm.nih.gov/sra/sdk/current/sratoolkit.current-centos_linux64.tar.gz"
-    TARBALL="$SRATOOLS_DIR/sratoolkit.tar.gz"
-    curl -fSL -o "$TARBALL" "$TARBALL_URL"
-    tar -xzf "$TARBALL" -C "$SRATOOLS_DIR"
-    rm -f "$TARBALL"
-    FASTERQ_DUMP=$(ls "$SRATOOLS_DIR"/sratoolkit.*/bin/fasterq-dump | head -1)
-    FASTQ_DUMP=$(ls "$SRATOOLS_DIR"/sratoolkit.*/bin/fastq-dump | head -1)
+    log "Installing sra-tools to $SRATOOLS_DIR via install-sratools.sh..."
+    bash "$SCRIPT_DIR/install-sratools.sh"
+    FASTERQ_DUMP=$(pick_latest fasterq-dump)
+    FASTQ_DUMP=$(pick_latest fastq-dump)
+    PREFETCH=$(pick_latest prefetch)
 fi
 
 # ---------- setup ----------
@@ -310,6 +313,41 @@ if should_run gzip; then
         echo
         cat "$OUTDIR/gzip.md"
     fi
+fi
+
+# =====================================================================
+# Benchmark: End-to-end — accession → FASTQ on disk
+# =====================================================================
+# Measures the practical "time to FASTQ" a user sees, including the
+# download. Uses --runs 3 (no warmup) with a cleaned output dir each
+# run so every iteration is a fresh download.
+if should_run e2e; then
+    log "Benchmark: end-to-end download + FASTQ (from accession)"
+
+    for ACC_SPEC in "SRR28588231:23 MiB" "SRR2584863:288 MiB"; do
+        ACC="${ACC_SPEC%%:*}"
+        SIZE="${ACC_SPEC#*:}"
+        log "Benchmark: $ACC ($SIZE) — accession → uncompressed FASTQ"
+
+        E2E_OUT="$SCRATCH/e2e-$ACC"
+        mkdir -p "$E2E_OUT"
+
+        hyperfine \
+            --warmup 0 \
+            --runs 5 \
+            --prepare "rm -rf $E2E_OUT/* && mkdir -p $E2E_OUT/sracha $E2E_OUT/fasterq $E2E_OUT/fastq" \
+            -n "sracha get" \
+                "$SRACHA get $ACC -O $E2E_OUT/sracha --no-gzip --no-progress -f -q" \
+            -n "prefetch + fasterq-dump" \
+                "$PREFETCH -O $E2E_OUT/fasterq $ACC && $FASTERQ_DUMP $E2E_OUT/fasterq/$ACC/$ACC.sra --split-3 -O $E2E_OUT/fasterq -f" \
+            -n "prefetch + fastq-dump" \
+                "$PREFETCH -O $E2E_OUT/fastq $ACC && $FASTQ_DUMP $E2E_OUT/fastq/$ACC/$ACC.sra --split-3 --outdir $E2E_OUT/fastq" \
+            --export-markdown "$OUTDIR/e2e-$ACC.md" \
+            2>&1
+
+        echo
+        cat "$OUTDIR/e2e-$ACC.md"
+    done
 fi
 
 log "Benchmarking complete!"
