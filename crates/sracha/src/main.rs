@@ -79,13 +79,93 @@ async fn main() -> Result<()> {
             let raw = collect_accessions(&args.accessions, args.accession_list.as_deref())?;
             let http_client = sracha_core::http::default_client();
             let client = SdlClient::with_client(http_client.clone());
-            let (run_accessions, has_projects) = resolve_to_runs(&raw, &client).await?;
+            let (run_accessions, has_projects) = if args.prefer_ena {
+                resolve_to_runs_via_ena(&raw, &client).await?
+            } else {
+                resolve_to_runs(&raw, &client).await?
+            };
+
+            // ENA fast path for fetch: when --prefer-ena is set, download ENA
+            // FASTQ.gz files directly instead of the SRA binary. We query ENA
+            // before SDL so we can skip the SRA resolve entirely for hits.
+            let ena_results: Vec<Option<sracha_core::ena::EnaResolved>> = if args.prefer_ena {
+                let sp = progress::Spinner::start(format!(
+                    "Querying ENA filereport for {} accession(s)",
+                    style::count(run_accessions.len()),
+                ));
+                let pairs = sracha_core::ena::resolve_ena_many(&http_client, &run_accessions).await;
+                let hits = pairs.iter().filter(|(_, v)| v.is_some()).count();
+                sp.finish(format!(
+                    "ENA serves {} of {} accession(s); rest will use NCBI",
+                    style::count(hits),
+                    style::count(run_accessions.len()),
+                ));
+                pairs.into_iter().map(|(_, v)| v).collect()
+            } else {
+                vec![None; run_accessions.len()]
+            };
+
+            tokio::fs::create_dir_all(&args.output_dir).await?;
+
+            // Handle ENA hits first (pure HTTP, no SDL involvement).
+            for (i, acc) in run_accessions.iter().enumerate() {
+                let Some(ena) = &ena_results[i] else {
+                    continue;
+                };
+                let dl_config = sracha_core::download::DownloadConfig {
+                    connections: args.connections,
+                    force: args.force,
+                    validate: !args.no_validate,
+                    progress: !args.no_progress,
+                    resume: !args.no_resume,
+                    client: Some(http_client.clone()),
+                    ..Default::default()
+                };
+                for file in &ena.fastq_files {
+                    let name = ena_fetch_filename(acc, file.slot);
+                    let out = args.output_dir.join(&name);
+                    tracing::info!(
+                        "{acc}: downloading ENA FASTQ {} ({}) to {}",
+                        file.url,
+                        format_size(file.size),
+                        out.display(),
+                    );
+                    sracha_core::download::download_file(
+                        std::slice::from_ref(&file.url),
+                        file.size,
+                        Some(&file.md5),
+                        &out,
+                        &dl_config,
+                    )
+                    .await?;
+                    eprintln!(
+                        "{}: {} downloaded from [{}]",
+                        style::header(acc),
+                        style::value(format_size(file.size)),
+                        style::value("ena"),
+                    );
+                    eprintln!("  wrote {}", style::path(out.display()));
+                }
+            }
+
+            // Resolve the remaining accessions (non-ENA) via SDL as before.
+            let ncbi_accessions: Vec<String> = run_accessions
+                .iter()
+                .zip(ena_results.iter())
+                .filter(|(_, ena)| ena.is_none())
+                .map(|(acc, _)| acc.clone())
+                .collect();
+
+            if ncbi_accessions.is_empty() {
+                return Ok(());
+            }
+
             let sp = progress::Spinner::start(format!(
                 "Resolving {} accession(s)",
-                style::count(run_accessions.len()),
+                style::count(ncbi_accessions.len()),
             ));
             let resolved_all = resolve_accessions(
-                &run_accessions,
+                &ncbi_accessions,
                 &client,
                 args.prefer_sdl,
                 false,
@@ -99,7 +179,6 @@ async fn main() -> Result<()> {
             check_download_confirmation(&resolved_all, args.yes, has_projects)?;
             check_disk_space(&resolved_all, &args.output_dir)?;
 
-            tokio::fs::create_dir_all(&args.output_dir).await?;
             for resolved in &resolved_all {
                 let acc = &resolved.accession;
                 let mirror = resolved
@@ -270,7 +349,45 @@ async fn main() -> Result<()> {
             let raw = collect_accessions(&args.accessions, args.accession_list.as_deref())?;
             let http_client = sracha_core::http::default_client();
             let sdl_client = SdlClient::with_client(http_client.clone());
-            let (run_accessions, has_projects) = resolve_to_runs(&raw, &sdl_client).await?;
+
+            let compression = cli::resolve_compression(
+                args.stdout,
+                args.zstd,
+                args.zstd_level,
+                args.threads,
+                args.no_gzip,
+                args.gzip_level,
+            );
+
+            // Phase 1 ENA fast path is only valid for gzip output, split-3 or
+            // split-files, no fasta, no stdout. Anything else falls back to
+            // the NCBI pipeline even if `--prefer-ena` is set.
+            let ena_compatible = args.prefer_ena
+                && matches!(
+                    compression,
+                    sracha_core::fastq::CompressionMode::Gzip { .. }
+                )
+                && matches!(
+                    split_mode,
+                    sracha_core::fastq::SplitMode::Split3
+                        | sracha_core::fastq::SplitMode::SplitFiles
+                )
+                && !args.fasta
+                && !args.stdout;
+
+            if args.prefer_ena && !ena_compatible {
+                tracing::info!(
+                    "--prefer-ena requested but output config is incompatible \
+                     (needs gzip + split-3/split-files + no-fasta + no-stdout); \
+                     falling back to NCBI pipeline"
+                );
+            }
+
+            let (run_accessions, has_projects) = if ena_compatible {
+                resolve_to_runs_via_ena(&raw, &sdl_client).await?
+            } else {
+                resolve_to_runs(&raw, &sdl_client).await?
+            };
             let sp = progress::Spinner::start(format!(
                 "Resolving {} accession(s)",
                 style::count(run_accessions.len()),
@@ -290,36 +407,53 @@ async fn main() -> Result<()> {
             check_download_confirmation(&resolved_all, args.yes, has_projects)?;
             check_disk_space(&resolved_all, &args.output_dir)?;
 
-            // Check platform — reject legacy platforms with complex read structures.
-            for resolved in &resolved_all {
-                if let Some(ref ri) = resolved.run_info
-                    && let Some(ref platform) = ri.platform
-                    && sracha_core::pipeline::is_unsupported_platform(platform)
-                {
-                    anyhow::bail!(
-                        "{}: unsupported platform '{}' — sracha does not support legacy sequencing platforms",
-                        resolved.accession,
-                        platform
-                    );
-                }
-            }
-
             let format_label = if args.fasta { "FASTA" } else { "FASTQ" };
             tracing::info!(
                 "get {} run accession(s) -> {format_label}",
                 resolved_all.len()
             );
 
-            let compression = cli::resolve_compression(
-                args.stdout,
-                args.zstd,
-                args.zstd_level,
-                args.threads,
-                args.no_gzip,
-                args.gzip_level,
-            );
-
             let progress = !args.no_progress && !args.stdout;
+
+            // If ENA is in play, resolve filereport metadata for every run up
+            // front. Accessions ENA can't serve (empty/None) silently fall back
+            // to the NCBI pipeline per-accession below.
+            let ena_results: Vec<Option<sracha_core::ena::EnaResolved>> = if ena_compatible {
+                let sp = progress::Spinner::start(format!(
+                    "Querying ENA filereport for {} accession(s)",
+                    style::count(resolved_all.len()),
+                ));
+                let accs: Vec<String> = resolved_all.iter().map(|r| r.accession.clone()).collect();
+                let pairs = sracha_core::ena::resolve_ena_many(&http_client, &accs).await;
+                let ena_hits = pairs.iter().filter(|(_, v)| v.is_some()).count();
+                sp.finish(format!(
+                    "ENA serves {} of {} accession(s); rest will use NCBI",
+                    style::count(ena_hits),
+                    style::count(resolved_all.len()),
+                ));
+                pairs.into_iter().map(|(_, v)| v).collect()
+            } else {
+                vec![None; resolved_all.len()]
+            };
+
+            // Check platform — reject legacy platforms with complex read structures.
+            // Only applies to accessions that will go through VDB decode; ENA
+            // serves pre-decoded FASTQ so the platform is irrelevant there.
+            for (resolved, ena) in resolved_all.iter().zip(ena_results.iter()) {
+                if ena.is_some() {
+                    continue;
+                }
+                if let Some(ref ri) = resolved.run_info
+                    && let Some(ref platform) = ri.platform
+                    && sracha_core::pipeline::is_unsupported_platform(platform)
+                {
+                    anyhow::bail!(
+                        "{}: unsupported platform '{}' — sracha does not support legacy sequencing platforms (use --prefer-ena to bypass VDB decode)",
+                        resolved.accession,
+                        platform
+                    );
+                }
+            }
 
             // -- Ctrl-C signal handling --
             use std::sync::Arc;
@@ -381,7 +515,9 @@ async fn main() -> Result<()> {
                 }
             };
 
-            // Spawn a download task for resolved_all[idx].
+            // Spawn a download task for resolved_all[idx]. Only used for the
+            // NCBI path; ENA accessions are handled inline (no decode to
+            // overlap with, so prefetching buys nothing).
             let spawn_download = |idx: usize| {
                 let resolved = resolved_all[idx].clone();
                 let config = make_config(&resolved);
@@ -390,12 +526,33 @@ async fn main() -> Result<()> {
                 })
             };
 
-            // Seed the queue with the first `prefetch_depth` downloads so
-            // iteration 0 already has accession 0 in flight (instead of
-            // paying its full download latency serially).
-            for j in 0..prefetch_depth.min(resolved_all.len()) {
-                pending_downloads.push_back(spawn_download(j));
+            // Seed the prefetch queue with the first `prefetch_depth` indices
+            // that will go through the NCBI path. Skip ENA indices — they
+            // don't need prefetching.
+            let mut seeded = 0usize;
+            for (j, ena) in ena_results.iter().enumerate() {
+                if seeded >= prefetch_depth {
+                    break;
+                }
+                if ena.is_none() {
+                    pending_downloads.push_back(spawn_download(j));
+                    seeded += 1;
+                }
             }
+
+            // Cursor for topping up the prefetch queue: the next index past
+            // the already-seeded set that still needs an NCBI download.
+            let mut next_prefetch_idx = {
+                let mut n = 0usize;
+                let mut count = 0usize;
+                while count < prefetch_depth && n < resolved_all.len() {
+                    if ena_results[n].is_none() {
+                        count += 1;
+                    }
+                    n += 1;
+                }
+                n
+            };
 
             for (i, resolved) in resolved_all.iter().enumerate() {
                 if cancelled.load(Ordering::Relaxed) {
@@ -404,6 +561,51 @@ async fn main() -> Result<()> {
 
                 let pipeline_config = make_config(resolved);
 
+                // ---- ENA fast path ------------------------------------------------
+                if let Some(ena) = &ena_results[i] {
+                    let ena_future =
+                        sracha_core::pipeline::download_ena_fastq(ena, &pipeline_config);
+                    let stats = match ena_future.await {
+                        Ok(s) => s,
+                        Err(sracha_core::error::Error::Cancelled { .. }) => {
+                            interrupted_accession = Some(resolved.accession.clone());
+                            break;
+                        }
+                        Err(e) => return Err(e.into()),
+                    };
+                    let source = "ena";
+                    if stats.bytes_transferred == 0 {
+                        eprintln!(
+                            "{}: {} of {} cached (no download needed) from [{}]",
+                            style::header(&stats.accession),
+                            style::value(format_size(stats.total_sra_size)),
+                            style::value(format_size(stats.total_sra_size)),
+                            style::value(source),
+                        );
+                    } else if stats.bytes_transferred < stats.total_sra_size {
+                        eprintln!(
+                            "{}: {} of {} transferred from [{}] (resumed)",
+                            style::header(&stats.accession),
+                            style::value(format_size(stats.bytes_transferred)),
+                            style::value(format_size(stats.total_sra_size)),
+                            style::value(source),
+                        );
+                    } else {
+                        eprintln!(
+                            "{}: {} downloaded from [{}]",
+                            style::header(&stats.accession),
+                            style::value(format_size(stats.total_sra_size)),
+                            style::value(source),
+                        );
+                    }
+                    for path in &stats.output_files {
+                        eprintln!("  wrote {}", style::path(path.display()));
+                    }
+                    completed_accessions.push(resolved.accession.clone());
+                    continue;
+                }
+
+                // ---- NCBI path ----------------------------------------------------
                 let handle = pending_downloads
                     .pop_front()
                     .expect("queue is pre-seeded and topped up per iteration");
@@ -423,11 +625,18 @@ async fn main() -> Result<()> {
                     }
                 };
 
-                // Top up the queue: keep `prefetch_depth` downloads in flight.
-                let next_idx = i + prefetch_depth;
-                if next_idx < resolved_all.len() && !cancelled.load(Ordering::Relaxed) {
-                    pending_downloads.push_back(spawn_download(next_idx));
+                // Top up the queue: find the next NCBI-bound index and spawn it.
+                while next_prefetch_idx < resolved_all.len()
+                    && ena_results[next_prefetch_idx].is_some()
+                {
+                    next_prefetch_idx += 1;
                 }
+                if next_prefetch_idx < resolved_all.len() && !cancelled.load(Ordering::Relaxed) {
+                    pending_downloads.push_back(spawn_download(next_prefetch_idx));
+                    next_prefetch_idx += 1;
+                }
+                // Skip trailing ENA indices after the one we just spawned.
+                let _ = i;
 
                 // Decode (CPU-bound) while the next download runs in the background.
                 let source = resolved
@@ -537,8 +746,13 @@ async fn main() -> Result<()> {
                 return Ok(());
             }
 
-            let client = SdlClient::with_client(sracha_core::http::default_client());
-            let (run_accessions, _has_projects) = resolve_to_runs(&accessions, &client).await?;
+            let http_client = sracha_core::http::default_client();
+            let client = SdlClient::with_client(http_client.clone());
+            let (run_accessions, _has_projects) = if args.prefer_ena {
+                resolve_to_runs_via_ena(&accessions, &client).await?
+            } else {
+                resolve_to_runs(&accessions, &client).await?
+            };
 
             let sp = progress::Spinner::start(format!(
                 "Resolving {} accession(s)",
@@ -580,6 +794,14 @@ async fn main() -> Result<()> {
                 print_info_table(&entries);
             } else if let Some(InfoEntry::Ok(r)) = entries.first() {
                 print_resolved(r);
+            }
+
+            if args.prefer_ena {
+                let accs: Vec<String> = resolved.iter().map(|r| r.accession.clone()).collect();
+                let ena = sracha_core::ena::resolve_ena_many(&http_client, &accs).await;
+                for (acc, r) in &ena {
+                    print_ena_section(acc, r.as_ref());
+                }
             }
             Ok(())
         }
@@ -780,6 +1002,39 @@ fn collect_accessions(positional: &[String], list_file: Option<&Path>) -> Result
 /// Study (SRP/ERP/DRP) and BioProject (PRJNA/PRJEB/PRJDB) accessions are
 /// resolved to their constituent runs via the NCBI EUtils API.
 async fn resolve_to_runs(inputs: &[String], client: &SdlClient) -> Result<(Vec<String>, bool)> {
+    resolve_to_runs_inner(inputs, client, false).await
+}
+
+/// Output filename for `fetch --prefer-ena`. ENA always serves gzip'd FASTQ,
+/// so the extension is fixed; the slot determines the suffix.
+fn ena_fetch_filename(accession: &str, slot: sracha_core::fastq::OutputSlot) -> String {
+    use sracha_core::fastq::OutputSlot;
+    match slot {
+        OutputSlot::Single | OutputSlot::Unpaired => format!("{accession}.fastq.gz"),
+        OutputSlot::Read1 => format!("{accession}_1.fastq.gz"),
+        OutputSlot::Read2 => format!("{accession}_2.fastq.gz"),
+        OutputSlot::ReadN(n) => format!("{accession}_{}.fastq.gz", n + 1),
+    }
+}
+
+/// Like [`resolve_to_runs`] but routes project resolution through ENA's
+/// filereport API when possible. Falls back to NCBI EUtils if ENA returns
+/// no runs for a project (rare — almost all INSDC projects are mirrored).
+///
+/// Reuses the HTTP client from the provided [`SdlClient`] so connection
+/// pools are shared between SDL and ENA calls.
+async fn resolve_to_runs_via_ena(
+    inputs: &[String],
+    client: &SdlClient,
+) -> Result<(Vec<String>, bool)> {
+    resolve_to_runs_inner(inputs, client, true).await
+}
+
+async fn resolve_to_runs_inner(
+    inputs: &[String],
+    client: &SdlClient,
+    via_ena: bool,
+) -> Result<(Vec<String>, bool)> {
     let mut run_accessions = Vec::new();
     let mut has_projects = false;
 
@@ -795,7 +1050,34 @@ async fn resolve_to_runs(inputs: &[String], client: &SdlClient) -> Result<(Vec<S
                     "{}: resolving project to run accessions",
                     style::header(&proj),
                 ));
-                let runs = client.resolve_project(&proj).await?;
+
+                let runs = if via_ena {
+                    match sracha_core::ena::resolve_ena_project(
+                        client.http_client(),
+                        &proj.to_string(),
+                    )
+                    .await
+                    {
+                        Ok(resolved) if !resolved.is_empty() => {
+                            resolved.into_iter().map(|r| r.accession).collect()
+                        }
+                        Ok(_) => {
+                            tracing::info!(
+                                "{proj}: ENA returned no runs, falling back to NCBI EUtils",
+                            );
+                            client.resolve_project(&proj).await?
+                        }
+                        Err(e) => {
+                            tracing::warn!(
+                                "{proj}: ENA project resolve failed ({e}), falling back to NCBI EUtils",
+                            );
+                            client.resolve_project(&proj).await?
+                        }
+                    }
+                } else {
+                    client.resolve_project(&proj).await?
+                };
+
                 sp.finish(format!(
                     "{}: found {} run(s)",
                     style::header(&proj),
@@ -1049,6 +1331,46 @@ fn print_resolved(resolved: &ResolvedAccession) {
             style::label("Mirrors:"),
             style::count(alts.len()),
             alts.join(", "),
+        );
+    }
+}
+
+/// Print the ENA FASTQ section for a single accession — shown under
+/// `sracha info --prefer-ena`. Renders URL, size, and MD5 per file, or
+/// a single "no ENA FASTQ available" line when `resolved` is None.
+fn print_ena_section(accession: &str, resolved: Option<&sracha_core::ena::EnaResolved>) {
+    println!();
+    println!("{} — ENA FASTQ", style::header(accession));
+    let Some(r) = resolved else {
+        println!("  {} no ENA FASTQ available", style::label("status:"));
+        return;
+    };
+    println!(
+        "  {}    {} across {} file(s)",
+        style::label("Total:"),
+        style::value(format_size(r.total_size)),
+        style::count(r.fastq_files.len()),
+    );
+    for f in &r.fastq_files {
+        let slot_tag = match f.slot {
+            sracha_core::fastq::OutputSlot::Single => "single",
+            sracha_core::fastq::OutputSlot::Read1 => "read1",
+            sracha_core::fastq::OutputSlot::Read2 => "read2",
+            sracha_core::fastq::OutputSlot::Unpaired => "unpaired",
+            sracha_core::fastq::OutputSlot::ReadN(_) => "readN",
+        };
+        println!(
+            "  {} [{}] {}",
+            style::label("File:"),
+            style::value(slot_tag),
+            style::path(&f.url),
+        );
+        println!(
+            "    {}  {}   {}  {}",
+            style::label("size:"),
+            style::value(format_size(f.size)),
+            style::label("md5:"),
+            style::value(&f.md5),
         );
     }
 }
