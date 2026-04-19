@@ -17,7 +17,7 @@ use std::sync::atomic::Ordering;
 
 use itoa;
 
-use crate::error::{Error, Result};
+use crate::error::Result;
 use crate::fastq::{
     FastqConfig, IntegrityDiag, OutputSlot, SplitMode, append_fasta_record, append_fastq_record,
 };
@@ -174,7 +174,8 @@ pub(crate) struct BlobDecodeCtx<'a> {
 /// rather than refusing the whole spot. One exception is the variant-2
 /// page_map shape (no data_runs + multiple distinct lengths), which
 /// can silently leak real N annotations — that case errors out with an
-/// [`Error::UnsupportedFormat`] so we never emit wrong FASTQ.
+/// [`sracha_vdb::Error::UnsupportedFormat`] (surfaced as [`Error::Vdb`])
+/// so we never emit wrong FASTQ.
 ///
 /// Extracted from [`decode_blob_to_fastq`] — behavior unchanged.
 fn apply_altread_merge(
@@ -226,7 +227,7 @@ fn apply_altread_merge(
         && pm.lengths.len() > 1
         && altread_data.iter().any(|&b| b != 0)
     {
-        return Err(Error::UnsupportedFormat {
+        return Err(sracha_vdb::Error::UnsupportedFormat {
             format: "page_map v1 variant 2 in ALTREAD".into(),
             hint: format!(
                 "ALTREAD blob {blob_idx} stores {} rows with {} unique length \
@@ -239,7 +240,8 @@ fn apply_altread_merge(
                 pm.leng_runs.iter().sum::<u32>(),
                 pm.lengths.len(),
             ),
-        });
+        }
+        .into());
     }
 
     // Pad ALTREAD across its *whole* blob (which may be larger
