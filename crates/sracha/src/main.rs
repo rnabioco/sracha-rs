@@ -1024,11 +1024,7 @@ fn print_resolved(resolved: &ResolvedAccession) {
             bases,
         );
         if let Some(ref plat) = ri.platform {
-            println!(
-                "  {} {}",
-                style::label("Platform:"),
-                style::value(plat),
-            );
+            println!("  {} {}", style::label("Platform:"), style::value(plat),);
         }
     }
 
@@ -1220,14 +1216,10 @@ fn print_info_table(entries: &[InfoEntry<'_>]) {
         // ticks were sticking up at nothing. The body/footer separator
         // keeps its `┴` (set via horizontals below) since the body row
         // above it does have columns.
-        .with(
-            Style::rounded()
-                .intersection_bottom('─')
-                .horizontals([
-                    (1, HorizontalLine::full('─', '┼', '├', '┤')),
-                    (footer_line, HorizontalLine::full('─', '┴', '├', '┤')),
-                ]),
-        )
+        .with(Style::rounded().intersection_bottom('─').horizontals([
+            (1, HorizontalLine::full('─', '┼', '├', '┤')),
+            (footer_line, HorizontalLine::full('─', '┴', '├', '┤')),
+        ]))
         .with(Modify::new(Rows::first()).with(Color::new("\x1b[1m", "\x1b[22m")))
         // Right-align numeric columns: Size (1), Spots (5).
         .with(Modify::new(Columns::new(1..=1)).with(Alignment::right()))
