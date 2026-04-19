@@ -9,6 +9,7 @@ pub mod blob;
 pub mod blob_codecs;
 pub mod csra;
 pub mod cursor;
+pub mod dump;
 pub mod encoding;
 pub mod error;
 pub mod inspect;

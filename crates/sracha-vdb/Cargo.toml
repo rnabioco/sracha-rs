@@ -15,6 +15,7 @@ memmap2.workspace = true
 flate2.workspace = true
 libdeflater.workspace = true
 libdeflate-sys.workspace = true
+serde_json.workspace = true
 thiserror.workspace = true
 tracing.workspace = true
 
