@@ -616,6 +616,17 @@ fn decode_and_write(
         };
 
         // ---- Decode loop (main thread) ----
+        //
+        // `cumulative_spots` tracks the total number of spots in blobs 0..blob_idx
+        // so each batch can compute `spots_before_per_blob` deterministically
+        // from blob metadata alone. Reading `spots_read` here would race with
+        // the writer thread on archives with more than `BATCH_SIZE` (1024)
+        // blobs — the bounded channel of capacity 4 lets the decoder queue
+        // four batches ahead of the writer, and the writer's fetch_add on
+        // `spots_read` doesn't happen until it has processed a batch.
+        // DRR045255 (3658 blobs) used to emit `spots_before=0` for batch 2
+        // onwards, resetting the FASTQ defline spot number to 1.
+        let mut cumulative_spots: u64 = 0;
         let mut blob_idx: usize = 0;
         while blob_idx < num_blobs {
             if let Some(ref flag) = config.cancelled
@@ -625,16 +636,13 @@ fn decode_and_write(
             }
 
             let batch_end = (blob_idx + BATCH_SIZE).min(num_blobs);
-            let batch_len = batch_end - blob_idx;
 
-            let mut spots_before_per_blob: Vec<u64> = Vec::with_capacity(batch_len);
-            {
-                let mut cumulative = spots_read.load(std::sync::atomic::Ordering::Relaxed);
-                for bi in blob_idx..batch_end {
-                    spots_before_per_blob.push(cumulative);
-                    cumulative += cursor.read_col().blobs()[bi].id_range as u64;
-                }
-            }
+            let blob_id_ranges: Vec<u32> = (blob_idx..batch_end)
+                .map(|bi| cursor.read_col().blobs()[bi].id_range)
+                .collect();
+            let (spots_before_per_blob, batch_spots) =
+                spots_before_per_blob_in_batch(cumulative_spots, &blob_id_ranges);
+            cumulative_spots += batch_spots;
 
             let formatted_batches: Vec<Result<FormattedBlob>> = pool.install(|| {
                 (blob_idx..batch_end)
@@ -915,6 +923,22 @@ pub fn run_fastq(
             .to_string()
     });
 
+    // Reference-compressed cSRA dispatch: archives with SEQUENCE.CMP_READ
+    // plus sibling PRIMARY_ALIGNMENT + REFERENCE tables can't decode
+    // through the regular VdbCursor (it reads physical READ only); route
+    // them through CsraCursor's splice. v1 handles one uncompressed output
+    // file and ignores split / compression / stdout flags — a follow-up
+    // will port CsraCursor to the batched pipeline.
+    let vdbcache_candidate = crate::vdb::csra::vdbcache_sidecar_path(sra_path);
+    let vdbcache_for_probe = if vdbcache_candidate.exists() {
+        Some(vdbcache_candidate.as_path())
+    } else {
+        None
+    };
+    if crate::vdb::csra::looks_like_decodable_csra(sra_path, vdbcache_for_probe).unwrap_or(false) {
+        return run_fastq_csra(sra_path, &acc, config, vdbcache_for_probe);
+    }
+
     // Detect SRA-lite by checking if the quality column is absent.
     // We pass `false` initially; decode_and_write will handle quality
     // absence gracefully via sra_lite_quality fallback.
@@ -973,6 +997,348 @@ pub fn run_fastq(
         reads_written,
         output_files,
         integrity: diag,
+    })
+}
+
+/// Compute the `spots_before` offset for each blob in a single decode
+/// batch, given the cumulative spot count before the batch and the
+/// batch's per-blob `id_range`s. Returns `(per_blob, total_spots_in_batch)`.
+///
+/// Extracted so the race-free accumulation pattern can be pinned with a
+/// unit test without needing the 246 MiB DRR045255 fixture.
+pub(crate) fn spots_before_per_blob_in_batch(
+    cumulative_before_batch: u64,
+    blob_id_ranges: &[u32],
+) -> (Vec<u64>, u64) {
+    let mut out = Vec::with_capacity(blob_id_ranges.len());
+    let mut cum = cumulative_before_batch;
+    for &id_range in blob_id_ranges {
+        out.push(cum);
+        cum += u64::from(id_range);
+    }
+    (out, cum - cumulative_before_batch)
+}
+
+#[cfg(test)]
+mod batch_spots_tests {
+    use super::spots_before_per_blob_in_batch;
+
+    #[test]
+    fn single_batch_starts_at_zero() {
+        let (per_blob, total) = spots_before_per_blob_in_batch(0, &[100, 200, 50]);
+        assert_eq!(per_blob, vec![0, 100, 300]);
+        assert_eq!(total, 350);
+    }
+
+    #[test]
+    fn second_batch_continues_from_cumulative() {
+        // Regression for the BATCH_SIZE=1024 race: batch 2's per-blob
+        // offsets must pick up from the running total at the end of
+        // batch 1, not from a stale `spots_read` atomic that the writer
+        // thread hadn't yet updated via `fetch_add`.
+        let batch1_blobs: Vec<u32> = vec![1024; 1024];
+        let (_, batch1_total) = spots_before_per_blob_in_batch(0, &batch1_blobs);
+        assert_eq!(batch1_total, 1_048_576);
+
+        let batch2_blobs: Vec<u32> = vec![1024, 1024, 1024];
+        let (batch2, _) = spots_before_per_blob_in_batch(batch1_total, &batch2_blobs);
+        // Pre-fix bug: batch2 would have started at 0 → [0, 1024, 2048].
+        assert_eq!(batch2, vec![1_048_576, 1_049_600, 1_050_624]);
+    }
+
+    #[test]
+    fn variable_blob_sizes_accumulate_precisely() {
+        // DRR045255 had a 1032-row blob near spot 1 048 577. Mixing
+        // blob sizes across batches still needs the right offset.
+        let (_, b1) = spots_before_per_blob_in_batch(0, &vec![1024; 1023]);
+        let (b2, _) = spots_before_per_blob_in_batch(b1, &[1032, 1024, 1024]);
+        assert_eq!(b1, 1023 * 1024);
+        assert_eq!(b2[0], 1_047_552);
+        assert_eq!(b2[1], 1_048_584);
+        assert_eq!(b2[2], 1_049_608);
+    }
+
+    #[test]
+    fn empty_batch_returns_zero_total() {
+        let (per_blob, total) = spots_before_per_blob_in_batch(1_000, &[]);
+        assert!(per_blob.is_empty());
+        assert_eq!(total, 0);
+    }
+}
+
+/// cSRA decode path — drives `CsraCursor` through the same FASTQ writer
+/// infrastructure (split modes, compression, stdout) as the regular
+/// pipeline, so all of `PipelineConfig` honours through.
+fn run_fastq_csra(
+    sra_path: &std::path::Path,
+    acc: &str,
+    config: &PipelineConfig,
+    vdbcache_path: Option<&std::path::Path>,
+) -> Result<FastqStats> {
+    use crate::fastq::{CompressionMode, FastqConfig, OutputSlot, SpotRecord, output_filename};
+    use crate::vdb::csra::CsraCursor;
+    use crate::vdb::kar::KarArchive;
+    use crate::vdb::restore::fourna_to_ascii;
+
+    let file = std::fs::File::open(sra_path)?;
+    let mut archive = KarArchive::open(std::io::BufReader::new(file))?;
+    // Open the vdbcache sidecar when present. Each decode worker opens
+    // its own copy below (mmap/file handles are not Send across rayon
+    // threads), so the top-level one is only used for the SEQUENCE
+    // open/row_count probe.
+    let mut vdbcache_archive = match vdbcache_path {
+        Some(p) => Some(KarArchive::open(std::io::BufReader::new(
+            std::fs::File::open(p)?,
+        ))?),
+        None => None,
+    };
+    let csra = {
+        let vdbcache_for_open: Option<(&mut KarArchive<_>, &std::path::Path)> =
+            match (&mut vdbcache_archive, vdbcache_path) {
+                (Some(a), Some(p)) => Some((a, p)),
+                _ => None,
+            };
+        CsraCursor::open_any(&mut archive, sra_path, vdbcache_for_open)?
+    };
+
+    let fastq_config = FastqConfig {
+        split_mode: config.split_mode,
+        skip_technical: config.skip_technical,
+        min_read_len: config.min_read_len,
+        fasta: config.fasta,
+    };
+
+    if !config.stdout {
+        std::fs::create_dir_all(&config.output_dir)?;
+    }
+
+    let mut writers: HashMap<OutputSlot, OutputWriter> = HashMap::new();
+    let mut output_paths: Vec<(PathBuf, PathBuf)> = Vec::new();
+    let mut stdout_writer: Option<OutputWriter> = if config.stdout {
+        Some(OutputWriter::Stdout(std::io::BufWriter::with_capacity(
+            256 * 1024,
+            std::io::stdout(),
+        )))
+    } else {
+        None
+    };
+
+    // Gzip pool reused across slot writers when --compress gzip is set.
+    let compress_pool: Option<Arc<rayon::ThreadPool>> = match config.compression {
+        CompressionMode::Gzip { .. } => {
+            let n = config.threads.max(1);
+            Some(Arc::new(
+                rayon::ThreadPoolBuilder::new()
+                    .num_threads(n)
+                    .build()
+                    .map_err(|e| Error::Vdb(format!("gzip threadpool: {e}")))?,
+            ))
+        }
+        _ => None,
+    };
+
+    // Partition the spot range into chunks of CHUNK_SIZE for parallel
+    // decode. Each rayon worker opens its own CsraCursor (mmap is cheap;
+    // actual I/O happens on-demand), decodes its spot range, returns a
+    // per-slot byte buffer. Main thread writes chunks in order to the
+    // shared writers, preserving spot order across all outputs.
+    //
+    // Opening CsraCursor inside rayon workers means we don't need to
+    // share the top-level one; drop it here to release its file handle
+    // and avoid the small double-open cost on single-threaded paths.
+    let total_spots = csra.row_count();
+    let first_row = csra.first_row();
+    drop(csra);
+    drop(archive);
+
+    // Chunk size picked to (a) amortise per-chunk cursor-open overhead
+    // (each chunk re-mmaps the SEQUENCE / PRIMARY_ALIGNMENT / REFERENCE
+    // columns), and (b) give rayon enough work items that all threads
+    // stay busy — roughly 8 chunks per thread so stragglers in one
+    // thread don't pile up.
+    let num_threads = config.threads.max(1);
+    let chunk_size: u64 = {
+        let target_chunks = (num_threads as u64) * 8;
+        let raw = total_spots.div_ceil(target_chunks.max(1));
+        raw.clamp(32, 1024)
+    };
+    let mut spots_read = 0u64;
+    let mut reads_written = 0u64;
+
+    // When there's only one thread or the archive is tiny, skip the
+    // parallel path — each worker carries ~20 mmap setups of overhead.
+    let use_parallel = num_threads > 1 && total_spots >= chunk_size * 2;
+
+    let chunks: Vec<(i64, i64)> = {
+        let mut out = Vec::new();
+        let mut start = first_row;
+        let end = first_row + total_spots as i64;
+        while start < end {
+            let chunk_end = (start + chunk_size as i64).min(end);
+            out.push((start, chunk_end));
+            start = chunk_end;
+        }
+        out
+    };
+
+    // Decode each chunk. The worker returns an ordered Vec of
+    // (slot, record-bytes, record-count) so the writer stays sequential.
+    type SlotChunk = (OutputSlot, Vec<u8>, u64);
+    let decode_chunk = |start: i64, end: i64| -> Result<Vec<SlotChunk>> {
+        let file = std::fs::File::open(sra_path)?;
+        let mut archive = KarArchive::open(std::io::BufReader::new(file))?;
+        let mut cache_archive = match vdbcache_path {
+            Some(p) => Some(KarArchive::open(std::io::BufReader::new(
+                std::fs::File::open(p)?,
+            ))?),
+            None => None,
+        };
+        let csra = {
+            let cache_opt: Option<(&mut KarArchive<_>, &std::path::Path)> =
+                match (&mut cache_archive, vdbcache_path) {
+                    (Some(a), Some(p)) => Some((a, p)),
+                    _ => None,
+                };
+            CsraCursor::open_any(&mut archive, sra_path, cache_opt)?
+        };
+        let mut per_slot: HashMap<OutputSlot, (Vec<u8>, u64)> = HashMap::new();
+        let mut itoa_buf = itoa::Buffer::new();
+        for row_id in start..end {
+            let s = csra.read_spot(row_id)?;
+            let sequence = fourna_to_ascii(&s.bases);
+            let quality: Vec<u8> = s.quality.iter().map(|q| q.wrapping_add(33)).collect();
+            let read_types: Vec<u8> = s
+                .read_types
+                .iter()
+                .map(|&rt| if rt & 0x01 != 0 { 0 } else { 1 })
+                .collect();
+            let spot_num_str = itoa_buf.format(row_id).to_string();
+            let spot = SpotRecord {
+                name: spot_num_str.as_bytes().to_vec(),
+                sequence,
+                quality,
+                read_lengths: s.read_lens,
+                read_types,
+                read_filter: Vec::new(),
+                spot_group: Vec::new(),
+            };
+            for (slot, rec) in crate::fastq::format_spot(&spot, acc, &fastq_config) {
+                let entry = per_slot.entry(slot).or_insert_with(|| (Vec::new(), 0));
+                entry.0.extend_from_slice(&rec.data);
+                entry.1 += 1;
+            }
+        }
+        Ok(per_slot
+            .into_iter()
+            .map(|(slot, (bytes, count))| (slot, bytes, count))
+            .collect())
+    };
+
+    // Create a writer for this slot lazily (mirrors the plain path).
+    let get_writer = |slot: OutputSlot,
+                      writers: &mut HashMap<OutputSlot, OutputWriter>,
+                      output_paths: &mut Vec<(PathBuf, PathBuf)>|
+     -> Result<()> {
+        if writers.contains_key(&slot) {
+            return Ok(());
+        }
+        let filename = output_filename(acc, slot, config.fasta, &config.compression);
+        let final_path = config.output_dir.join(&filename);
+        let tmp_path = config.output_dir.join(format!("{filename}.partial"));
+        output_paths.push((final_path, tmp_path.clone()));
+        let file = std::fs::File::create(&tmp_path)?;
+        let buf = std::io::BufWriter::with_capacity(256 * 1024, file);
+        let w = match config.compression {
+            CompressionMode::Gzip { level } => OutputWriter::Gz(ParGzWriter::new(
+                buf,
+                level,
+                DEFAULT_BLOCK_SIZE,
+                compress_pool.clone().expect("gzip pool must exist"),
+            )),
+            CompressionMode::Zstd { level, threads } => {
+                let mut encoder = zstd::stream::write::Encoder::new(buf, level)
+                    .map_err(|e| Error::Vdb(format!("zstd encoder: {e}")))?;
+                encoder
+                    .multithread(threads)
+                    .map_err(|e| Error::Vdb(format!("zstd threads: {e}")))?;
+                OutputWriter::Zstd(encoder)
+            }
+            CompressionMode::None => OutputWriter::Plain(buf),
+        };
+        writers.insert(slot, w);
+        Ok(())
+    };
+
+    if use_parallel {
+        use rayon::prelude::*;
+        let pool = rayon::ThreadPoolBuilder::new()
+            .num_threads(num_threads)
+            .build()
+            .map_err(|e| Error::Vdb(format!("cSRA threadpool: {e}")))?;
+        let results: Vec<Result<Vec<SlotChunk>>> = pool.install(|| {
+            chunks
+                .par_iter()
+                .map(|(s, e)| decode_chunk(*s, *e))
+                .collect()
+        });
+        for (chunk_res, (s, e)) in results.into_iter().zip(chunks.iter()) {
+            let chunk = chunk_res?;
+            spots_read += (e - s) as u64;
+            for (slot, bytes, records) in chunk {
+                if let Some(ref mut sw) = stdout_writer {
+                    sw.write_all(&bytes).map_err(Error::Io)?;
+                } else {
+                    get_writer(slot, &mut writers, &mut output_paths)?;
+                    writers
+                        .get_mut(&slot)
+                        .unwrap()
+                        .write_all(&bytes)
+                        .map_err(Error::Io)?;
+                }
+                reads_written += records;
+            }
+        }
+    } else {
+        for &(s, e) in &chunks {
+            let chunk = decode_chunk(s, e)?;
+            spots_read += (e - s) as u64;
+            for (slot, bytes, records) in chunk {
+                if let Some(ref mut sw) = stdout_writer {
+                    sw.write_all(&bytes).map_err(Error::Io)?;
+                } else {
+                    get_writer(slot, &mut writers, &mut output_paths)?;
+                    writers
+                        .get_mut(&slot)
+                        .unwrap()
+                        .write_all(&bytes)
+                        .map_err(Error::Io)?;
+                }
+                reads_written += records;
+            }
+        }
+    }
+
+    if let Some(sw) = stdout_writer {
+        sw.finish().map_err(Error::Io)?;
+    }
+    for (_, writer) in writers {
+        writer.finish().map_err(Error::Io)?;
+    }
+
+    let mut final_paths = Vec::with_capacity(output_paths.len());
+    if !config.stdout {
+        for (final_path, tmp_path) in &output_paths {
+            std::fs::rename(tmp_path, final_path).map_err(Error::Io)?;
+            final_paths.push(final_path.clone());
+        }
+    }
+
+    Ok(FastqStats {
+        accession: acc.to_string(),
+        spots_read,
+        reads_written,
+        output_files: final_paths,
+        integrity: Arc::new(IntegrityDiag::default()),
     })
 }
 

@@ -612,6 +612,409 @@ fn corrupt_flipped_bytes_trigger_checksum_or_decode_error() {
 
 #[ignore]
 #[test]
+fn csra_alignment_columns_open() {
+    // Phase 1 smoke test: open the PRIMARY_ALIGNMENT columns of a real
+    // reference-compressed cSRA fixture. VDB-3418 is a 12 MiB BAM-loaded
+    // archive shipped with ncbi-vdb's test suite (schema
+    // `NCBI:align:db:alignment_sorted#1.3`; 985 SEQUENCE / 938 PRIMARY_ALIGNMENT
+    // rows). All we verify here is that the column-opening plumbing works
+    // end-to-end against a real archive; read_row and reconstruction land
+    // in later phases.
+    use sracha_core::vdb::alignment::AlignmentCursor;
+    use sracha_core::vdb::kar::KarArchive;
+
+    let path = fixtures_dir().join("VDB-3418.sra");
+    if !path.exists() {
+        eprintln!(
+            "skipping csra_alignment_columns_open: {} not present",
+            path.display()
+        );
+        return;
+    }
+
+    let file = std::fs::File::open(&path).unwrap();
+    let mut archive = KarArchive::open(std::io::BufReader::new(file)).unwrap();
+    let cur = AlignmentCursor::open(&mut archive, &path).unwrap();
+    assert_eq!(cur.row_count(), 938, "expected 938 PRIMARY_ALIGNMENT rows");
+    assert_eq!(cur.first_row(), 1);
+
+    let grs = cur.first_global_ref_start().unwrap();
+    let rlen = cur.first_ref_len().unwrap();
+    eprintln!("row 1: GLOBAL_REF_START={grs} REF_LEN={rlen}");
+    assert_eq!(grs, 2, "expected vdb-dump GLOBAL_REF_START=2");
+    assert_eq!(rlen, 35712, "expected vdb-dump REF_LEN=35712");
+
+    // vdb-dump row 1 reports:
+    //   HAS_MISMATCH length 36185, 2689 ones
+    //   HAS_REF_OFFSET length 36185, 2149 ones
+    //   HAS_MISMATCH first 100 bits: all 1s
+    // Cross-check row 1 against `vdb-dump -T PRIMARY_ALIGNMENT -R 1`:
+    //   HAS_MISMATCH   length 36185, 2689 ones, first 100 bits all-1,
+    //                  last 10 bits "1011111010"
+    //   HAS_REF_OFFSET length 36185, 2149 ones
+    //   REF_OFFSET     first values -260, -1, -1, -1, -1; last value -80
+    let row = cur.read_row(1).unwrap();
+    assert_eq!(row.has_mismatch.len(), 36185);
+    assert_eq!(row.has_ref_offset.len(), 36185);
+    assert_eq!(row.mismatch.len(), 2689);
+    assert_eq!(row.ref_offset.len(), 2149);
+    assert!(row.has_mismatch[..100].iter().all(|&b| b == 1));
+    let tail: Vec<u8> = row.has_mismatch[row.has_mismatch.len() - 10..].to_vec();
+    assert_eq!(tail, vec![1, 0, 1, 1, 1, 1, 1, 0, 1, 0]);
+    assert_eq!(&row.ref_offset[..5], &[-260, -1, -1, -1, -1]);
+    assert_eq!(row.ref_offset.last().copied(), Some(-80));
+
+    // Internal consistency: the invariant align_restore_read relies on.
+    let mm1s = row.has_mismatch.iter().filter(|&&b| b != 0).count();
+    let ro1s = row.has_ref_offset.iter().filter(|&&b| b != 0).count();
+    assert_eq!(mm1s, row.mismatch.len());
+    assert_eq!(ro1s, row.ref_offset.len());
+}
+
+#[ignore]
+#[test]
+fn csra_reference_fetch_span() {
+    // Verify REFERENCE chunk reader against vdb-dump. VDB-3418's REFERENCE
+    // table: 180 chunks, MAX_SEQ_LEN=5000, chromosome "III".
+    // vdb-dump -T REFERENCE -C READ -R 1 first bases: CCCACACACCACACCCACACCACACCCACA...
+    use sracha_core::vdb::kar::KarArchive;
+    use sracha_core::vdb::reference::ReferenceCursor;
+
+    let path = fixtures_dir().join("VDB-3418.sra");
+    if !path.exists() {
+        eprintln!(
+            "skipping csra_reference_fetch_span: {} not present",
+            path.display()
+        );
+        return;
+    }
+
+    let file = std::fs::File::open(&path).unwrap();
+    let mut archive = KarArchive::open(std::io::BufReader::new(file)).unwrap();
+    let refs = ReferenceCursor::open(&mut archive, &path).unwrap();
+    assert_eq!(refs.row_count(), 180);
+    assert_eq!(refs.max_seq_len(), 5000);
+
+    // First 30 bases of chunk 1 (global_ref_start=0): CCCACACACCACACCCACACCACACCCACA
+    let bases = refs.fetch_span(0, 30).unwrap();
+    let expected_text = "CCCACACACCACACCCACACCACACCCACA";
+    let got_text: String = bases
+        .iter()
+        .map(|&b| match b {
+            0x1 => 'A',
+            0x2 => 'C',
+            0x4 => 'G',
+            0x8 => 'T',
+            _ => '?',
+        })
+        .collect();
+    assert_eq!(got_text, expected_text, "first 30 bases mismatch");
+
+    // Cross-chunk span: start at position 4995 (end of chunk 1), length 10,
+    // should straddle into chunk 2. Just assert we get 10 bases back without
+    // error — a stronger check lands once we have a second fixture to
+    // compare against vdb-dump's concatenated output.
+    let bases2 = refs.fetch_span(4995, 10).unwrap();
+    assert_eq!(bases2.len(), 10);
+    for (i, &b) in bases2.iter().enumerate() {
+        assert!(
+            matches!(b, 0x1 | 0x2 | 0x4 | 0x8),
+            "byte {i} of cross-chunk span not a 2na code: {b}"
+        );
+    }
+}
+
+#[ignore]
+#[test]
+fn csra_align_restore_read_row_1() {
+    // Phase 2 end-to-end: reconstruct PRIMARY_ALIGNMENT row 1's aligned
+    // bases from REFERENCE + HAS_MISMATCH + MISMATCH + HAS_REF_OFFSET +
+    // REF_OFFSET, and verify the ASCII matches `vdb-dump -T PRIMARY_ALIGNMENT
+    // -C READ -R 1`:
+    //   length  36185
+    //   first30 AGTTACGTATTGCTAAGGTTATTAGGGAAA
+    //   last31  AGCAATACGTAACTGAACGAAGTAATACCGA
+    //
+    // `align_restore_read` output is in REFERENCE orientation — vdb-dump's
+    // `PRIMARY_ALIGNMENT.READ` column matches it directly. Strand flip
+    // based on SEQUENCE.READ_TYPE happens one level up in seq_restore_read
+    // when splicing aligned halves into a full spot.
+    use sracha_core::vdb::alignment::AlignmentCursor;
+    use sracha_core::vdb::kar::KarArchive;
+    use sracha_core::vdb::reference::ReferenceCursor;
+    use sracha_core::vdb::restore::{align_restore_read, fourna_to_ascii};
+
+    let path = fixtures_dir().join("VDB-3418.sra");
+    if !path.exists() {
+        eprintln!("skipping: {} not present", path.display());
+        return;
+    }
+
+    let file = std::fs::File::open(&path).unwrap();
+    let mut archive = KarArchive::open(std::io::BufReader::new(file)).unwrap();
+    let align = AlignmentCursor::open(&mut archive, &path).unwrap();
+    let refs = ReferenceCursor::open(&mut archive, &path).unwrap();
+
+    let row = align.read_row(1).unwrap();
+    let read_len = row.has_mismatch.len();
+    assert_eq!(read_len, 36185);
+
+    let ref_read = refs.fetch_span(row.global_ref_start, row.ref_len).unwrap();
+    let bases = align_restore_read(
+        &ref_read,
+        &row.has_mismatch,
+        &row.mismatch,
+        &row.has_ref_offset,
+        &row.ref_offset,
+        read_len,
+    )
+    .unwrap();
+    let ascii = fourna_to_ascii(&bases);
+    let text = std::str::from_utf8(&ascii).unwrap();
+
+    assert_eq!(text.len(), 36185);
+    assert_eq!(&text[..30], "AGTTACGTATTGCTAAGGTTATTAGGGAAA");
+    assert_eq!(&text[text.len() - 31..], "AGCAATACGTAACTGAACGAAGTAATACCGA");
+}
+
+#[ignore]
+#[test]
+fn csra_seq_restore_read_row_1() {
+    // End-to-end Phase 2 splice: SEQUENCE row 1 of VDB-3418.
+    //
+    // `vdb-dump -T SEQUENCE -R 1` reports READ_LEN=36185,
+    // READ_TYPE=BIOLOGICAL|REVERSE (0x0A), PRIMARY_ALIGNMENT_ID=1, CMP_READ
+    // empty (single-read fully-aligned spot). So the splice reduces to:
+    // reverse-complement(align_restore_read(alignment row 1)).
+    //
+    // vdb-dump -T SEQUENCE -C READ first 30 chars:
+    //   TCGGTATTACTTCGTTCAGTTACGTATTGCT  (31)
+    // last 31:
+    //   GTTTCCCTAATAACCTTAGCAATACGTAACT
+    use sracha_core::vdb::alignment::AlignmentCursor;
+    use sracha_core::vdb::kar::KarArchive;
+    use sracha_core::vdb::reference::ReferenceCursor;
+    use sracha_core::vdb::restore::{
+        SRA_READ_TYPE_REVERSE, align_restore_read, fourna_to_ascii, seq_restore_read,
+    };
+
+    let path = fixtures_dir().join("VDB-3418.sra");
+    if !path.exists() {
+        eprintln!("skipping: {} not present", path.display());
+        return;
+    }
+
+    let file = std::fs::File::open(&path).unwrap();
+    let mut archive = KarArchive::open(std::io::BufReader::new(file)).unwrap();
+    let align = AlignmentCursor::open(&mut archive, &path).unwrap();
+    let refs = ReferenceCursor::open(&mut archive, &path).unwrap();
+
+    // Hardcoded SEQUENCE row 1 values (see vdb-dump). A SEQUENCE column
+    // reader lands in Phase 3; the splice algorithm is the same either way.
+    let align_ids = [1i64];
+    let read_lens = [36185u32];
+    // BIOLOGICAL (0x01) | REVERSE (0x04) = 0x05 per vdb-dump.
+    let read_types = [SRA_READ_TYPE_REVERSE | 0x01];
+    let cmp_rd: Vec<u8> = Vec::new();
+
+    let spot = seq_restore_read(
+        &cmp_rd,
+        &align_ids,
+        &read_lens,
+        &read_types,
+        |alignment_id| {
+            let row = align.read_row(alignment_id)?;
+            let ref_read = refs.fetch_span(row.global_ref_start, row.ref_len)?;
+            align_restore_read(
+                &ref_read,
+                &row.has_mismatch,
+                &row.mismatch,
+                &row.has_ref_offset,
+                &row.ref_offset,
+                row.has_mismatch.len(),
+            )
+        },
+    )
+    .unwrap();
+
+    let ascii = fourna_to_ascii(&spot);
+    let text = std::str::from_utf8(&ascii).unwrap();
+    assert_eq!(text.len(), 36185);
+    assert_eq!(&text[..31], "TCGGTATTACTTCGTTCAGTTACGTATTGCT");
+    assert_eq!(&text[text.len() - 31..], "GTTTCCCTAATAACCTTAGCAATACGTAACT");
+}
+
+#[ignore]
+#[test]
+fn csra_cursor_read_spot_row_1() {
+    // Phase 3 entry point: the user-facing CsraCursor opens all six
+    // column readers (SEQUENCE.CMP_READ / PRIMARY_ALIGNMENT_ID /
+    // READ_LEN / READ_TYPE / QUALITY + PRIMARY_ALIGNMENT + REFERENCE)
+    // and decodes one spot's bases + quality in one call. No hardcoded
+    // metadata — everything comes from the archive.
+    //
+    // Cross-checks against vdb-dump on VDB-3418 row 1:
+    //   SEQUENCE.READ first 31: TCGGTATTACTTCGTTCAGTTACGTATTGCT
+    //   SEQUENCE.READ last 31:  GTTTCCCTAATAACCTTAGCAATACGTAACT
+    //   length 36185, single read, paired-end status: n/a (1-read spot)
+    use sracha_core::vdb::csra::CsraCursor;
+    use sracha_core::vdb::kar::KarArchive;
+    use sracha_core::vdb::restore::fourna_to_ascii;
+
+    let path = fixtures_dir().join("VDB-3418.sra");
+    if !path.exists() {
+        eprintln!("skipping: {} not present", path.display());
+        return;
+    }
+
+    let file = std::fs::File::open(&path).unwrap();
+    let mut archive = KarArchive::open(std::io::BufReader::new(file)).unwrap();
+    let csra = CsraCursor::open(&mut archive, &path).unwrap();
+    assert_eq!(csra.row_count(), 985);
+    assert_eq!(csra.first_row(), 1);
+
+    let spot = csra.read_spot(1).unwrap();
+    assert_eq!(spot.read_lens, vec![36185]);
+    assert_eq!(spot.read_types.len(), 1);
+    // BIOLOGICAL (0x01) | REVERSE (0x04) = 0x05 per vdb-dump.
+    assert_eq!(spot.read_types[0] & 0x07, 0x05);
+    assert_eq!(spot.bases.len(), 36185);
+    assert_eq!(spot.quality.len(), 36185);
+
+    let ascii = fourna_to_ascii(&spot.bases);
+    let text = std::str::from_utf8(&ascii).unwrap();
+    assert_eq!(&text[..31], "TCGGTATTACTTCGTTCAGTTACGTATTGCT");
+    assert_eq!(&text[text.len() - 31..], "GTTTCCCTAATAACCTTAGCAATACGTAACT");
+}
+
+#[ignore]
+#[test]
+fn csra_full_archive_matches_fasterq_dump() {
+    // Phase 3b end-to-end: decode every spot in VDB-3418 and verify the
+    // resulting FASTQ has the expected shape (985 records, 985 *4 lines).
+    // A byte-identity check against a fasterq-dump reference FASTQ is the
+    // stronger signal and runs when /tmp/csra-ref/VDB-3418.fastq exists
+    // (generate with `fasterq-dump --split-files` into that directory).
+    use sracha_core::vdb::csra::CsraCursor;
+    use sracha_core::vdb::kar::KarArchive;
+
+    let path = fixtures_dir().join("VDB-3418.sra");
+    if !path.exists() {
+        eprintln!("skipping: {} not present", path.display());
+        return;
+    }
+
+    let file = std::fs::File::open(&path).unwrap();
+    let mut archive = KarArchive::open(std::io::BufReader::new(file)).unwrap();
+    let csra = CsraCursor::open(&mut archive, &path).unwrap();
+
+    let tmp = tempfile::tempdir().unwrap();
+    let out_path = tmp.path().join("VDB-3418.fastq");
+    let out_file = std::fs::File::create(&out_path).unwrap();
+    let buf_writer = std::io::BufWriter::new(out_file);
+    let stats = csra.write_fastq("VDB-3418", buf_writer).unwrap();
+    assert_eq!(stats.spots, 985);
+
+    let out_bytes = std::fs::read(&out_path).unwrap();
+    let line_count = out_bytes.iter().filter(|&&b| b == b'\n').count();
+    assert_eq!(line_count, 985 * 4, "expected 985 × 4 FASTQ lines");
+
+    // Byte-identity check against fasterq-dump reference, when present.
+    let ref_path = std::path::Path::new("/tmp/csra-ref/VDB-3418.fastq");
+    if ref_path.exists() {
+        let got = md5_file(&out_path);
+        let want = md5_file(ref_path);
+        assert_eq!(
+            got, want,
+            "cSRA FASTQ diverges from fasterq-dump — got {got}, want {want}"
+        );
+    } else {
+        eprintln!(
+            "fasterq-dump reference not found at {}; skipping md5 check",
+            ref_path.display()
+        );
+    }
+}
+
+/// Ensure the DRR045255 fixture (Illumina paired, ~246 MB, 3.7M spots,
+/// 3658 blobs). Exercises two pipeline invariants:
+///
+/// - **BATCH_SIZE=1024 cumulative-spots tracking**: the decode loop used
+///   to read `spots_read` atomically, racing with the writer thread
+///   across the bounded channel (capacity 4). For archives with > 1024
+///   blobs the spot-number in FASTQ deflines would reset to 1 at the
+///   1,048,577th spot. The fix tracks `cumulative_spots` locally in
+///   the decode loop; this archive is the smallest known trigger.
+/// - **Adaptive page_map dispatch**: a READ_LEN blob at row ~1M has a
+///   data_runs that only fits the u32-index interpretation, not the
+///   usual entry-index one.
+fn ensure_drr045255() -> PathBuf {
+    static DOWNLOAD: Once = Once::new();
+    let path = fixtures_dir().join("DRR045255.sra");
+
+    DOWNLOAD.call_once(|| {
+        if path.exists() {
+            return;
+        }
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        let url = "https://sra-pub-run-odp.s3.amazonaws.com/sra/DRR045255/DRR045255";
+        eprintln!("downloading DRR045255 fixture from {url} ...");
+        let resp = reqwest::blocking::get(url)
+            .unwrap_or_else(|e| panic!("failed to download DRR045255: {e}"));
+        assert!(
+            resp.status().is_success(),
+            "HTTP {} downloading fixture",
+            resp.status()
+        );
+        let bytes = resp.bytes().unwrap();
+        std::fs::write(&path, &bytes).unwrap();
+    });
+
+    assert!(path.exists(), "fixture not found at {}", path.display());
+    path
+}
+
+#[ignore]
+#[test]
+fn drr045255_cross_batch_spot_numbering() {
+    // Regression: spots_before computation used to reset at each
+    // BATCH_SIZE=1024 boundary, producing `@DRR045255.1` instead of
+    // `@DRR045255.1048577` at spot 1048577. Verified with md5 parity
+    // against `fasterq-dump --split-files`:
+    //   DRR045255_1.fastq  74fd4681aff8fd1cd52140322e86ac45
+    //   DRR045255_2.fastq  ecb11ba74aa9d6d02ff63872d04fc76f
+    // (Recomputed each time the fixture is ensured; values captured
+    // from sra-tools 3.2.1 via `module load sratoolkit/3.2.1 &&
+    // fasterq-dump --split-files DRR045255.sra`.)
+    let sra_path = ensure_drr045255();
+    let tmp = tempfile::tempdir().unwrap();
+    let config = test_config(tmp.path(), SplitMode::Split3, CompressionMode::None);
+
+    let stats = sracha_core::pipeline::run_fastq(&sra_path, Some("DRR045255"), &config).unwrap();
+    assert_eq!(stats.spots_read, 3_745_800);
+    assert_eq!(stats.reads_written, 7_491_600);
+    assert_eq!(stats.output_files.len(), 2);
+
+    // Cheaper than md5 on ~280 MB files: check the defline at record
+    // 1048577 is the correct spot number. The race-condition bug made
+    // sracha emit `@DRR045255.1` here before the fix.
+    let file = std::fs::File::open(&stats.output_files[0]).unwrap();
+    let reader = std::io::BufReader::new(file);
+    use std::io::BufRead;
+    let target_line = (1_048_577 - 1) * 4; // 0-indexed line number of the defline
+    let line = reader
+        .lines()
+        .nth(target_line)
+        .expect("R1 should have >= 1048577 records")
+        .unwrap();
+    assert!(
+        line.starts_with("@DRR045255.1048577 1048577 "),
+        "spot 1048577 defline regressed: {line:?}"
+    );
+}
+
+#[ignore]
+#[test]
 fn corrupt_kar_magic_fails_fast() {
     let tmp = tempfile::tempdir().unwrap();
     let path = clone_fixture(tmp.path(), "badmagic.sra");

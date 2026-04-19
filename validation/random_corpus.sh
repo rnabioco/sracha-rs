@@ -28,6 +28,11 @@ ACCESSIONS_FILE=""
 PLATFORM="ILLUMINA"
 TIMEOUT_MIN=15
 SPLIT="split-3"
+# --aligned: sample from WGS-only to target reference-compressed cSRA
+# archives (see validation/sample_accessions.sh). The sracha vs
+# fasterq-dump comparison itself is cSRA-aware — sracha's pipeline
+# dispatches decodable cSRA through CsraCursor automatically.
+ALIGNED=0
 KEEP_INTERMEDIATES=0
 RESUME_DIR=""
 WORK_DIR=""
@@ -48,6 +53,7 @@ while [[ $# -gt 0 ]]; do
         -s|--seed)            SEED="$2"; shift 2 ;;
         -a|--accessions)      ACCESSIONS_FILE="$2"; shift 2 ;;
         -p|--platform)        PLATFORM="$2"; shift 2 ;;
+        --aligned)            ALIGNED=1; shift ;;
         --timeout)            TIMEOUT_MIN="$2"; shift 2 ;;
         --split)              SPLIT="$2"; shift 2 ;;
         --keep-intermediates) KEEP_INTERMEDIATES=1; shift ;;
@@ -120,6 +126,7 @@ if [[ "$SUMMARY_ONLY" -eq 0 && ! -f "$ACC_LIST" ]]; then
     else
         SAMPLER_ARGS=(-n "$N" -p "$PLATFORM")
         [[ -n "$SEED" ]] && SAMPLER_ARGS+=(-s "$SEED")
+        [[ "$ALIGNED" == "1" ]] && SAMPLER_ARGS+=(--aligned)
         bash "$SAMPLE_SH" "${SAMPLER_ARGS[@]}" > "$ACC_LIST" 2> "$META_FILE"
         grep -oP '(?<=seed=)\S+' "$META_FILE" | head -1 > "$SEED_FILE" 2>/dev/null || true
     fi
