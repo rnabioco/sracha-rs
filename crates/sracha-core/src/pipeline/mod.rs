@@ -164,6 +164,46 @@ impl OutputWriter {
     }
 }
 
+/// Build the output writer for a given (accession, slot), returning the
+/// writer along with the final and in-flight (`*.partial`) paths. Extracted
+/// from `decode_and_write` so the writer thread body is readable at a
+/// glance; behavior is unchanged. Callers are responsible for recording
+/// `(final_path, tmp_path)` so the post-decode rename logic can promote
+/// partial files into place.
+fn create_output_writer_for_slot(
+    accession: &str,
+    slot: OutputSlot,
+    config: &PipelineConfig,
+    compress_pool: &Option<Arc<rayon::ThreadPool>>,
+) -> (OutputWriter, PathBuf, PathBuf) {
+    let filename = output_filename(accession, slot, config.fasta, &config.compression);
+    let final_path = config.output_dir.join(&filename);
+    let tmp_path = config.output_dir.join(format!("{filename}.partial"));
+
+    let file = std::fs::File::create(&tmp_path).expect("failed to create output file");
+    let buf = std::io::BufWriter::with_capacity(256 * 1024, file);
+
+    let writer = match config.compression {
+        CompressionMode::Gzip { level } => OutputWriter::Gz(ParGzWriter::new(
+            buf,
+            level,
+            DEFAULT_BLOCK_SIZE,
+            compress_pool.clone().expect("gzip pool must exist"),
+        )),
+        CompressionMode::Zstd { level, threads } => {
+            let mut encoder = zstd::stream::write::Encoder::new(buf, level)
+                .expect("failed to create zstd encoder");
+            encoder
+                .multithread(threads)
+                .expect("failed to set zstd threads");
+            OutputWriter::Zstd(encoder)
+        }
+        CompressionMode::None => OutputWriter::Plain(buf),
+    };
+
+    (writer, final_path, tmp_path)
+}
+
 // ---------------------------------------------------------------------------
 // Mirror selection
 // ---------------------------------------------------------------------------
@@ -546,41 +586,14 @@ fn decode_and_write(
                             sw
                         } else {
                             writers.entry(slot_out.slot).or_insert_with(|| {
-                                let filename = output_filename(
+                                let (writer, final_path, tmp_path) = create_output_writer_for_slot(
                                     accession,
                                     slot_out.slot,
-                                    config.fasta,
-                                    &config.compression,
+                                    config,
+                                    &compress_pool,
                                 );
-                                let final_path = config.output_dir.join(&filename);
-                                let tmp_path =
-                                    config.output_dir.join(format!("{filename}.partial"));
-                                output_paths.push((final_path, tmp_path.clone()));
-
-                                let file = std::fs::File::create(&tmp_path)
-                                    .expect("failed to create output file");
-                                let buf = std::io::BufWriter::with_capacity(256 * 1024, file);
-
-                                match config.compression {
-                                    CompressionMode::Gzip { level } => {
-                                        OutputWriter::Gz(ParGzWriter::new(
-                                            buf,
-                                            level,
-                                            DEFAULT_BLOCK_SIZE,
-                                            compress_pool.clone().expect("gzip pool must exist"),
-                                        ))
-                                    }
-                                    CompressionMode::Zstd { level, threads } => {
-                                        let mut encoder =
-                                            zstd::stream::write::Encoder::new(buf, level)
-                                                .expect("failed to create zstd encoder");
-                                        encoder
-                                            .multithread(threads)
-                                            .expect("failed to set zstd threads");
-                                        OutputWriter::Zstd(encoder)
-                                    }
-                                    CompressionMode::None => OutputWriter::Plain(buf),
-                                }
+                                output_paths.push((final_path, tmp_path));
+                                writer
                             })
                         };
 
