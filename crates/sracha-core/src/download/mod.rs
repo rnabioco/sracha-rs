@@ -3,7 +3,7 @@ use std::path::{Path, PathBuf};
 
 use md5::{Digest, Md5};
 use serde::{Deserialize, Serialize};
-use tokio::io::{AsyncSeekExt, AsyncWriteExt};
+use tokio::io::AsyncWriteExt;
 use tokio::sync::Semaphore;
 
 use crate::error::{Error, Result};
@@ -154,8 +154,10 @@ async fn download_chunk(
 
     for attempt in 0..MAX_RETRIES {
         if attempt > 0 {
-            // Exponential backoff: 1s, 2s, 4s
-            let delay = std::time::Duration::from_secs(1 << attempt);
+            // Short first retry (a read-timeout stall is usually a dead TCP
+            // connection; a fresh one wins fast), then back off in case the
+            // real problem is server-side rate limiting.
+            let delay = std::time::Duration::from_millis(250u64 << (attempt - 1));
             tracing::warn!(
                 "Retrying chunk {}-{} (attempt {}/{}), backoff {:?}",
                 chunk.start,
@@ -188,6 +190,15 @@ async fn download_chunk(
 }
 
 /// Single attempt to download a chunk.
+///
+/// Streams hyper's response pieces through a bounded mpsc into a
+/// single `spawn_blocking` writer that uses `pwrite` (one atomic
+/// positioned write per piece) on a synchronous `std::fs::File`. This
+/// pays one `spawn_blocking` per chunk instead of one per 16 KiB
+/// piece, which matters at ~70 MiB/s throughput where the piece-level
+/// write loop was a measurable bottleneck. The channel is bounded at
+/// 4 pieces so backpressure throttles hyper when the disk writer
+/// falls behind.
 async fn try_download_chunk(
     client: &reqwest::Client,
     url: &str,
@@ -196,13 +207,13 @@ async fn try_download_chunk(
     progress: Option<&indicatif::ProgressBar>,
 ) -> Result<()> {
     let range_header = format!("bytes={}-{}", chunk.start, chunk.end);
-    let resp = client
+    let mut response = client
         .get(url)
         .header(reqwest::header::RANGE, &range_header)
         .send()
         .await?;
 
-    let status = resp.status();
+    let status = response.status();
     if !status.is_success() && status != reqwest::StatusCode::PARTIAL_CONTENT {
         return Err(Error::Download {
             accession: String::new(),
@@ -210,24 +221,55 @@ async fn try_download_chunk(
         });
     }
 
-    // Open the file for writing at the correct offset (pwrite-style).
-    let mut file = tokio::fs::OpenOptions::new()
-        .write(true)
-        .open(output_path)
-        .await?;
-    file.seek(std::io::SeekFrom::Start(chunk.start)).await?;
+    let (tx, mut rx) = tokio::sync::mpsc::channel::<bytes::Bytes>(4);
 
-    // Stream the response body in pieces.
-    let mut bytes_written = 0u64;
-    // Use reqwest's chunk() API which doesn't require futures::StreamExt.
-    let mut response = resp;
+    let writer_path = output_path.to_path_buf();
+    let writer_start = chunk.start;
+    let writer = tokio::task::spawn_blocking(move || -> std::io::Result<u64> {
+        use std::os::unix::fs::FileExt;
+        let file = std::fs::OpenOptions::new().write(true).open(&writer_path)?;
+        let mut offset = writer_start;
+        let mut total = 0u64;
+        while let Some(piece) = rx.blocking_recv() {
+            file.write_all_at(&piece, offset)?;
+            let n = piece.len() as u64;
+            offset += n;
+            total += n;
+        }
+        Ok(total)
+    });
+
+    // Feed the writer. Abort if it returned early (disk error) — dropping
+    // `tx` closes the channel so the writer's `blocking_recv` returns None.
+    let mut feed_error: Option<Error> = None;
     while let Some(piece) = response.chunk().await? {
-        file.write_all(&piece).await?;
         let n = piece.len() as u64;
-        bytes_written += n;
+        if tx.send(piece).await.is_err() {
+            feed_error = Some(Error::Download {
+                accession: String::new(),
+                message: format!(
+                    "chunk {}-{}: writer task exited while receiving data",
+                    chunk.start, chunk.end,
+                ),
+            });
+            break;
+        }
         if let Some(pb) = progress {
             pb.inc(n);
         }
+    }
+    drop(tx);
+
+    let bytes_written = writer
+        .await
+        .map_err(|e| Error::Download {
+            accession: String::new(),
+            message: format!("writer task panicked: {e}"),
+        })?
+        .map_err(Error::Io)?;
+
+    if let Some(err) = feed_error {
+        return Err(err);
     }
 
     if bytes_written != chunk.len() {
