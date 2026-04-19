@@ -1,6 +1,6 @@
 [workspace]
 name = "sracha-rs"
-version = "0.3.0"
+version = "0.3.1"
 description = "Fast SRA downloader and FASTQ converter"
 channels = ["conda-forge", "bioconda"]
 platforms = ["linux-64", "osx-arm64"]

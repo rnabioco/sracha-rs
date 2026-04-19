@@ -1,5 +1,33 @@
 # Changelog
 
+## 0.3.1 (2026-04-19)
+
+### Performance
+
+- **pwrite download writer + read_timeout**: per-chunk writer now sends
+  hyper pieces over a bounded `mpsc` to a single `spawn_blocking` task
+  doing positional `write_all_at` on a sync `std::fs::File`, avoiding
+  tens of thousands of blocking-pool round-trips per download. Added a
+  15 s `read_timeout` and 10 s `connect_timeout` to the reqwest client
+  so a single stalled TCP connection no longer sets the floor for the
+  whole parallel download; retry backoff tightened from 2 s/4 s to
+  250 ms/500 ms. Post-fix on compute18: baseline 10.2 s for 288 MiB,
+  slow runs capped at ~15 s (previously unbounded).
+
+### Benchmarks / docs
+
+- **End-to-end benchmark stage**: new `e2e` sbatch array index times
+  the full accession → FASTQ workflow (`sracha get` vs `prefetch +
+  fasterq-dump` vs `prefetch + fastq-dump`) on SRR28588231 and
+  SRR2584863.
+- **`pixi run install-sratools`**: pins the reference toolkit
+  (default sra-tools 3.4.1) into `validation/sra-tools/`;
+  `benchmark.sh` auto-discovers the newest installed version.
+- **README refreshed against sra-tools 3.4.1** on the head node (stable
+  S3): 11.6× / 4.5× / 4.4× local decode; `sracha get` 2.9× faster than
+  `prefetch + fasterq-dump` on the small accession and 1.55× on the
+  288 MiB medium.
+
 ## 0.3.0 (2026-04-19)
 
 ### Added
