@@ -4,7 +4,7 @@
 //! the fixture) and a ~23 MiB file on disk. Run with:
 //!
 //! ```bash
-//! cargo test -p sracha-core -- --ignored vdb_inspect
+//! cargo test -p sracha-vdb -- --ignored
 //! ```
 
 use std::fs::File;
@@ -12,9 +12,9 @@ use std::io::BufReader;
 use std::path::PathBuf;
 use std::sync::Once;
 
-use sracha_core::vdb::inspect::{self, VdbKind};
-use sracha_core::vdb::kar::KarArchive;
-use sracha_core::vdb::metadata;
+use sracha_vdb::inspect::{self, VdbKind};
+use sracha_vdb::kar::KarArchive;
+use sracha_vdb::metadata;
 
 fn fixtures_dir() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures")

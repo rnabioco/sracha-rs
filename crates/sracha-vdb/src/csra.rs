@@ -10,14 +10,14 @@
 use std::io::{Read, Seek};
 use std::path::Path;
 
+use crate::alignment::AlignmentCursor;
+use crate::blob::{self, DecodedBlob};
 use crate::error::{Error, Result};
-use crate::vdb::alignment::AlignmentCursor;
-use crate::vdb::blob::{self, DecodedBlob};
-use crate::vdb::inspect;
-use crate::vdb::kar::KarArchive;
-use crate::vdb::kdb::ColumnReader;
-use crate::vdb::reference::ReferenceCursor;
-use crate::vdb::restore::{align_restore_read, seq_restore_read};
+use crate::inspect;
+use crate::kar::KarArchive;
+use crate::kdb::ColumnReader;
+use crate::reference::ReferenceCursor;
+use crate::restore::{align_restore_read, seq_restore_read};
 
 /// Given a `.sra` path, return the canonical `.sra.vdbcache` sibling path
 /// (NCBI's default layout — `sracha fetch` saves the vdbcache with that
@@ -111,7 +111,7 @@ fn open_kar(path: &Path) -> Result<KarArchive<std::io::BufReader<std::fs::File>>
 /// actionable message beats the opaque "idx1 not found" that bubbles
 /// up from `ColumnReader::open`.
 fn external_refseq_error() -> Error {
-    Error::Vdb(
+    Error::Format(
         "cSRA: REFERENCE table has no embedded CMP_READ column — reference \
          bases are stored externally (fetched from NCBI refseq by SEQ_ID). \
          sracha does not yet implement external refseq fetch; decode this \
@@ -127,7 +127,7 @@ fn external_refseq_error() -> Error {
 /// requires physical READ_LEN; the static-metadata fallback is tracked
 /// as a follow-up.
 fn fixed_length_readlen_error() -> Error {
-    Error::Vdb(
+    Error::Format(
         "cSRA: SEQUENCE.READ_LEN is not a physical column — this archive \
          encodes a fixed spot layout in static metadata, which sracha does \
          not yet synthesize. Decode this archive with `fasterq-dump` for now."
@@ -205,7 +205,7 @@ impl CsraCursor {
         let col_base = inspect::column_base_path_public(main, Some("SEQUENCE"))?;
         let open_col = |archive: &mut KarArchive<R>, name: &str| -> Result<ColumnReader> {
             ColumnReader::open(archive, &format!("{col_base}/{name}"), main_path)
-                .map_err(|e| Error::Vdb(format!("SEQUENCE/{name}: {e}")))
+                .map_err(|e| Error::Format(format!("SEQUENCE/{name}: {e}")))
         };
         // Pre-flight: surface actionable errors for known-unsupported
         // shapes before we start opening columns. These checks are cheap
@@ -249,7 +249,7 @@ impl CsraCursor {
                 } else if archive_has_table(cache, "PRIMARY_ALIGNMENT") {
                     AlignmentCursor::open(cache, cache_path)?
                 } else {
-                    return Err(Error::Vdb(
+                    return Err(Error::Format(
                         "cSRA: PRIMARY_ALIGNMENT table not found in main archive or vdbcache"
                             .into(),
                     ));
@@ -265,7 +265,7 @@ impl CsraCursor {
                     }
                     ReferenceCursor::open(cache, cache_path)?
                 } else {
-                    return Err(Error::Vdb(
+                    return Err(Error::Format(
                         "cSRA: REFERENCE table not found in main archive or vdbcache".into(),
                     ));
                 };
@@ -308,11 +308,12 @@ impl CsraCursor {
         output_dir: &Path,
     ) -> Result<(std::path::PathBuf, FastqStats)> {
         std::fs::create_dir_all(output_dir).map_err(|e| {
-            Error::Vdb(format!("cSRA output: create {}: {e}", output_dir.display()))
+            Error::Format(format!("cSRA output: create {}: {e}", output_dir.display()))
         })?;
         let out_path = output_dir.join(format!("{accession}.fastq"));
-        let out_file = std::fs::File::create(&out_path)
-            .map_err(|e| Error::Vdb(format!("cSRA output: create {}: {e}", out_path.display())))?;
+        let out_file = std::fs::File::create(&out_path).map_err(|e| {
+            Error::Format(format!("cSRA output: create {}: {e}", out_path.display()))
+        })?;
         let buf_writer = std::io::BufWriter::new(out_file);
         let stats = self.write_fastq(accession, buf_writer)?;
         Ok((out_path, stats))
@@ -338,7 +339,7 @@ impl CsraCursor {
         accession: &str,
         mut writer: W,
     ) -> Result<FastqStats> {
-        use crate::vdb::restore::fourna_to_ascii;
+        use crate::restore::fourna_to_ascii;
         let mut spots = 0u64;
         for row_id in self.first_row..(self.first_row + self.row_count as i64) {
             let spot = self.read_spot(row_id)?;
@@ -347,21 +348,21 @@ impl CsraCursor {
             let qual: Vec<u8> = spot.quality.iter().map(|q| q.wrapping_add(33)).collect();
 
             writeln!(writer, "@{accession}.{row_id} {row_id} length={total}")
-                .map_err(|e| Error::Vdb(format!("fastq write: {e}")))?;
+                .map_err(|e| Error::Format(format!("fastq write: {e}")))?;
             writer
                 .write_all(&ascii)
-                .map_err(|e| Error::Vdb(format!("fastq write: {e}")))?;
+                .map_err(|e| Error::Format(format!("fastq write: {e}")))?;
             writer
                 .write_all(b"\n")
-                .map_err(|e| Error::Vdb(format!("fastq write: {e}")))?;
+                .map_err(|e| Error::Format(format!("fastq write: {e}")))?;
             writeln!(writer, "+{accession}.{row_id} {row_id} length={total}")
-                .map_err(|e| Error::Vdb(format!("fastq write: {e}")))?;
+                .map_err(|e| Error::Format(format!("fastq write: {e}")))?;
             writer
                 .write_all(&qual)
-                .map_err(|e| Error::Vdb(format!("fastq write: {e}")))?;
+                .map_err(|e| Error::Format(format!("fastq write: {e}")))?;
             writer
                 .write_all(b"\n")
-                .map_err(|e| Error::Vdb(format!("fastq write: {e}")))?;
+                .map_err(|e| Error::Format(format!("fastq write: {e}")))?;
             spots += 1;
         }
         Ok(FastqStats { spots })
@@ -376,7 +377,7 @@ impl CsraCursor {
         let quality = read_byte_row(&self.quality, row_id)?;
 
         if read_lens.len() != align_ids.len() || read_types.len() != align_ids.len() {
-            return Err(Error::Vdb(format!(
+            return Err(Error::Format(format!(
                 "csra row {row_id}: inconsistent per-read array lengths \
                  (align_ids={}, read_lens={}, read_types={})",
                 align_ids.len(),
@@ -434,7 +435,7 @@ fn read_u32_row(col: &ColumnReader, row_id: i64) -> Result<Vec<u32>> {
     let len_elems = record_lens[rec_idx] as usize;
     let end = start + len_elems * 4;
     if end > bytes.len() {
-        return Err(Error::Vdb(format!(
+        return Err(Error::Format(format!(
             "u32 row {row_id}: slice [{start}..{end}] past payload {}",
             bytes.len()
         )));
@@ -457,7 +458,7 @@ fn read_i64_row(col: &ColumnReader, row_id: i64) -> Result<Vec<i64>> {
     let len_elems = record_lens[rec_idx] as usize;
     let end = start + len_elems * 8;
     if end > bytes.len() {
-        return Err(Error::Vdb(format!(
+        return Err(Error::Format(format!(
             "i64 row {row_id}: slice [{start}..{end}] past payload {}",
             bytes.len()
         )));
@@ -476,7 +477,7 @@ fn read_byte_row(col: &ColumnReader, row_id: i64) -> Result<Vec<u8>> {
     let len = record_lens[rec_idx] as usize;
     let end = start + len;
     if end > bytes.len() {
-        return Err(Error::Vdb(format!(
+        return Err(Error::Format(format!(
             "byte row {row_id}: slice [{start}..{end}] past payload {}",
             bytes.len()
         )));
@@ -490,13 +491,13 @@ fn read_byte_row(col: &ColumnReader, row_id: i64) -> Result<Vec<u8>> {
 fn read_2na_row(col: &ColumnReader, row_id: i64) -> Result<Vec<u8>> {
     let blob = col
         .find_blob(row_id)
-        .ok_or_else(|| Error::Vdb(format!("2na row: no blob for row {row_id}")))?;
+        .ok_or_else(|| Error::Format(format!("2na row: no blob for row {row_id}")))?;
     let raw = col.read_raw_blob_slice(row_id)?;
     let decoded = blob::decode_blob(raw, col.meta().checksum_type, u64::from(blob.id_range), 2)?;
     let pm = decoded
         .page_map
         .as_ref()
-        .ok_or_else(|| Error::Vdb("SEQUENCE.CMP_READ: page_map required".into()))?;
+        .ok_or_else(|| Error::Format("SEQUENCE.CMP_READ: page_map required".into()))?;
     let record_lens = pm.data_record_lengths();
     let row_offset = (row_id - blob.start_id) as usize;
     let rec_idx = resolve_record_idx(pm, row_offset, row_id)?;
@@ -517,7 +518,7 @@ fn read_2na_row(col: &ColumnReader, row_id: i64) -> Result<Vec<u8>> {
         let byte = bit_idx / 8;
         let shift = 6 - (bit_idx % 8);
         let b = decoded.data.get(byte).copied().ok_or_else(|| {
-            Error::Vdb(format!(
+            Error::Format(format!(
                 "SEQUENCE.CMP_READ row {row_id}: bit {bit_idx} past payload"
             ))
         })?;
@@ -540,13 +541,13 @@ fn read_variable_payload(
 ) -> Result<(Vec<u8>, blob::PageMap, usize)> {
     let blob = col
         .find_blob(row_id)
-        .ok_or_else(|| Error::Vdb(format!("no blob for row {row_id}")))?;
+        .ok_or_else(|| Error::Format(format!("no blob for row {row_id}")))?;
     let raw = col.read_raw_blob_slice(row_id)?;
     let decoded = blob::decode_blob(raw, col.meta().checksum_type, u64::from(blob.id_range), 8)?;
     let pm = decoded
         .page_map
         .clone()
-        .ok_or_else(|| Error::Vdb("variable column: page_map required".into()))?;
+        .ok_or_else(|| Error::Format("variable column: page_map required".into()))?;
     let bytes = match enc {
         VarEncoding::Zip => decode_bytes_payload(&decoded)?,
         VarEncoding::IrzipBits(bits) => decode_integer_bytes(&decoded, bits)?,
@@ -565,7 +566,7 @@ fn decode_bytes_payload(decoded: &DecodedBlob<'_>) -> Result<Vec<u8>> {
     {
         return Ok(out);
     }
-    Err(Error::Vdb(format!(
+    Err(Error::Format(format!(
         "byte column: no decoder succeeded (data.len={}, osize={osize})",
         decoded.data.len()
     )))
@@ -603,7 +604,7 @@ fn decode_integer_bytes(decoded: &DecodedBlob<'_>, elem_bits: u32) -> Result<Vec
     {
         return Ok(out);
     }
-    Err(Error::Vdb(format!(
+    Err(Error::Format(format!(
         "integer column: no decoder succeeded (elem_bits={elem_bits}, data.len={}, osize={osize})",
         decoded.data.len()
     )))
@@ -621,7 +622,7 @@ fn resolve_record_idx(pm: &blob::PageMap, logical_offset: usize, row_id: i64) ->
         }
         seen = end;
     }
-    Err(Error::Vdb(format!(
+    Err(Error::Format(format!(
         "row {row_id}: logical offset {logical_offset} outside data_runs"
     )))
 }

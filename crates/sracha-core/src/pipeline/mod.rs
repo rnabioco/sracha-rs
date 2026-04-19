@@ -178,17 +178,17 @@ pub fn is_unsupported_platform(platform: &str) -> bool {
     UNSUPPORTED_PLATFORMS.contains(&platform)
 }
 
-/// Map a raw `Error::BlobIntegrity` from `decode_blob` into the user-facing
-/// [`Error::IntegrityFailure`], attaching the accession and the shared
-/// [`crate::error::BLOB_INTEGRITY_GUIDANCE`] text. Passes other errors through
-/// unchanged.
+/// Map a raw `sracha_vdb::Error::BlobIntegrity` from `decode_blob` into the
+/// user-facing [`Error::IntegrityFailure`], attaching the accession and the
+/// shared [`crate::error::BLOB_INTEGRITY_GUIDANCE`] text. Passes other errors
+/// through unchanged.
 fn wrap_blob_integrity(accession: &str, err: Error) -> Error {
     match err {
-        Error::BlobIntegrity {
+        Error::Vdb(sracha_vdb::Error::BlobIntegrity {
             kind,
             stored,
             computed,
-        } => Error::IntegrityFailure {
+        }) => Error::IntegrityFailure {
             accession: accession.to_string(),
             summary: format!(
                 "per-blob {kind} mismatch during decode (stored={stored}, computed={computed}). {}",
@@ -263,13 +263,13 @@ fn validate_blob_ranges(
             continue;
         }
         if blob.start_id < prev_end {
-            return Err(Error::Vdb(format!(
+            return Err(Error::Pipeline(format!(
                 "{accession}: blob {i} start_id {} overlaps previous end {prev_end}",
                 blob.start_id,
             )));
         }
         if blob.start_id > prev_end {
-            return Err(Error::Vdb(format!(
+            return Err(Error::Pipeline(format!(
                 "{accession}: blob {i} start_id {} leaves a gap from {prev_end}",
                 blob.start_id,
             )));
@@ -281,7 +281,7 @@ fn validate_blob_ranges(
     if let Some(expected) = expected_spots
         && covered != expected
     {
-        return Err(Error::Vdb(format!(
+        return Err(Error::Pipeline(format!(
             "{accession}: blob ranges cover {covered} rows, RunInfo expects {expected}",
         )));
     }
@@ -359,7 +359,7 @@ fn decode_and_write(
     let pool = rayon::ThreadPoolBuilder::new()
         .num_threads(num_threads)
         .build()
-        .map_err(|e| Error::Vdb(format!("failed to build rayon thread pool: {e}")))?;
+        .map_err(|e| Error::Pipeline(format!("failed to build rayon thread pool: {e}")))?;
 
     // Dedicated thread pool for parallel gzip compression (only needed for gzip).
     let compress_pool: Option<Arc<rayon::ThreadPool>> =
@@ -371,7 +371,9 @@ fn decode_and_write(
                     .num_threads(compress_threads)
                     .thread_name(|i| format!("pargz-{i}"))
                     .build()
-                    .map_err(|e| Error::Vdb(format!("failed to build gzip thread pool: {e}")))?,
+                    .map_err(|e| {
+                        Error::Pipeline(format!("failed to build gzip thread pool: {e}"))
+                    })?,
             ))
         } else {
             None
@@ -1131,7 +1133,7 @@ fn run_fastq_csra(
                 rayon::ThreadPoolBuilder::new()
                     .num_threads(n)
                     .build()
-                    .map_err(|e| Error::Vdb(format!("gzip threadpool: {e}")))?,
+                    .map_err(|e| Error::Pipeline(format!("gzip threadpool: {e}")))?,
             ))
         }
         _ => None,
@@ -1257,10 +1259,10 @@ fn run_fastq_csra(
             )),
             CompressionMode::Zstd { level, threads } => {
                 let mut encoder = zstd::stream::write::Encoder::new(buf, level)
-                    .map_err(|e| Error::Vdb(format!("zstd encoder: {e}")))?;
+                    .map_err(|e| Error::Pipeline(format!("zstd encoder: {e}")))?;
                 encoder
                     .multithread(threads)
-                    .map_err(|e| Error::Vdb(format!("zstd threads: {e}")))?;
+                    .map_err(|e| Error::Pipeline(format!("zstd threads: {e}")))?;
                 OutputWriter::Zstd(encoder)
             }
             CompressionMode::None => OutputWriter::Plain(buf),
@@ -1274,7 +1276,7 @@ fn run_fastq_csra(
         let pool = rayon::ThreadPoolBuilder::new()
             .num_threads(num_threads)
             .build()
-            .map_err(|e| Error::Vdb(format!("cSRA threadpool: {e}")))?;
+            .map_err(|e| Error::Pipeline(format!("cSRA threadpool: {e}")))?;
         let results: Vec<Result<Vec<SlotChunk>>> = pool.install(|| {
             chunks
                 .par_iter()

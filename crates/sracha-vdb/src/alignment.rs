@@ -7,11 +7,11 @@
 use std::io::{Read, Seek};
 use std::path::Path;
 
+use crate::blob::{self, DecodedBlob};
 use crate::error::{Error, Result};
-use crate::vdb::blob::{self, DecodedBlob};
-use crate::vdb::inspect;
-use crate::vdb::kar::KarArchive;
-use crate::vdb::kdb::ColumnReader;
+use crate::inspect;
+use crate::kar::KarArchive;
+use crate::kdb::ColumnReader;
 
 /// All per-row fields sracha needs to reconstruct an aligned read.
 ///
@@ -66,7 +66,7 @@ impl AlignmentCursor {
         let col_base = inspect::column_base_path_public(archive, Some("PRIMARY_ALIGNMENT"))?;
         let open = |archive: &mut KarArchive<R>, name: &str| -> Result<ColumnReader> {
             ColumnReader::open(archive, &format!("{col_base}/{name}"), sra_path)
-                .map_err(|e| Error::Vdb(format!("PRIMARY_ALIGNMENT/{name}: {e}")))
+                .map_err(|e| Error::Format(format!("PRIMARY_ALIGNMENT/{name}: {e}")))
         };
         let global_ref_start = open(archive, "GLOBAL_REF_START")?;
         let ref_len = open(archive, "REF_LEN")?;
@@ -185,13 +185,13 @@ fn read_variable_payload(
 ) -> Result<(Vec<u8>, blob::PageMap, usize)> {
     let blob = col
         .find_blob(row_id)
-        .ok_or_else(|| Error::Vdb(format!("no blob for row {row_id}")))?;
+        .ok_or_else(|| Error::Format(format!("no blob for row {row_id}")))?;
     let raw = col.read_raw_blob_slice(row_id)?;
     let decoded = blob::decode_blob(raw, col.meta().checksum_type, u64::from(blob.id_range), 8)?;
     let pm = decoded
         .page_map
         .clone()
-        .ok_or_else(|| Error::Vdb("variable column: page_map required".into()))?;
+        .ok_or_else(|| Error::Format("variable column: page_map required".into()))?;
     let bytes = match enc {
         VarEncoding::Zip => decode_bytes_payload(&decoded)?,
         VarEncoding::IrzipAtBitWidth(bits) => decode_integer_bytes(&decoded, bits)?,
@@ -223,10 +223,9 @@ fn read_bool_row_as_bytes(col: &ColumnReader, row_id: i64) -> Result<Vec<u8>> {
         let bit_idx = start_bits as usize + i;
         let byte = bit_idx / 8;
         let bit = 7 - (bit_idx % 8);
-        let b = bytes
-            .get(byte)
-            .copied()
-            .ok_or_else(|| Error::Vdb(format!("bool row {row_id}: bit {bit_idx} past payload")))?;
+        let b = bytes.get(byte).copied().ok_or_else(|| {
+            Error::Format(format!("bool row {row_id}: bit {bit_idx} past payload"))
+        })?;
         out.push((b >> bit) & 1);
     }
     Ok(out)
@@ -243,7 +242,7 @@ fn read_byte_row(col: &ColumnReader, row_id: i64) -> Result<Vec<u8>> {
     let len = record_lens[rec_idx] as usize;
     let end = start + len;
     if end > bytes.len() {
-        return Err(Error::Vdb(format!(
+        return Err(Error::Format(format!(
             "byte row {row_id}: slice [{start}..{end}] past payload {}",
             bytes.len()
         )));
@@ -267,7 +266,7 @@ fn read_i32_row(col: &ColumnReader, row_id: i64) -> Result<Vec<i32>> {
     let len_elems = record_lens[rec_idx] as usize;
     let end = start + len_elems * 4;
     if end > bytes.len() {
-        return Err(Error::Vdb(format!(
+        return Err(Error::Format(format!(
             "i32 row {row_id}: slice [{start}..{end}] past payload {}",
             bytes.len()
         )));
@@ -291,7 +290,7 @@ fn resolve_record_idx(pm: &blob::PageMap, logical_offset: usize, row_id: i64) ->
         }
         seen = end;
     }
-    Err(Error::Vdb(format!(
+    Err(Error::Format(format!(
         "row {row_id}: logical offset {logical_offset} outside data_runs"
     )))
 }
@@ -309,7 +308,7 @@ fn decode_bytes_payload(decoded: &DecodedBlob<'_>) -> Result<Vec<u8>> {
     {
         return Ok(out);
     }
-    Err(Error::Vdb(format!(
+    Err(Error::Format(format!(
         "byte column: no decoder succeeded (data.len={}, osize={osize})",
         decoded.data.len()
     )))
@@ -325,7 +324,7 @@ fn decode_bytes_payload(decoded: &DecodedBlob<'_>) -> Result<Vec<u8>> {
 fn read_scalar_int(col: &ColumnReader, row_id: i64, elem_bits: u32) -> Result<i64> {
     let blob = col
         .find_blob(row_id)
-        .ok_or_else(|| Error::Vdb(format!("scalar int: no blob for row {row_id}")))?;
+        .ok_or_else(|| Error::Format(format!("scalar int: no blob for row {row_id}")))?;
     let raw = col.read_raw_blob_slice(row_id)?;
     let decoded = blob::decode_blob(
         raw,
@@ -341,7 +340,7 @@ fn read_scalar_int(col: &ColumnReader, row_id: i64, elem_bits: u32) -> Result<i6
     {
         if pm.data_runs.len() as u64 >= pm.total_rows() {
             *pm.data_runs.get(logical_offset).ok_or_else(|| {
-                Error::Vdb(format!(
+                Error::Format(format!(
                     "scalar row {row_id}: data_runs[{logical_offset}] missing"
                 ))
             })? as usize
@@ -357,7 +356,7 @@ fn read_scalar_int(col: &ColumnReader, row_id: i64, elem_bits: u32) -> Result<i6
                 seen = end;
             }
             chosen.ok_or_else(|| {
-                Error::Vdb(format!(
+                Error::Format(format!(
                     "scalar row {row_id}: logical offset {logical_offset} outside data_runs"
                 ))
             })?
@@ -369,7 +368,7 @@ fn read_scalar_int(col: &ColumnReader, row_id: i64, elem_bits: u32) -> Result<i6
     let bytes_per = (elem_bits / 8) as usize;
     let byte_off = data_idx * bytes_per;
     if byte_off + bytes_per > bytes.len() {
-        return Err(Error::Vdb(format!(
+        return Err(Error::Format(format!(
             "scalar row {row_id}: byte offset {byte_off} past decoded {}",
             bytes.len()
         )));
@@ -391,7 +390,7 @@ fn read_scalar_int(col: &ColumnReader, row_id: i64, elem_bits: u32) -> Result<i6
             bytes[byte_off + 6],
             bytes[byte_off + 7],
         ]),
-        _ => return Err(Error::Vdb(format!("unsupported elem_bits {elem_bits}"))),
+        _ => return Err(Error::Format(format!("unsupported elem_bits {elem_bits}"))),
     };
     Ok(val)
 }
@@ -450,7 +449,7 @@ fn decode_integer_bytes(decoded: &DecodedBlob<'_>, elem_bits: u32) -> Result<Vec
         return blob::izip_decode(&decoded.data, elem_bits, num_elems);
     }
 
-    Err(Error::Vdb(format!(
+    Err(Error::Format(format!(
         "alignment column: no decoder succeeded (elem_bits={elem_bits}, data.len={}, osize={osize})",
         decoded.data.len()
     )))

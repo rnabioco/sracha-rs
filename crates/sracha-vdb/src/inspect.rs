@@ -8,11 +8,11 @@
 use std::io::{Read, Seek};
 use std::path::Path;
 
+use crate::blob::decode_blob;
 use crate::error::{Error, Result};
-use crate::vdb::blob::decode_blob;
-use crate::vdb::kar::{KarArchive, KarEntry};
-use crate::vdb::kdb::ColumnReader;
-use crate::vdb::metadata::{self, MetaNode, SoftwareEvent};
+use crate::kar::{KarArchive, KarEntry};
+use crate::kdb::ColumnReader;
+use crate::metadata::{self, MetaNode, SoftwareEvent};
 
 /// Whether a VDB archive is a Database (has `tbl/` subdirectories) or a
 /// flat Table (has `col/` at the root).
@@ -38,7 +38,7 @@ pub fn detect_kind<R: Read + Seek>(archive: &KarArchive<R>) -> Result<VdbKind> {
     } else if has_dir(archive, "col") {
         Ok(VdbKind::Table)
     } else {
-        Err(Error::Vdb(
+        Err(Error::Format(
             "not a VDB archive: no tbl/ or col/ directory found at root".into(),
         ))
     }
@@ -110,15 +110,15 @@ fn column_base_path<R: Read + Seek>(
             let table_name = match table {
                 Some(t) => t.to_string(),
                 None => default_table(archive)?
-                    .ok_or_else(|| Error::Vdb("database has no tables".into()))?,
+                    .ok_or_else(|| Error::Format("database has no tables".into()))?,
             };
             let tbl_path = format!("tbl/{table_name}");
             if !has_dir(archive, &tbl_path) {
-                return Err(Error::Vdb(format!("table not found: {table_name}")));
+                return Err(Error::Format(format!("table not found: {table_name}")));
             }
             let col_path = format!("{tbl_path}/col");
             if !has_dir(archive, &col_path) {
-                return Err(Error::Vdb(format!(
+                return Err(Error::Format(format!(
                     "table {table_name} has no col/ directory"
                 )));
             }
@@ -126,7 +126,7 @@ fn column_base_path<R: Read + Seek>(
         }
         VdbKind::Table => {
             if table.is_some() {
-                return Err(Error::Vdb(
+                return Err(Error::Format(
                     "this archive is a flat table; --table cannot be specified".into(),
                 ));
             }
@@ -235,7 +235,7 @@ pub fn id_range<R: Read + Seek>(
         None => list_columns(archive, table)?
             .into_iter()
             .next()
-            .ok_or_else(|| Error::Vdb("no columns available to determine id range".into()))?,
+            .ok_or_else(|| Error::Format("no columns available to determine id range".into()))?,
     };
 
     let col_full = format!("{col_base}/{column_name}");
@@ -491,7 +491,7 @@ fn platform_from_nodes(nodes: &[MetaNode]) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::vdb::kar::test_helpers::{
+    use crate::kar::test_helpers::{
         build_dir_node, build_empty_file_node, build_file_node, build_kar_archive,
     };
     use std::io::Cursor;
@@ -666,8 +666,8 @@ mod tests {
     /// `ColumnReader::open` succeeds and the first-blob decoder populates
     /// `FirstBlobStats` fields.
     fn single_column_kar() -> (Vec<u8>, std::path::PathBuf) {
-        use crate::vdb::kar::test_helpers::{build_dir_node, build_file_node, build_kar_archive};
-        use crate::vdb::kdb::test_helpers::{build_blob_loc, build_idx1_v1};
+        use crate::kar::test_helpers::{build_dir_node, build_file_node, build_kar_archive};
+        use crate::kdb::test_helpers::{build_blob_loc, build_idx1_v1};
         let col_data = b"ACGTN";
         let idx1 = build_idx1_v1(col_data.len() as u64, 1, 0);
         let idx0 = build_blob_loc(0, col_data.len() as u32, 1, 1);

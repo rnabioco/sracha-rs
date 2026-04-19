@@ -90,7 +90,7 @@ pub(crate) fn ncbi_crc32(data: &[u8]) -> u32 {
 /// Returns `(value, bytes_consumed)`.
 pub fn vlen_decode_u64(data: &[u8]) -> Result<(u64, usize)> {
     if data.is_empty() {
-        return Err(Error::Vdb("vlen_decode_u64: empty input".into()));
+        return Err(Error::Format("vlen_decode_u64: empty input".into()));
     }
 
     let limit = data.len().min(10);
@@ -99,7 +99,7 @@ pub fn vlen_decode_u64(data: &[u8]) -> Result<(u64, usize)> {
 
     loop {
         if i >= limit {
-            return Err(Error::Vdb(
+            return Err(Error::Format(
                 "vlen_decode_u64: too many continuation bytes".into(),
             ));
         }
@@ -120,7 +120,7 @@ pub fn vlen_decode_u64(data: &[u8]) -> Result<(u64, usize)> {
 /// Returns `(value, bytes_consumed)`.
 pub fn vlen_decode_i64(data: &[u8]) -> Result<(i64, usize)> {
     if data.is_empty() {
-        return Err(Error::Vdb("vlen_decode_i64: empty input".into()));
+        return Err(Error::Format("vlen_decode_i64: empty input".into()));
     }
 
     let limit = data.len().min(10);
@@ -132,7 +132,7 @@ pub fn vlen_decode_i64(data: &[u8]) -> Result<(i64, usize)> {
     if first & 0x80 != 0 {
         loop {
             if i >= limit {
-                return Err(Error::Vdb(
+                return Err(Error::Format(
                     "vlen_decode_i64: too many continuation bytes".into(),
                 ));
             }
@@ -301,13 +301,13 @@ impl PageMap {
         for (rec_idx, &rec_len_u32) in record_lens.iter().enumerate() {
             let rec_len = rec_len_u32 as usize;
             if rec_len > row_bytes {
-                return Err(Error::Vdb(format!(
+                return Err(Error::Format(format!(
                     "page_map: record {rec_idx} stored {rec_len} bytes exceeds \
                      row_bytes={row_bytes}"
                 )));
             }
             if in_off + rec_len > data.len() {
-                return Err(Error::Vdb(format!(
+                return Err(Error::Format(format!(
                     "page_map: record {rec_idx} wants {rec_len} bytes at offset \
                      {in_off} but data has only {}",
                     data.len()
@@ -359,7 +359,7 @@ impl PageMap {
         let record_lens = self.data_record_lengths();
 
         if self.data_runs.len() < record_lens.len() {
-            return Err(Error::Vdb(format!(
+            return Err(Error::Format(format!(
                 "page_map: data_runs has {} entries, expected at least {}",
                 self.data_runs.len(),
                 record_lens.len(),
@@ -368,7 +368,7 @@ impl PageMap {
 
         let total_data: usize = record_lens.iter().map(|&l| l as usize).sum();
         if data.len() < total_data {
-            return Err(Error::Vdb(format!(
+            return Err(Error::Format(format!(
                 "page_map: variable data truncated — have {} bytes, need {}",
                 data.len(),
                 total_data,
@@ -392,7 +392,7 @@ impl PageMap {
         }
 
         if expanded.len() != expected_out {
-            return Err(Error::Vdb(format!(
+            return Err(Error::Format(format!(
                 "page_map: expanded length {} != expected {}",
                 expanded.len(),
                 expected_out,
@@ -418,7 +418,7 @@ impl PageMap {
 
         let n = data.len() / elem_bytes;
         if self.data_runs.len() < n {
-            return Err(Error::Vdb(format!(
+            return Err(Error::Format(format!(
                 "page_map: data_runs has {} entries, expected at least {} for {} bytes at {} bytes/elem",
                 self.data_runs.len(),
                 n,
@@ -456,7 +456,7 @@ impl PageMap {
 /// may delegate to v0 after decompression.
 pub fn page_map_deserialize(data: &[u8], row_count: u64) -> Result<PageMap> {
     if data.is_empty() {
-        return Err(Error::Vdb("page_map_deserialize: empty input".into()));
+        return Err(Error::Format("page_map_deserialize: empty input".into()));
     }
 
     let version = data[0] >> 2;
@@ -464,7 +464,7 @@ pub fn page_map_deserialize(data: &[u8], row_count: u64) -> Result<PageMap> {
     match version {
         0 => page_map_deserialize_v0(data, row_count),
         1 | 2 => page_map_deserialize_v1(data, row_count),
-        _ => Err(Error::Vdb(format!(
+        _ => Err(Error::Format(format!(
             "page_map_deserialize: unsupported version {version}"
         ))),
     }
@@ -484,7 +484,7 @@ fn deserialize_lengths(data: &[u8], count: usize) -> Result<(Vec<u32>, usize)> {
 
 fn page_map_deserialize_v0(data: &[u8], row_count: u64) -> Result<PageMap> {
     if data.is_empty() {
-        return Err(Error::Vdb("page_map_v0: empty input".into()));
+        return Err(Error::Format("page_map_v0: empty input".into()));
     }
 
     let variant = data[0] & 3;
@@ -578,7 +578,7 @@ fn page_map_deserialize_v0(data: &[u8], row_count: u64) -> Result<PageMap> {
                 data_runs,
             })
         }
-        _ => Err(Error::Vdb(format!(
+        _ => Err(Error::Format(format!(
             "page_map_v0: unsupported variant {variant}"
         ))),
     }
@@ -586,7 +586,7 @@ fn page_map_deserialize_v0(data: &[u8], row_count: u64) -> Result<PageMap> {
 
 fn page_map_deserialize_v1(data: &[u8], row_count: u64) -> Result<PageMap> {
     if data.is_empty() {
-        return Err(Error::Vdb("page_map_v1: empty input".into()));
+        return Err(Error::Format("page_map_v1: empty input".into()));
     }
 
     let variant = data[0] & 3;
@@ -630,7 +630,7 @@ fn page_map_deserialize_v1(data: &[u8], row_count: u64) -> Result<PageMap> {
             (1 + sz1 + sz2, bs)
         }
         _ => {
-            return Err(Error::Vdb(format!(
+            return Err(Error::Format(format!(
                 "page_map_v1: unsupported variant {variant}"
             )));
         }
@@ -639,7 +639,7 @@ fn page_map_deserialize_v1(data: &[u8], row_count: u64) -> Result<PageMap> {
     // Decompress the body (zlib after the header portion).
     let compressed = &data[hsize..];
     if compressed.is_empty() {
-        return Err(Error::Vdb("page_map_v1: no compressed data".into()));
+        return Err(Error::Format("page_map_v1: no compressed data".into()));
     }
 
     // Build decompressed buffer: copy header + decompress body.
@@ -683,10 +683,10 @@ pub struct BlobHeaderFrame {
 /// Returns the stack of header frames (outermost first).
 pub fn blob_headers_deserialize(data: &[u8]) -> Result<Vec<BlobHeaderFrame>> {
     if data.is_empty() {
-        return Err(Error::Vdb("blob_headers: empty input".into()));
+        return Err(Error::Format("blob_headers: empty input".into()));
     }
     if data[0] != 0 {
-        return Err(Error::Vdb(format!(
+        return Err(Error::Format(format!(
             "blob_headers: unsupported serialization version {}",
             data[0]
         )));
@@ -700,7 +700,7 @@ fn deserialize_header_frames(data: &[u8]) -> Result<Vec<BlobHeaderFrame>> {
 
     while pos < data.len() {
         if data.len() - pos < 2 {
-            return Err(Error::Vdb(
+            return Err(Error::Format(
                 "blob_headers: insufficient data for frame".into(),
             ));
         }
@@ -729,7 +729,7 @@ fn deserialize_header_frames(data: &[u8]) -> Result<Vec<BlobHeaderFrame>> {
         let mut ops = Vec::new();
         if op_count > 0 {
             if data.len() - pos < op_count {
-                return Err(Error::Vdb("blob_headers: insufficient ops data".into()));
+                return Err(Error::Format("blob_headers: insufficient ops data".into()));
             }
             ops.extend_from_slice(&data[pos..pos + op_count]);
             pos += op_count;
@@ -779,7 +779,7 @@ pub struct BlobEnvelope {
 /// Returns `(byte_order_big_endian, adjust, row_length, offset_to_data)`.
 fn decode_blob_v1(data: &[u8]) -> Result<(bool, u8, u64, usize)> {
     if data.is_empty() {
-        return Err(Error::Vdb("blob v1: empty".into()));
+        return Err(Error::Format("blob v1: empty".into()));
     }
 
     let header = data[0];
@@ -801,7 +801,7 @@ fn decode_blob_v1(data: &[u8]) -> Result<(bool, u8, u64, usize)> {
         1
     } else {
         if data.len() < offset {
-            return Err(Error::Vdb("blob v1: header too short".into()));
+            return Err(Error::Format("blob v1: header too short".into()));
         }
         let mut val: u64 = 0;
         for i in 0..rls {
@@ -816,7 +816,7 @@ fn decode_blob_v1(data: &[u8]) -> Result<(bool, u8, u64, usize)> {
 /// Decode the v2 blob envelope.
 fn decode_blob_v2(data: &[u8]) -> Result<BlobEnvelope> {
     if data.is_empty() {
-        return Err(Error::Vdb("blob v2: empty".into()));
+        return Err(Error::Format("blob v2: empty".into()));
     }
 
     let hdr_byte = data[0];
@@ -826,7 +826,7 @@ fn decode_blob_v2(data: &[u8]) -> Result<BlobEnvelope> {
     let version = hdr_byte >> 6;
 
     if version != 2 {
-        return Err(Error::Vdb(format!(
+        return Err(Error::Format(format!(
             "blob v2: bad version {version}, expected 2"
         )));
     }
@@ -834,34 +834,34 @@ fn decode_blob_v2(data: &[u8]) -> Result<BlobEnvelope> {
     let (hdr_size, map_size, envelope_size) = match variant {
         0 => {
             if data.len() < 3 {
-                return Err(Error::Vdb("blob v2.0: too short".into()));
+                return Err(Error::Format("blob v2.0: too short".into()));
             }
             (u32::from(data[1]), u32::from(data[2]), 3u32)
         }
         1 => {
             if data.len() < 4 {
-                return Err(Error::Vdb("blob v2.1: too short".into()));
+                return Err(Error::Format("blob v2.1: too short".into()));
             }
             let ms = u32::from(data[2]) | (u32::from(data[3]) << 8);
             (u32::from(data[1]), ms, 4)
         }
         2 => {
             if data.len() < 6 {
-                return Err(Error::Vdb("blob v2.2: too short".into()));
+                return Err(Error::Format("blob v2.2: too short".into()));
             }
             let ms = u32::from_le_bytes(data[2..6].try_into().unwrap());
             (u32::from(data[1]), ms, 6)
         }
         3 => {
             if data.len() < 9 {
-                return Err(Error::Vdb("blob v2.3: too short".into()));
+                return Err(Error::Format("blob v2.3: too short".into()));
             }
             let hs = u32::from_le_bytes(data[1..5].try_into().unwrap());
             let ms = u32::from_le_bytes(data[5..9].try_into().unwrap());
             (hs, ms, 9)
         }
         _ => {
-            return Err(Error::Vdb(format!(
+            return Err(Error::Format(format!(
                 "blob v2: unsupported variant {variant}"
             )));
         }
@@ -931,12 +931,14 @@ pub fn decode_blob<'a>(
         1 => 4,  // CRC32
         2 => 16, // MD5
         _ => {
-            return Err(Error::Vdb(format!("unknown checksum type {checksum_type}")));
+            return Err(Error::Format(format!(
+                "unknown checksum type {checksum_type}"
+            )));
         }
     };
 
     if raw.len() < cs_size {
-        return Err(Error::Vdb("blob too short for checksum".into()));
+        return Err(Error::Format("blob too short for checksum".into()));
     }
 
     let blob_data = &raw[..raw.len() - cs_size];
@@ -993,7 +995,7 @@ pub fn decode_blob<'a>(
         let ms = envelope.map_size as usize;
 
         if blob_data.len() < es + hs + ms {
-            return Err(Error::Vdb(
+            return Err(Error::Format(
                 "blob v2: data too short for headers + page map".into(),
             ));
         }
@@ -1092,7 +1094,7 @@ struct IzipFields<'a> {
 
 fn read_u32_le(data: &[u8], offset: usize) -> Result<u32> {
     if data.len() < offset + 4 {
-        return Err(Error::Vdb("izip: read_u32_le out of bounds".into()));
+        return Err(Error::Format("izip: read_u32_le out of bounds".into()));
     }
     Ok(u32::from_le_bytes([
         data[offset],
@@ -1104,7 +1106,7 @@ fn read_u32_le(data: &[u8], offset: usize) -> Result<u32> {
 
 fn read_i64_le(data: &[u8], offset: usize) -> Result<i64> {
     if data.len() < offset + 8 {
-        return Err(Error::Vdb("izip: read_i64_le out of bounds".into()));
+        return Err(Error::Format("izip: read_i64_le out of bounds".into()));
     }
     Ok(i64::from_le_bytes([
         data[offset],
@@ -1120,7 +1122,7 @@ fn read_i64_le(data: &[u8], offset: usize) -> Result<i64> {
 
 fn deserialize_izip_encoded(src: &[u8]) -> Result<IzipEncoded<'_>> {
     if src.len() < 5 {
-        return Err(Error::Vdb("izip: data too short".into()));
+        return Err(Error::Format("izip: data too short".into()));
     }
 
     let flags = src[0];
@@ -1132,7 +1134,7 @@ fn deserialize_izip_encoded(src: &[u8]) -> Result<IzipEncoded<'_>> {
         // Type 2 or 3: packed (optionally zipped)
         2 | 3 => {
             if src.len() < i + 8 {
-                return Err(Error::Vdb("izip: packed data too short for min".into()));
+                return Err(Error::Format("izip: packed data too short for min".into()));
             }
             let min = read_i64_le(src, i)?;
             i += 8;
@@ -1193,7 +1195,7 @@ fn deserialize_izip_encoded(src: &[u8]) -> Result<IzipEncoded<'_>> {
             let flag_type = flag_extract(data_flags, 0);
             let type_data = if flag_type != DATA_ABSENT && flag_type != DATA_CONSTANT {
                 if src.len() < i + type_size as usize {
-                    return Err(Error::Vdb("izip: type_data too short".into()));
+                    return Err(Error::Format("izip: type_data too short".into()));
                 }
                 let d = &src[i..i + type_size as usize];
                 i += type_size as usize;
@@ -1205,7 +1207,7 @@ fn deserialize_izip_encoded(src: &[u8]) -> Result<IzipEncoded<'_>> {
             let flag_diff = flag_extract(data_flags, FLAG_BITS);
             let diff_data = if flag_diff != DATA_ABSENT && flag_diff != DATA_CONSTANT {
                 if src.len() < i + diff_size as usize {
-                    return Err(Error::Vdb("izip: diff_data too short".into()));
+                    return Err(Error::Format("izip: diff_data too short".into()));
                 }
                 let d = &src[i..i + diff_size as usize];
                 i += diff_size as usize;
@@ -1217,7 +1219,7 @@ fn deserialize_izip_encoded(src: &[u8]) -> Result<IzipEncoded<'_>> {
             let flag_length = flag_extract(data_flags, 2 * FLAG_BITS);
             let length_data = if flag_length != DATA_ABSENT && flag_length != DATA_CONSTANT {
                 if src.len() < i + length_size as usize {
-                    return Err(Error::Vdb("izip: length_data too short".into()));
+                    return Err(Error::Format("izip: length_data too short".into()));
                 }
                 let d = &src[i..i + length_size as usize];
                 i += length_size as usize;
@@ -1229,7 +1231,7 @@ fn deserialize_izip_encoded(src: &[u8]) -> Result<IzipEncoded<'_>> {
             let flag_dy = flag_extract(data_flags, 3 * FLAG_BITS);
             let dy_data = if flag_dy != DATA_ABSENT && flag_dy != DATA_CONSTANT {
                 if src.len() < i + dy_size as usize {
-                    return Err(Error::Vdb("izip: dy_data too short".into()));
+                    return Err(Error::Format("izip: dy_data too short".into()));
                 }
                 let d = &src[i..i + dy_size as usize];
                 i += dy_size as usize;
@@ -1241,7 +1243,7 @@ fn deserialize_izip_encoded(src: &[u8]) -> Result<IzipEncoded<'_>> {
             let flag_dx = flag_extract(data_flags, 4 * FLAG_BITS);
             let dx_data = if flag_dx != DATA_ABSENT && flag_dx != DATA_CONSTANT {
                 if src.len() < i + dx_size as usize {
-                    return Err(Error::Vdb("izip: dx_data too short".into()));
+                    return Err(Error::Format("izip: dx_data too short".into()));
                 }
                 let d = &src[i..i + dx_size as usize];
                 i += dx_size as usize;
@@ -1253,7 +1255,7 @@ fn deserialize_izip_encoded(src: &[u8]) -> Result<IzipEncoded<'_>> {
             let flag_a = flag_extract(data_flags, 5 * FLAG_BITS);
             let a_data = if flag_a != DATA_ABSENT && flag_a != DATA_CONSTANT {
                 if src.len() < i + a_size as usize {
-                    return Err(Error::Vdb("izip: a_data too short".into()));
+                    return Err(Error::Format("izip: a_data too short".into()));
                 }
                 let d = &src[i..i + a_size as usize];
                 i += a_size as usize;
@@ -1265,7 +1267,7 @@ fn deserialize_izip_encoded(src: &[u8]) -> Result<IzipEncoded<'_>> {
             let flag_outlier = flag_extract(data_flags, 6 * FLAG_BITS);
             let outlier_data = if flag_outlier != DATA_ABSENT && flag_outlier != DATA_CONSTANT {
                 if src.len() < i + outlier_size as usize {
-                    return Err(Error::Vdb("izip: outlier_data too short".into()));
+                    return Err(Error::Format("izip: outlier_data too short".into()));
                 }
 
                 // i += outlier_size as usize; (last field)
@@ -1306,7 +1308,7 @@ fn deserialize_izip_encoded(src: &[u8]) -> Result<IzipEncoded<'_>> {
                 }),
             })
         }
-        _ => Err(Error::Vdb(format!(
+        _ => Err(Error::Format(format!(
             "izip: unknown encoding type {enc_type}"
         ))),
     }
@@ -1331,7 +1333,7 @@ fn zlib_raw_decompress(data: &[u8], max_out: usize) -> Result<Vec<u8>> {
 ///
 /// `expected_size` is the expected output size. If the actual decompressed
 /// data is larger, falls back to flate2 streaming decoder.
-pub(crate) fn deflate_decompress(data: &[u8], expected_size: usize) -> Result<Vec<u8>> {
+pub fn deflate_decompress(data: &[u8], expected_size: usize) -> Result<Vec<u8>> {
     use libdeflater::Decompressor;
 
     if data.is_empty() {
@@ -1353,7 +1355,7 @@ pub(crate) fn deflate_decompress(data: &[u8], expected_size: usize) -> Result<Ve
 }
 
 /// Fast zlib (with header) decompression via libdeflate.
-pub(crate) fn zlib_decompress(data: &[u8], expected_size: usize) -> Result<Vec<u8>> {
+pub fn zlib_decompress(data: &[u8], expected_size: usize) -> Result<Vec<u8>> {
     use libdeflater::Decompressor;
 
     if data.is_empty() {
@@ -1384,7 +1386,7 @@ pub(crate) fn deflate_decompress_ex(data: &[u8], expected_size: usize) -> Result
 
     let decompressor = unsafe { libdeflate_sys::libdeflate_alloc_decompressor() };
     if decompressor.is_null() {
-        return Err(Error::Vdb(
+        return Err(Error::Format(
             "failed to allocate libdeflate decompressor".into(),
         ));
     }
@@ -1421,7 +1423,7 @@ pub(crate) fn deflate_decompress_ex(data: &[u8], expected_size: usize) -> Result
         loop {
             let n = decoder
                 .read(&mut fallback_out[total..])
-                .map_err(|e| Error::Vdb(format!("deflate_ex fallback failed: {e}")))?;
+                .map_err(|e| Error::Format(format!("deflate_ex fallback failed: {e}")))?;
             if n == 0 {
                 break;
             }
@@ -1442,7 +1444,7 @@ fn deflate_decompress_fallback(data: &[u8]) -> Result<Vec<u8>> {
     let mut out = Vec::new();
     decoder
         .read_to_end(&mut out)
-        .map_err(|e| Error::Vdb(format!("deflate decompression failed: {e}")))?;
+        .map_err(|e| Error::Format(format!("deflate decompression failed: {e}")))?;
     Ok(out)
 }
 
@@ -1455,7 +1457,7 @@ fn zlib_decompress_fallback(data: &[u8]) -> Result<Vec<u8>> {
     let mut out = Vec::new();
     decoder
         .read_to_end(&mut out)
-        .map_err(|e| Error::Vdb(format!("zlib decompression failed: {e}")))?;
+        .map_err(|e| Error::Format(format!("zlib decompression failed: {e}")))?;
     Ok(out)
 }
 
@@ -1466,7 +1468,9 @@ fn variant_from_elem_bits(elem_bits: u32) -> Result<u32> {
         16 => Ok(3),
         32 => Ok(2),
         64 => Ok(1),
-        _ => Err(Error::Vdb(format!("izip: invalid elem_bits {elem_bits}"))),
+        _ => Err(Error::Format(format!(
+            "izip: invalid elem_bits {elem_bits}"
+        ))),
     }
 }
 
@@ -1580,7 +1584,7 @@ pub fn izip_decode(data: &[u8], elem_bits: u32, _num_elements_hint: u32) -> Resu
             let iz = encoded
                 .izipped
                 .as_ref()
-                .ok_or_else(|| Error::Vdb("izip type 0: missing izip fields".into()))?;
+                .ok_or_else(|| Error::Format("izip type 0: missing izip fields".into()))?;
 
             // Decode diff buffer.
             let flag_diff = flag_extract(iz.data_flags, FLAG_BITS);
@@ -1734,7 +1738,7 @@ pub fn izip_decode(data: &[u8], elem_bits: u32, _num_elements_hint: u32) -> Resu
             }
         }
         _ => {
-            return Err(Error::Vdb(format!(
+            return Err(Error::Format(format!(
                 "izip: unsupported encoding type {enc_type}"
             )));
         }
@@ -1933,7 +1937,7 @@ fn read_bits_be(src: &[u8], bit_offset: u64, n_bits: u32) -> Result<u64> {
         let bit_in_byte = 7 - (abs_bit % 8);
 
         if byte_idx >= src.len() {
-            return Err(Error::Vdb("read_bits_be: out of bounds".into()));
+            return Err(Error::Format("read_bits_be: out of bounds".into()));
         }
 
         let bit_val = (src[byte_idx] >> bit_in_byte) & 1;
@@ -1945,15 +1949,15 @@ fn read_bits_be(src: &[u8], bit_offset: u64, n_bits: u32) -> Result<u64> {
 #[cfg(test)]
 fn unpack(packed_bits: u32, unpacked_bits: u32, src: &[u8], num_elements: u32) -> Result<Vec<u8>> {
     if packed_bits == 0 || unpacked_bits == 0 {
-        return Err(Error::Vdb("unpack: zero bit width".into()));
+        return Err(Error::Format("unpack: zero bit width".into()));
     }
     if packed_bits > unpacked_bits {
-        return Err(Error::Vdb(format!(
+        return Err(Error::Format(format!(
             "unpack: packed_bits ({packed_bits}) > unpacked_bits ({unpacked_bits})"
         )));
     }
     if !matches!(unpacked_bits, 8 | 16 | 32 | 64) {
-        return Err(Error::Vdb(format!(
+        return Err(Error::Format(format!(
             "unpack: unpacked_bits must be 8/16/32/64, got {unpacked_bits}"
         )));
     }
@@ -1963,7 +1967,7 @@ fn unpack(packed_bits: u32, unpacked_bits: u32, src: &[u8], num_elements: u32) -
     if packed_bits == unpacked_bits && unpacked_bits == 8 {
         let count = num_elements as usize;
         if src.len() < count {
-            return Err(Error::Vdb("unpack: source too short".into()));
+            return Err(Error::Format("unpack: source too short".into()));
         }
         return Ok(src[..count].to_vec());
     }

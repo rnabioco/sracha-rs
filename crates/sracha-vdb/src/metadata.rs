@@ -12,7 +12,7 @@
 //! 1. `READ_0`, `READ_1`, ... metadata nodes (pipe-delimited: `"B|151|"`)
 //! 2. The embedded schema name (e.g. `NCBI:SRA:Illumina:...` → nreads=2)
 
-use crate::vdb::kar;
+use crate::kar;
 
 /// Read descriptors extracted from metadata.
 #[derive(Debug, Clone)]

@@ -35,13 +35,13 @@ use super::BlobSlotOutput;
 /// The blob locator `size` field includes trailing checksum bytes, which
 /// [`blob::decode_blob`] checks against the on-disk data before returning.
 /// A mismatch indicates a corrupt download or truncated blob and surfaces as
-/// [`Error::Vdb`] so callers can abort rather than produce wrong reads.
+/// [`Error::Pipeline`] so callers can abort rather than produce wrong reads.
 pub(crate) fn decode_raw<'a>(
     raw: &'a [u8],
     checksum_type: u8,
     row_count: u64,
 ) -> Result<blob::DecodedBlob<'a>> {
-    blob::decode_blob(raw, checksum_type, row_count, 8)
+    Ok(blob::decode_blob(raw, checksum_type, row_count, 8)?)
 }
 
 /// Decode irzip-compressed integers from a blob, detecting single vs dual series.
@@ -107,7 +107,7 @@ pub(super) fn expand_via_page_map(
         } else if u32_index_fits {
             elem_bytes
         } else {
-            return Err(Error::Vdb(format!(
+            return Err(Error::Pipeline(format!(
                 "page_map: max offset {max_offset} overflows decoded buffer \
                  ({} bytes) under both entry-index (×{entry_bytes}) and u32-index \
                  (×{elem_bytes}) interpretations",
@@ -120,7 +120,7 @@ pub(super) fn expand_via_page_map(
             let start = offset as usize * stride;
             let end = start + entry_bytes;
             if end > decoded_ints.len() {
-                return Err(Error::Vdb(format!(
+                return Err(Error::Pipeline(format!(
                     "page_map: offset {offset} × {stride} + {entry_bytes} out of {} decoded bytes",
                     decoded_ints.len(),
                 )));
@@ -132,7 +132,7 @@ pub(super) fn expand_via_page_map(
         // data_runs is per-row; each row is `entry_bytes` (row_length × elem_bytes).
         // Passing elem_bytes here would trip the length check on any column with
         // row_length > 1, crashing with a 2:1 (or N:1) "expected at least" ratio.
-        pm.expand_data_runs_bytes(&decoded_ints, entry_bytes)
+        Ok(pm.expand_data_runs_bytes(&decoded_ints, entry_bytes)?)
     } else {
         Ok(decoded_ints)
     }
@@ -210,7 +210,7 @@ pub(crate) fn decode_zip_encoding(decoded: &blob::DecodedBlob<'_>) -> Result<Vec
             );
             return Ok(decoded.data.to_vec());
         }
-        return Err(Error::Vdb(format!(
+        return Err(Error::Pipeline(format!(
             "zip_encoding v{hdr_version}: both deflate and zlib failed on {}-byte payload",
             decoded.data.len(),
         )));

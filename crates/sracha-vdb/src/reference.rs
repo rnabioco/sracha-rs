@@ -12,11 +12,11 @@
 use std::io::{Read, Seek};
 use std::path::Path;
 
+use crate::blob::{self, DecodedBlob};
 use crate::error::{Error, Result};
-use crate::vdb::blob::{self, DecodedBlob};
-use crate::vdb::inspect;
-use crate::vdb::kar::KarArchive;
-use crate::vdb::kdb::ColumnReader;
+use crate::inspect;
+use crate::kar::KarArchive;
+use crate::kdb::ColumnReader;
 
 /// BAM-load's standard chunk size. REFERENCE rows each hold up to this many
 /// bases (last chunk of a reference may be shorter, recorded in SEQ_LEN).
@@ -42,7 +42,7 @@ impl ReferenceCursor {
         let col_base = inspect::column_base_path_public(archive, Some("REFERENCE"))?;
         let open = |archive: &mut KarArchive<R>, name: &str| -> Result<ColumnReader> {
             ColumnReader::open(archive, &format!("{col_base}/{name}"), sra_path)
-                .map_err(|e| Error::Vdb(format!("REFERENCE/{name}: {e}")))
+                .map_err(|e| Error::Format(format!("REFERENCE/{name}: {e}")))
         };
         let cmp_read = open(archive, "CMP_READ")?;
         let seq_len = open(archive, "SEQ_LEN")?;
@@ -83,7 +83,7 @@ impl ReferenceCursor {
         while remaining > 0 {
             let chunk_len = self.read_chunk_len(chunk_row)?;
             if offset_in_chunk > chunk_len {
-                return Err(Error::Vdb(format!(
+                return Err(Error::Format(format!(
                     "reference: offset {offset_in_chunk} past chunk {chunk_row} len {chunk_len}"
                 )));
             }
@@ -109,7 +109,7 @@ impl ReferenceCursor {
         let blob = self
             .seq_len
             .find_blob(row_id)
-            .ok_or_else(|| Error::Vdb(format!("SEQ_LEN: no blob for row {row_id}")))?;
+            .ok_or_else(|| Error::Format(format!("SEQ_LEN: no blob for row {row_id}")))?;
         let raw = self.seq_len.read_raw_blob_slice(row_id)?;
         let decoded = blob::decode_blob(
             raw,
@@ -127,7 +127,7 @@ impl ReferenceCursor {
                 // Random-access variant: data_runs[i] is the unique-value
                 // index for logical row i.
                 *pm.data_runs.get(logical_offset).ok_or_else(|| {
-                    Error::Vdb(format!(
+                    Error::Format(format!(
                         "SEQ_LEN row {row_id}: data_runs[{logical_offset}] missing"
                     ))
                 })? as usize
@@ -145,7 +145,7 @@ impl ReferenceCursor {
                     seen = end;
                 }
                 chosen.ok_or_else(|| {
-                    Error::Vdb(format!(
+                    Error::Format(format!(
                         "SEQ_LEN row {row_id}: logical offset {logical_offset} outside data_runs coverage"
                     ))
                 })?
@@ -155,7 +155,7 @@ impl ReferenceCursor {
         };
         let byte_off = data_idx * 4;
         if byte_off + 4 > bytes.len() {
-            return Err(Error::Vdb(format!(
+            return Err(Error::Format(format!(
                 "SEQ_LEN row {row_id}: data_idx {data_idx} × 4 = {byte_off} past decoded {}",
                 bytes.len()
             )));
@@ -176,7 +176,7 @@ impl ReferenceCursor {
         let blob = self
             .cmp_read
             .find_blob(row_id)
-            .ok_or_else(|| Error::Vdb(format!("CMP_READ: no blob for row {row_id}")))?;
+            .ok_or_else(|| Error::Format(format!("CMP_READ: no blob for row {row_id}")))?;
         let raw = self.cmp_read.read_raw_blob_slice(row_id)?;
         let decoded = blob::decode_blob(
             raw,
@@ -187,19 +187,19 @@ impl ReferenceCursor {
         let pm = decoded
             .page_map
             .as_ref()
-            .ok_or_else(|| Error::Vdb("REFERENCE.CMP_READ: page_map required".into()))?;
+            .ok_or_else(|| Error::Format("REFERENCE.CMP_READ: page_map required".into()))?;
         let record_lens = pm.data_record_lengths();
 
         let row_offset = (row_id - blob.start_id) as usize;
         if row_offset >= record_lens.len() {
-            return Err(Error::Vdb(format!(
+            return Err(Error::Format(format!(
                 "REFERENCE.CMP_READ row {row_id}: record index {row_offset} past {}",
                 record_lens.len()
             )));
         }
         let rec_len_bases = record_lens[row_offset] as usize;
         if rec_len_bases != chunk_len {
-            return Err(Error::Vdb(format!(
+            return Err(Error::Format(format!(
                 "REFERENCE.CMP_READ row {row_id}: page_map says {rec_len_bases} bases, \
                  SEQ_LEN says {chunk_len}"
             )));
@@ -223,7 +223,7 @@ impl ReferenceCursor {
             let byte = bit_idx / 8;
             let shift = 6 - (bit_idx % 8);
             let b = decoded.data.get(byte).copied().ok_or_else(|| {
-                Error::Vdb(format!(
+                Error::Format(format!(
                     "REFERENCE.CMP_READ row {row_id}: bit {bit_idx} past payload"
                 ))
             })?;
@@ -272,7 +272,7 @@ fn decode_integer_bytes(decoded: &DecodedBlob<'_>, elem_bits: u32) -> Result<Vec
     {
         return Ok(out);
     }
-    Err(Error::Vdb(format!(
+    Err(Error::Format(format!(
         "reference column: no decoder succeeded (elem_bits={elem_bits}, data.len={}, osize={osize})",
         decoded.data.len()
     )))

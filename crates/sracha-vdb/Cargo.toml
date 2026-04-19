@@ -1,0 +1,23 @@
+[package]
+name = "sracha-vdb"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Pure-Rust parser for the NCBI VDB / KAR binary format (no C FFI)"
+publish = false
+
+[dependencies]
+md-5.workspace = true
+byteorder.workspace = true
+memmap2.workspace = true
+flate2.workspace = true
+libdeflater.workspace = true
+libdeflate-sys.workspace = true
+thiserror.workspace = true
+tracing.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true
+reqwest = { workspace = true, features = ["blocking"] }

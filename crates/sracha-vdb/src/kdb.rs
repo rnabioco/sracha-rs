@@ -25,7 +25,7 @@ use std::io::Seek;
 use byteorder::{ByteOrder, LittleEndian};
 
 use crate::error::{Error, Result};
-use crate::vdb::kar::KarArchive;
+use crate::kar::KarArchive;
 
 // ---------------------------------------------------------------------------
 // Constants
@@ -69,7 +69,7 @@ impl BlockType {
             1 => Ok(Self::Uniform),
             2 => Ok(Self::Magnitude),
             3 => Ok(Self::Predictable),
-            _ => Err(Error::Vdb(format!("invalid block type: {v}"))),
+            _ => Err(Error::Format(format!("invalid block type: {v}"))),
         }
     }
 }
@@ -192,7 +192,7 @@ fn parse_idx1(buf: &[u8]) -> Result<ColumnMeta> {
     // For v1, the full header follows (data_eof, idx2_eof, etc.).
     // For v2+, idx1 has only KDBHdr + block locators.
     if buf.len() < 8 {
-        return Err(Error::Vdb(format!(
+        return Err(Error::Format(format!(
             "idx1 too short: {} bytes (need at least 8)",
             buf.len()
         )));
@@ -203,7 +203,7 @@ fn parse_idx1(buf: &[u8]) -> Result<ColumnMeta> {
         KDB_ENDIAN_MAGIC => false,
         _ if magic.swap_bytes() == KDB_ENDIAN_MAGIC => true,
         _ => {
-            return Err(Error::Vdb(format!(
+            return Err(Error::Format(format!(
                 "invalid idx1 endian magic: {magic:#010x}"
             )));
         }
@@ -424,7 +424,7 @@ fn parse_idx2_block(idx2_slice: &[u8], block: &BlockLoc) -> Result<Vec<BlobLoc>>
     let expected_end = pg_s_off + pg_ssz * count;
 
     if idx2_slice.len() < expected_end {
-        return Err(Error::Vdb(format!(
+        return Err(Error::Format(format!(
             "idx2 block too short: {} bytes, expected at least {expected_end}",
             idx2_slice.len()
         )));
@@ -581,7 +581,7 @@ fn update_meta_from_idx_file(meta: &mut ColumnMeta, buf: &[u8]) {
 
 fn parse_idx0(buf: &[u8]) -> Result<Vec<BlobLoc>> {
     if !buf.len().is_multiple_of(BLOB_LOC_SIZE) {
-        return Err(Error::Vdb(format!(
+        return Err(Error::Format(format!(
             "idx0 size {} is not a multiple of {BLOB_LOC_SIZE}",
             buf.len()
         )));
@@ -685,7 +685,7 @@ impl ColumnReader {
 
             for bloc in &block_locs {
                 if bloc.compressed {
-                    return Err(Error::Vdb(
+                    return Err(Error::Format(
                         "compressed idx2 blocks are not supported".into(),
                     ));
                 }
@@ -704,7 +704,7 @@ impl ColumnReader {
                 };
 
                 if start > idx2_bytes.len() {
-                    return Err(Error::Vdb(format!(
+                    return Err(Error::Format(format!(
                         "idx2 block offset {start} exceeds idx2 size {}",
                         idx2_bytes.len()
                     )));
@@ -763,7 +763,7 @@ impl ColumnReader {
         // Parse idx1 (required).
         let idx1_buf = archive
             .read_file(&idx1_path)
-            .map_err(|_| Error::Vdb(format!("column header (idx1) not found at {idx1_path}")))?;
+            .map_err(|_| Error::Format(format!("column header (idx1) not found at {idx1_path}")))?;
 
         // Parse idx0 (may be empty or missing — legacy format).
         let idx0_buf = archive.read_file(&idx0_path).unwrap_or_default();
@@ -799,7 +799,7 @@ impl ColumnReader {
                     .offset(file_offset)
                     .len(file_size as usize)
                     .map(&file)
-                    .map_err(|e| Error::Vdb(format!("mmap failed: {e}")))?
+                    .map_err(|e| Error::Format(format!("mmap failed: {e}")))?
             };
             reader.data = DataSource::Mmap {
                 mmap,
@@ -812,7 +812,7 @@ impl ColumnReader {
 
     /// Read the raw (unprocessed) blob bytes for a given row ID.
     ///
-    /// Does NOT attempt decompression. Use [`crate::vdb::blob::decode_blob`]
+    /// Does NOT attempt decompression. Use [`crate::blob::decode_blob`]
     /// for proper envelope parsing, CRC validation, and decompression.
     pub fn read_raw_blob_for_row(&self, row_id: i64) -> Result<Vec<u8>> {
         self.read_raw_blob_slice(row_id).map(|s| s.to_vec())
@@ -823,7 +823,7 @@ impl ColumnReader {
     pub fn read_raw_blob_slice(&self, row_id: i64) -> Result<&[u8]> {
         let blob = self
             .find_blob(row_id)
-            .ok_or_else(|| Error::Vdb(format!("no blob found for row_id {row_id}")))?;
+            .ok_or_else(|| Error::Format(format!("no blob found for row_id {row_id}")))?;
 
         let blob_offset = self.blob_data_offset(blob);
         let size = blob.size as usize;
@@ -831,7 +831,7 @@ impl ColumnReader {
         match &self.data {
             DataSource::InMemory(data) => {
                 if blob_offset + size > data.len() {
-                    return Err(Error::Vdb(format!(
+                    return Err(Error::Format(format!(
                         "blob data out of bounds: offset={blob_offset}, size={size}, data_len={}",
                         data.len()
                     )));
@@ -840,7 +840,7 @@ impl ColumnReader {
             }
             DataSource::Mmap { mmap, .. } => {
                 if blob_offset + size > mmap.len() {
-                    return Err(Error::Vdb(format!(
+                    return Err(Error::Format(format!(
                         "blob data out of bounds: offset={blob_offset}, size={size}, mmap_len={}",
                         mmap.len()
                     )));
@@ -968,7 +968,7 @@ pub(crate) mod test_helpers {
 // Production code uses read_raw_blob_slice() + decode_blob() instead.
 #[cfg(test)]
 fn try_zlib_decompress(data: &[u8]) -> Option<Vec<u8>> {
-    use crate::vdb::blob;
+    use crate::blob;
 
     if data.is_empty() {
         return None;
@@ -1539,7 +1539,7 @@ mod tests {
 
     #[test]
     fn open_from_kar_archive() {
-        use crate::vdb::kar::test_helpers::*;
+        use crate::kar::test_helpers::*;
         use std::io::Cursor;
 
         // Build idx1 (v1 header)

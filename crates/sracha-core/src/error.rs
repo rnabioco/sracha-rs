@@ -24,24 +24,11 @@ pub enum Error {
         actual: u64,
     },
 
-    #[error("invalid KAR archive: {0}")]
-    InvalidKar(String),
+    #[error(transparent)]
+    Vdb(#[from] sracha_vdb::Error),
 
-    #[error("VDB format error: {0}")]
-    Vdb(String),
-
-    #[error("{kind} mismatch: stored={stored}, computed={computed}")]
-    BlobIntegrity {
-        kind: &'static str,
-        stored: String,
-        computed: String,
-    },
-
-    #[error("column not found: {table}/{column}")]
-    ColumnNotFound { table: String, column: String },
-
-    #[error("unsupported encoding: {0}")]
-    UnsupportedEncoding(String),
+    #[error("pipeline error: {0}")]
+    Pipeline(String),
 
     #[error(
         "unsupported platform: {platform} — sracha does not support legacy sequencing platforms"

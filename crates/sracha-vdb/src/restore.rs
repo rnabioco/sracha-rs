@@ -67,7 +67,7 @@ pub fn align_restore_read(
     read_len: usize,
 ) -> Result<Vec<u8>> {
     if has_mismatch.len() != read_len || has_ref_offset.len() != read_len {
-        return Err(Error::Vdb(format!(
+        return Err(Error::Format(format!(
             "align_restore_read: length mismatch — read_len={read_len}, \
              has_mismatch.len={}, has_ref_offset.len={}",
             has_mismatch.len(),
@@ -82,7 +82,7 @@ pub fn align_restore_read(
     for di in 0..read_len {
         if has_ref_offset[di] != 0 {
             let off = *ref_offset.get(roi).ok_or_else(|| {
-                Error::Vdb(format!(
+                Error::Format(format!(
                     "align_restore_read: ref_offset cursor {roi} past array of {}",
                     ref_offset.len()
                 ))
@@ -93,7 +93,7 @@ pub fn align_restore_read(
 
         if has_mismatch[di] != 0 {
             let m = *mismatch.get(mmi).ok_or_else(|| {
-                Error::Vdb(format!(
+                Error::Format(format!(
                     "align_restore_read: mismatch cursor {mmi} past array of {}",
                     mismatch.len()
                 ))
@@ -102,7 +102,7 @@ pub fn align_restore_read(
             mmi += 1;
         } else {
             if rri < 0 || rri as usize >= ref_read.len() {
-                return Err(Error::Vdb(format!(
+                return Err(Error::Format(format!(
                     "align_restore_read: ref cursor {rri} outside ref_read ({})",
                     ref_read.len()
                 )));
@@ -174,7 +174,7 @@ pub fn seq_restore_read(
 ) -> Result<Vec<u8>> {
     let num_reads = align_ids.len();
     if read_lens.len() != num_reads || read_types.len() != num_reads {
-        return Err(Error::Vdb(format!(
+        return Err(Error::Format(format!(
             "seq_restore_read: inconsistent per-read arrays — \
              align_ids.len={num_reads}, read_lens.len={}, read_types.len={}",
             read_lens.len(),
@@ -191,7 +191,7 @@ pub fn seq_restore_read(
         if align_ids[i] > 0 {
             let aligned = fetch_aligned(align_ids[i])?;
             if aligned.len() != len {
-                return Err(Error::Vdb(format!(
+                return Err(Error::Format(format!(
                     "seq_restore_read: alignment {} returned {} bases, expected {}",
                     align_ids[i],
                     aligned.len(),
@@ -207,7 +207,7 @@ pub fn seq_restore_read(
                     out.push(COMPLEMENT_4NA[(aligned[j] & 0x0F) as usize]);
                 }
             } else {
-                return Err(Error::Vdb(format!(
+                return Err(Error::Format(format!(
                     "seq_restore_read: read {i} has READ_TYPE={rt:#x} without FORWARD or REVERSE bit"
                 )));
             }
@@ -215,7 +215,7 @@ pub fn seq_restore_read(
             // Unaligned: consume len bases from cmp_rd.
             let end = cmp_cursor + len;
             if end > cmp_rd.len() {
-                return Err(Error::Vdb(format!(
+                return Err(Error::Format(format!(
                     "seq_restore_read: read {i} wants {len} unaligned bases at offset {cmp_cursor}, cmp_rd has {}",
                     cmp_rd.len()
                 )));
