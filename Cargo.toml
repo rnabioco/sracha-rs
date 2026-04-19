@@ -1,6 +1,6 @@
 [workspace]
 resolver = "2"
-members = ["crates/sracha", "crates/sracha-core"]
+members = ["crates/sracha", "crates/sracha-core", "crates/sracha-vdb"]
 
 [workspace.package]
 version = "0.2.0"
@@ -58,6 +58,7 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 
 # Internal
 sracha-core = { path = "crates/sracha-core" }
+sracha-vdb = { path = "crates/sracha-vdb" }
 
 # Optimized release build: LTO + single codegen unit for maximum performance
 [profile.release]

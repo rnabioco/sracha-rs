@@ -29,6 +29,7 @@ url.workspace = true
 tempfile.workspace = true
 bytes.workspace = true
 tracing.workspace = true
+sracha-vdb.workspace = true
 
 [dev-dependencies]
 reqwest = { workspace = true, features = ["blocking"] }

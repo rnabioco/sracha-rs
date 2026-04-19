@@ -31,9 +31,9 @@ pub struct ValidationResult {
     pub errors: Vec<String>,
     /// MD5 hex digest of the entire SRA file.
     pub md5: Option<String>,
-    /// True if any error originated from [`Error::BlobIntegrity`] (per-blob
-    /// CRC32/MD5 failure during decode). Callers can use this to show the
-    /// shared [`crate::error::BLOB_INTEGRITY_GUIDANCE`] text once.
+    /// True if any error originated from [`sracha_vdb::Error::BlobIntegrity`]
+    /// (per-blob CRC32/MD5 failure during decode). Callers can use this to
+    /// show the shared [`crate::error::BLOB_INTEGRITY_GUIDANCE`] text once.
     pub any_blob_integrity_error: bool,
 }
 
@@ -167,7 +167,7 @@ pub fn run_validate(
 
     // Helper: capture (msg, is_blob_integrity) from a decode Error.
     fn fmt_err(tag: &str, bi: usize, e: Error) -> (String, bool) {
-        let is_integrity = matches!(e, Error::BlobIntegrity { .. });
+        let is_integrity = matches!(e, Error::Vdb(sracha_vdb::Error::BlobIntegrity { .. }));
         (format!("{tag} blob {bi} decode: {e}"), is_integrity)
     }
 

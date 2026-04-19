@@ -6,9 +6,9 @@
 use std::io::{Read, Seek};
 
 use crate::error::{Error, Result};
-use crate::vdb::kar::KarArchive;
-use crate::vdb::kdb::ColumnReader;
-use crate::vdb::metadata::ReadDescriptor;
+use crate::kar::KarArchive;
+use crate::kdb::ColumnReader;
+use crate::metadata::ReadDescriptor;
 
 // ---------------------------------------------------------------------------
 // Column names within the SEQUENCE table
@@ -531,14 +531,14 @@ impl VdbCursor {
                 return None;
             }
             let tree_data = md_bytes[8..].to_vec();
-            let rps = match crate::vdb::metadata::parse_read_structure(&tree_data) {
+            let rps = match crate::metadata::parse_read_structure(&tree_data) {
                 Ok(descs) => Some(descs),
                 Err(e) => {
                     tracing::debug!("metadata {path}: no read structure: {e}");
                     None
                 }
             };
-            let platform = crate::vdb::metadata::detect_platform(&tree_data);
+            let platform = crate::metadata::detect_platform(&tree_data);
             Some((rps, platform))
         }
 
@@ -566,7 +566,7 @@ impl VdbCursor {
             if md_bytes.len() < 8 {
                 continue;
             }
-            if crate::vdb::metadata::detect_sra_lite(&md_bytes[8..]) {
+            if crate::metadata::detect_sra_lite(&md_bytes[8..]) {
                 tracing::debug!("metadata {path}: SOFTWARE/delite node present — SRA-Lite");
                 return true;
             }
@@ -604,7 +604,7 @@ fn find_sequence_col_base<R: Read + Seek>(archive: &KarArchive<R>) -> Result<Str
         if (path == "tbl/SEQUENCE/col" || path.ends_with("/tbl/SEQUENCE/col"))
             && matches!(
                 archive.entries().get(path.as_str()),
-                Some(crate::vdb::kar::KarEntry::Directory)
+                Some(crate::kar::KarEntry::Directory)
             )
         {
             return Ok(path.clone());
@@ -634,7 +634,7 @@ fn find_sequence_col_base<R: Read + Seek>(archive: &KarArchive<R>) -> Result<Str
         }
     }
 
-    Err(Error::Vdb(
+    Err(Error::Format(
         "SEQUENCE table not found in KAR archive (tried database and flat-table layouts)".into(),
     ))
 }
@@ -709,7 +709,7 @@ fn read_cmp_base_count_from_archive<R: Read + Seek>(archive: &mut KarArchive<R>)
     for path in ["tbl/SEQUENCE/md/cur", "md/cur"] {
         if let Ok(md_bytes) = archive.read_file(path)
             && md_bytes.len() >= 8
-            && let Some(n) = crate::vdb::metadata::read_cmp_base_count(&md_bytes[8..])
+            && let Some(n) = crate::metadata::read_cmp_base_count(&md_bytes[8..])
         {
             return Some(n);
         }
@@ -723,7 +723,7 @@ fn read_unaligned_marker_from_archive<R: Read + Seek>(archive: &mut KarArchive<R
     for path in ["tbl/SEQUENCE/md/cur", "md/cur"] {
         if let Ok(md_bytes) = archive.read_file(path)
             && md_bytes.len() >= 8
-            && crate::vdb::metadata::has_unaligned_marker(&md_bytes[8..])
+            && crate::metadata::has_unaligned_marker(&md_bytes[8..])
         {
             return true;
         }
@@ -740,8 +740,8 @@ fn read_aligned_schema_name<R: Read + Seek>(archive: &mut KarArchive<R>) -> Opti
             && md_bytes.len() >= 8
         {
             let tree_data = &md_bytes[8..];
-            if let Some(schema_name) = crate::vdb::metadata::schema_attr_name(tree_data)
-                && crate::vdb::metadata::is_aligned_database_schema(&schema_name)
+            if let Some(schema_name) = crate::metadata::schema_attr_name(tree_data)
+                && crate::metadata::is_aligned_database_schema(&schema_name)
             {
                 return Some(schema_name);
             }
@@ -757,8 +757,8 @@ fn read_aligned_schema_name<R: Read + Seek>(archive: &mut KarArchive<R>) -> Opti
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::vdb::kar::test_helpers::*;
-    use crate::vdb::kdb::test_helpers::{build_blob_loc as build_kdb_blob_loc, build_idx1_v1};
+    use crate::kar::test_helpers::*;
+    use crate::kdb::test_helpers::{build_blob_loc as build_kdb_blob_loc, build_idx1_v1};
     use std::io::Cursor;
 
     /// Helper: build a minimal KAR archive containing a SEQUENCE table with
@@ -919,7 +919,7 @@ mod tests {
             nodes.push(node);
         }
         let refs: Vec<&[u8]> = nodes.iter().map(|v| v.as_slice()).collect();
-        let tree = crate::vdb::kar::test_helpers::build_pbstree(&refs);
+        let tree = crate::kar::test_helpers::build_pbstree(&refs);
 
         // Prepend 8-byte KDBHdr (endian tag + version).
         let mut md = Vec::new();
@@ -1085,7 +1085,7 @@ mod tests {
     /// `name=<schema_name>` as an attribute. Shape matches what ncbi-vdb
     /// writes: 8-byte KDBHdr prefix followed by a PBSTree.
     fn build_md_cur_with_schema(schema_name: &str) -> Vec<u8> {
-        use crate::vdb::metadata::tests::{build_attrs_pbstree, build_meta_node, build_pbstree};
+        use crate::metadata::tests::{build_attrs_pbstree, build_meta_node, build_pbstree};
         let attrs = build_attrs_pbstree(&[("name", schema_name.as_bytes())]);
         let schema_node = build_meta_node("schema", b"", Some(&attrs));
         let tree = build_pbstree(&[&schema_node]);
@@ -1146,7 +1146,7 @@ mod tests {
         cmp_base_count: u64,
         with_unaligned: bool,
     ) -> Vec<u8> {
-        use crate::vdb::metadata::tests::{
+        use crate::metadata::tests::{
             build_attrs_pbstree, build_meta_node, build_meta_node_with_children, build_pbstree,
         };
         let attrs = build_attrs_pbstree(&[("name", schema_name.as_bytes())]);
