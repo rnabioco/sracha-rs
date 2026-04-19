@@ -99,6 +99,8 @@ sracha get [OPTIONS] [ACCESSION]...
 | `-y, --yes` | | Confirm project downloads and large downloads (>100 GiB) |
 | `--prefer-sdl` | | Skip direct S3 and resolve via the SDL API |
 | `--no-runinfo` | | Skip EUtils RunInfo API call (derive read structure from VDB metadata) |
+| `--prefetch-depth <N>` | `2` | Number of accessions to download ahead of the decoder. Larger values hide slow networks behind decode at the cost of one extra temp SRA file per step. Multi-accession `get` only |
+| `--keep-sra` | | Keep the downloaded SRA file in the output directory instead of deleting it after decode |
 | `--no-progress` | | Disable progress bar |
 | `--strict` | | Fail on data-integrity anomalies (quality length mismatch, paired-spot violations, truncated reads) |
 
@@ -234,3 +236,86 @@ sracha validate [OPTIONS] <INPUT>...
 | `--no-progress` | | Disable progress bar |
 | `--md5 <HASH>` | | Expected MD5 hex; fail on mismatch. With multiple inputs every file must match |
 | `--offline` | | Skip the SDL lookup for the expected MD5 (air-gapped use) |
+
+---
+
+## sracha vdb
+
+Inspect the VDB structure of a local `.sra` file. Pure-Rust
+replacement for `vdb-dump` — no network, no C FFI, no subprocess to
+sra-tools.
+
+```
+sracha vdb <SUBCOMMAND> <FILE> [OPTIONS]
+```
+
+### sracha vdb info
+
+Print summary metadata: schema, platform, table row counts, load
+timestamp, and formatter / loader / update software events.
+
+```
+sracha vdb info <FILE> [--json]
+```
+
+| Option | Default | Description |
+|--------|---------|-------------|
+| `--json` | | Emit a single JSON object instead of human-readable text |
+
+### sracha vdb tables
+
+List tables in the archive. Only meaningful for Database archives
+(cSRA / aligned); flat Tables print a note.
+
+```
+sracha vdb tables <FILE>
+```
+
+### sracha vdb columns
+
+List columns in a table.
+
+```
+sracha vdb columns <FILE> [-T TABLE] [-s]
+```
+
+| Option | Default | Description |
+|--------|---------|-------------|
+| `-T, --table <NAME>` | `SEQUENCE` (or first) | Table to inspect |
+| `-s, --stats` | | Show row counts, blob counts, and first-blob header stats per column |
+
+### sracha vdb meta
+
+Dump the metadata tree (schema / stats / LOAD / SOFTWARE nodes).
+
+```
+sracha vdb meta <FILE> [-T TABLE] [-P PATH] [-d DEPTH] [--db]
+```
+
+| Option | Default | Description |
+|--------|---------|-------------|
+| `-T, --table <NAME>` | `SEQUENCE` | Table whose metadata tree to walk |
+| `-P, --path <PATH>` | | Restrict to a sub-path like `STATS/TABLE` or `LOAD` |
+| `-d, --depth <N>` | | Limit recursion depth below the chosen sub-path |
+| `--db` | | Walk the database-level tree (root `md/cur`) instead of a table tree |
+
+### sracha vdb schema
+
+Print the embedded schema text.
+
+```
+sracha vdb schema <FILE>
+```
+
+### sracha vdb id-range
+
+Print the first row id and row count for a table/column.
+
+```
+sracha vdb id-range <FILE> [-T TABLE] [-C COLUMN]
+```
+
+| Option | Default | Description |
+|--------|---------|-------------|
+| `-T, --table <NAME>` | `SEQUENCE` (or first) | Table to inspect |
+| `-C, --column <NAME>` | first alphabetically | Column to read |

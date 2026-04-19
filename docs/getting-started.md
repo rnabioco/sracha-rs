@@ -68,8 +68,8 @@ sracha get SRR9999999 --accession-list SRR_Acc_List.txt
 If you prefer more control, use the individual subcommands:
 
 ```bash
-# Download only
-sracha fetch SRR28588231 -O /data/sra/ --validate
+# Download only (MD5 is verified by default; pass --no-validate to skip)
+sracha fetch SRR28588231 -O /data/sra/
 
 # Convert to FASTQ
 sracha fastq /data/sra/SRR28588231.sra -O /data/fastq/

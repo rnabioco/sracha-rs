@@ -4,6 +4,8 @@
 
 Fast SRA downloader and FASTQ converter, written in pure Rust.
 
+![sracha get](docs/images/get.gif)
+
 ## Features
 
 - **Fast** -- 3-11x faster than `fasterq-dump` on typical SRA files

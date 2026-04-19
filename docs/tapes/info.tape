@@ -10,6 +10,7 @@ Set LetterSpacing 0
 Set LineHeight 1.2
 Set Padding 20
 Set Theme "Dracula"
+Set MarginFill "#fe00fe"
 Set WindowBar Colorful
 Set Margin 20
 Set BorderRadius 10
