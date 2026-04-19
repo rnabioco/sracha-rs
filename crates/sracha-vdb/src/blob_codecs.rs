@@ -406,4 +406,82 @@ mod tests {
         let out = decode_quality_encoding(&blob).unwrap();
         assert!(out.is_empty());
     }
+
+    // -----------------------------------------------------------------------
+    // Property tests
+    // -----------------------------------------------------------------------
+
+    use proptest::prelude::*;
+
+    proptest! {
+        /// `expand_via_page_map` with `page_map = None` is a pure
+        /// passthrough — no matter what bytes we feed in.
+        #[test]
+        fn prop_expand_via_page_map_none_is_identity(
+            data in proptest::collection::vec(any::<u8>(), 0..256)
+        ) {
+            let out = expand_via_page_map(data.clone(), &None).unwrap();
+            prop_assert_eq!(out, data);
+        }
+
+        /// In the per-row expansion branch (`data_runs.len() < total_rows`)
+        /// the output byte count is exactly `sum(data_runs) * elem_bytes`
+        /// for row_length=1 — the invariant `expand_data_runs_bytes`
+        /// enforces, exposed via `expand_via_page_map`. Values start at 2
+        /// so `sum(runs) > runs.len()` and we always hit the per-row branch
+        /// rather than the equal-length random-access branch.
+        #[test]
+        fn prop_expand_via_page_map_per_row_length_is_sum_of_runs(
+            runs in proptest::collection::vec(2u32..4, 1..16)
+        ) {
+            let n = runs.len();
+            let total: u32 = runs.iter().sum();
+            let pm = PageMap {
+                data_recs: n as u64,
+                lengths: vec![1],
+                leng_runs: vec![total],
+                data_runs: runs.clone(),
+            };
+            // row_length=1 → each record is one u32 (4 bytes).
+            let mut data = Vec::with_capacity(n * 4);
+            for i in 0..n {
+                data.extend_from_slice(&(i as u32).to_le_bytes());
+            }
+            let out = expand_via_page_map(data, &Some(pm)).unwrap();
+            prop_assert_eq!(out.len(), total as usize * 4);
+            let mut cursor = 0;
+            for (i, &rep) in runs.iter().enumerate() {
+                let expected = (i as u32).to_le_bytes();
+                for _ in 0..rep {
+                    prop_assert_eq!(&out[cursor..cursor + 4], &expected[..]);
+                    cursor += 4;
+                }
+            }
+        }
+
+        /// Random-access (entry-index) branch: for row_length=1, every
+        /// `data_runs[i]` picks one u32 entry, so output length always
+        /// equals `data_runs.len() * 4`.
+        #[test]
+        fn prop_expand_via_page_map_random_access_entry_index_length(
+            entries in 1usize..16,
+            refs in proptest::collection::vec(0u32..16, 1..32),
+        ) {
+            let max_ref = (entries - 1) as u32;
+            let refs: Vec<u32> = refs.into_iter().map(|r| r % max_ref.max(1)).collect();
+            // For random-access dispatch, data_runs.len() must be >= total_rows.
+            let pm = PageMap {
+                data_recs: refs.len() as u64,
+                lengths: vec![1],
+                leng_runs: vec![refs.len() as u32],
+                data_runs: refs.clone(),
+            };
+            let mut data = Vec::with_capacity(entries * 4);
+            for i in 0..entries {
+                data.extend_from_slice(&(i as u32).to_le_bytes());
+            }
+            let out = expand_via_page_map(data, &Some(pm)).unwrap();
+            prop_assert_eq!(out.len(), refs.len() * 4);
+        }
+    }
 }

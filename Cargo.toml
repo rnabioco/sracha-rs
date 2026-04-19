@@ -52,6 +52,7 @@ tabled = { version = "0.20", features = ["ansi"] }
 url = "2"
 tempfile = "3"
 bytes = "1"
+proptest = "1"
 chrono = { version = "0.4", default-features = false, features = ["clock"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
