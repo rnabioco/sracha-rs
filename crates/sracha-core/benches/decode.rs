@@ -10,20 +10,16 @@
 //! srun -p normal -c 16 cargo bench -p sracha-core --bench decode
 //! ```
 //!
-//! A flamegraph for each bench case is written to
-//! `target/criterion/<group>/<case>/profile/flamegraph.svg` via `pprof`.
-//! Pass `--profile-time <seconds>` to criterion to skip measurement and
-//! only collect profiles:
+//! For flamegraphs, wrap the bench run with samply:
 //!
 //! ```sh
-//! cargo bench -p sracha-core --bench decode -- --profile-time 20
+//! samply record cargo bench -p sracha-core --bench decode -- --bench <case>
 //! ```
 
 use std::path::PathBuf;
 use std::time::Duration;
 
 use criterion::{BatchSize, BenchmarkId, Criterion, Throughput, criterion_group, criterion_main};
-use pprof::criterion::{Output, PProfProfiler};
 
 use sracha_core::fastq::{CompressionMode, SplitMode};
 use sracha_core::pipeline::{PipelineConfig, run_fastq};
@@ -105,10 +101,5 @@ fn bench_decode(c: &mut Criterion) {
     group.finish();
 }
 
-criterion_group! {
-    name = benches;
-    config = Criterion::default()
-        .with_profiler(PProfProfiler::new(100, Output::Flamegraph(None)));
-    targets = bench_decode
-}
+criterion_group!(benches, bench_decode);
 criterion_main!(benches);

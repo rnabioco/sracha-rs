@@ -35,8 +35,7 @@ reqwest = { workspace = true, features = ["blocking"] }
 flate2.workspace = true
 tempfile.workspace = true
 md-5.workspace = true
-criterion = { version = "0.5", features = ["html_reports"] }
-pprof = { version = "0.14", features = ["criterion", "flamegraph"] }
+criterion = { version = "0.8", features = ["html_reports"] }
 
 [[bench]]
 name = "decode"
