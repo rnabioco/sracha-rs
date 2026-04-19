@@ -5,6 +5,7 @@
 ext/
 .sracha-tmp-*
 crates/sracha-core/tests/fixtures/*.sra
+crates/sracha-vdb/tests/fixtures/*.sra
 sracha-big-*.out
 test-big*.sh
 validation/

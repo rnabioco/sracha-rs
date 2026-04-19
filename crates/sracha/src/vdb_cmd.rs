@@ -3,11 +3,13 @@ use std::io::{BufReader, Write};
 use std::path::Path;
 
 use anyhow::{Context, Result};
+use sracha_core::vdb::dump::{self, DumpSpec};
 use sracha_core::vdb::inspect::{self, ColumnStats, InfoReport, VdbKind};
 use sracha_core::vdb::kar::KarArchive;
 use sracha_core::vdb::metadata::{self, SoftwareEvent};
+use sracha_core::vdb::row_range::RowRanges;
 
-use crate::cli::VdbCmd;
+use crate::cli::{DumpFormat, VdbCmd};
 use crate::style;
 
 pub fn run(cmd: VdbCmd) -> Result<()> {
@@ -28,6 +30,21 @@ pub fn run(cmd: VdbCmd) -> Result<()> {
             table,
             column,
         } => cmd_id_range(&file, table.as_deref(), column.as_deref()),
+        VdbCmd::Dump {
+            file,
+            table,
+            columns,
+            exclude,
+            rows,
+            format,
+        } => cmd_dump(
+            &file,
+            table.as_deref(),
+            columns,
+            exclude,
+            rows.as_deref(),
+            format,
+        ),
     }
 }
 
@@ -338,6 +355,35 @@ fn cmd_id_range(path: &Path, table: Option<&str>, column: Option<&str>) -> Resul
         "id-range: first-row = {first}, row-count = {}",
         thousands(count)
     )?;
+    Ok(())
+}
+
+fn cmd_dump(
+    path: &Path,
+    table: Option<&str>,
+    columns: Vec<String>,
+    exclude: Vec<String>,
+    rows: Option<&str>,
+    format: DumpFormat,
+) -> Result<()> {
+    let mut kar = open_kar(path)?;
+    let rows = match rows {
+        Some(s) => RowRanges::parse(s).context("parsing --rows / -R argument")?,
+        None => RowRanges::default(),
+    };
+    let spec = DumpSpec {
+        columns,
+        exclude,
+        rows,
+        format: format.into(),
+    };
+    let mut runner = dump::DumpRunner::new(&mut kar, path, table, spec)
+        .with_context(|| format!("preparing vdb dump for {}", path.display()))?;
+    let stdout = std::io::stdout();
+    let mut out = stdout.lock();
+    runner
+        .run(&mut out)
+        .with_context(|| format!("dumping rows from {}", path.display()))?;
     Ok(())
 }
 

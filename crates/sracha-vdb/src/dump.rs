@@ -71,10 +71,17 @@ impl CellKind {
 }
 
 /// Guess the [`CellKind`] for a SEQUENCE-style column by name.
+///
+/// ALTREAD intentionally falls through to [`CellKind::HexRaw`] in Phase 2a:
+/// it's stored as `trim<0,0>(<INSDC:4na:bin>zip_encoding#1)` where each
+/// row's leading zeros are stripped, so the raw payload length is smaller
+/// than `row_count × bases_per_spot`. Reconstructing the padded rows
+/// requires the sibling READ column's row bases — logic that lives in the
+/// fastq pipeline and isn't worth duplicating for a dump command that
+/// would still produce non-user-friendly 4na codes.
 pub fn infer_kind(col_name: &str) -> CellKind {
     match col_name {
         "READ" | "CMP_READ" => CellKind::Dna2na,
-        "ALTREAD" => CellKind::Dna4naBin,
         "QUALITY" | "ORIGINAL_QUALITY" | "CMP_QUALITY" => CellKind::QualityPhred33,
         "NAME" | "SPOT_NAME" | "SPOT_GROUP" | "LABEL" => CellKind::AsciiBytes,
         "READ_LEN" | "READ_START" => CellKind::U32Array,
@@ -392,18 +399,48 @@ fn materialize_hex_fallback(
     row_count: u64,
 ) -> Result<(Vec<u8>, Vec<usize>)> {
     let raw = decode_zip_encoding(decoded).unwrap_or_else(|_| decoded.data.to_vec());
-    // No structural info → treat as one monolithic row when row_count == 1,
-    // otherwise split by equal shares if divisible.
+
+    // Prefer the page_map's own lengths when present — columns like ALTREAD
+    // that are stored with `trim<0,0>` carry per-row stored sizes here and
+    // would otherwise fail the equal-split check below.
+    if let Some(pm) = decoded.page_map.as_ref() {
+        let lens = expand_leng_runs(pm);
+        if lens.len() as u64 == row_count {
+            let mut offsets = Vec::with_capacity(lens.len() + 1);
+            let mut cur = 0usize;
+            offsets.push(cur);
+            for l in &lens {
+                cur += *l as usize;
+                offsets.push(cur);
+            }
+            // When the page_map-summed length doesn't match the decoded
+            // payload, stop early rather than indexing past the end. We
+            // render whatever we have and tag the remainder as empty.
+            if cur <= raw.len() {
+                return Ok((raw, offsets));
+            }
+            tracing::debug!(
+                "dump: hex-fallback page_map sums to {cur} but payload is {} bytes",
+                raw.len(),
+            );
+        }
+    }
     if row_count <= 1 {
         let offsets = vec![0, raw.len()];
         return Ok((raw, offsets));
     }
     let per_row = raw.len() / row_count as usize;
     if per_row * row_count as usize != raw.len() {
-        return Err(Error::Format(format!(
-            "dump: hex-fallback can't split {} bytes evenly across {row_count} rows",
+        // Last resort: emit one opaque row and zero-length placeholders for the rest
+        // so the dump can still proceed on columns with odd storage shapes.
+        tracing::warn!(
+            "dump: column payload {} bytes doesn't split evenly across {row_count} rows; \
+             emitting all bytes on row 1 and empty cells for the rest",
             raw.len(),
-        )));
+        );
+        let mut offsets = vec![0usize, raw.len()];
+        offsets.extend(std::iter::repeat_n(raw.len(), row_count as usize - 1));
+        return Ok((raw, offsets));
     }
     let offsets: Vec<usize> = (0..=row_count as usize).map(|i| i * per_row).collect();
     Ok((raw, offsets))
@@ -729,8 +766,9 @@ fn write_hex<W: Write>(w: &mut W, bytes: &[u8]) -> Result<()> {
     Ok(())
 }
 
-/// Convenience for tests: run a dump to an in-memory `Vec<u8>`.
-#[cfg(test)]
+/// Convenience for tests and small callers: run a dump to an in-memory
+/// `Vec<u8>`. Equivalent to constructing a `DumpRunner` and calling `run`
+/// against a `Vec<u8>` writer.
 pub fn dump_to_vec<R: Read + Seek>(
     archive: &mut KarArchive<R>,
     sra_path: &Path,
@@ -751,7 +789,8 @@ mod tests {
     fn infer_kind_table_matches_spec() {
         assert_eq!(infer_kind("READ"), CellKind::Dna2na);
         assert_eq!(infer_kind("CMP_READ"), CellKind::Dna2na);
-        assert_eq!(infer_kind("ALTREAD"), CellKind::Dna4naBin);
+        // ALTREAD is intentionally HexRaw in Phase 2a — see `infer_kind` doc.
+        assert_eq!(infer_kind("ALTREAD"), CellKind::HexRaw);
         assert_eq!(infer_kind("QUALITY"), CellKind::QualityPhred33);
         assert_eq!(infer_kind("ORIGINAL_QUALITY"), CellKind::QualityPhred33);
         assert_eq!(infer_kind("NAME"), CellKind::AsciiBytes);

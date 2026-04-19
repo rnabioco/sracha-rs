@@ -142,6 +142,49 @@ pub enum VdbCmd {
         #[arg(short = 'C', long)]
         column: Option<String>,
     },
+    /// Dump row-level data for the chosen columns
+    Dump {
+        /// Local .sra file path
+        file: PathBuf,
+        /// Table to dump from (defaults to SEQUENCE / first table)
+        #[arg(short = 'T', long)]
+        table: Option<String>,
+        /// Comma-separated list of columns (default: all known SEQUENCE columns)
+        #[arg(short = 'C', long, value_delimiter = ',')]
+        columns: Vec<String>,
+        /// Columns to exclude (applied after --columns)
+        #[arg(short = 'x', long = "exclude", value_delimiter = ',')]
+        exclude: Vec<String>,
+        /// Row range, comma-separated. Examples: `5`, `5-20`, `100-`, `-50`, `1-10,200,500-`
+        #[arg(short = 'R', long)]
+        rows: Option<String>,
+        /// Output format
+        #[arg(short = 'f', long, default_value = "default")]
+        format: DumpFormat,
+    },
+}
+
+#[derive(Clone, Copy, ValueEnum)]
+pub enum DumpFormat {
+    /// vdb-dump-style row dump with quoted strings and bracketed arrays
+    Default,
+    /// Comma-separated values with standard CSV quoting
+    Csv,
+    /// Tab-separated values
+    Tab,
+    /// Newline-delimited JSON, one object per row
+    Json,
+}
+
+impl From<DumpFormat> for sracha_core::vdb::dump::DumpFormat {
+    fn from(f: DumpFormat) -> Self {
+        match f {
+            DumpFormat::Default => Self::Default,
+            DumpFormat::Csv => Self::Csv,
+            DumpFormat::Tab => Self::Tab,
+            DumpFormat::Json => Self::Json,
+        }
+    }
 }
 
 #[derive(Args)]

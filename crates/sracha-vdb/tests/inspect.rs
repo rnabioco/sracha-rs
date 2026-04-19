@@ -12,9 +12,11 @@ use std::io::BufReader;
 use std::path::PathBuf;
 use std::sync::Once;
 
+use sracha_vdb::dump::{self, DumpFormat, DumpSpec};
 use sracha_vdb::inspect::{self, VdbKind};
 use sracha_vdb::kar::KarArchive;
 use sracha_vdb::metadata;
+use sracha_vdb::row_range::RowRanges;
 
 fn fixtures_dir() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures")
@@ -89,4 +91,63 @@ fn srr28588231_id_range_matches_row_count() {
     let (first, count) = inspect::id_range(&mut kar, &path, None, None).unwrap();
     assert!(count > 0);
     assert_eq!(first, 1, "row IDs are 1-indexed");
+}
+
+#[test]
+#[ignore]
+fn srr28588231_dump_json_is_valid_ndjson() {
+    let path = ensure_srr28588231();
+    let f = File::open(&path).unwrap();
+    let mut kar = KarArchive::open(BufReader::new(f)).unwrap();
+    // SRR28588231 is an SRA-Lite run (synthetic QUALITY; no physical
+    // QUALITY column on disk), so exercise READ + X + Y here.
+    let spec = DumpSpec {
+        columns: vec!["READ".into(), "X".into(), "Y".into()],
+        exclude: Vec::new(),
+        rows: RowRanges::parse("1-5").unwrap(),
+        format: DumpFormat::Json,
+    };
+    let buf = dump::dump_to_vec(&mut kar, &path, None, spec).unwrap();
+    let text = std::str::from_utf8(&buf).unwrap();
+    let lines: Vec<&str> = text.lines().collect();
+    assert_eq!(lines.len(), 5, "expected 5 JSON lines, got {}", lines.len());
+    for (i, line) in lines.iter().enumerate() {
+        let val: serde_json::Value =
+            serde_json::from_str(line).unwrap_or_else(|e| panic!("line {i}: {e}: {line}"));
+        let obj = val.as_object().unwrap();
+        assert_eq!(obj["row_id"].as_i64().unwrap(), (i + 1) as i64);
+        assert!(obj["READ"].is_string());
+        assert!(obj["X"].is_i64() || obj["X"].is_u64());
+        assert!(obj["Y"].is_i64() || obj["Y"].is_u64());
+    }
+}
+
+#[test]
+#[ignore]
+fn srr28588231_dump_csv_emits_row_per_line() {
+    let path = ensure_srr28588231();
+    let f = File::open(&path).unwrap();
+    let mut kar = KarArchive::open(BufReader::new(f)).unwrap();
+    let spec = DumpSpec {
+        columns: vec!["X".into(), "Y".into()],
+        exclude: Vec::new(),
+        rows: RowRanges::parse("1-5").unwrap(),
+        format: DumpFormat::Csv,
+    };
+    let buf = dump::dump_to_vec(&mut kar, &path, None, spec).unwrap();
+    let text = std::str::from_utf8(&buf).unwrap();
+    let lines: Vec<&str> = text.lines().collect();
+    assert_eq!(lines.len(), 5);
+    for (i, line) in lines.iter().enumerate() {
+        // Row format: "N,X,Y"
+        let fields: Vec<&str> = line.split(',').collect();
+        assert_eq!(fields.len(), 3, "line {i}: {line}");
+        assert_eq!(fields[0], (i + 1).to_string());
+        let _: i32 = fields[1]
+            .parse()
+            .unwrap_or_else(|e| panic!("X: {e}: {line}"));
+        let _: i32 = fields[2]
+            .parse()
+            .unwrap_or_else(|e| panic!("Y: {e}: {line}"));
+    }
 }
