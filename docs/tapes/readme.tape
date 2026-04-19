@@ -4,8 +4,8 @@ Output docs/images/readme.gif
 Set Shell "bash"
 Set FontFamily "FiraCode Nerd Font"
 Set FontSize 16
-Set Width 1000
-Set Height 800
+Set Width 1100
+Set Height 550
 Set LetterSpacing 0
 Set LineHeight 1.2
 Set Padding 20
@@ -30,7 +30,7 @@ Type "# two-step: fetch SRA, then convert to FASTQ"
 Enter
 Type "sracha fetch SRR28588231 -f --no-progress -O /tmp"
 Enter
-Sleep 6s
+Sleep 9s
 Type "sracha fastq /tmp/SRR28588231.sra -f -O /tmp"
 Enter
 Sleep 4s
@@ -51,6 +51,6 @@ Enter
 # 4. Project metadata (resolves to runs via EUtils)
 Type "# project metadata (resolves to runs via EUtils)"
 Enter
-Type "sracha info PRJNA675068"
+Type "sracha info SRP067698"
 Enter
-Sleep 7s
+Sleep 10s

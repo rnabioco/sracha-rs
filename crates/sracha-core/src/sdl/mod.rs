@@ -39,7 +39,10 @@ async fn http_get_with_retry(
             let base = std::time::Duration::from_secs(1 << attempt);
             let jitter = std::time::Duration::from_millis(rand_jitter_ms());
             let delay = base + jitter;
-            tracing::warn!(
+            // `info!` not `warn!`: a single 429/5xx that recovers under the
+            // 3-attempt backoff isn't an error the user needs to see — the
+            // exhausted-retry case will surface as a real Error to the caller.
+            tracing::info!(
                 "HTTP {status} from {url}, retry {}/{MAX_API_RETRIES} in {delay:?}",
                 attempt + 1
             );

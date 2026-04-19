@@ -140,9 +140,10 @@ async fn main() -> Result<()> {
                 )
                 .await?;
                 eprintln!(
-                    "{}: {} downloaded",
+                    "{}: {} downloaded from [{}]",
                     style::header(acc),
                     style::value(format_size(resolved.sra_file.size)),
+                    style::value(&mirror.service),
                 );
                 eprintln!("  wrote {}", style::path(output_path.display()));
 
@@ -429,6 +430,12 @@ async fn main() -> Result<()> {
                 }
 
                 // Decode (CPU-bound) while the next download runs in the background.
+                let source = resolved
+                    .sra_file
+                    .mirrors
+                    .first()
+                    .map(|m| m.service.clone())
+                    .unwrap_or_else(|| "unknown".into());
                 match tokio::task::block_in_place(|| {
                     sracha_core::pipeline::decode_sra(&downloaded, &pipeline_config)
                 }) {
@@ -447,20 +454,22 @@ async fn main() -> Result<()> {
                             );
                         } else if stats.bytes_transferred < stats.total_sra_size {
                             eprintln!(
-                                "{}: {} spots, {} reads written, {} of {} transferred (resumed)",
+                                "{}: {} spots, {} reads written, {} of {} transferred from [{}] (resumed)",
                                 style::header(&stats.accession),
                                 style::count(stats.spots_read),
                                 style::count(stats.reads_written),
                                 style::value(format_size(stats.bytes_transferred)),
                                 style::value(format_size(stats.total_sra_size)),
+                                style::value(&source),
                             );
                         } else {
                             eprintln!(
-                                "{}: {} spots, {} reads written, {} downloaded",
+                                "{}: {} spots, {} reads written, {} downloaded from [{}]",
                                 style::header(&stats.accession),
                                 style::count(stats.spots_read),
                                 style::count(stats.reads_written),
                                 style::value(format_size(stats.total_sra_size)),
+                                style::value(&source),
                             );
                         }
                         if !args.stdout {
@@ -535,41 +544,42 @@ async fn main() -> Result<()> {
                 "Resolving {} accession(s)",
                 style::count(run_accessions.len()),
             ));
-            let resolve_results = client
-                .resolve_many(&run_accessions, Default::default())
-                .await?;
+            // Use the same resolver as `get`/`fetch` so info reports the
+            // actual download source (s3-direct vs sdl-s3/ncbi/gs)
+            // that sracha will pick up when downloading. Failures in the
+            // S3 probe fall through to SDL inside `resolve_accessions`,
+            // so per-accession errors are surfaced as a single bail.
+            let resolved = match resolve_accessions(
+                &run_accessions,
+                &client,
+                false, // prefer_sdl
+                true,  // need_run_info
+                sracha_core::sdl::FormatPreference::Sra,
+            )
+            .await
+            {
+                Ok(r) => r,
+                Err(e) => {
+                    sp.finish(format!(
+                        "Resolved {} accession(s) with errors",
+                        style::count(run_accessions.len()),
+                    ));
+                    eprintln!("{} {e}", style::error_label("error:"));
+                    return Ok(());
+                }
+            };
             sp.finish(format!(
                 "Resolved {} accession(s)",
-                style::count(resolve_results.len()),
+                style::count(resolved.len()),
             ));
 
-            let entries: Vec<InfoEntry> = run_accessions
-                .iter()
-                .zip(resolve_results.iter())
-                .map(|(acc, result)| match result {
-                    Ok(resolved) => InfoEntry::Ok(resolved),
-                    Err(e) => InfoEntry::Error {
-                        accession: acc.clone(),
-                        message: format!("{e}"),
-                    },
-                })
-                .collect();
-
-            let ok_count = entries
-                .iter()
-                .filter(|e| matches!(e, InfoEntry::Ok(_)))
-                .count();
+            let entries: Vec<InfoEntry> = resolved.iter().map(InfoEntry::Ok).collect();
 
             if entries.len() > 1 {
-                // Project/multi-accession: summary table; errors included as rows.
+                // Project/multi-accession: summary table.
                 print_info_table(&entries);
-            } else if ok_count == 1 {
-                // Single accession: detailed view.
-                if let Some(InfoEntry::Ok(resolved)) = entries.first() {
-                    print_resolved(resolved);
-                }
-            } else if let Some(InfoEntry::Error { accession, message }) = entries.first() {
-                eprintln!("{} {accession}: {message}", style::error_label("error:"),);
+            } else if let Some(InfoEntry::Ok(r)) = entries.first() {
+                print_resolved(r);
             }
             Ok(())
         }
@@ -948,48 +958,127 @@ fn print_resolved(resolved: &ResolvedAccession) {
     let f = &resolved.sra_file;
 
     println!("{}", style::header(&resolved.accession));
+
+    // Size and format flavor on one line.
+    let format_tag = if f.is_lite {
+        "SRA-lite"
+    } else {
+        "SRA normalized"
+    };
     println!(
-        "  {}    {}",
+        "  {}     {}  ({})",
         style::label("Size:"),
-        style::value(format_size(f.size))
+        style::value(format_size(f.size)),
+        format_tag,
     );
+
+    // Source: whichever mirror sracha will actually use for download.
+    // `s3-direct` means the bucket HEAD probe succeeded; anything else
+    // (s3/ncbi/gs) came from the SDL locate API.
+    if let Some(primary) = f.mirrors.first() {
+        println!(
+            "  {}   [{}] {}",
+            style::label("Source:"),
+            style::value(&primary.service),
+            style::path(&primary.url),
+        );
+    }
+
     println!(
-        "  {}     {}",
+        "  {}      {}",
         style::label("MD5:"),
-        style::value(f.md5.as_deref().unwrap_or("not provided"))
+        style::value(f.md5.as_deref().unwrap_or("not provided")),
     );
-    println!(
-        "  {}    {}",
-        style::label("Lite:"),
-        style::value(if f.is_lite { "yes" } else { "no" })
-    );
-    println!(
-        "  {} {}",
-        style::label("Mirrors:"),
-        style::count(f.mirrors.len())
-    );
-    for m in &f.mirrors {
-        println!("    [{}] {}", style::value(&m.service), style::path(&m.url));
+
+    if let Some(ref ri) = resolved.run_info {
+        let layout = match ri.nreads {
+            1 => "SINGLE".to_string(),
+            2 => "PAIRED".to_string(),
+            n => format!("{n}-read"),
+        };
+        let read_desc = if !ri.avg_read_len.is_empty()
+            && ri.avg_read_len.iter().all(|&l| l == ri.avg_read_len[0])
+        {
+            format!("{}×{}bp", ri.nreads, ri.avg_read_len[0])
+        } else {
+            ri.avg_read_len
+                .iter()
+                .map(|l| format!("{l}bp"))
+                .collect::<Vec<_>>()
+                .join("+")
+        };
+        let spots = ri
+            .spots
+            .map(|s| format!(", {} spots", style::count(thousands(s))))
+            .unwrap_or_default();
+        let bases = ri
+            .spots
+            .map(|s| format!(", {}", style::value(format_bases(s * ri.spot_len as u64))))
+            .unwrap_or_default();
+        println!(
+            "  {}   {} {}{}{}",
+            style::label("Layout:"),
+            style::value(layout),
+            style::value(read_desc),
+            spots,
+            bases,
+        );
+        if let Some(ref plat) = ri.platform {
+            println!("  {} {}", style::label("Platform:"), style::value(plat),);
+        }
     }
 
     if let Some(ref vdb) = resolved.vdbcache_file {
         println!(
-            "  {} yes ({}, {} mirrors)",
+            "  {} yes  ({})",
             style::label("VDBcache:"),
             style::value(format_size(vdb.size)),
-            style::count(vdb.mirrors.len())
         );
     }
 
-    if let Some(ref ri) = resolved.run_info {
-        let layout = if ri.nreads == 2 { "PAIRED" } else { "SINGLE" };
+    // Alternate mirrors, if any — primary already rendered above.
+    if f.mirrors.len() > 1 {
+        let alts: Vec<&str> = f
+            .mirrors
+            .iter()
+            .skip(1)
+            .map(|m| m.service.as_str())
+            .collect();
         println!(
-            "  {}  {} ({}, read lengths: {:?})",
-            style::label("Layout:"),
-            style::value(layout),
-            style::value(format!("{}bp spot", ri.spot_len)),
-            ri.avg_read_len
+            "  {}  {} alternate(s) [{}]",
+            style::label("Mirrors:"),
+            style::count(alts.len()),
+            alts.join(", "),
         );
+    }
+}
+
+/// Insert thousands separators into an integer (e.g. 1234567 → "1,234,567").
+fn thousands<T: Into<u64>>(n: T) -> String {
+    let s = n.into().to_string();
+    let bytes = s.as_bytes();
+    let mut out = String::with_capacity(s.len() + s.len() / 3);
+    for (i, b) in bytes.iter().enumerate() {
+        if i > 0 && (bytes.len() - i) % 3 == 0 {
+            out.push(',');
+        }
+        out.push(*b as char);
+    }
+    out
+}
+
+/// Format a base count as Mbp / Gbp for readability.
+fn format_bases(b: u64) -> String {
+    const M: u64 = 1_000_000;
+    const G: u64 = 1_000_000_000;
+    if b >= G {
+        format!("{:.2} Gbp", b as f64 / G as f64)
+    } else if b >= M {
+        format!("{:.2} Mbp", b as f64 / M as f64)
+    } else if b >= 1_000 {
+        format!("{:.1} Kbp", b as f64 / 1_000.0)
+    } else {
+        format!("{b} bp")
     }
 }
 
@@ -1002,7 +1091,7 @@ pub enum InfoEntry<'a> {
 }
 
 /// Print a compact table for multiple accessions. Errored entries appear
-/// as rows with a `error` status (Size/Layout/Lite dashed) and the error
+/// as rows with an `error` status (other columns dashed) and the error
 /// message is printed beneath the table.
 fn print_info_table(entries: &[InfoEntry<'_>]) {
     use tabled::builder::Builder;
@@ -1011,10 +1100,19 @@ fn print_info_table(entries: &[InfoEntry<'_>]) {
     use tabled::settings::{Alignment, Color, Modify, Panel, Style};
 
     let mut total_size: u64 = 0;
+    let mut total_spots: u64 = 0;
     let mut ok_count = 0usize;
     let mut builder = Builder::new();
 
-    builder.push_record(["Accession", "Size", "Layout", "Lite", "Status"]);
+    builder.push_record([
+        "Accession",
+        "Size",
+        "Layout",
+        "Reads",
+        "Platform",
+        "Spots",
+        "Source",
+    ]);
 
     for entry in entries {
         match entry {
@@ -1022,23 +1120,67 @@ fn print_info_table(entries: &[InfoEntry<'_>]) {
                 let layout = r
                     .run_info
                     .as_ref()
-                    .map(|ri| if ri.nreads == 2 { "PAIRED" } else { "SINGLE" })
-                    .unwrap_or("?");
-                let lite = if r.sra_file.is_lite { "yes" } else { "no" };
+                    .map(|ri| match ri.nreads {
+                        1 => "SINGLE".to_string(),
+                        2 => "PAIRED".to_string(),
+                        n => format!("{n}-read"),
+                    })
+                    .unwrap_or_else(|| "?".into());
+                let reads = r
+                    .run_info
+                    .as_ref()
+                    .map(|ri| {
+                        if !ri.avg_read_len.is_empty()
+                            && ri.avg_read_len.iter().all(|&l| l == ri.avg_read_len[0])
+                        {
+                            format!("{}×{}bp", ri.nreads, ri.avg_read_len[0])
+                        } else {
+                            ri.avg_read_len
+                                .iter()
+                                .map(|l| format!("{l}bp"))
+                                .collect::<Vec<_>>()
+                                .join("+")
+                        }
+                    })
+                    .unwrap_or_else(|| "-".into());
+                let platform = r
+                    .run_info
+                    .as_ref()
+                    .and_then(|ri| ri.platform.clone())
+                    .unwrap_or_else(|| "-".into());
+                let spots = r
+                    .run_info
+                    .as_ref()
+                    .and_then(|ri| ri.spots)
+                    .map(|s| {
+                        total_spots += s;
+                        thousands(s)
+                    })
+                    .unwrap_or_else(|| "-".into());
+                let source = r
+                    .sra_file
+                    .mirrors
+                    .first()
+                    .map(|m| m.service.clone())
+                    .unwrap_or_else(|| "-".into());
                 total_size += r.sra_file.size;
                 ok_count += 1;
 
                 builder.push_record([
                     r.accession.clone(),
                     format_size(r.sra_file.size),
-                    layout.to_string(),
-                    lite.to_string(),
-                    style::value("ok"),
+                    layout,
+                    reads,
+                    platform,
+                    spots,
+                    source,
                 ]);
             }
             InfoEntry::Error { accession, .. } => {
                 builder.push_record([
                     accession.clone(),
+                    "-".into(),
+                    "-".into(),
                     "-".into(),
                     "-".into(),
                     "-".into(),
@@ -1051,9 +1193,10 @@ fn print_info_table(entries: &[InfoEntry<'_>]) {
     let err_count = entries.len() - ok_count;
     let summary = if err_count == 0 {
         format!(
-            "Total: {} across {} run(s)",
+            "Total: {} across {} run(s), {} spots",
             style::value(format_size(total_size)),
             style::count(ok_count),
+            style::count(thousands(total_spots)),
         )
     } else {
         format!(
@@ -1068,12 +1211,19 @@ fn print_info_table(entries: &[InfoEntry<'_>]) {
     let mut table = builder.build();
     table
         .with(Panel::footer(summary))
-        .with(Style::rounded().horizontals([
+        // `intersection_bottom('─')` flattens the outer bottom border —
+        // the footer panel has no column separators, so the default `┴`
+        // ticks were sticking up at nothing. The body/footer separator
+        // keeps its `┴` (set via horizontals below) since the body row
+        // above it does have columns.
+        .with(Style::rounded().intersection_bottom('─').horizontals([
             (1, HorizontalLine::full('─', '┼', '├', '┤')),
             (footer_line, HorizontalLine::full('─', '┴', '├', '┤')),
         ]))
         .with(Modify::new(Rows::first()).with(Color::new("\x1b[1m", "\x1b[22m")))
-        .with(Modify::new(Columns::new(1..=1)).with(Alignment::right()));
+        // Right-align numeric columns: Size (1), Spots (5).
+        .with(Modify::new(Columns::new(1..=1)).with(Alignment::right()))
+        .with(Modify::new(Columns::new(5..=5)).with(Alignment::right()));
 
     println!("{table}");
 
