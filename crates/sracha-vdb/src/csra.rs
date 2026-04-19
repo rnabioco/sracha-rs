@@ -11,7 +11,7 @@ use std::io::{Read, Seek};
 use std::path::Path;
 
 use crate::alignment::AlignmentCursor;
-use crate::blob::{self, DecodedBlob};
+use crate::cache::{CachedColumn, ColumnKind};
 use crate::error::{Error, Result};
 use crate::inspect;
 use crate::kar::KarArchive;
@@ -152,11 +152,11 @@ fn archive_has_seq_column<R: Read + Seek>(
 
 pub struct CsraCursor {
     // SEQUENCE-side columns
-    cmp_read: ColumnReader,
-    primary_alignment_id: ColumnReader,
-    read_len: ColumnReader,
-    read_type: ColumnReader,
-    quality: ColumnReader,
+    cmp_read: CachedColumn,
+    primary_alignment_id: CachedColumn,
+    read_len: CachedColumn,
+    read_type: CachedColumn,
+    quality: CachedColumn,
 
     alignment: AlignmentCursor,
     reference: ReferenceCursor,
@@ -277,11 +277,14 @@ impl CsraCursor {
         let row_count = cmp_read.row_count();
 
         Ok(Self {
-            cmp_read,
-            primary_alignment_id,
-            read_len,
-            read_type,
-            quality,
+            cmp_read: CachedColumn::new(cmp_read, ColumnKind::TwoNa),
+            primary_alignment_id: CachedColumn::new(
+                primary_alignment_id,
+                ColumnKind::Irzip { elem_bits: 64 },
+            ),
+            read_len: CachedColumn::new(read_len, ColumnKind::Irzip { elem_bits: 32 }),
+            read_type: CachedColumn::new(read_type, ColumnKind::Zip),
+            quality: CachedColumn::new(quality, ColumnKind::Zip),
             alignment,
             reference,
             row_count,
@@ -370,11 +373,11 @@ impl CsraCursor {
 
     /// Decode one SEQUENCE row's full bases + quality.
     pub fn read_spot(&self, row_id: i64) -> Result<SpotRead> {
-        let align_ids = read_i64_row(&self.primary_alignment_id, row_id)?;
-        let read_lens = read_u32_row(&self.read_len, row_id)?;
-        let read_types = read_byte_row(&self.read_type, row_id)?;
-        let cmp_read_2na = read_2na_row(&self.cmp_read, row_id)?;
-        let quality = read_byte_row(&self.quality, row_id)?;
+        let align_ids = self.primary_alignment_id.read_i64_row(row_id)?;
+        let read_lens = self.read_len.read_u32_row(row_id)?;
+        let read_types = self.read_type.read_byte_row(row_id)?;
+        let cmp_read_2na = self.cmp_read.read_2na_row(row_id)?;
+        let quality = self.quality.read_byte_row(row_id)?;
 
         if read_lens.len() != align_ids.len() || read_types.len() != align_ids.len() {
             return Err(Error::Format(format!(
@@ -416,215 +419,6 @@ impl CsraCursor {
             read_types,
         })
     }
-}
-
-// ---------------------------------------------------------------------------
-// Per-row decoders for SEQUENCE columns. Mirror `alignment.rs`'s helpers but
-// at the element widths the SEQUENCE side uses.
-// ---------------------------------------------------------------------------
-
-fn read_u32_row(col: &ColumnReader, row_id: i64) -> Result<Vec<u32>> {
-    let (bytes, pm, row_offset) = read_variable_payload(col, row_id, VarEncoding::IrzipBits(32))?;
-    let record_lens = pm.data_record_lengths();
-    let rec_idx = resolve_record_idx(&pm, row_offset, row_id)?;
-    let start: usize = record_lens
-        .iter()
-        .take(rec_idx)
-        .map(|&n| n as usize * 4)
-        .sum();
-    let len_elems = record_lens[rec_idx] as usize;
-    let end = start + len_elems * 4;
-    if end > bytes.len() {
-        return Err(Error::Format(format!(
-            "u32 row {row_id}: slice [{start}..{end}] past payload {}",
-            bytes.len()
-        )));
-    }
-    Ok(bytes[start..end]
-        .chunks_exact(4)
-        .map(|c| u32::from_le_bytes([c[0], c[1], c[2], c[3]]))
-        .collect())
-}
-
-fn read_i64_row(col: &ColumnReader, row_id: i64) -> Result<Vec<i64>> {
-    let (bytes, pm, row_offset) = read_variable_payload(col, row_id, VarEncoding::IrzipBits(64))?;
-    let record_lens = pm.data_record_lengths();
-    let rec_idx = resolve_record_idx(&pm, row_offset, row_id)?;
-    let start: usize = record_lens
-        .iter()
-        .take(rec_idx)
-        .map(|&n| n as usize * 8)
-        .sum();
-    let len_elems = record_lens[rec_idx] as usize;
-    let end = start + len_elems * 8;
-    if end > bytes.len() {
-        return Err(Error::Format(format!(
-            "i64 row {row_id}: slice [{start}..{end}] past payload {}",
-            bytes.len()
-        )));
-    }
-    Ok(bytes[start..end]
-        .chunks_exact(8)
-        .map(|c| i64::from_le_bytes([c[0], c[1], c[2], c[3], c[4], c[5], c[6], c[7]]))
-        .collect())
-}
-
-fn read_byte_row(col: &ColumnReader, row_id: i64) -> Result<Vec<u8>> {
-    let (bytes, pm, row_offset) = read_variable_payload(col, row_id, VarEncoding::Zip)?;
-    let record_lens = pm.data_record_lengths();
-    let rec_idx = resolve_record_idx(&pm, row_offset, row_id)?;
-    let start: usize = record_lens.iter().take(rec_idx).map(|&n| n as usize).sum();
-    let len = record_lens[rec_idx] as usize;
-    let end = start + len;
-    if end > bytes.len() {
-        return Err(Error::Format(format!(
-            "byte row {row_id}: slice [{start}..{end}] past payload {}",
-            bytes.len()
-        )));
-    }
-    Ok(bytes[start..end].to_vec())
-}
-
-/// Read one SEQUENCE.CMP_READ row's bases as 4na-bin. The underlying column
-/// is 2na-packed MSB-first (same encoding as REFERENCE.CMP_READ). The
-/// page_map record lengths are in bases (nucleotides), not bits.
-fn read_2na_row(col: &ColumnReader, row_id: i64) -> Result<Vec<u8>> {
-    let blob = col
-        .find_blob(row_id)
-        .ok_or_else(|| Error::Format(format!("2na row: no blob for row {row_id}")))?;
-    let raw = col.read_raw_blob_slice(row_id)?;
-    let decoded = blob::decode_blob(raw, col.meta().checksum_type, u64::from(blob.id_range), 2)?;
-    let pm = decoded
-        .page_map
-        .as_ref()
-        .ok_or_else(|| Error::Format("SEQUENCE.CMP_READ: page_map required".into()))?;
-    let record_lens = pm.data_record_lengths();
-    let row_offset = (row_id - blob.start_id) as usize;
-    let rec_idx = resolve_record_idx(pm, row_offset, row_id)?;
-    let len_bases = record_lens[rec_idx] as usize;
-    if len_bases == 0 {
-        return Ok(Vec::new());
-    }
-    let start_bits: usize = record_lens
-        .iter()
-        .take(rec_idx)
-        .map(|&n| n as usize * 2)
-        .sum();
-
-    const LUT_2NA_TO_4NA: [u8; 4] = [0x1, 0x2, 0x4, 0x8]; // A C G T
-    let mut out = Vec::with_capacity(len_bases);
-    for i in 0..len_bases {
-        let bit_idx = start_bits + i * 2;
-        let byte = bit_idx / 8;
-        let shift = 6 - (bit_idx % 8);
-        let b = decoded.data.get(byte).copied().ok_or_else(|| {
-            Error::Format(format!(
-                "SEQUENCE.CMP_READ row {row_id}: bit {bit_idx} past payload"
-            ))
-        })?;
-        let code = (b >> shift) & 0x03;
-        out.push(LUT_2NA_TO_4NA[code as usize]);
-    }
-    Ok(out)
-}
-
-#[derive(Clone, Copy)]
-enum VarEncoding {
-    Zip,
-    IrzipBits(u32),
-}
-
-fn read_variable_payload(
-    col: &ColumnReader,
-    row_id: i64,
-    enc: VarEncoding,
-) -> Result<(Vec<u8>, blob::PageMap, usize)> {
-    let blob = col
-        .find_blob(row_id)
-        .ok_or_else(|| Error::Format(format!("no blob for row {row_id}")))?;
-    let raw = col.read_raw_blob_slice(row_id)?;
-    let decoded = blob::decode_blob(raw, col.meta().checksum_type, u64::from(blob.id_range), 8)?;
-    let pm = decoded
-        .page_map
-        .clone()
-        .ok_or_else(|| Error::Format("variable column: page_map required".into()))?;
-    let bytes = match enc {
-        VarEncoding::Zip => decode_bytes_payload(&decoded)?,
-        VarEncoding::IrzipBits(bits) => decode_integer_bytes(&decoded, bits)?,
-    };
-    Ok((bytes, pm, (row_id - blob.start_id) as usize))
-}
-
-fn decode_bytes_payload(decoded: &DecodedBlob<'_>) -> Result<Vec<u8>> {
-    let hdr = decoded.headers.first();
-    let osize = hdr.map(|h| h.osize as usize).unwrap_or(decoded.data.len());
-    if decoded.data.len() == osize {
-        return Ok(decoded.data.to_vec());
-    }
-    if let Ok(out) = blob::deflate_decompress(&decoded.data, osize)
-        && out.len() == osize
-    {
-        return Ok(out);
-    }
-    Err(Error::Format(format!(
-        "byte column: no decoder succeeded (data.len={}, osize={osize})",
-        decoded.data.len()
-    )))
-}
-
-fn decode_integer_bytes(decoded: &DecodedBlob<'_>, elem_bits: u32) -> Result<Vec<u8>> {
-    let hdr = decoded.headers.first();
-    let osize = hdr.map(|h| h.osize as usize).unwrap_or(decoded.data.len());
-    if let Some(h) = hdr
-        && !h.ops.is_empty()
-    {
-        let planes = h.ops[0];
-        let min = h.args.first().copied().unwrap_or(0);
-        let slope = h.args.get(1).copied().unwrap_or(0);
-        let num_elems = (osize as u32) / (elem_bits / 8);
-        let series2 = h
-            .args
-            .get(2)
-            .and_then(|&m2| h.args.get(3).map(|&s2| (m2, s2)));
-        return blob::irzip_decode(
-            &decoded.data,
-            elem_bits,
-            num_elems,
-            min,
-            slope,
-            planes,
-            series2,
-        );
-    }
-    if decoded.data.len() == osize {
-        return Ok(decoded.data.to_vec());
-    }
-    if let Ok(out) = blob::deflate_decompress(&decoded.data, osize)
-        && out.len() == osize
-    {
-        return Ok(out);
-    }
-    Err(Error::Format(format!(
-        "integer column: no decoder succeeded (elem_bits={elem_bits}, data.len={}, osize={osize})",
-        decoded.data.len()
-    )))
-}
-
-fn resolve_record_idx(pm: &blob::PageMap, logical_offset: usize, row_id: i64) -> Result<usize> {
-    if pm.data_runs.is_empty() {
-        return Ok(logical_offset);
-    }
-    let mut seen = 0usize;
-    for (i, &repeat) in pm.data_runs.iter().enumerate() {
-        let end = seen + repeat as usize;
-        if logical_offset < end {
-            return Ok(i);
-        }
-        seen = end;
-    }
-    Err(Error::Format(format!(
-        "row {row_id}: logical offset {logical_offset} outside data_runs"
-    )))
 }
 
 #[cfg(test)]

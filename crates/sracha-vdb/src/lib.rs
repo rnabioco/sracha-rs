@@ -7,6 +7,7 @@
 pub mod alignment;
 pub mod blob;
 pub mod blob_codecs;
+pub(crate) mod cache;
 pub mod csra;
 pub mod cursor;
 pub mod dump;
