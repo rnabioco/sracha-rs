@@ -25,9 +25,11 @@ done
 
 echo "Making margins transparent..."
 # -fuzz absorbs the palette quantization + border antialiasing pixels
-# (e.g. #fb00fc, #e709ea) that cluster around the sentinel magenta.
+# (e.g. #fb00fc, #e709ea, #c401c8) that cluster around the sentinel
+# magenta. 25% is well below the distance to the nearest Dracula /
+# windowbar colors (~43% to the red dot).
 for gif in docs/images/*.gif; do
-    magick "$gif" -fuzz 15% -transparent '#fe00fe' "$gif"
+    magick "$gif" -fuzz 25% -transparent '#fe00fe' "$gif"
 done
 
 echo "Done! Gifs are in docs/images/"
