@@ -186,7 +186,7 @@ pub fn run_validate(
                     };
                     let id_range = read_blob.id_range as u64;
                     if let Err(e) = decode_raw(read_raw, read_cs, id_range) {
-                        let (msg, is_integ) = fmt_err("READ", bi, e);
+                        let (msg, is_integ) = fmt_err("READ", bi, e.into());
                         return Some((bi, msg, is_integ));
                     }
 
@@ -211,7 +211,7 @@ pub fn run_validate(
                                         }
                                     }
                                     Err(e) => {
-                                        let (msg, is_integ) = fmt_err("QUALITY", bi, e);
+                                        let (msg, is_integ) = fmt_err("QUALITY", bi, e.into());
                                         return Some((bi, msg, is_integ));
                                     }
                                 }
@@ -230,7 +230,7 @@ pub fn run_validate(
                             Ok(rl_raw) => {
                                 let rl_id = rlblob.id_range as u64;
                                 if let Err(e) = decode_raw(rl_raw, read_len_cs, rl_id) {
-                                    let (msg, is_integ) = fmt_err("READ_LEN", bi, e);
+                                    let (msg, is_integ) = fmt_err("READ_LEN", bi, e.into());
                                     return Some((bi, msg, is_integ));
                                 }
                             }

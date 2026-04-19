@@ -6,6 +6,7 @@
 
 pub mod alignment;
 pub mod blob;
+pub mod blob_codecs;
 pub mod csra;
 pub mod cursor;
 pub mod encoding;
