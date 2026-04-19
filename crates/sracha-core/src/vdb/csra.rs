@@ -24,6 +24,10 @@ use crate::vdb::restore::{align_restore_read, seq_restore_read};
 /// has a physical CMP_READ column, PRIMARY_ALIGNMENT table is present,
 /// and REFERENCE table is present. Archives that fail any of these
 /// checks fall through to the regular VDB decode path.
+///
+/// This is a pure path-scan over the KAR TOC — no column reads, so it's
+/// safe to call up-front from `pipeline::run_fastq` to pick the decode
+/// dispatch before opening any cursor.
 pub fn looks_like_decodable_csra(sra_path: &Path) -> Result<bool> {
     let file = std::fs::File::open(sra_path)?;
     let archive = KarArchive::open(std::io::BufReader::new(file))?;
@@ -447,4 +451,47 @@ fn resolve_record_idx(pm: &blob::PageMap, logical_offset: usize, row_id: i64) ->
     Err(Error::Vdb(format!(
         "row {row_id}: logical offset {logical_offset} outside data_runs"
     )))
+}
+
+#[cfg(test)]
+mod looks_like_tests {
+    use super::looks_like_decodable_csra;
+    use std::path::Path;
+
+    #[test]
+    fn real_csra_detected() {
+        // VDB-3418 is the reference-compressed cSRA in our fixtures —
+        // SEQUENCE/col/CMP_READ + PRIMARY_ALIGNMENT + REFERENCE all
+        // present. Skip silently when the fixture isn't materialised
+        // (CI may not have run the download).
+        let p = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/VDB-3418.sra");
+        if !p.exists() {
+            return;
+        }
+        assert!(
+            looks_like_decodable_csra(&p).unwrap(),
+            "VDB-3418 should pass the cSRA detector"
+        );
+    }
+
+    #[test]
+    fn non_csra_not_detected() {
+        // DRR045255 is a flat-SEQUENCE bam-load-residue archive that
+        // decodes via the plain VdbCursor path, not CsraCursor — the
+        // detector must NOT claim it.
+        let p = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/DRR045255.sra");
+        if !p.exists() {
+            return;
+        }
+        assert!(
+            !looks_like_decodable_csra(&p).unwrap(),
+            "DRR045255 should not be routed through CsraCursor"
+        );
+    }
+
+    #[test]
+    fn missing_file_returns_io_error() {
+        let p = Path::new("/this/path/does/not/exist.sra");
+        assert!(looks_like_decodable_csra(p).is_err());
+    }
 }
