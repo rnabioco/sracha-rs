@@ -1,5 +1,54 @@
 # Changelog
 
+## Unreleased
+
+### Added
+
+- **Reference-compressed cSRA (aligned SRA) decode**: archives with a
+  physical `SEQUENCE/col/CMP_READ` plus sibling `PRIMARY_ALIGNMENT` +
+  `REFERENCE` tables are now decoded in pure Rust —
+  `NCBI:align:seq_restore_read` and `NCBI:align:align_restore_read`
+  are both reimplemented (see `vdb/restore.rs`). `sracha fastq` on a
+  cSRA file produces output byte-identical to `fasterq-dump`
+  (validated against ncbi-vdb's `VDB-3418.sra` test fixture, 985
+  spots / ~36 Mbp in ~4 s release). Platform-agnostic; long-read and
+  short-read aligned archives both work. Split / compression / stdout
+  flags and parallel decode (`-t N`) all go through the existing FASTQ
+  writer.
+- **vdbcache-aware cSRA reader**: `CsraCursor::open_any` routes each
+  sub-cursor (AlignmentCursor, ReferenceCursor) to whichever archive
+  carries its table. `sracha fetch` downloads the `.sra.vdbcache`
+  sidecar alongside the main `.sra` whenever SDL advertises one.
+- **Narrowed `reject_if_csra`**: the iter-4 rule rejected any archive
+  with aligned schema + `CMP_BASE_COUNT > 0` + no `unaligned` marker.
+  Those archives still carry a full physical READ column in practice
+  and decode cleanly through the plain VdbCursor path; validated on
+  9 of the 10 past-rejected archives from prior random-corpus runs
+  (DRR017176, DRR027259, DRR027597, DRR032355, DRR040407, DRR040559,
+  DRR041303, DRR045227, DRR045255, DRR045332).
+- **`validation/random_corpus.sh --aligned`**: targets WGS /
+  BAM-loaded accessions via the ENA portal, passed through to
+  `sample_accessions.sh`.
+- **Actionable errors for known-unsupported cSRA shapes**: external
+  refseq fetch (REFERENCE without embedded CMP_READ; SRR341578-class)
+  and fixed-length SEQUENCE without physical READ_LEN both surface
+  clear "decode with fasterq-dump for now" messages instead of opaque
+  `column header (idx1) not found` diagnostics.
+
+### Fixed
+
+- **`spots_before` race across BATCH_SIZE=1024 boundaries**: the decode
+  loop used to read `spots_read` atomically into per-batch cumulative
+  offsets, racing with the writer thread across the bounded channel.
+  Archives with > 1024 blobs (e.g. DRR045255) silently reset the FASTQ
+  defline spot number to 1 at the 1,048,577th spot. Now tracked
+  locally in the decode loop using blob metadata only.
+- **page_map random-access offset unit**: variable-length integer
+  columns with `row_length > 1` sometimes carry u32-indexed `data_runs`
+  (rather than entry-indexed). Adaptive dispatch tries entry-index
+  first and falls back to u32-index when the max offset would overflow
+  the decoded buffer. Unblocks DRR045255's READ_LEN blob at row ~1 M.
+
 ## 0.2.0 (2026-04-18)
 
 ### Added

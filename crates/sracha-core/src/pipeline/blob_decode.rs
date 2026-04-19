@@ -83,17 +83,45 @@ pub(super) fn expand_via_page_map(
     let entry_bytes = row_length * elem_bytes;
 
     if !pm.data_runs.is_empty() && pm.data_runs.len() as u64 >= pm.total_rows() {
-        // Random-access variant: data_runs is repurposed as offsets into
-        // the unique decoded entries. A missing/oversized offset means the
-        // page map disagrees with the decoded column — refuse to silently
-        // drop those rows.
+        // Random-access variant: data_runs[i] picks the source for logical
+        // row i. Two offset-unit conventions coexist in practice:
+        //
+        // - entry-index (default): offset is the index of a row_length-wide
+        //   entry in the decoded buffer, so `start = offset * entry_bytes`.
+        // - u32-index (rare; e.g. DRR045255's READ_LEN blob with 1032 rows
+        //   where the decoded buffer holds a flat u32 stream): offset is
+        //   the index of a single u32, so `start = offset * elem_bytes` and
+        //   row_length consecutive u32s are consumed per row.
+        //
+        // We can't statically tell them apart — the page_map serialisation
+        // uses the same on-disk shape for both. Dispatch adaptively: if
+        // the max data_run fits the entry-index interpretation, use it;
+        // otherwise fall back to u32-index. Either way a dispatch that
+        // can't reconstruct row_count * entry_bytes of output is an error.
+        let max_offset = pm.data_runs.iter().max().copied().unwrap_or(0) as usize;
+        let entry_index_fits = max_offset * entry_bytes + entry_bytes <= decoded_ints.len();
+        let u32_index_fits =
+            row_length >= 2 && max_offset * elem_bytes + entry_bytes <= decoded_ints.len();
+        let stride = if entry_index_fits {
+            entry_bytes
+        } else if u32_index_fits {
+            elem_bytes
+        } else {
+            return Err(Error::Pipeline(format!(
+                "page_map: max offset {max_offset} overflows decoded buffer \
+                 ({} bytes) under both entry-index (×{entry_bytes}) and u32-index \
+                 (×{elem_bytes}) interpretations",
+                decoded_ints.len(),
+            )));
+        };
+
         let mut expanded = Vec::with_capacity(pm.data_runs.len() * entry_bytes);
         for &offset in &pm.data_runs {
-            let start = offset as usize * entry_bytes;
+            let start = offset as usize * stride;
             let end = start + entry_bytes;
             if end > decoded_ints.len() {
                 return Err(Error::Pipeline(format!(
-                    "page_map: offset {offset} × {entry_bytes} out of {} decoded bytes",
+                    "page_map: offset {offset} × {stride} + {entry_bytes} out of {} decoded bytes",
                     decoded_ints.len(),
                 )));
             }

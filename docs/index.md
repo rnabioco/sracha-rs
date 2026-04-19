@@ -28,26 +28,31 @@ Fast SRA downloader and FASTQ converter, written in pure Rust.
 3. **Parse** -- reads the KAR archive and decodes VDB columns (READ, QUALITY, READ_LEN, NAME)
 4. **Output** -- formats FASTQ (or FASTA) records and compresses with parallel gzip/zstd
 
-## Not yet supported
+## Reference-compressed cSRA
 
-The following are on the to-be-implemented list. sracha detects each at
-cursor open (or download) and exits with a clear error rather than
-producing bad output, so you can fall back to `fasterq-dump` for these
-specific runs.
+Archives with a physical `CMP_READ` column plus sibling
+`PRIMARY_ALIGNMENT` + `REFERENCE` tables decode through a separate
+code path. Reads are stored as deltas against a reference genome; a
+pure-Rust reimplementation of `NCBI:align:seq_restore_read` +
+`NCBI:align:align_restore_read` splices them back together. Output is
+byte-identical to `fasterq-dump` on the test fixtures we've verified
+(e.g. `VDB-3418.sra`).
 
-- **Reference-compressed cSRA** — archives with a physical `CMP_READ`
-  column or a sibling `PRIMARY_ALIGNMENT` table. Reads are stored as
-  deltas against a reference genome and require
-  `NCBI:align:seq_restore_read` cross-table joins, which sracha does
-  not yet implement. Common in human WGS/WES re-analyses; most
-  unaligned submissions (latf-load, BGISEQ, Element, PacBio, Nanopore)
-  are unaffected.
+Known v1 caveats on the cSRA path:
 
-  Archives that merely *label* themselves with an aligned schema
-  (e.g. bam-load's `ConvertDatabaseToUnmapped` pathway, which renames
-  `CMP_READ` → `READ` when no alignments were ingested) are handled
-  transparently — they decode through the same physical-column path
-  as regular SRA-lite files.
+- **Single-file uncompressed output.** `--split split-3` / `--split
+  split-files` / `--compress gzip|zstd` / `--stdout` are ignored on
+  cSRA archives; sracha emits one uncompressed `{accession}.fastq` and
+  warns. (The regular SRA path honours them as before.)
+- **Serial per-spot iteration.** The rayon-batched decode used for
+  plain SRA doesn't apply; expect ~100 MB/s on typical PCIe SSDs. Fine
+  for validation / smaller archives; large cSRA re-decodes will get
+  slower than `fasterq-dump` until the batched variant lands.
+
+Archives that merely *label* themselves with an aligned schema (e.g.
+bam-load's `ConvertDatabaseToUnmapped` pathway, which renames
+`CMP_READ` → `READ` when no alignments were ingested) keep decoding
+through the plain physical-column path as before.
 
 ## Demo
 

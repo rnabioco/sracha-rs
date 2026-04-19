@@ -94,6 +94,13 @@ pub fn list_columns<R: Read + Seek>(
 }
 
 /// Resolve the in-archive path to the `col/` directory of the chosen table.
+pub(crate) fn column_base_path_public<R: Read + Seek>(
+    archive: &KarArchive<R>,
+    table: Option<&str>,
+) -> Result<String> {
+    column_base_path(archive, table)
+}
+
 fn column_base_path<R: Read + Seek>(
     archive: &KarArchive<R>,
     table: Option<&str>,

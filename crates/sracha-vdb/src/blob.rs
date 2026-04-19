@@ -239,7 +239,7 @@ impl PageMap {
     /// (how many consecutive rows share each length). This function expands
     /// to one length per data record (not per logical row — data_runs are
     /// NOT applied here).
-    fn data_record_lengths(&self) -> Vec<u32> {
+    pub fn data_record_lengths(&self) -> Vec<u32> {
         if self.data_runs.is_empty() {
             // No data_runs: data_recs == total_rows, expand leng_runs directly
             let mut row_lens = Vec::with_capacity(self.data_recs as usize);

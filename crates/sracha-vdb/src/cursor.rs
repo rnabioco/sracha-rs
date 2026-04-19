@@ -681,20 +681,43 @@ fn reject_if_csra<R: Read + Seek>(archive: &mut KarArchive<R>, seq_col_base: &st
     // stale pre-conversion bookkeeping.
     let cmp_base_count = read_cmp_base_count_from_archive(archive);
     let has_unaligned_marker = read_unaligned_marker_from_archive(archive);
-    let has_compressed_bases = cmp_base_count.unwrap_or(0) > 0 && !has_unaligned_marker;
+
+    // When the archive has no CMP_READ, no PRIMARY_ALIGNMENT, and a
+    // physical READ column, the plain VdbCursor path can handle it —
+    // `CMP_BASE_COUNT > 0` on its own is stale pre-conversion metadata
+    // left over from bam-load's compressed stage, not evidence the
+    // physical READ column is residue-only. This covers DRR017176-class
+    // archives (schema NCBI:align:db:alignment_sorted#1.2.1, flat
+    // SEQUENCE table, READ present) that vdb-dump / fasterq-dump decode
+    // cleanly via the physical READ column.
+    let read_col_prefix = format!("{seq_col_base}/READ");
+    let has_physical_read = archive
+        .entries()
+        .keys()
+        .any(|p| p == &read_col_prefix || p.starts_with(&format!("{read_col_prefix}/")));
+    let has_compressed_bases =
+        cmp_base_count.unwrap_or(0) > 0 && !has_unaligned_marker && !has_physical_read;
 
     if !has_cmp_read && !has_primary_alignment && !has_compressed_bases {
         return Ok(());
     }
 
+    // `pipeline::run_fastq` routes reference-compressed cSRA (CMP_READ +
+    // PRIMARY_ALIGNMENT + REFERENCE) through `CsraCursor` before this
+    // check fires, so anything arriving here is a rarer aligned-SRA
+    // shape that the VDB-direct decoder can't handle — most commonly
+    // DRR032766-style CMP_BASE_COUNT>0 without the sibling tables.
     let hint = match read_aligned_schema_name(archive) {
         Some(name) => format!(
-            "schema={name}. Reads require ncbi-vdb's schema-aware virtual cursor \
-             to reconstruct; sracha reads physical columns only. Use fasterq-dump \
-             from sra-tools instead."
+            "schema={name}. VDB-direct decode requires a physical READ column. \
+             For reference-compressed cSRA with PRIMARY_ALIGNMENT + REFERENCE \
+             tables, use `sracha fastq`, which dispatches through CsraCursor. \
+             This archive has neither a physical READ nor the alignment+reference \
+             tables we need to reconstruct it."
         ),
-        None => "reads are reference-compressed and cannot be directly converted; \
-                 use fasterq-dump from sra-tools instead."
+        None => "reads are reference-compressed and this archive lacks the \
+                 PRIMARY_ALIGNMENT + REFERENCE tables sracha's cSRA path needs; \
+                 use fasterq-dump from sra-tools for this specific shape."
             .into(),
     };
     Err(Error::UnsupportedFormat {
@@ -1197,22 +1220,22 @@ mod tests {
     }
 
     #[test]
-    fn reject_csra_with_nonzero_cmp_base_count() {
-        // Regression for iter-4 cSRA detection: DRR032766-class archives
-        // have aligned schema + non-zero CMP_BASE_COUNT + no `unaligned`
-        // marker — sracha cannot reconstruct reads via seq_restore_read,
-        // so must reject instead of emitting half-length garbage.
+    fn accept_csra_with_nonzero_cmp_base_count_and_physical_read() {
+        // Originally pinned the iter-4 DRR032766-class rejection (aligned
+        // schema + CMP_BASE_COUNT>0 + no unaligned marker → reject). The
+        // real-world follow-up on the csra-support branch showed that
+        // these archives still carry a full physical READ column
+        // (DRR017176 decodes through the plain VdbCursor path and the
+        // output matches fasterq-dump modulo the sracha-wide Q0→N
+        // ALTREAD-merge policy). `reject_if_csra` now allows them
+        // through when a physical READ is present; this test pins the
+        // narrower rejection.
         let archive_bytes = build_align_archive_with_csra_stats(1_000_000, false);
         let sra_path = write_temp_sra(&archive_bytes);
         let mut archive = KarArchive::open(Cursor::new(archive_bytes)).unwrap();
-        let msg = match VdbCursor::open(&mut archive, &sra_path) {
-            Ok(_) => panic!("expected cSRA rejection"),
-            Err(e) => e.to_string(),
-        };
-        assert!(
-            msg.contains("aligned SRA") || msg.contains("cSRA"),
-            "expected cSRA rejection, got: {msg}"
-        );
+        let cursor = VdbCursor::open(&mut archive, &sra_path)
+            .expect("aligned schema + CMP_BASE_COUNT + physical READ should decode");
+        assert_eq!(cursor.spot_count(), 1);
         let _ = std::fs::remove_file(&sra_path);
     }
 

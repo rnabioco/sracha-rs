@@ -145,6 +145,46 @@ async fn main() -> Result<()> {
                     style::value(format_size(resolved.sra_file.size)),
                 );
                 eprintln!("  wrote {}", style::path(output_path.display()));
+
+                // If SDL returned a vdbcache sidecar (modern cSRA
+                // archives split the REFERENCE / extra alignment
+                // columns out of the main KAR), download it next to
+                // the .sra so `sracha fastq` can find it via the
+                // `.sra.vdbcache` convention.
+                if let Some(ref vdb) = resolved.vdbcache_file {
+                    let vdb_mirror = vdb
+                        .mirrors
+                        .iter()
+                        .min_by_key(|m| match m.service.as_str() {
+                            "s3" | "s3-direct" => 0u8,
+                            "gs" => 1,
+                            _ if m.service.contains("sra-ncbi") => 2,
+                            "ncbi" => 3,
+                            _ => 4,
+                        })
+                        .ok_or_else(|| anyhow::anyhow!("no vdbcache mirrors for {acc}"))?;
+                    let vdb_url = vdb_mirror.url.clone();
+                    let vdb_path = args.output_dir.join(format!("{acc}.sra.vdbcache"));
+                    tracing::info!(
+                        "{acc}: downloading vdbcache {} from [{}] to {}",
+                        format_size(vdb.size),
+                        vdb_mirror.service,
+                        vdb_path.display()
+                    );
+                    sracha_core::download::download_file(
+                        &[vdb_url],
+                        vdb.size,
+                        vdb.md5.as_deref(),
+                        &vdb_path,
+                        &dl_config,
+                    )
+                    .await?;
+                    eprintln!(
+                        "  vdbcache {} wrote {}",
+                        style::value(format_size(vdb.size)),
+                        style::path(vdb_path.display())
+                    );
+                }
             }
             Ok(())
         }
@@ -796,6 +836,22 @@ fn print_local_file_info(path: &std::path::Path) {
             return;
         }
     };
+    // cSRA dispatch: archives we can decode via CsraCursor don't open as
+    // a plain VdbCursor (no physical READ column). Render a cSRA-flavoured
+    // info block instead of surfacing the reject-if-csra error. When a
+    // `.sra.vdbcache` sidecar exists alongside the .sra, check both so
+    // modern NCBI split-archive cSRA is recognised.
+    let vdbcache = sracha_core::vdb::csra::vdbcache_sidecar_path(path);
+    let vdbcache_opt = if vdbcache.exists() {
+        Some(vdbcache.as_path())
+    } else {
+        None
+    };
+    if sracha_core::vdb::csra::looks_like_decodable_csra(path, vdbcache_opt).unwrap_or(false) {
+        print_local_csra_info(path, &mut archive);
+        return;
+    }
+
     let cursor = match VdbCursor::open(&mut archive, path) {
         Ok(c) => c,
         Err(e) => {
@@ -847,6 +903,44 @@ fn print_local_file_info(path: &std::path::Path) {
         "  {} {}",
         style::label("Columns:"),
         style::value(columns.join(", "))
+    );
+}
+
+fn print_local_csra_info<R: std::io::Read + std::io::Seek>(
+    path: &std::path::Path,
+    archive: &mut sracha_core::vdb::kar::KarArchive<R>,
+) {
+    use sracha_core::vdb::csra::CsraCursor;
+
+    let csra = match CsraCursor::open(archive, path) {
+        Ok(c) => c,
+        Err(e) => {
+            eprintln!("  {} cSRA cursor failed: {e}", style::error_label("error:"));
+            return;
+        }
+    };
+
+    println!(
+        "  {} {}",
+        style::label("Platform:"),
+        style::value("reference-compressed cSRA")
+    );
+    println!(
+        "  {}   {}",
+        style::label("Spots:"),
+        style::count(csra.row_count())
+    );
+    println!(
+        "  {} {}",
+        style::label("Columns:"),
+        style::value(
+            "CMP_READ, PRIMARY_ALIGNMENT_ID, READ_LEN, READ_TYPE, QUALITY (+ PRIMARY_ALIGNMENT + REFERENCE)"
+        )
+    );
+    println!(
+        "  {} {}",
+        style::label("Note:"),
+        style::value("decode via `sracha fastq` (not supported by plain VDB cursor)")
     );
 }
 
