@@ -929,8 +929,14 @@ pub fn run_fastq(
     // them through CsraCursor's splice. v1 handles one uncompressed output
     // file and ignores split / compression / stdout flags — a follow-up
     // will port CsraCursor to the batched pipeline.
-    if crate::vdb::csra::looks_like_decodable_csra(sra_path).unwrap_or(false) {
-        return run_fastq_csra(sra_path, &acc, config);
+    let vdbcache_candidate = crate::vdb::csra::vdbcache_sidecar_path(sra_path);
+    let vdbcache_for_probe = if vdbcache_candidate.exists() {
+        Some(vdbcache_candidate.as_path())
+    } else {
+        None
+    };
+    if crate::vdb::csra::looks_like_decodable_csra(sra_path, vdbcache_for_probe).unwrap_or(false) {
+        return run_fastq_csra(sra_path, &acc, config, vdbcache_for_probe);
     }
 
     // Detect SRA-lite by checking if the quality column is absent.
@@ -1067,6 +1073,7 @@ fn run_fastq_csra(
     sra_path: &std::path::Path,
     acc: &str,
     config: &PipelineConfig,
+    vdbcache_path: Option<&std::path::Path>,
 ) -> Result<FastqStats> {
     use crate::fastq::{CompressionMode, FastqConfig, OutputSlot, SpotRecord, output_filename};
     use crate::vdb::csra::CsraCursor;
@@ -1075,7 +1082,24 @@ fn run_fastq_csra(
 
     let file = std::fs::File::open(sra_path)?;
     let mut archive = KarArchive::open(std::io::BufReader::new(file))?;
-    let csra = CsraCursor::open(&mut archive, sra_path)?;
+    // Open the vdbcache sidecar when present. Each decode worker opens
+    // its own copy below (mmap/file handles are not Send across rayon
+    // threads), so the top-level one is only used for the SEQUENCE
+    // open/row_count probe.
+    let mut vdbcache_archive = match vdbcache_path {
+        Some(p) => Some(KarArchive::open(std::io::BufReader::new(
+            std::fs::File::open(p)?,
+        ))?),
+        None => None,
+    };
+    let csra = {
+        let vdbcache_for_open: Option<(&mut KarArchive<_>, &std::path::Path)> =
+            match (&mut vdbcache_archive, vdbcache_path) {
+                (Some(a), Some(p)) => Some((a, p)),
+                _ => None,
+            };
+        CsraCursor::open_any(&mut archive, sra_path, vdbcache_for_open)?
+    };
 
     let fastq_config = FastqConfig {
         split_mode: config.split_mode,
@@ -1163,7 +1187,20 @@ fn run_fastq_csra(
     let decode_chunk = |start: i64, end: i64| -> Result<Vec<SlotChunk>> {
         let file = std::fs::File::open(sra_path)?;
         let mut archive = KarArchive::open(std::io::BufReader::new(file))?;
-        let csra = CsraCursor::open(&mut archive, sra_path)?;
+        let mut cache_archive = match vdbcache_path {
+            Some(p) => Some(KarArchive::open(std::io::BufReader::new(
+                std::fs::File::open(p)?,
+            ))?),
+            None => None,
+        };
+        let csra = {
+            let cache_opt: Option<(&mut KarArchive<_>, &std::path::Path)> =
+                match (&mut cache_archive, vdbcache_path) {
+                    (Some(a), Some(p)) => Some((a, p)),
+                    _ => None,
+                };
+            CsraCursor::open_any(&mut archive, sra_path, cache_opt)?
+        };
         let mut per_slot: HashMap<OutputSlot, (Vec<u8>, u64)> = HashMap::new();
         let mut itoa_buf = itoa::Buffer::new();
         for row_id in start..end {

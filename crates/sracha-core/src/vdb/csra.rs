@@ -19,34 +19,73 @@ use crate::vdb::kdb::ColumnReader;
 use crate::vdb::reference::ReferenceCursor;
 use crate::vdb::restore::{align_restore_read, seq_restore_read};
 
-/// Inspect the KAR archive at `sra_path` and return true if it looks like
-/// a reference-compressed cSRA we can decode via `CsraCursor`: SEQUENCE
-/// has a physical CMP_READ column, PRIMARY_ALIGNMENT table is present,
-/// and REFERENCE table is present. Archives that fail any of these
-/// checks fall through to the regular VDB decode path.
+/// Given a `.sra` path, return the canonical `.sra.vdbcache` sibling path
+/// (NCBI's default layout — `sracha fetch` saves the vdbcache with that
+/// suffix when the SDL response lists one). The file may or may not
+/// exist; callers are expected to gate on `.exists()`.
+pub fn vdbcache_sidecar_path(sra_path: &Path) -> std::path::PathBuf {
+    let mut p = sra_path.as_os_str().to_owned();
+    p.push(".vdbcache");
+    std::path::PathBuf::from(p)
+}
+
+/// Does the KAR TOC contain `tbl/{table}` as a directory entry (either at
+/// the archive root or nested under a single accession prefix)?
+pub(crate) fn archive_has_table<R: Read + Seek>(archive: &KarArchive<R>, table: &str) -> bool {
+    let suffix = format!("/tbl/{table}");
+    let exact = format!("tbl/{table}");
+    archive
+        .entries()
+        .keys()
+        .any(|k| k == &exact || k.ends_with(&suffix))
+}
+
+fn archive_has_seq_cmp_read<R: Read + Seek>(archive: &KarArchive<R>) -> bool {
+    let exact = "tbl/SEQUENCE/col/CMP_READ";
+    let nested = "/tbl/SEQUENCE/col/CMP_READ";
+    archive.entries().keys().any(|k| {
+        k == exact
+            || k.ends_with(nested)
+            || k.starts_with(&format!("{exact}/"))
+            || k.contains(&format!("{nested}/"))
+    })
+}
+
+/// Inspect the KAR archive at `sra_path` (and optional `.vdbcache`
+/// sidecar) and return true if the pair looks like a reference-
+/// compressed cSRA decodable by `CsraCursor`. `SEQUENCE/col/CMP_READ`
+/// must live in the main archive (the SEQUENCE half is never
+/// sidecar'd). `PRIMARY_ALIGNMENT` and `REFERENCE` may live in either
+/// archive — older monolithic cSRA (VDB-3418) keeps them in main,
+/// modern NCBI uploads split them into `.sra.vdbcache`.
 ///
-/// This is a pure path-scan over the KAR TOC — no column reads, so it's
-/// safe to call up-front from `pipeline::run_fastq` to pick the decode
-/// dispatch before opening any cursor.
-pub fn looks_like_decodable_csra(sra_path: &Path) -> Result<bool> {
-    let file = std::fs::File::open(sra_path)?;
-    let archive = KarArchive::open(std::io::BufReader::new(file))?;
-    let keys = archive.entries().keys();
-    let mut has_seq_cmp_read = false;
-    let mut has_primary = false;
-    let mut has_reference = false;
-    for k in keys {
-        if k.ends_with("tbl/SEQUENCE/col/CMP_READ") || k.contains("/tbl/SEQUENCE/col/CMP_READ/") {
-            has_seq_cmp_read = true;
-        }
-        if k == "tbl/PRIMARY_ALIGNMENT" || k.ends_with("/tbl/PRIMARY_ALIGNMENT") {
-            has_primary = true;
-        }
-        if k == "tbl/REFERENCE" || k.ends_with("/tbl/REFERENCE") {
-            has_reference = true;
-        }
-    }
+/// Pure TOC scan — no column reads — so safe to call up-front from
+/// `pipeline::run_fastq`.
+pub fn looks_like_decodable_csra(sra_path: &Path, vdbcache_path: Option<&Path>) -> Result<bool> {
+    let main = open_kar(sra_path)?;
+    let cache = match vdbcache_path {
+        Some(p) if p.exists() => Some(open_kar(p)?),
+        _ => None,
+    };
+
+    let has_seq_cmp_read = archive_has_seq_cmp_read(&main);
+    let has_primary = archive_has_table(&main, "PRIMARY_ALIGNMENT")
+        || cache
+            .as_ref()
+            .map(|c| archive_has_table(c, "PRIMARY_ALIGNMENT"))
+            .unwrap_or(false);
+    let has_reference = archive_has_table(&main, "REFERENCE")
+        || cache
+            .as_ref()
+            .map(|c| archive_has_table(c, "REFERENCE"))
+            .unwrap_or(false);
+
     Ok(has_seq_cmp_read && has_primary && has_reference)
+}
+
+fn open_kar(path: &Path) -> Result<KarArchive<std::io::BufReader<std::fs::File>>> {
+    let file = std::fs::File::open(path)?;
+    KarArchive::open(std::io::BufReader::new(file))
 }
 
 pub struct CsraCursor {
@@ -86,19 +125,68 @@ pub struct SpotRead {
 
 impl CsraCursor {
     pub fn open<R: Read + Seek>(archive: &mut KarArchive<R>, sra_path: &Path) -> Result<Self> {
-        let col_base = inspect::column_base_path_public(archive, Some("SEQUENCE"))?;
+        Self::open_any::<R>(archive, sra_path, None)
+    }
+
+    /// vdbcache-aware open: SEQUENCE columns come from `main`, but
+    /// `PRIMARY_ALIGNMENT` / `REFERENCE` are routed to whichever archive
+    /// carries them (modern NCBI cSRA keeps them in the `.sra.vdbcache`
+    /// sidecar). Pass `None` for monolithic archives like VDB-3418 — the
+    /// legacy behaviour.
+    pub fn open_any<R: Read + Seek>(
+        main: &mut KarArchive<R>,
+        main_path: &Path,
+        vdbcache: Option<(&mut KarArchive<R>, &Path)>,
+    ) -> Result<Self> {
+        // SEQUENCE-side columns always live in the main archive — the
+        // vdbcache only carries the alignment + reference halves.
+        let col_base = inspect::column_base_path_public(main, Some("SEQUENCE"))?;
         let open_col = |archive: &mut KarArchive<R>, name: &str| -> Result<ColumnReader> {
-            ColumnReader::open(archive, &format!("{col_base}/{name}"), sra_path)
+            ColumnReader::open(archive, &format!("{col_base}/{name}"), main_path)
                 .map_err(|e| Error::Vdb(format!("SEQUENCE/{name}: {e}")))
         };
-        let cmp_read = open_col(archive, "CMP_READ")?;
-        let primary_alignment_id = open_col(archive, "PRIMARY_ALIGNMENT_ID")?;
-        let read_len = open_col(archive, "READ_LEN")?;
-        let read_type = open_col(archive, "READ_TYPE")?;
-        let quality = open_col(archive, "QUALITY")?;
+        let cmp_read = open_col(main, "CMP_READ")?;
+        let primary_alignment_id = open_col(main, "PRIMARY_ALIGNMENT_ID")?;
+        let read_len = open_col(main, "READ_LEN")?;
+        let read_type = open_col(main, "READ_TYPE")?;
+        let quality = open_col(main, "QUALITY")?;
 
-        let alignment = AlignmentCursor::open(archive, sra_path)?;
-        let reference = ReferenceCursor::open(archive, sra_path)?;
+        let primary_in_main = archive_has_table(main, "PRIMARY_ALIGNMENT");
+        let reference_in_main = archive_has_table(main, "REFERENCE");
+
+        // Destructure vdbcache once so we can reborrow the inner refs
+        // per sub-cursor; each `AlignmentCursor::open` /
+        // `ReferenceCursor::open` call only borrows the archive for the
+        // duration of its scope.
+        let (alignment, reference) = match vdbcache {
+            None => {
+                let alignment = AlignmentCursor::open(main, main_path)?;
+                let reference = ReferenceCursor::open(main, main_path)?;
+                (alignment, reference)
+            }
+            Some((cache, cache_path)) => {
+                let alignment = if primary_in_main {
+                    AlignmentCursor::open(main, main_path)?
+                } else if archive_has_table(cache, "PRIMARY_ALIGNMENT") {
+                    AlignmentCursor::open(cache, cache_path)?
+                } else {
+                    return Err(Error::Vdb(
+                        "cSRA: PRIMARY_ALIGNMENT table not found in main archive or vdbcache"
+                            .into(),
+                    ));
+                };
+                let reference = if reference_in_main {
+                    ReferenceCursor::open(main, main_path)?
+                } else if archive_has_table(cache, "REFERENCE") {
+                    ReferenceCursor::open(cache, cache_path)?
+                } else {
+                    return Err(Error::Vdb(
+                        "cSRA: REFERENCE table not found in main archive or vdbcache".into(),
+                    ));
+                };
+                (alignment, reference)
+            }
+        };
 
         let first_row = cmp_read.first_row_id().unwrap_or(1);
         let row_count = cmp_read.row_count();
@@ -469,7 +557,7 @@ mod looks_like_tests {
             return;
         }
         assert!(
-            looks_like_decodable_csra(&p).unwrap(),
+            looks_like_decodable_csra(&p, None).unwrap(),
             "VDB-3418 should pass the cSRA detector"
         );
     }
@@ -484,7 +572,7 @@ mod looks_like_tests {
             return;
         }
         assert!(
-            !looks_like_decodable_csra(&p).unwrap(),
+            !looks_like_decodable_csra(&p, None).unwrap(),
             "DRR045255 should not be routed through CsraCursor"
         );
     }
@@ -492,6 +580,6 @@ mod looks_like_tests {
     #[test]
     fn missing_file_returns_io_error() {
         let p = Path::new("/this/path/does/not/exist.sra");
-        assert!(looks_like_decodable_csra(p).is_err());
+        assert!(looks_like_decodable_csra(p, None).is_err());
     }
 }
