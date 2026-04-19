@@ -51,6 +51,22 @@ fn archive_has_seq_cmp_read<R: Read + Seek>(archive: &KarArchive<R>) -> bool {
     })
 }
 
+/// True when the archive has a `REFERENCE/col/CMP_READ` column — i.e.
+/// reference bases are embedded in the archive rather than fetched from
+/// an external refseq service. The detector is a cheap TOC scan so the
+/// caller can surface an actionable error without attempting to open
+/// the column.
+fn archive_has_reference_cmp_read<R: Read + Seek>(archive: &KarArchive<R>) -> bool {
+    let exact = "tbl/REFERENCE/col/CMP_READ";
+    let nested = "/tbl/REFERENCE/col/CMP_READ";
+    archive.entries().keys().any(|k| {
+        k == exact
+            || k.ends_with(nested)
+            || k.starts_with(&format!("{exact}/"))
+            || k.contains(&format!("{nested}/"))
+    })
+}
+
 /// Inspect the KAR archive at `sra_path` (and optional `.vdbcache`
 /// sidecar) and return true if the pair looks like a reference-
 /// compressed cSRA decodable by `CsraCursor`. `SEQUENCE/col/CMP_READ`
@@ -86,6 +102,52 @@ pub fn looks_like_decodable_csra(sra_path: &Path, vdbcache_path: Option<&Path>) 
 fn open_kar(path: &Path) -> Result<KarArchive<std::io::BufReader<std::fs::File>>> {
     let file = std::fs::File::open(path)?;
     KarArchive::open(std::io::BufReader::new(file))
+}
+
+/// Build the user-facing error for archives whose REFERENCE table has
+/// no embedded `CMP_READ` — i.e. reference bases are fetched from an
+/// external NCBI refseq service (common on modern SRR-prefix cSRA).
+/// sracha doesn't yet implement the external fetcher; returning an
+/// actionable message beats the opaque "idx1 not found" that bubbles
+/// up from `ColumnReader::open`.
+fn external_refseq_error() -> Error {
+    Error::Vdb(
+        "cSRA: REFERENCE table has no embedded CMP_READ column — reference \
+         bases are stored externally (fetched from NCBI refseq by SEQ_ID). \
+         sracha does not yet implement external refseq fetch; decode this \
+         archive with `fasterq-dump` for now."
+            .into(),
+    )
+}
+
+/// Build the user-facing error for archives whose SEQUENCE table omits
+/// a physical READ_LEN column because every spot has the same
+/// fixed-length layout (values live in `tbl/SEQUENCE/md/cur/col/
+/// READ_LEN/row` as static metadata). sracha's CsraCursor currently
+/// requires physical READ_LEN; the static-metadata fallback is tracked
+/// as a follow-up.
+fn fixed_length_readlen_error() -> Error {
+    Error::Vdb(
+        "cSRA: SEQUENCE.READ_LEN is not a physical column — this archive \
+         encodes a fixed spot layout in static metadata, which sracha does \
+         not yet synthesize. Decode this archive with `fasterq-dump` for now."
+            .into(),
+    )
+}
+
+/// Does `col_base/{col_name}` exist as a directory under the SEQUENCE
+/// table? Used to check for physical columns without opening them.
+fn archive_has_seq_column<R: Read + Seek>(
+    archive: &KarArchive<R>,
+    col_base: &str,
+    col_name: &str,
+) -> bool {
+    let exact = format!("{col_base}/{col_name}");
+    let prefix = format!("{exact}/");
+    archive
+        .entries()
+        .keys()
+        .any(|k| k == &exact || k.starts_with(&prefix))
 }
 
 pub struct CsraCursor {
@@ -145,6 +207,20 @@ impl CsraCursor {
             ColumnReader::open(archive, &format!("{col_base}/{name}"), main_path)
                 .map_err(|e| Error::Vdb(format!("SEQUENCE/{name}: {e}")))
         };
+        // Pre-flight: surface actionable errors for known-unsupported
+        // shapes before we start opening columns. These checks are cheap
+        // TOC scans so the error fires with useful guidance rather than
+        // an opaque "idx1 not found" deep in the decoder.
+        if !archive_has_seq_column(main, &col_base, "READ_LEN") {
+            return Err(fixed_length_readlen_error());
+        }
+        let main_has_ref_cmp_read = archive_has_reference_cmp_read(main);
+        let cache_has_ref_cmp_read =
+            matches!(&vdbcache, Some((c, _)) if archive_has_reference_cmp_read(c));
+        if !main_has_ref_cmp_read && !cache_has_ref_cmp_read {
+            return Err(external_refseq_error());
+        }
+
         let cmp_read = open_col(main, "CMP_READ")?;
         let primary_alignment_id = open_col(main, "PRIMARY_ALIGNMENT_ID")?;
         let read_len = open_col(main, "READ_LEN")?;
@@ -160,6 +236,9 @@ impl CsraCursor {
         // duration of its scope.
         let (alignment, reference) = match vdbcache {
             None => {
+                if !archive_has_reference_cmp_read(main) {
+                    return Err(external_refseq_error());
+                }
                 let alignment = AlignmentCursor::open(main, main_path)?;
                 let reference = ReferenceCursor::open(main, main_path)?;
                 (alignment, reference)
@@ -176,8 +255,14 @@ impl CsraCursor {
                     ));
                 };
                 let reference = if reference_in_main {
+                    if !archive_has_reference_cmp_read(main) {
+                        return Err(external_refseq_error());
+                    }
                     ReferenceCursor::open(main, main_path)?
                 } else if archive_has_table(cache, "REFERENCE") {
+                    if !archive_has_reference_cmp_read(cache) {
+                        return Err(external_refseq_error());
+                    }
                     ReferenceCursor::open(cache, cache_path)?
                 } else {
                     return Err(Error::Vdb(
