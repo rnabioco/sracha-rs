@@ -76,13 +76,6 @@ const LUT_2NA: [[u8; 4]; 256] = {
     lut
 };
 
-/// Decode a single 4-bit nibble to an ASCII IUPAC base.
-#[inline]
-fn decode_4na(nibble: u8) -> u8 {
-    // Safety: `nibble & 0x0F` guarantees the index is 0..15.
-    DNA_4NA[(nibble & 0x0F) as usize]
-}
-
 // ---------------------------------------------------------------------------
 // Public API — DNA unpacking
 // ---------------------------------------------------------------------------
@@ -134,23 +127,23 @@ pub fn unpack_2na(packed: &[u8], num_bases: usize) -> Vec<u8> {
 /// `num_bases` may be less than `packed.len() * 2` when the last byte contains
 /// only one meaningful nibble.
 pub fn unpack_4na(packed: &[u8], num_bases: usize) -> Vec<u8> {
-    let mut bases = Vec::with_capacity(num_bases);
-    let mut remaining = num_bases;
+    // Output truncates when `packed` is shorter than `num_bases` implies; this
+    // matches the prior `push`-per-nibble loop.
+    let output_len = num_bases.min(packed.len() * 2);
+    let full_bytes = output_len / 2;
+    let trailing = output_len % 2;
 
-    for &byte in packed {
-        if remaining == 0 {
-            break;
-        }
-        // High nibble = first base.
-        bases.push(decode_4na(byte >> 4));
-        remaining -= 1;
+    // Sized upfront so the hot loop drops the capacity check and length
+    // writeback — mirrors unpack_2na's pattern.
+    let mut bases = vec![0u8; output_len];
 
-        if remaining == 0 {
-            break;
-        }
-        // Low nibble = second base.
-        bases.push(decode_4na(byte & 0x0F));
-        remaining -= 1;
+    for (chunk, &byte) in bases.chunks_exact_mut(2).zip(packed[..full_bytes].iter()) {
+        chunk[0] = DNA_4NA[((byte >> 4) & 0x0F) as usize];
+        chunk[1] = DNA_4NA[(byte & 0x0F) as usize];
+    }
+
+    if trailing > 0 {
+        bases[full_bytes * 2] = DNA_4NA[((packed[full_bytes] >> 4) & 0x0F) as usize];
     }
 
     bases
@@ -177,6 +170,7 @@ const ASCII_TO_4NA: [u8; 256] = {
 /// Used when the physical ALTREAD column stores `INSDC:4na:packed` (2 bases
 /// per byte, high nibble first). Reproduces the VDB schema's
 /// `bit_or(out_2na_4na_bin, .ALTREAD)` followed by `map<4na→text>`.
+#[inline]
 pub fn merge_altread(bases: &mut [u8], altread_packed: &[u8], num_bases: usize) {
     let count = bases.len().min(num_bases);
     for i in 0..count {
@@ -211,6 +205,7 @@ pub fn merge_altread(bases: &mut [u8], altread_packed: &[u8], num_bases: usize) 
 /// `altread_bytes` is expected to be padded to `num_bases` bytes — one
 /// entry per base position (zeros beyond the end of a per-row trim are
 /// restored by the caller before calling this function).
+#[inline]
 pub fn merge_altread_bin(bases: &mut [u8], altread_bytes: &[u8], num_bases: usize) {
     let count = bases.len().min(num_bases).min(altread_bytes.len());
     for i in 0..count {
@@ -596,5 +591,99 @@ mod tests {
         let altread = [0xF0]; // high nibble set, low nibble zero → no change
         merge_altread_bin(&mut bases, &altread, 1);
         assert_eq!(bases, b"A");
+    }
+
+    // -----------------------------------------------------------------------
+    // Property tests
+    // -----------------------------------------------------------------------
+
+    use proptest::prelude::*;
+
+    /// Pack 4 ASCII A/C/G/T bases into one 2na byte (MSB-first).
+    fn pack_2na_nibble(base: u8) -> u8 {
+        match base {
+            b'A' => 0b00,
+            b'C' => 0b01,
+            b'G' => 0b10,
+            b'T' => 0b11,
+            _ => unreachable!(),
+        }
+    }
+
+    fn pack_2na(bases: &[u8]) -> Vec<u8> {
+        let mut out = Vec::with_capacity(bases.len().div_ceil(4));
+        for chunk in bases.chunks(4) {
+            let mut byte = 0u8;
+            for (i, &b) in chunk.iter().enumerate() {
+                byte |= pack_2na_nibble(b) << (6 - 2 * i);
+            }
+            out.push(byte);
+        }
+        out
+    }
+
+    proptest! {
+        /// Packing then unpacking any ACGT sequence returns the original.
+        #[test]
+        fn prop_unpack_2na_round_trip(ref seq in "[ACGT]{0,256}") {
+            let bases = seq.as_bytes();
+            let packed = pack_2na(bases);
+            let unpacked = unpack_2na(&packed, bases.len());
+            prop_assert_eq!(unpacked.as_slice(), bases);
+        }
+
+        /// Packing then unpacking any IUPAC 4-bit nibble sequence round-trips.
+        #[test]
+        fn prop_unpack_4na_round_trip(nibbles in proptest::collection::vec(0u8..16, 0..256)) {
+            let num_bases = nibbles.len();
+            let mut packed = vec![0u8; num_bases.div_ceil(2)];
+            for (i, &n) in nibbles.iter().enumerate() {
+                if i % 2 == 0 {
+                    packed[i / 2] |= n << 4;
+                } else {
+                    packed[i / 2] |= n;
+                }
+            }
+            let unpacked = unpack_4na(&packed, num_bases);
+            prop_assert_eq!(unpacked.len(), num_bases);
+            for (i, &n) in nibbles.iter().enumerate() {
+                prop_assert_eq!(unpacked[i], DNA_4NA[n as usize]);
+            }
+        }
+
+        /// PHRED+33 invariant: every byte must be mapped to min(b+33, 255).
+        /// The "all-zero = empty" sentinel only applies to the wrapper
+        /// `encode_raw_quality_for_fastq`, not to `phred_to_ascii` itself.
+        #[test]
+        fn prop_phred_to_ascii_adds_33_saturating(ref q in proptest::collection::vec(any::<u8>(), 0..512)) {
+            let out = phred_to_ascii(q);
+            prop_assert_eq!(out.len(), q.len());
+            for (i, &b) in q.iter().enumerate() {
+                let expected = b.saturating_add(QUAL_PHRED_OFFSET);
+                prop_assert_eq!(out[i], expected);
+            }
+        }
+
+        /// All-zero ALTREAD leaves 2na-decoded bases untouched, regardless
+        /// of base content or length. Regression guard on the "early exit
+        /// on zero nibble" fast path.
+        #[test]
+        fn prop_merge_altread_all_zero_is_identity(ref seq in "[ACGT]{0,128}") {
+            let mut bases = seq.as_bytes().to_vec();
+            let before = bases.clone();
+            let altread = vec![0u8; bases.len().div_ceil(2)];
+            merge_altread(&mut bases, &altread, before.len());
+            prop_assert_eq!(bases, before);
+        }
+
+        /// SRA-lite quality is a uniform run of the configured score, for
+        /// any length within reason.
+        #[test]
+        fn prop_sra_lite_quality_uniform(length in 0usize..2048, pass in any::<bool>()) {
+            let q = sra_lite_quality(length, pass);
+            prop_assert_eq!(q.len(), length);
+            let expected = if pass { b'?' } else { b'$' };
+            prop_assert!(q.iter().all(|&b| b == expected));
+        }
     }
 }

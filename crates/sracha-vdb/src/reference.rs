@@ -74,10 +74,10 @@ impl ReferenceCursor {
     /// position `global_ref_start`, as 4na-bin bytes (one nibble per byte,
     /// low nibble populated). Spans chunk boundaries as needed.
     pub fn fetch_span(&self, global_ref_start: u64, ref_len: u32) -> Result<Vec<u8>> {
-        let msl = u64::from(self.max_seq_len);
+        let (first_chunk_row, mut offset_in_chunk) =
+            plan_span_start(global_ref_start, self.max_seq_len);
         let mut remaining = ref_len as usize;
-        let mut chunk_row = (global_ref_start / msl) as i64 + 1; // 1-based
-        let mut offset_in_chunk = (global_ref_start % msl) as usize;
+        let mut chunk_row = first_chunk_row;
 
         let mut out = Vec::with_capacity(ref_len as usize);
         while remaining > 0 {
@@ -237,6 +237,18 @@ impl ReferenceCursor {
     }
 }
 
+/// Translate a global reference position to `(chunk_row, offset_in_chunk)`.
+///
+/// REFERENCE rows are 1-based and each holds up to `max_seq_len` bases, laid
+/// out end-to-end. Extracted from [`ReferenceCursor::fetch_span`] so the
+/// arithmetic can be covered by unit tests without touching a KAR archive.
+fn plan_span_start(global_ref_start: u64, max_seq_len: u32) -> (i64, usize) {
+    let msl = u64::from(max_seq_len);
+    let chunk_row = (global_ref_start / msl) as i64 + 1;
+    let offset = (global_ref_start % msl) as usize;
+    (chunk_row, offset)
+}
+
 /// Integer column decode dispatch (shared semantics with alignment.rs).
 fn decode_integer_bytes(decoded: &DecodedBlob<'_>, elem_bits: u32) -> Result<Vec<u8>> {
     let hdr = decoded.headers.first();
@@ -276,4 +288,47 @@ fn decode_integer_bytes(decoded: &DecodedBlob<'_>, elem_bits: u32) -> Result<Vec
         "reference column: no decoder succeeded (elem_bits={elem_bits}, data.len={}, osize={osize})",
         decoded.data.len()
     )))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn plan_span_start_at_chunk_origin() {
+        // Row 1 starts at global 0; row 2 at global 5000 when max_seq_len=5000.
+        assert_eq!(plan_span_start(0, 5000), (1, 0));
+        assert_eq!(plan_span_start(5000, 5000), (2, 0));
+    }
+
+    #[test]
+    fn plan_span_start_mid_chunk() {
+        assert_eq!(plan_span_start(123, 5000), (1, 123));
+        // 5000 + 1620 lands mid row 2.
+        assert_eq!(plan_span_start(6620, 5000), (2, 1620));
+    }
+
+    #[test]
+    fn plan_span_start_chunk_boundary_minus_one() {
+        assert_eq!(plan_span_start(4999, 5000), (1, 4999));
+    }
+
+    #[test]
+    fn plan_span_start_large_offset_gives_large_row() {
+        // 1000 chunks into the reference.
+        let (row, off) = plan_span_start(1000 * 5000 + 42, 5000);
+        assert_eq!(row, 1001);
+        assert_eq!(off, 42);
+    }
+
+    #[test]
+    fn plan_span_start_small_max_seq_len() {
+        // Uncommon but valid: if a fixture uses MAX_SEQ_LEN=100, the math
+        // must keep working.
+        assert_eq!(plan_span_start(0, 100), (1, 0));
+        assert_eq!(plan_span_start(99, 100), (1, 99));
+        assert_eq!(plan_span_start(100, 100), (2, 0));
+        assert_eq!(plan_span_start(199, 100), (2, 99));
+        assert_eq!(plan_span_start(200, 100), (3, 0));
+    }
 }

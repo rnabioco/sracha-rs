@@ -422,8 +422,19 @@ pub fn format_spot(
     run_name: &str,
     config: &FastqConfig,
 ) -> Vec<(OutputSlot, FastqRecord)> {
-    // Split the concatenated sequence/quality into individual read segments.
-    let mut segments: Vec<ReadSegment<'_>> = Vec::with_capacity(spot.read_lengths.len());
+    let segments = filter_spot_segments(spot, config);
+    if segments.is_empty() {
+        return Vec::new();
+    }
+    route_segments_to_slots(&segments, &spot.name, run_name, config.split_mode)
+}
+
+/// Split a spot's concatenated sequence/quality into per-read segments,
+/// applying the filters governed by [`FastqConfig`] (zero-length, technical,
+/// min-length). Extracted from [`format_spot`] so the filter invariants can
+/// be tested without also exercising the output-slot routing.
+fn filter_spot_segments<'a>(spot: &'a SpotRecord, config: &FastqConfig) -> Vec<ReadSegment<'a>> {
+    let mut segments: Vec<ReadSegment<'a>> = Vec::with_capacity(spot.read_lengths.len());
     let mut offset: usize = 0;
 
     for (i, &rlen) in spot.read_lengths.iter().enumerate() {
@@ -468,55 +479,43 @@ pub fn format_spot(
         });
     }
 
-    if segments.is_empty() {
-        return Vec::new();
-    }
+    segments
+}
 
-    // Route each segment to the appropriate output slot.
+/// Route the filtered `segments` to output slots per [`SplitMode`].
+/// Extracted from [`format_spot`]: the routing decision tree is the only
+/// thing that varies across split modes, and pulling it out makes the
+/// Split3 / Interleaved / SplitFiles / SplitSpot behaviors trivial to
+/// eyeball side-by-side.
+fn route_segments_to_slots(
+    segments: &[ReadSegment<'_>],
+    spot_name: &[u8],
+    run_name: &str,
+    split_mode: SplitMode,
+) -> Vec<(OutputSlot, FastqRecord)> {
     let mut results = Vec::with_capacity(segments.len());
+    let format =
+        |seg: &ReadSegment<'_>| format_read(run_name, spot_name, None, seg.sequence, seg.quality);
 
-    match config.split_mode {
+    match split_mode {
         SplitMode::Split3 => {
             if segments.len() == 2 {
-                let r1 = format_read(
-                    run_name,
-                    &spot.name,
-                    None,
-                    segments[0].sequence,
-                    segments[0].quality,
-                );
-                let r2 = format_read(
-                    run_name,
-                    &spot.name,
-                    None,
-                    segments[1].sequence,
-                    segments[1].quality,
-                );
-                results.push((OutputSlot::Read1, r1));
-                results.push((OutputSlot::Read2, r2));
+                results.push((OutputSlot::Read1, format(&segments[0])));
+                results.push((OutputSlot::Read2, format(&segments[1])));
             } else {
-                for seg in &segments {
-                    let rec = format_read(run_name, &spot.name, None, seg.sequence, seg.quality);
-                    results.push((OutputSlot::Unpaired, rec));
+                for seg in segments {
+                    results.push((OutputSlot::Unpaired, format(seg)));
                 }
             }
         }
-        SplitMode::Interleaved => {
-            for seg in &segments {
-                let rec = format_read(run_name, &spot.name, None, seg.sequence, seg.quality);
-                results.push((OutputSlot::Single, rec));
+        SplitMode::Interleaved | SplitMode::SplitSpot => {
+            for seg in segments {
+                results.push((OutputSlot::Single, format(seg)));
             }
         }
         SplitMode::SplitFiles => {
             for (file_idx, seg) in segments.iter().enumerate() {
-                let rec = format_read(run_name, &spot.name, None, seg.sequence, seg.quality);
-                results.push((OutputSlot::ReadN(file_idx as u32), rec));
-            }
-        }
-        SplitMode::SplitSpot => {
-            for seg in &segments {
-                let rec = format_read(run_name, &spot.name, None, seg.sequence, seg.quality);
-                results.push((OutputSlot::Single, rec));
+                results.push((OutputSlot::ReadN(file_idx as u32), format(seg)));
             }
         }
     }

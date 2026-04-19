@@ -35,9 +35,6 @@ pub enum Error {
     )]
     UnsupportedPlatform { platform: String },
 
-    #[error("unsupported format: {format} — {hint}")]
-    UnsupportedFormat { format: String, hint: String },
-
     #[error("file not found: {0}")]
     FileNotFound(PathBuf),
 
