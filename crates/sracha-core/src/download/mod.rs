@@ -509,13 +509,19 @@ pub async fn download_file(
         let all_chunks = plan_chunks(file_size, chunk_size);
         let total_chunks = all_chunks.len();
 
-        // Check for existing progress sidecar.
+        // Check for existing progress sidecar. `--force` means "start
+        // fresh", so ignore any stale sidecar even when resume is on;
+        // otherwise a prior run's completed-chunks record would
+        // short-circuit the download and skew the progress bar total.
         let prog_path = progress_path(output_path);
-        let prev_progress = if config.resume {
+        let prev_progress = if config.resume && !config.force {
             load_progress(&prog_path)
         } else {
             None
         };
+        if config.force {
+            delete_progress(&prog_path);
+        }
 
         // Track whether we have a prior-MD5 mismatch so we also wipe the
         // partial file, not just the sidecar.
@@ -743,7 +749,11 @@ pub async fn download_file(
         delete_progress(&prog_path);
     } else {
         // --- Single-stream fallback (with resume support) ---
-        let existing_size = if config.resume && output_path.exists() {
+        // `--force` short-circuits resume: otherwise an already-complete
+        // file on disk leaves `bytes_remaining = 0`, creating a
+        // progress bar with `total = 0` that ticks to the real file
+        // size (displays "X MiB/0 B") while the download re-runs.
+        let existing_size = if config.resume && !config.force && output_path.exists() {
             tokio::fs::metadata(output_path).await?.len()
         } else {
             0
