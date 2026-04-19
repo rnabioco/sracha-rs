@@ -454,3 +454,57 @@ fn decode_integer_bytes(decoded: &DecodedBlob<'_>, elem_bits: u32) -> Result<Vec
         decoded.data.len()
     )))
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::blob::PageMap;
+
+    fn pm(data_runs: Vec<u32>) -> PageMap {
+        PageMap {
+            data_recs: 0,
+            lengths: vec![1],
+            leng_runs: vec![data_runs.iter().sum()],
+            data_runs,
+        }
+    }
+
+    #[test]
+    fn resolve_record_idx_no_data_runs_is_identity() {
+        let p = PageMap {
+            data_recs: 0,
+            lengths: vec![],
+            leng_runs: vec![],
+            data_runs: vec![],
+        };
+        assert_eq!(resolve_record_idx(&p, 0, 1).unwrap(), 0);
+        assert_eq!(resolve_record_idx(&p, 5, 1).unwrap(), 5);
+    }
+
+    #[test]
+    fn resolve_record_idx_walks_run_lengths() {
+        // data_runs = [3, 2, 4] → logical rows 0..3 → rec 0, 3..5 → rec 1,
+        // 5..9 → rec 2.
+        let p = pm(vec![3, 2, 4]);
+        assert_eq!(resolve_record_idx(&p, 0, 1).unwrap(), 0);
+        assert_eq!(resolve_record_idx(&p, 2, 1).unwrap(), 0);
+        assert_eq!(resolve_record_idx(&p, 3, 1).unwrap(), 1);
+        assert_eq!(resolve_record_idx(&p, 4, 1).unwrap(), 1);
+        assert_eq!(resolve_record_idx(&p, 5, 1).unwrap(), 2);
+        assert_eq!(resolve_record_idx(&p, 8, 1).unwrap(), 2);
+    }
+
+    #[test]
+    fn resolve_record_idx_out_of_bounds_errors() {
+        let p = pm(vec![2, 3]);
+        let err = resolve_record_idx(&p, 99, 1).expect_err("past coverage must error");
+        assert!(matches!(err, Error::Format(_)));
+    }
+
+    #[test]
+    fn resolve_record_idx_single_run_of_one() {
+        let p = pm(vec![1]);
+        assert_eq!(resolve_record_idx(&p, 0, 1).unwrap(), 0);
+        assert!(resolve_record_idx(&p, 1, 1).is_err());
+    }
+}

@@ -973,3 +973,72 @@ pub(crate) fn decode_blob_to_fastq(
 
     Ok((records, spot_idx_in_blob as u64))
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // -----------------------------------------------------------------------
+    // encode_raw_quality_for_fastq — PHRED+33 invariant
+    //
+    // The contract: raw numeric Phred bytes always get +33 applied. An
+    // earlier heuristic mis-detected already-encoded inputs and silently
+    // skipped the offset, producing systematic off-by-33 quality divergence
+    // on DRR040728-style archives whose raw distribution happened to fall
+    // within [33, 126]. These tests pin that boundary.
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn encode_raw_quality_empty_input_is_empty() {
+        let (out, is_empty) = encode_raw_quality_for_fastq(&[]);
+        assert!(out.is_empty());
+        assert!(is_empty);
+    }
+
+    #[test]
+    fn encode_raw_quality_all_zero_reports_empty() {
+        // All-zero is the sentinel for "quality column absent or
+        // placeholder" — the caller must synthesize a fallback rather
+        // than emitting a run of '!'.
+        let (out, is_empty) = encode_raw_quality_for_fastq(&[0; 8]);
+        assert!(out.is_empty());
+        assert!(is_empty);
+    }
+
+    #[test]
+    fn encode_raw_quality_q0_maps_to_bang_when_mixed() {
+        // Q0 mixed with other scores must pass through as '!' — srf-load
+        // archives (e.g. DRR000918) legitimately store Q0.
+        let raw = [0u8, 30, 0, 40, 0];
+        let (out, is_empty) = encode_raw_quality_for_fastq(&raw);
+        assert!(!is_empty);
+        assert_eq!(out, vec![b'!', b'?', b'!', b'I', b'!']);
+    }
+
+    #[test]
+    fn encode_raw_quality_known_phred_values() {
+        let raw = [0u8, 10, 20, 30, 40, 50, 60];
+        let (out, is_empty) = encode_raw_quality_for_fastq(&raw);
+        assert!(!is_empty);
+        assert_eq!(out, raw.iter().map(|&b| b + 33).collect::<Vec<_>>());
+    }
+
+    #[test]
+    fn encode_raw_quality_does_not_double_offset_ascii_like_input() {
+        // Bytes in [33, 126] are NOT treated as already-encoded. This
+        // regression test pins the boundary: any non-zero numeric input
+        // must have +33 applied.
+        let raw = [b'?', b'I']; // 63, 73 — plausibly ASCII, must still +33
+        let (out, is_empty) = encode_raw_quality_for_fastq(&raw);
+        assert!(!is_empty);
+        assert_eq!(out, vec![63 + 33, 73 + 33]);
+    }
+
+    #[test]
+    fn encode_raw_quality_saturates_on_overflow() {
+        let raw = [250u8];
+        let (out, is_empty) = encode_raw_quality_for_fastq(&raw);
+        assert!(!is_empty);
+        assert_eq!(out, vec![255u8]); // saturating_add caps at u8::MAX
+    }
+}

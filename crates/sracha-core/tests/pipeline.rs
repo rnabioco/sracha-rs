@@ -1034,3 +1034,104 @@ fn corrupt_kar_magic_fails_fast() {
         result.as_ref().map(|s| &s.output_files)
     );
 }
+
+// ---------------------------------------------------------------------------
+// validate subcommand
+// ---------------------------------------------------------------------------
+
+#[ignore]
+#[test]
+fn validate_clean_sra_reports_valid() {
+    let path = ensure_srr28588231();
+    let result = sracha_core::pipeline::run_validate(&path, 2, false);
+    assert!(
+        result.valid,
+        "clean fixture must validate clean: {:?}",
+        result.errors
+    );
+    assert!(result.errors.is_empty());
+    assert!(result.spots_validated > 0);
+    assert!(result.blobs_validated > 0);
+    assert!(
+        result.columns_found.iter().any(|c| c == "READ"),
+        "READ column expected: {:?}",
+        result.columns_found
+    );
+    assert!(result.md5.as_ref().map(|s| s.len() == 32).unwrap_or(false));
+    assert!(!result.any_blob_integrity_error);
+}
+
+#[ignore]
+#[test]
+fn validate_missing_file_reports_error() {
+    let tmp = tempfile::tempdir().unwrap();
+    let missing = tmp.path().join("not-there.sra");
+    let result = sracha_core::pipeline::run_validate(&missing, 2, false);
+    assert!(!result.valid);
+    assert!(!result.errors.is_empty());
+    assert!(
+        result.errors[0].contains("cannot open"),
+        "expected open error, got {:?}",
+        result.errors
+    );
+    assert_eq!(result.spots_validated, 0);
+    assert_eq!(result.blobs_validated, 0);
+    assert!(result.md5.is_none());
+}
+
+#[ignore]
+#[test]
+fn validate_corrupt_kar_magic_reports_invalid_archive() {
+    let tmp = tempfile::tempdir().unwrap();
+    let path = clone_fixture(tmp.path(), "bad-validate.sra");
+    let mut bytes = std::fs::read(&path).unwrap();
+    for b in &mut bytes[..8] {
+        *b = 0;
+    }
+    std::fs::write(&path, &bytes).unwrap();
+
+    let result = sracha_core::pipeline::run_validate(&path, 2, false);
+    assert!(!result.valid);
+    assert!(
+        result
+            .errors
+            .iter()
+            .any(|e| e.contains("invalid KAR") || e.contains("VDB cursor")),
+        "expected archive error, got {:?}",
+        result.errors
+    );
+    // No blob decode was reachable — so this is not a blob-integrity failure.
+    assert!(!result.any_blob_integrity_error);
+}
+
+#[ignore]
+#[test]
+fn validate_flipped_bytes_surface_integrity_errors() {
+    let tmp = tempfile::tempdir().unwrap();
+    let path = clone_fixture(tmp.path(), "flipped-validate.sra");
+    let mut bytes = std::fs::read(&path).unwrap();
+    // Corrupt a single mid-file stripe; validate should continue scanning
+    // all blobs and report the per-blob failures, not abort on the first.
+    let stripe = (bytes.len() / 100).max(8192);
+    let start = bytes.len() / 2;
+    let end = (start + stripe).min(bytes.len());
+    for b in &mut bytes[start..end] {
+        *b ^= 0xA5;
+    }
+    std::fs::write(&path, &bytes).unwrap();
+
+    let result = sracha_core::pipeline::run_validate(&path, 2, false);
+    assert!(!result.valid);
+    assert!(
+        !result.errors.is_empty(),
+        "expected at least one blob error"
+    );
+    // At least one blob decode error should bubble through; whether it
+    // trips CRC32 or zlib depends on whether the stripe lands on the
+    // checksum tail or the compressed payload — either outcome counts as
+    // a correctness signal.
+    assert!(
+        result.blobs_validated > 0,
+        "validate should still iterate blobs even with mid-file corruption"
+    );
+}

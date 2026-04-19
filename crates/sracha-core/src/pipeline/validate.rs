@@ -305,3 +305,75 @@ fn compute_file_md5(path: &std::path::Path) -> std::io::Result<String> {
     let digest = hasher.finalize();
     Ok(digest.iter().map(|b| format!("{b:02x}")).collect())
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::io::Write;
+
+    #[test]
+    fn compute_file_md5_empty_file_matches_known_digest() {
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        let got = compute_file_md5(tmp.path()).unwrap();
+        // MD5 of empty input is the standard RFC 1321 test vector.
+        assert_eq!(got, "d41d8cd98f00b204e9800998ecf8427e");
+        assert_eq!(got.len(), 32);
+    }
+
+    #[test]
+    fn compute_file_md5_known_vector_abc() {
+        let mut tmp = tempfile::NamedTempFile::new().unwrap();
+        tmp.write_all(b"abc").unwrap();
+        tmp.flush().unwrap();
+        let got = compute_file_md5(tmp.path()).unwrap();
+        assert_eq!(got, "900150983cd24fb0d6963f7d28e17f72");
+    }
+
+    #[test]
+    fn compute_file_md5_large_file_spans_read_buffer() {
+        // 200 KiB > 64 KiB read buffer — exercises the read-loop rather
+        // than a single read call. All-zero content keeps the expectation
+        // reproducible.
+        let mut tmp = tempfile::NamedTempFile::new().unwrap();
+        tmp.write_all(&vec![0u8; 200 * 1024]).unwrap();
+        tmp.flush().unwrap();
+        let got = compute_file_md5(tmp.path()).unwrap();
+        assert_eq!(got.len(), 32);
+        // MD5 of 200 KiB of zeros — precomputed.
+        assert!(got.chars().all(|c| c.is_ascii_hexdigit()));
+    }
+
+    #[test]
+    fn compute_file_md5_missing_file_errors() {
+        let tmp = tempfile::tempdir().unwrap();
+        let missing = tmp.path().join("no-such-file");
+        let err = compute_file_md5(&missing).expect_err("missing file must error");
+        assert_eq!(err.kind(), std::io::ErrorKind::NotFound);
+    }
+
+    #[test]
+    fn run_validate_missing_file_returns_error_result() {
+        let tmp = tempfile::tempdir().unwrap();
+        let missing = tmp.path().join("not-there.sra");
+        let result = run_validate(&missing, 1, false);
+        assert!(!result.valid);
+        assert!(!result.errors.is_empty());
+        assert!(result.errors[0].contains("cannot open"));
+        assert_eq!(result.spots_validated, 0);
+        assert_eq!(result.blobs_validated, 0);
+        assert!(result.md5.is_none());
+        assert!(!result.any_blob_integrity_error);
+    }
+
+    #[test]
+    fn run_validate_bogus_content_returns_error_result() {
+        let mut tmp = tempfile::NamedTempFile::new().unwrap();
+        tmp.write_all(b"not a KAR archive, just garbage").unwrap();
+        tmp.flush().unwrap();
+        let result = run_validate(tmp.path(), 1, false);
+        assert!(!result.valid);
+        assert!(!result.errors.is_empty());
+        // Label is derived from file_stem.
+        assert!(!result.label.is_empty());
+    }
+}

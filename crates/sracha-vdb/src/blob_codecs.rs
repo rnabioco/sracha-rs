@@ -217,3 +217,193 @@ pub fn decode_quality_encoding(decoded: &blob::DecodedBlob<'_>) -> Result<Vec<u8
     }
     decode_zip_encoding(decoded)
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::blob::{DecodedBlob, PageMap};
+    use std::borrow::Cow;
+
+    /// Build a minimal v1 blob: header byte with rls=3 (implicit row_length=1),
+    /// big-endian=0, adjust=0, then `payload` bytes, then optional checksum.
+    /// header = 0b0110_0000 = 0x60.
+    fn build_v1_blob_crc32(payload: &[u8]) -> Vec<u8> {
+        let mut buf = Vec::with_capacity(1 + payload.len() + 4);
+        buf.push(0x60);
+        buf.extend_from_slice(payload);
+        // CRC32 over envelope + data.
+        let crc = crate::blob::ncbi_crc32(&buf);
+        buf.extend_from_slice(&crc.to_le_bytes());
+        buf
+    }
+
+    #[test]
+    fn decode_raw_empty_returns_empty_blob() {
+        let got = decode_raw(&[], 0, 0).expect("empty is valid");
+        assert!(got.data.is_empty());
+        assert!(got.headers.is_empty());
+        assert!(got.page_map.is_none());
+    }
+
+    #[test]
+    fn decode_raw_unknown_checksum_type_errors() {
+        let raw = [0x60, 0xAA];
+        let err = decode_raw(&raw, 99, 1).expect_err("unknown checksum must error");
+        assert!(matches!(err, Error::Format(_)), "got {err:?}");
+    }
+
+    #[test]
+    fn decode_raw_too_short_for_crc32() {
+        let raw = [0x01, 0x02]; // 2 bytes, but CRC32 needs 4
+        let err = decode_raw(&raw, 1, 0).expect_err("short blob must error");
+        assert!(matches!(err, Error::Format(_)), "got {err:?}");
+    }
+
+    #[test]
+    fn decode_raw_valid_crc32_roundtrips() {
+        let blob = build_v1_blob_crc32(&[0x11, 0x22, 0x33]);
+        let got = decode_raw(&blob, 1, 3).expect("valid blob must decode");
+        assert_eq!(&*got.data, &[0x11, 0x22, 0x33]);
+    }
+
+    #[test]
+    fn decode_raw_crc32_mismatch_returns_integrity_error() {
+        let mut blob = build_v1_blob_crc32(&[0x11, 0x22, 0x33]);
+        let last = blob.len() - 1;
+        blob[last] ^= 0x01; // flip a checksum bit
+        let err = decode_raw(&blob, 1, 3).expect_err("bad CRC must error");
+        assert!(
+            matches!(err, Error::BlobIntegrity { kind: "CRC32", .. }),
+            "got {err:?}"
+        );
+    }
+
+    fn make_blob(data: Vec<u8>, page_map: Option<PageMap>) -> DecodedBlob<'static> {
+        DecodedBlob {
+            data: Cow::Owned(data),
+            adjust: 0,
+            big_endian: false,
+            headers: vec![],
+            page_map,
+            row_length: None,
+        }
+    }
+
+    #[test]
+    fn expand_via_page_map_none_passthrough() {
+        let out = expand_via_page_map(vec![1, 2, 3, 4], &None).unwrap();
+        assert_eq!(out, vec![1, 2, 3, 4]);
+    }
+
+    #[test]
+    fn expand_via_page_map_empty_data_runs_passthrough() {
+        let pm = PageMap {
+            data_recs: 1,
+            lengths: vec![1],
+            leng_runs: vec![1],
+            data_runs: vec![],
+        };
+        let out = expand_via_page_map(vec![0xAA; 4], &Some(pm)).unwrap();
+        assert_eq!(out, vec![0xAA; 4]);
+    }
+
+    #[test]
+    fn expand_via_page_map_per_row_expansion_uses_repeat_counts() {
+        // 2 records, each of row_length=1 u32. data_runs=[1,3] means the
+        // second record is replicated 3 times → 4 rows total × 4 bytes.
+        let pm = PageMap {
+            data_recs: 2,
+            lengths: vec![1],
+            leng_runs: vec![4],
+            data_runs: vec![1, 3],
+        };
+        let mut data = Vec::new();
+        data.extend_from_slice(&1u32.to_le_bytes());
+        data.extend_from_slice(&2u32.to_le_bytes());
+        let out = expand_via_page_map(data, &Some(pm)).unwrap();
+        assert_eq!(out.len(), 16);
+        assert_eq!(&out[0..4], &1u32.to_le_bytes());
+        assert_eq!(&out[4..8], &2u32.to_le_bytes());
+        assert_eq!(&out[8..12], &2u32.to_le_bytes());
+        assert_eq!(&out[12..16], &2u32.to_le_bytes());
+    }
+
+    #[test]
+    fn expand_via_page_map_random_access_entry_index() {
+        // data_runs length >= total_rows triggers the random-access branch.
+        // row_length=1, entry_bytes=4. Offsets index into full entries.
+        let pm = PageMap {
+            data_recs: 3,
+            lengths: vec![1],
+            leng_runs: vec![3],
+            data_runs: vec![0, 2, 1],
+        };
+        let mut data = Vec::new();
+        data.extend_from_slice(&10u32.to_le_bytes());
+        data.extend_from_slice(&20u32.to_le_bytes());
+        data.extend_from_slice(&30u32.to_le_bytes());
+        let out = expand_via_page_map(data, &Some(pm)).unwrap();
+        assert_eq!(&out[0..4], &10u32.to_le_bytes());
+        assert_eq!(&out[4..8], &30u32.to_le_bytes());
+        assert_eq!(&out[8..12], &20u32.to_le_bytes());
+    }
+
+    #[test]
+    fn expand_via_page_map_random_access_u32_index_dispatch() {
+        // row_length=2: entry_bytes=8. If data_runs holds u32 indices (not
+        // entry indices), max_offset * 8 would overflow a small buffer — but
+        // max_offset * 4 fits. We verify the u32-index branch is picked and
+        // that row_length consecutive u32s flow out per logical row.
+        //
+        // Decoded buffer has 4 u32s; row_length=2 means each row consumes 2
+        // consecutive u32s. data_runs=[0, 2] means row 0 = u32s[0..2],
+        // row 1 = u32s[2..4]. With entry-index dispatch, offset 2 * 8 + 8 =
+        // 24 > 16 (overflow) → falls back to u32-index.
+        let pm = PageMap {
+            data_recs: 2,
+            lengths: vec![2],
+            leng_runs: vec![2],
+            data_runs: vec![0, 2],
+        };
+        let mut data = Vec::new();
+        for v in [100u32, 200, 300, 400] {
+            data.extend_from_slice(&v.to_le_bytes());
+        }
+        let out = expand_via_page_map(data, &Some(pm)).unwrap();
+        assert_eq!(out.len(), 16);
+        assert_eq!(&out[0..4], &100u32.to_le_bytes());
+        assert_eq!(&out[4..8], &200u32.to_le_bytes());
+        assert_eq!(&out[8..12], &300u32.to_le_bytes());
+        assert_eq!(&out[12..16], &400u32.to_le_bytes());
+    }
+
+    #[test]
+    fn expand_via_page_map_random_access_offset_overflow_errors() {
+        // row_length=1 so entry_bytes=4. Buffer has 2 u32s (8 bytes). Offset
+        // 5 overflows both dispatch modes.
+        let pm = PageMap {
+            data_recs: 3,
+            lengths: vec![1],
+            leng_runs: vec![3],
+            data_runs: vec![0, 1, 5],
+        };
+        let data = vec![0u8; 8];
+        let err =
+            expand_via_page_map(data, &Some(pm)).expect_err("out-of-bounds offset must error");
+        assert!(matches!(err, Error::Format(_)), "got {err:?}");
+    }
+
+    #[test]
+    fn decode_zip_encoding_empty_data_returns_empty() {
+        let blob = make_blob(vec![], None);
+        let out = decode_zip_encoding(&blob).unwrap();
+        assert!(out.is_empty());
+    }
+
+    #[test]
+    fn decode_quality_encoding_empty_data_returns_empty() {
+        let blob = make_blob(vec![], None);
+        let out = decode_quality_encoding(&blob).unwrap();
+        assert!(out.is_empty());
+    }
+}
