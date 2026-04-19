@@ -1432,6 +1432,7 @@ fn print_info_table(entries: &[InfoEntry<'_>]) {
         "Layout",
         "Reads",
         "Platform",
+        "Type",
         "Spots",
         "Source",
     ]);
@@ -1485,6 +1486,17 @@ fn print_info_table(entries: &[InfoEntry<'_>]) {
                     .first()
                     .map(|m| m.service.clone())
                     .unwrap_or_else(|| "-".into());
+                // SDL ships modern reference-compressed cSRA with a
+                // `.sra.vdbcache` sidecar carrying PRIMARY_ALIGNMENT /
+                // REFERENCE. Its presence is the strongest remote signal
+                // short of opening the archive. Legacy monolithic cSRA
+                // (pre-split like VDB-3418) has no sidecar and will read
+                // as "SRA" here — a known blind spot.
+                let archive_type = if r.vdbcache_file.is_some() {
+                    "cSRA"
+                } else {
+                    "SRA"
+                };
                 total_size += r.sra_file.size;
                 ok_count += 1;
 
@@ -1494,6 +1506,7 @@ fn print_info_table(entries: &[InfoEntry<'_>]) {
                     layout,
                     reads,
                     platform,
+                    archive_type.into(),
                     spots,
                     source,
                 ]);
@@ -1501,6 +1514,7 @@ fn print_info_table(entries: &[InfoEntry<'_>]) {
             InfoEntry::Error { accession, .. } => {
                 builder.push_record([
                     accession.clone(),
+                    "-".into(),
                     "-".into(),
                     "-".into(),
                     "-".into(),
@@ -1543,9 +1557,9 @@ fn print_info_table(entries: &[InfoEntry<'_>]) {
             (footer_line, HorizontalLine::full('─', '┴', '├', '┤')),
         ]))
         .with(Modify::new(Rows::first()).with(Color::new("\x1b[1m", "\x1b[22m")))
-        // Right-align numeric columns: Size (1), Spots (5).
+        // Right-align numeric columns: Size (1), Spots (6).
         .with(Modify::new(Columns::new(1..=1)).with(Alignment::right()))
-        .with(Modify::new(Columns::new(5..=5)).with(Alignment::right()));
+        .with(Modify::new(Columns::new(6..=6)).with(Alignment::right()));
 
     println!("{table}");
 
