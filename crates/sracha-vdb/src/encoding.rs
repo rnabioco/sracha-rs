@@ -76,13 +76,6 @@ const LUT_2NA: [[u8; 4]; 256] = {
     lut
 };
 
-/// Decode a single 4-bit nibble to an ASCII IUPAC base.
-#[inline]
-fn decode_4na(nibble: u8) -> u8 {
-    // Safety: `nibble & 0x0F` guarantees the index is 0..15.
-    DNA_4NA[(nibble & 0x0F) as usize]
-}
-
 // ---------------------------------------------------------------------------
 // Public API — DNA unpacking
 // ---------------------------------------------------------------------------
@@ -134,23 +127,23 @@ pub fn unpack_2na(packed: &[u8], num_bases: usize) -> Vec<u8> {
 /// `num_bases` may be less than `packed.len() * 2` when the last byte contains
 /// only one meaningful nibble.
 pub fn unpack_4na(packed: &[u8], num_bases: usize) -> Vec<u8> {
-    let mut bases = Vec::with_capacity(num_bases);
-    let mut remaining = num_bases;
+    // Output truncates when `packed` is shorter than `num_bases` implies; this
+    // matches the prior `push`-per-nibble loop.
+    let output_len = num_bases.min(packed.len() * 2);
+    let full_bytes = output_len / 2;
+    let trailing = output_len % 2;
 
-    for &byte in packed {
-        if remaining == 0 {
-            break;
-        }
-        // High nibble = first base.
-        bases.push(decode_4na(byte >> 4));
-        remaining -= 1;
+    // Sized upfront so the hot loop drops the capacity check and length
+    // writeback — mirrors unpack_2na's pattern.
+    let mut bases = vec![0u8; output_len];
 
-        if remaining == 0 {
-            break;
-        }
-        // Low nibble = second base.
-        bases.push(decode_4na(byte & 0x0F));
-        remaining -= 1;
+    for (chunk, &byte) in bases.chunks_exact_mut(2).zip(packed[..full_bytes].iter()) {
+        chunk[0] = DNA_4NA[((byte >> 4) & 0x0F) as usize];
+        chunk[1] = DNA_4NA[(byte & 0x0F) as usize];
+    }
+
+    if trailing > 0 {
+        bases[full_bytes * 2] = DNA_4NA[((packed[full_bytes] >> 4) & 0x0F) as usize];
     }
 
     bases
@@ -177,6 +170,7 @@ const ASCII_TO_4NA: [u8; 256] = {
 /// Used when the physical ALTREAD column stores `INSDC:4na:packed` (2 bases
 /// per byte, high nibble first). Reproduces the VDB schema's
 /// `bit_or(out_2na_4na_bin, .ALTREAD)` followed by `map<4na→text>`.
+#[inline]
 pub fn merge_altread(bases: &mut [u8], altread_packed: &[u8], num_bases: usize) {
     let count = bases.len().min(num_bases);
     for i in 0..count {
@@ -211,6 +205,7 @@ pub fn merge_altread(bases: &mut [u8], altread_packed: &[u8], num_bases: usize) 
 /// `altread_bytes` is expected to be padded to `num_bases` bytes — one
 /// entry per base position (zeros beyond the end of a per-row trim are
 /// restored by the caller before calling this function).
+#[inline]
 pub fn merge_altread_bin(bases: &mut [u8], altread_bytes: &[u8], num_bases: usize) {
     let count = bases.len().min(num_bases).min(altread_bytes.len());
     for i in 0..count {
