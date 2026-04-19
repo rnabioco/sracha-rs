@@ -17,6 +17,7 @@ pub mod kdb;
 pub mod metadata;
 pub mod reference;
 pub mod restore;
+pub mod row_range;
 
 pub use cursor::VdbCursor;
 pub use error::{Error, Result};
