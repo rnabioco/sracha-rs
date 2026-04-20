@@ -60,6 +60,16 @@ pub struct DownloadConfig {
     /// concurrent bars — e.g. a decode bar from a streaming consumer).
     /// When `None` and `progress` is true, the bar prints standalone.
     pub progress_parent: Option<Arc<indicatif::MultiProgress>>,
+    /// Optional shared "combined work" progress bar. When `Some`, the
+    /// download worker loop ticks THIS bar (by chunk byte share) in
+    /// addition to the standalone per_sec/eta bar — or, if `progress`
+    /// is also false, INSTEAD of it. Used by `run_get_streaming` to
+    /// collapse the previous dual-bar UX (separate download + decode
+    /// bars, the latter of which stalled during per-batch waits) into
+    /// a single monotonically-advancing bar whose download side keeps
+    /// moving while decode is gated. Total = 10000; download
+    /// contributes up to 5000; see Phase 4d plan.
+    pub progress_combined: Option<Arc<indicatif::ProgressBar>>,
 }
 
 impl Default for DownloadConfig {
@@ -74,6 +84,7 @@ impl Default for DownloadConfig {
             client: None,
             expected_prefix: None,
             progress_parent: None,
+            progress_combined: None,
         }
     }
 }
@@ -992,6 +1003,8 @@ async fn download_file_inner(
                 let u = url.clone();
                 let f = shared_file.clone();
                 let pb_clone = pb.clone();
+                let combined_pb_clone = config.progress_combined.clone();
+                let file_size_for_bar = file_size;
                 let tx = done_tx.clone();
                 let chunk_tracker = tracker.clone();
                 let by_idx = chunks_by_idx.clone();
@@ -1014,6 +1027,22 @@ async fn download_file_inner(
                             .expect("queue index must be in chunks_by_idx");
 
                         download_chunk(&cli, &u, chunk, &f, pb_clone.as_deref()).await?;
+
+                        // Phase 4d: tick the combined work bar (if wired).
+                        // Download contributes up to 5000 of the bar's
+                        // 10000-unit total (decode contributes the other
+                        // 5000); each chunk ticks its byte-share of that
+                        // 5000. Using saturating math so a zero-sized
+                        // file can't divide-by-zero.
+                        if let Some(ref combined_pb) = combined_pb_clone {
+                            let chunk_len = chunk.end - chunk.start + 1;
+                            let units = chunk_len
+                                .saturating_mul(5000)
+                                .checked_div(file_size_for_bar)
+                                .map(|u| u.max(1))
+                                .unwrap_or(0);
+                            combined_pb.inc(units);
+                        }
 
                         // Mark this chunk's bytes as readable. Order matters:
                         // do this AFTER download_chunk's pwrite returns

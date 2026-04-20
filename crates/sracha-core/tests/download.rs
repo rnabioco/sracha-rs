@@ -24,6 +24,7 @@ fn test_config() -> DownloadConfig {
         client: None,
         expected_prefix: None,
         progress_parent: None,
+        progress_combined: None,
     }
 }
 

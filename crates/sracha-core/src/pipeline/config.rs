@@ -61,6 +61,15 @@ pub struct PipelineConfig {
     /// decode progress in one tidy stack. `None` keeps the bars as
     /// independent (legacy single-bar) renderers.
     pub progress_parent: Option<Arc<indicatif::MultiProgress>>,
+    /// Optional shared "combined work" progress bar. When `Some`,
+    /// `decode_and_write`'s writer ticks THIS bar by blob share instead
+    /// of creating a separate per-decode bar with per_sec/eta (which
+    /// stalled and misled during streaming per-batch waits — see
+    /// Phase 4d plan). `run_get_streaming` sets this along with the
+    /// matching field on DownloadConfig so BOTH sides of the pipeline
+    /// feed the same bar. Non-streaming paths (`sracha fetch`,
+    /// `sracha fastq`) leave this None and keep the legacy bars.
+    pub progress_combined: Option<Arc<indicatif::ProgressBar>>,
 }
 
 /// Statistics from a completed pipeline run.

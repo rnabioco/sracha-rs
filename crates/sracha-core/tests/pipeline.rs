@@ -257,6 +257,7 @@ fn test_config(
         http_client: None,
         keep_sra: false,
         progress_parent: None,
+        progress_combined: None,
     }
 }
 
