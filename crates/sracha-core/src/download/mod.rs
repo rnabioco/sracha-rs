@@ -857,37 +857,68 @@ async fn download_file_inner(
             // Channel for completed chunk indices (for progress sidecar updates).
             let (done_tx, mut done_rx) = tokio::sync::mpsc::unbounded_channel::<usize>();
 
-            let mut handles = Vec::with_capacity(chunks_to_download.len());
+            // Phase 3g-2: dispatch via the tracker's pending queue.
+            // Workers pull the next chunk index to fetch from the queue
+            // (replacing the old "spawn-one-task-per-chunk + FIFO
+            // semaphore" pattern). A streaming consumer can call
+            // `tracker.prioritize_pending(idx_chunks)` after parsing
+            // the TOC to fetch idx-containing chunks ahead of normal
+            // numerical-order data chunks — that's how decode actually
+            // gets to start while the file is still streaming.
+            //
+            // `chunks_by_idx` is the worker's lookup from chunk index
+            // (what the queue stores) to ChunkRange (what
+            // `download_chunk` needs). Wrapped in Arc so the per-worker
+            // clone is just a pointer bump.
+            let chunks_by_idx: std::sync::Arc<std::collections::HashMap<usize, ChunkRange>> =
+                std::sync::Arc::new(chunks_to_download.iter().copied().collect());
+            tracker.init_pending(chunks_to_download.iter().map(|(idx, _)| *idx));
+            tracker.close_pending();
+            // Drop the unused semaphore — workers self-limit by spawning
+            // exactly `connections` of them.
+            drop(semaphore);
 
-            for (chunk_idx, chunk) in chunks_to_download {
-                let sem = semaphore.clone();
+            let mut handles = Vec::with_capacity(connections);
+            for _worker_id in 0..connections {
                 let cli = client.clone();
                 let u = url.clone();
                 let f = shared_file.clone();
                 let pb_clone = pb.clone();
                 let tx = done_tx.clone();
                 let chunk_tracker = tracker.clone();
+                let by_idx = chunks_by_idx.clone();
 
                 let handle = tokio::spawn(async move {
-                    let _permit = sem.acquire().await.map_err(|e| Error::Download {
-                        accession: String::new(),
-                        message: format!("semaphore acquire failed: {e}"),
-                    })?;
+                    loop {
+                        let chunk_idx = match chunk_tracker.pop_pending() {
+                            Some(i) => i,
+                            None => {
+                                if chunk_tracker.pending_closed() {
+                                    return Ok::<(), Error>(());
+                                }
+                                chunk_tracker.wait_for_pending().await;
+                                continue;
+                            }
+                        };
+                        let chunk = by_idx
+                            .get(&chunk_idx)
+                            .copied()
+                            .expect("queue index must be in chunks_by_idx");
 
-                    download_chunk(&cli, &u, chunk, &f, pb_clone.as_deref()).await?;
+                        download_chunk(&cli, &u, chunk, &f, pb_clone.as_deref()).await?;
 
-                    // Mark this chunk's bytes as readable. Order matters:
-                    // do this AFTER download_chunk's pwrite returns
-                    // (bytes are durably on disk via the shared fd) so
-                    // any streaming consumer awaiting this byte range
-                    // sees a consistent view.
-                    chunk_tracker.mark_done(chunk_idx);
+                        // Mark this chunk's bytes as readable. Order matters:
+                        // do this AFTER download_chunk's pwrite returns
+                        // (bytes are durably on disk via the shared fd) so
+                        // any streaming consumer awaiting this byte range
+                        // sees a consistent view.
+                        chunk_tracker.mark_done(chunk_idx);
 
-                    // Notify the progress sidecar saver (separate from the
-                    // streaming tracker — this drives the .sracha-progress
-                    // JSON checkpoint, not decoder readiness).
-                    let _ = tx.send(chunk_idx);
-                    Ok::<(), Error>(())
+                        // Notify the progress sidecar saver (separate from the
+                        // streaming tracker — this drives the .sracha-progress
+                        // JSON checkpoint, not decoder readiness).
+                        let _ = tx.send(chunk_idx);
+                    }
                 });
 
                 handles.push(handle);

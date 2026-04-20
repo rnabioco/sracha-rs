@@ -370,10 +370,8 @@ fn decode_and_write(
 
     if let Some(tracker) = chunk_ready {
         // Collect all non-`/data` archive file ranges first so we can
-        // log the summary BEFORE waiting on any of them. Layout-sensitive
-        // diagnostics need to fire even when the metadata gate is going
-        // to take a long time — otherwise the user can't tell whether
-        // we're waiting on download or stuck somewhere else.
+        // log the summary + inject chunk-priority hints BEFORE waiting
+        // on any of them.
         let total_size = tracker.file_size();
         let mut idx_ranges: Vec<(String, u64, u64)> = Vec::new();
         for path in archive.list_files() {
@@ -391,18 +389,37 @@ fn decode_and_write(
         let pct = (idx_max_offset as f64 / total_size.max(1) as f64) * 100.0;
         tracing::info!(
             "{accession}: streaming-decode metadata gate: {} idx files, furthest at byte \
-             {idx_max_offset} ({pct:.1}% into {total_size}-byte file) — chunks <= that \
-             point must download before per-batch decode can start",
+             {idx_max_offset} ({pct:.1}% into {total_size}-byte file)",
             idx_ranges.len(),
         );
 
-        // Per-file wait. Replaces the old contiguous wait_range(0, max_end)
-        // which forced us to wait for every chunk between the start and
-        // the furthest idx file (often the whole download) — see
-        // Phase 3g-1 commit for context. The per-file form prepares the
-        // ground for Phase 3g-2 chunk-priority download, where these
-        // specific ranges become the priority hints sent back to the
-        // downloader so they fetch ahead of numerical-order chunks.
+        // Phase 3g-2: compute which chunks contain idx file bytes and
+        // ask the downloader to prioritize them. Workers will finish
+        // their current chunk and pick up the priority indices next,
+        // so decode can open the cursor (read these idx files) seconds
+        // into the download instead of minutes (which is what happened
+        // when chunks were dispatched in pure numerical order).
+        let mut prio_chunks: Vec<usize> = Vec::new();
+        for (_, off, sz) in &idx_ranges {
+            let first = tracker.chunk_index_for_byte(*off);
+            let last = tracker.chunk_index_for_byte((off + sz).saturating_sub(1));
+            for c in first..=last {
+                if !prio_chunks.contains(&c) {
+                    prio_chunks.push(c);
+                }
+            }
+        }
+        if !prio_chunks.is_empty() {
+            tracing::info!(
+                "{accession}: prioritizing {} chunks containing idx-file bytes",
+                prio_chunks.len(),
+            );
+            tracker.prioritize_pending(&prio_chunks);
+        }
+
+        // Per-file wait — now that we've nudged the dispatch order, the
+        // chunks we need will arrive ASAP rather than at their
+        // numerical-order turn.
         for (_, off, sz) in &idx_ranges {
             tracker.wait_range(*off, off + sz);
         }
@@ -1949,11 +1966,24 @@ pub fn decode_sra(downloaded: &DownloadedSra, config: &PipelineConfig) -> Result
         );
     }
 
+    // `downloaded.bytes_transferred` may be 0 here even on a real network
+    // transfer: when called from `run_get_streaming` the value is a
+    // placeholder (the real number isn't known until the parallel download
+    // task finishes; the orchestrator patches it into the returned
+    // PipelineStats afterward). Suppress the misleading "0 B transferred"
+    // line in that case — the CLI prints the correct totals at the end
+    // anyway.
+    let bytes_msg = if downloaded.bytes_transferred == 0 {
+        "(bytes transferred reported by orchestrator)".to_string()
+    } else {
+        format!(
+            "{} transferred",
+            crate::util::format_size(downloaded.bytes_transferred)
+        )
+    };
     tracing::info!(
-        "{}: done -- {spots_read} spots, {reads_written} reads written, \
-         {} transferred",
+        "{}: done -- {spots_read} spots, {reads_written} reads written, {bytes_msg}",
         downloaded.accession,
-        crate::util::format_size(downloaded.bytes_transferred),
     );
 
     if diag.any() {
