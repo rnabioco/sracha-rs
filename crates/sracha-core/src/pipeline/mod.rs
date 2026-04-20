@@ -1419,6 +1419,15 @@ pub struct DownloadedSra {
     pub accession: String,
     /// MD5 of the SRA file (computed or verified during download).
     pub sra_md5: Option<String>,
+    /// Per-chunk readiness tracker (see
+    /// [`crate::download::chunk_ready::ChunkReadyTracker`]). `Some` only
+    /// when the parallel-chunked download path was used. By the time
+    /// `download_sra` returns successfully, every chunk is marked done
+    /// — the tracker is Phase-2 plumbing for a future Phase 3b that
+    /// runs decode concurrently with download. Phase 3a code paths
+    /// just call `tracker.await_all()` at decode entry as a no-op
+    /// gate that proves the wiring works without changing behavior.
+    pub chunk_ready: Option<Arc<crate::download::chunk_ready::ChunkReadyTracker>>,
 }
 
 /// Download an SRA file to a temporary location.
@@ -1453,6 +1462,9 @@ pub async fn download_sra(
             is_lite: resolved.sra_file.is_lite,
             accession: accession.clone(),
             sra_md5: resolved.sra_file.md5.clone(),
+            // Outputs already exist; no download happened, so no
+            // streaming tracker is meaningful.
+            chunk_ready: None,
         });
     }
 
@@ -1522,6 +1534,7 @@ pub async fn download_sra(
         is_lite: resolved.sra_file.is_lite,
         accession: accession.clone(),
         sra_md5: dl_result.md5,
+        chunk_ready: dl_result.chunk_ready,
     })
 }
 
@@ -1658,6 +1671,17 @@ pub fn decode_sra(downloaded: &DownloadedSra, config: &PipelineConfig) -> Result
             output_files,
             integrity: Arc::new(IntegrityDiag::default()),
         });
+    }
+
+    // Phase 3a gate: if a streaming tracker is attached, ensure every
+    // chunk is on disk before decode begins. For Phase 3a this is a
+    // no-op — `run_get` only calls `decode_sra` AFTER `download_sra`
+    // returns successfully, by which point the tracker is fully marked
+    // done. Phase 3b will redesign `run_get` to spawn decode early so
+    // this gate becomes load-bearing (decode can begin as soon as the
+    // KAR header chunk lands, granular per-blob waits below).
+    if let Some(tracker) = &downloaded.chunk_ready {
+        tracker.wait_all();
     }
 
     let diag = Arc::new(IntegrityDiag::default());

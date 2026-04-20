@@ -80,6 +80,13 @@ async fn download_file_succeeds_against_mock_server() {
     assert_eq!(res.size, payload.len() as u64);
     assert_eq!(res.md5.as_deref(), Some(expected_md5.as_str()));
     assert_eq!(std::fs::read(&out).unwrap(), payload);
+    // Tiny payload uses the single-stream fallback path; chunk_ready
+    // tracker is only attached on the parallel-chunked path
+    // (file_size >= SMALL_FILE).
+    assert!(
+        res.chunk_ready.is_none(),
+        "single-stream path should not return a tracker",
+    );
 }
 
 #[tokio::test]
