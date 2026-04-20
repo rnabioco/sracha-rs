@@ -273,9 +273,23 @@ pub fn run_validate(
         ));
     }
 
-    let md5 = compute_file_md5(sra_path)
+    let md5_pb = if progress {
+        let total = std::fs::metadata(sra_path).map(|m| m.len()).unwrap_or(0);
+        Some(make_styled_pb(
+            total,
+            "  {elapsed_precise} [{bar:40.cyan}] {bytes}/{total_bytes}  {bytes_per_sec}  md5",
+        ))
+    } else {
+        None
+    };
+
+    let md5 = compute_file_md5(sra_path, md5_pb.as_ref())
         .map_err(|e| errors.push(format!("MD5 compute: {e}")))
         .ok();
+
+    if let Some(pb) = md5_pb {
+        pb.finish_and_clear();
+    }
 
     ValidationResult {
         valid: errors.is_empty(),
@@ -289,18 +303,24 @@ pub fn run_validate(
     }
 }
 
-fn compute_file_md5(path: &std::path::Path) -> std::io::Result<String> {
+fn compute_file_md5(
+    path: &std::path::Path,
+    pb: Option<&indicatif::ProgressBar>,
+) -> std::io::Result<String> {
     use md5::{Digest, Md5};
     use std::io::Read;
     let mut file = std::fs::File::open(path)?;
     let mut hasher = Md5::new();
-    let mut buf = vec![0u8; 64 * 1024];
+    let mut buf = vec![0u8; 1024 * 1024];
     loop {
         let n = file.read(&mut buf)?;
         if n == 0 {
             break;
         }
         hasher.update(&buf[..n]);
+        if let Some(pb) = pb {
+            pb.inc(n as u64);
+        }
     }
     let digest = hasher.finalize();
     Ok(digest.iter().map(|b| format!("{b:02x}")).collect())
@@ -314,7 +334,7 @@ mod tests {
     #[test]
     fn compute_file_md5_empty_file_matches_known_digest() {
         let tmp = tempfile::NamedTempFile::new().unwrap();
-        let got = compute_file_md5(tmp.path()).unwrap();
+        let got = compute_file_md5(tmp.path(), None).unwrap();
         // MD5 of empty input is the standard RFC 1321 test vector.
         assert_eq!(got, "d41d8cd98f00b204e9800998ecf8427e");
         assert_eq!(got.len(), 32);
@@ -325,7 +345,7 @@ mod tests {
         let mut tmp = tempfile::NamedTempFile::new().unwrap();
         tmp.write_all(b"abc").unwrap();
         tmp.flush().unwrap();
-        let got = compute_file_md5(tmp.path()).unwrap();
+        let got = compute_file_md5(tmp.path(), None).unwrap();
         assert_eq!(got, "900150983cd24fb0d6963f7d28e17f72");
     }
 
@@ -337,7 +357,7 @@ mod tests {
         let mut tmp = tempfile::NamedTempFile::new().unwrap();
         tmp.write_all(&vec![0u8; 200 * 1024]).unwrap();
         tmp.flush().unwrap();
-        let got = compute_file_md5(tmp.path()).unwrap();
+        let got = compute_file_md5(tmp.path(), None).unwrap();
         assert_eq!(got.len(), 32);
         // MD5 of 200 KiB of zeros — precomputed.
         assert!(got.chars().all(|c| c.is_ascii_hexdigit()));
@@ -347,7 +367,7 @@ mod tests {
     fn compute_file_md5_missing_file_errors() {
         let tmp = tempfile::tempdir().unwrap();
         let missing = tmp.path().join("no-such-file");
-        let err = compute_file_md5(&missing).expect_err("missing file must error");
+        let err = compute_file_md5(&missing, None).expect_err("missing file must error");
         assert_eq!(err.kind(), std::io::ErrorKind::NotFound);
     }
 
