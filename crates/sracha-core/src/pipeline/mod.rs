@@ -369,22 +369,43 @@ fn decode_and_write(
     let mut archive = KarArchive::open(std::io::BufReader::new(file))?;
 
     if let Some(tracker) = chunk_ready {
-        // Now that the TOC is parsed we know where every idx file lives.
-        // Wait for the contiguous span [0, max_idx_end) so the
-        // VdbCursor::open below can read every idx file safely.
-        let mut max_meta_end = archive.header().file_offset;
+        // Collect all non-`/data` archive file ranges first so we can
+        // log the summary BEFORE waiting on any of them. Layout-sensitive
+        // diagnostics need to fire even when the metadata gate is going
+        // to take a long time — otherwise the user can't tell whether
+        // we're waiting on download or stuck somewhere else.
+        let total_size = tracker.file_size();
+        let mut idx_ranges: Vec<(String, u64, u64)> = Vec::new();
         for path in archive.list_files() {
-            // Data slabs are gated per-batch later; here we want only
-            // the small index files (idx, idx0, idx1, idx2, plus skey).
-            let is_data = path.ends_with("/data");
-            if is_data {
+            if path.ends_with("/data") {
+                // Data slabs are gated per-batch later; only idx-style
+                // files (idx, idx0, idx1, idx2, skey) need pre-decode
+                // wait coverage.
                 continue;
             }
             if let Some((off, sz)) = archive.file_location(path) {
-                max_meta_end = max_meta_end.max(off + sz);
+                idx_ranges.push((path.to_string(), off, sz));
             }
         }
-        tracker.wait_range(0, max_meta_end);
+        let idx_max_offset = idx_ranges.iter().map(|(_, o, s)| o + s).max().unwrap_or(0);
+        let pct = (idx_max_offset as f64 / total_size.max(1) as f64) * 100.0;
+        tracing::info!(
+            "{accession}: streaming-decode metadata gate: {} idx files, furthest at byte \
+             {idx_max_offset} ({pct:.1}% into {total_size}-byte file) — chunks <= that \
+             point must download before per-batch decode can start",
+            idx_ranges.len(),
+        );
+
+        // Per-file wait. Replaces the old contiguous wait_range(0, max_end)
+        // which forced us to wait for every chunk between the start and
+        // the furthest idx file (often the whole download) — see
+        // Phase 3g-1 commit for context. The per-file form prepares the
+        // ground for Phase 3g-2 chunk-priority download, where these
+        // specific ranges become the priority hints sent back to the
+        // downloader so they fetch ahead of numerical-order chunks.
+        for (_, off, sz) in &idx_ranges {
+            tracker.wait_range(*off, off + sz);
+        }
     }
 
     let cursor = VdbCursor::open(&mut archive, sra_path)?;
