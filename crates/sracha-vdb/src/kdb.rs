@@ -152,9 +152,13 @@ enum DataSource {
     Mmap {
         /// Memory-mapped region covering the column data.
         mmap: memmap2::Mmap,
-        /// Offset within the mmap where column data starts (always 0 since
-        /// we map only the column's portion).
-        _file_offset: u64,
+        /// Absolute byte offset in the underlying .sra file where this
+        /// column's `data` section begins (i.e. the offset passed to
+        /// `MmapOptions::offset`). Streaming consumers use this to
+        /// translate blob offsets (which are relative to the column
+        /// data slab) into absolute file byte ranges they can await on
+        /// a [`crate::ChunkReadyTracker`]-style readiness map.
+        file_offset: u64,
     },
 }
 
@@ -801,10 +805,7 @@ impl ColumnReader {
                     .map(&file)
                     .map_err(|e| Error::Format(format!("mmap failed: {e}")))?
             };
-            reader.data = DataSource::Mmap {
-                mmap,
-                _file_offset: file_offset,
-            };
+            reader.data = DataSource::Mmap { mmap, file_offset };
         }
 
         Ok(reader)
@@ -910,6 +911,39 @@ impl ColumnReader {
             blob.pg as usize
         } else {
             (blob.pg * u64::from(self.meta.page_size)) as usize
+        }
+    }
+
+    /// Absolute byte range this blob occupies in the backing .sra file
+    /// (NOT within the column's data slab). Returns `None` for in-memory
+    /// readers (used in tests) where no underlying file exists.
+    ///
+    /// Streaming-decode consumers use this to await chunk readiness on
+    /// the underlying download before reading the blob bytes — see
+    /// [`crate::sracha_core_chunk_ready_doc`] (n/a here, lives in
+    /// sracha-core).
+    pub fn blob_absolute_range(&self, blob: &BlobLoc) -> Option<(u64, u64)> {
+        match &self.data {
+            DataSource::Mmap { file_offset, .. } => {
+                let start = *file_offset + self.blob_data_offset(blob) as u64;
+                let end = start + u64::from(blob.size);
+                Some((start, end))
+            }
+            DataSource::InMemory(_) => None,
+        }
+    }
+
+    /// Absolute byte range covering the entire data slab of this column
+    /// in the backing .sra file. `None` for in-memory readers.
+    ///
+    /// Streaming consumers use this once at column-open time to gate on
+    /// the column header (page maps live in the data slab itself).
+    pub fn data_absolute_range(&self) -> Option<(u64, u64)> {
+        match &self.data {
+            DataSource::Mmap { mmap, file_offset } => {
+                Some((*file_offset, *file_offset + mmap.len() as u64))
+            }
+            DataSource::InMemory(_) => None,
         }
     }
 }
