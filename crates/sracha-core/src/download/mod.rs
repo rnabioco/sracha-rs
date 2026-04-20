@@ -757,6 +757,27 @@ async fn download_file_inner(
             tracker.mark_done(done_idx);
         }
         chunk_ready_tracker = Some(tracker.clone());
+
+        // Ensure the output file exists at exactly `file_size` BEFORE
+        // we hand the tracker to a streaming consumer. Otherwise the
+        // consumer could race us, open a non-existent path, and error.
+        // (This also means a streaming decoder can assume the file
+        // exists and is at least `file_size` bytes long — only the
+        // contents of not-yet-ready chunks are invalid.)
+        // Fresh downloads get a sparse zero-filled file; resumes verify
+        // the partial file and extend/truncate if it drifted.
+        {
+            let f = tokio::fs::OpenOptions::new()
+                .write(true)
+                .create(true)
+                .truncate(false)
+                .open(output_path)
+                .await?;
+            if f.metadata().await?.len() != file_size {
+                f.set_len(file_size).await?;
+            }
+        }
+
         // Hand the tracker out to a streaming consumer (if any) BEFORE
         // we spawn chunk workers. Receiver may have already given up if
         // we took too long getting here — that's fine, send returns
@@ -793,21 +814,9 @@ async fn download_file_inner(
                 None
             };
 
-            // Ensure the output file exists at exactly `file_size`. Fresh
-            // downloads get a sparse zero-filled file; resumes verify the
-            // partial file and extend/truncate if it drifted (user copied
-            // something in, previous run died mid-preallocate, etc.).
-            {
-                let f = tokio::fs::OpenOptions::new()
-                    .write(true)
-                    .create(true)
-                    .truncate(false)
-                    .open(output_path)
-                    .await?;
-                if f.metadata().await?.len() != file_size {
-                    f.set_len(file_size).await?;
-                }
-            }
+            // (File pre-allocation moved above the tracker hand-off so
+            // a streaming consumer can safely open the file the moment
+            // it receives the tracker.)
 
             // Open one shared sync file handle for pwrite across all chunks.
             // Pays one `open` + one `spawn_blocking` for the whole download

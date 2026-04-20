@@ -344,9 +344,49 @@ fn decode_and_write(
     config: &PipelineConfig,
     is_lite: bool,
     diag: &IntegrityDiag,
+    chunk_ready: Option<&Arc<crate::download::chunk_ready::ChunkReadyTracker>>,
 ) -> Result<(u64, u64, Vec<PathBuf>)> {
+    // Phase 3c gate (entry, metadata): when a streaming tracker is
+    // present, wait for the bytes that KarArchive::open + VdbCursor::open
+    // will read before we open them. Otherwise sparse-mmap reads return
+    // zeros and we'd silently get a corrupt TOC / column metadata.
+    //
+    // Two-stage:
+    //   1. Wait for the 24-byte KAR header so we can extract file_offset
+    //      (where the data section starts).
+    //   2. Wait for [0, file_offset) — the rest of the TOC.
+    //   3. Open KarArchive, walk its entries to find the maximum byte
+    //      offset of any non-`/data` file (these are the small idx*
+    //      sidecars). Wait for [0, max_meta_end).
+    //   4. Open VdbCursor (its ColumnReader::open calls read those idx
+    //      files; mmaps the data slabs but doesn't read them yet — the
+    //      per-batch gate below handles those reads).
+    if let Some(tracker) = chunk_ready {
+        wait_metadata_ready(sra_path, tracker)?;
+    }
+
     let file = std::fs::File::open(sra_path)?;
     let mut archive = KarArchive::open(std::io::BufReader::new(file))?;
+
+    if let Some(tracker) = chunk_ready {
+        // Now that the TOC is parsed we know where every idx file lives.
+        // Wait for the contiguous span [0, max_idx_end) so the
+        // VdbCursor::open below can read every idx file safely.
+        let mut max_meta_end = archive.header().file_offset;
+        for path in archive.list_files() {
+            // Data slabs are gated per-batch later; here we want only
+            // the small index files (idx, idx0, idx1, idx2, plus skey).
+            let is_data = path.ends_with("/data");
+            if is_data {
+                continue;
+            }
+            if let Some((off, sz)) = archive.file_location(path) {
+                max_meta_end = max_meta_end.max(off + sz);
+            }
+        }
+        tracker.wait_range(0, max_meta_end);
+    }
+
     let cursor = VdbCursor::open(&mut archive, sra_path)?;
 
     // Check platform — reject legacy platforms with complex read structures.
@@ -659,6 +699,66 @@ fn decode_and_write(
                 spots_before_per_blob_in_batch(cumulative_spots, &blob_id_ranges);
             cumulative_spots += batch_spots;
 
+            // Phase 3c gate (per-batch): if streaming, wait for the
+            // bytes the upcoming rayon decode will read. We compute the
+            // union of [min_start, max_end) across every blob the batch
+            // will touch (READ + all auxiliary columns; ALTREAD blob
+            // boundaries can differ from READ's so use find_blob).
+            // Per-batch is the right granularity: the rayon workers
+            // aren't in a tokio context (so calling `wait_range` from
+            // inside the parallel iterator would panic), and the
+            // overshoot from waiting on a contiguous superset rather
+            // than a precise multi-range set is small in practice
+            // because adjacent blobs of the same column are
+            // sequentially placed.
+            if let Some(tracker) = chunk_ready {
+                let mut min_byte = u64::MAX;
+                let mut max_byte = 0u64;
+                let mut accumulate = |range: Option<(u64, u64)>| {
+                    if let Some((s, e)) = range {
+                        min_byte = min_byte.min(s);
+                        max_byte = max_byte.max(e);
+                    }
+                };
+                for bi in blob_idx..batch_end {
+                    let rb = &cursor.read_col().blobs()[bi];
+                    accumulate(cursor.read_col().blob_absolute_range(rb));
+                    if has_quality && bi < quality_blob_count {
+                        let c = cursor.quality_col().unwrap();
+                        accumulate(c.blob_absolute_range(&c.blobs()[bi]));
+                    }
+                    if has_read_len && bi < read_len_blob_count {
+                        let c = cursor.read_len_col().unwrap();
+                        accumulate(c.blob_absolute_range(&c.blobs()[bi]));
+                    }
+                    if has_name && bi < name_blob_count {
+                        let c = cursor.name_col().unwrap();
+                        accumulate(c.blob_absolute_range(&c.blobs()[bi]));
+                    }
+                    if has_read_type && bi < read_type_blob_count {
+                        let c = cursor.read_type_col().unwrap();
+                        accumulate(c.blob_absolute_range(&c.blobs()[bi]));
+                    }
+                    if has_altread {
+                        let c = cursor.altread_col().unwrap();
+                        if let Some(b) = c.find_blob(rb.start_id) {
+                            accumulate(c.blob_absolute_range(b));
+                        }
+                    }
+                    if has_illumina_name_parts && bi < x_blob_count {
+                        let c = cursor.x_col().unwrap();
+                        accumulate(c.blob_absolute_range(&c.blobs()[bi]));
+                    }
+                    if has_illumina_name_parts && bi < y_blob_count {
+                        let c = cursor.y_col().unwrap();
+                        accumulate(c.blob_absolute_range(&c.blobs()[bi]));
+                    }
+                }
+                if max_byte > min_byte {
+                    tracker.wait_range(min_byte, max_byte);
+                }
+            }
+
             let formatted_batches: Vec<Result<FormattedBlob>> = pool.install(|| {
                 (blob_idx..batch_end)
                     .into_par_iter()
@@ -961,7 +1061,7 @@ pub fn run_fastq(
 
     let diag = Arc::new(IntegrityDiag::default());
     let (spots_read, reads_written, output_files) =
-        decode_and_write(sra_path, &acc, config, is_lite, &diag)
+        decode_and_write(sra_path, &acc, config, is_lite, &diag, None)
             .map_err(|e| wrap_blob_integrity(&acc, e))?;
 
     // Warn (but don't fail) when split-3 was requested on an effectively
@@ -1414,6 +1514,30 @@ pub async fn download_sra_streaming(
     download_sra_inner(resolved, config, Some(tracker_init)).await
 }
 
+/// First-stage metadata gate for streaming decode. Waits for the bytes
+/// `KarArchive::open` needs to read (24-byte header + the TOC, whose
+/// extent is encoded as `header.file_offset`).
+///
+/// Returns once enough of the file is on disk that `KarArchive::open`
+/// can be called without hitting sparse holes.
+fn wait_metadata_ready(
+    sra_path: &std::path::Path,
+    tracker: &Arc<crate::download::chunk_ready::ChunkReadyTracker>,
+) -> Result<()> {
+    use std::io::Read;
+    // KAR header is 24 bytes at offset 0; chunk 0 always covers it.
+    tracker.wait_range(0, 24);
+    let mut hdr = [0u8; 24];
+    let mut f = std::fs::File::open(sra_path)?;
+    f.read_exact(&mut hdr)?;
+    // Bytes 16..24 hold the little-endian file_offset (start of the
+    // data section). Anything before that is the TOC and must be on
+    // disk before we can parse it.
+    let file_offset = u64::from_le_bytes(hdr[16..24].try_into().unwrap());
+    tracker.wait_range(0, file_offset);
+    Ok(())
+}
+
 /// Wrap a download future with the standard cancellation handler:
 /// honor `config.cancelled` if set, removing the temp file + progress
 /// sidecar before bubbling `Error::Cancelled`. Extracted so the two
@@ -1681,17 +1805,12 @@ pub fn decode_sra(downloaded: &DownloadedSra, config: &PipelineConfig) -> Result
         });
     }
 
-    // Phase 3a gate: if a streaming tracker is attached, ensure every
-    // chunk is on disk before decode begins. For Phase 3a this is a
-    // no-op — `run_get` only calls `decode_sra` AFTER `download_sra`
-    // returns successfully, by which point the tracker is fully marked
-    // done. Phase 3b will redesign `run_get` to spawn decode early so
-    // this gate becomes load-bearing (decode can begin as soon as the
-    // KAR header chunk lands, granular per-blob waits below).
-    if let Some(tracker) = &downloaded.chunk_ready {
-        tracker.wait_all();
-    }
-
+    // Phase 3c: granular gating now lives inside `decode_and_write`
+    // (metadata waits at entry, per-batch waits in the decode loop).
+    // The Phase 3a coarse `wait_all()` is removed so streaming decode
+    // can actually overlap with download. When `chunk_ready` is None
+    // (single-stream fallback or already-on-disk path) decode_and_write
+    // skips the gates entirely.
     let diag = Arc::new(IntegrityDiag::default());
     let (spots_read, reads_written, output_files) = match decode_and_write(
         &downloaded.temp_path,
@@ -1699,6 +1818,7 @@ pub fn decode_sra(downloaded: &DownloadedSra, config: &PipelineConfig) -> Result
         config,
         downloaded.is_lite,
         &diag,
+        downloaded.chunk_ready.as_ref(),
     ) {
         Ok(result) => result,
         Err(Error::Cancelled { output_files }) => {
@@ -1846,21 +1966,29 @@ pub async fn run_get(
     tokio::task::block_in_place(|| decode_sra(&downloaded, config))
 }
 
-/// Streaming variant of [`run_get`]: uses [`download_sra_streaming`] so
-/// the chunk-readiness tracker can be observed before download
-/// completes, and orchestrates download + decode as concurrent tasks.
+/// Streaming variant of [`run_get`]: starts the FASTQ decode while
+/// the SRA download is still in flight.
 ///
-/// **Phase 3b status:** the orchestration is in place but observable
-/// behavior is identical to [`run_get`]. The decoder still gates
-/// at-entry on `tracker.wait_all()` (which blocks until the download is
-/// done), so wall-clock is unchanged. Phase 3c will replace the
-/// at-entry gate with per-blob `tracker.wait_range(...)` calls; from
-/// that point the spawned decode task makes real progress while the
-/// download is still in flight.
+/// **How it works** (post-Phase 3c+3d):
+/// 1. Download is spawned as a background Tokio task. As soon as the
+///    parallel-chunked path constructs its `ChunkReadyTracker`, the
+///    tracker is delivered to us via a oneshot.
+/// 2. With the tracker in hand we synthesize a `DownloadedSra` for the
+///    decoder using the fields we already know (temp path, accession,
+///    `is_lite` from SDL metadata). `bytes_transferred` is unknown at
+///    this point — we patch it in from the real `DownloadedSra` after
+///    the download task finishes.
+/// 3. Decode runs in `spawn_blocking`. Its first action is the
+///    streaming-decode metadata gate (waits for KAR header + TOC + idx
+///    files); each subsequent batch waits for the chunks covering its
+///    blobs before the rayon decode block runs. Both threads make
+///    progress in parallel.
+/// 4. We `try_join!` download and decode; the decoder finishes shortly
+///    after the last chunk lands.
 ///
 /// On the single-stream fallback (file < `SMALL_FILE`) the tracker is
 /// never sent — we transparently fall through to the same await-then-
-/// decode flow [`run_get`] uses.
+/// decode flow [`run_get`] uses, with no streaming overlap.
 pub async fn run_get_streaming(
     resolved: &ResolvedAccession,
     config: &PipelineConfig,
@@ -1869,32 +1997,65 @@ pub async fn run_get_streaming(
     let resolved_owned = resolved.clone();
     let config_for_dl = config.clone();
 
-    // Spawn the download as a Tokio task. It must be 'static, hence
-    // the clones above. Tracker (if any) flows out via `tracker_rx`.
+    // Spawn the download as a Tokio task. Args must be 'static.
     let dl_handle: tokio::task::JoinHandle<Result<DownloadedSra>> = tokio::spawn(async move {
         download_sra_streaming(&resolved_owned, &config_for_dl, tracker_tx).await
     });
 
     // Receive the tracker. Err means the sender was dropped without
-    // firing — either the download took the single-stream path (file <
-    // SMALL_FILE) or it failed before reaching the tracker-construction
-    // site. Either way the right next step is the same: just wait for
-    // download_sra_streaming to finish (it'll return either a result
-    // with chunk_ready=None or the underlying error).
-    let _early_tracker = tracker_rx.await.ok();
+    // firing — either the download took the single-stream path or
+    // failed before reaching the tracker-construction site.
+    let early_tracker = tracker_rx.await.ok();
 
-    // Phase 3b: decode runs *after* download here because Phase 3c's
-    // granular per-blob gating isn't in yet, so spawning decode in
-    // parallel would just have it block on `wait_all` for the duration
-    // of the download — no win, more complexity. The orchestration
-    // primitive is in place; flipping to truly-concurrent execution is
-    // a Phase 3c follow-up that replaces the at-entry gate with
-    // per-blob waits.
-    let downloaded = dl_handle
+    let Some(tracker) = early_tracker else {
+        // No streaming available — degrade gracefully to await-then-decode.
+        let downloaded = dl_handle
+            .await
+            .map_err(|e| Error::Pipeline(format!("download task panicked: {e}")))??;
+        return tokio::task::block_in_place(|| decode_sra(&downloaded, config));
+    };
+
+    // Synthesize the DownloadedSra fields the decoder needs upfront.
+    // Everything except `bytes_transferred` is known from `resolved` +
+    // the temp-path convention; we patch `bytes_transferred` in from
+    // the real result after the download task finishes.
+    let temp_path = config
+        .output_dir
+        .join(format!(".sracha-tmp-{}.sra", resolved.accession));
+    let synthetic = DownloadedSra {
+        temp_path,
+        bytes_transferred: 0,
+        total_sra_size: resolved.sra_file.size,
+        is_lite: resolved.sra_file.is_lite,
+        accession: resolved.accession.clone(),
+        sra_md5: resolved.sra_file.md5.clone(),
+        chunk_ready: Some(tracker),
+    };
+
+    // Spawn decode on a blocking thread (decode_sra is sync and uses
+    // rayon internally; spawn_blocking gives it a dedicated OS thread
+    // off the Tokio worker pool). It runs concurrently with the
+    // download task — its metadata + per-batch gates inside
+    // `decode_and_write` block on chunk readiness as needed.
+    let config_for_decode = config.clone();
+    let decode_handle: tokio::task::JoinHandle<Result<PipelineStats>> =
+        tokio::task::spawn_blocking(move || decode_sra(&synthetic, &config_for_decode));
+
+    // Await both. The download finishes first (download's MD5 + sidecar
+    // cleanup are part of `download_sra_streaming`); decode finishes
+    // shortly after the last chunk's bytes are wait_range-released.
+    let dl_result = dl_handle
         .await
-        .map_err(|e| Error::Pipeline(format!("download task panicked: {e}")))??;
+        .map_err(|e| Error::Pipeline(format!("download task panicked: {e}")))?;
+    let downloaded = dl_result?;
+    let decode_result = decode_handle
+        .await
+        .map_err(|e| Error::Pipeline(format!("decode task panicked: {e}")))?;
+    let mut stats = decode_result?;
 
-    tokio::task::block_in_place(|| decode_sra(&downloaded, config))
+    // Patch in the real bytes_transferred (synthetic was 0).
+    stats.bytes_transferred = downloaded.bytes_transferred;
+    Ok(stats)
 }
 
 #[cfg(test)]
