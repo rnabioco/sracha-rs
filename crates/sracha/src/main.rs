@@ -516,6 +516,88 @@ async fn main() -> Result<()> {
                 }
             };
 
+            // ----------------------------------------------------------
+            // Phase 3e: streaming fast path for single-NCBI-accession Get.
+            //
+            // For a single accession the prefetch_depth queue gives no
+            // win (there's no N+1 to download while N decodes), but
+            // run_get_streaming overlaps the SAME accession's download
+            // and decode for ~10-15% e2e wall-clock improvement on
+            // medium files (~25%+ on multi-GB files where decode is a
+            // bigger share of e2e). Multi-accession runs stay on the
+            // prefetch_depth path below; cross-accession prefetch
+            // dominates when N is large and decode << download.
+            if resolved_all.len() == 1 && ena_results[0].is_none() {
+                let resolved = &resolved_all[0];
+                let pipeline_config = make_config(resolved);
+                let source = resolved
+                    .sra_file
+                    .mirrors
+                    .first()
+                    .map(|m| m.service.clone())
+                    .unwrap_or_else(|| "unknown".into());
+
+                match sracha_core::pipeline::run_get_streaming(resolved, &pipeline_config).await {
+                    Ok(stats) => {
+                        if stats.spots_read == 0 && stats.bytes_transferred == 0 {
+                            eprintln!(
+                                "{}: outputs already exist, skipped (use --force to re-process)",
+                                style::header(&stats.accession),
+                            );
+                        } else if stats.bytes_transferred == 0 {
+                            eprintln!(
+                                "{}: {} spots, {} reads written (cached, no download needed)",
+                                style::header(&stats.accession),
+                                style::count(stats.spots_read),
+                                style::count(stats.reads_written),
+                            );
+                        } else if stats.bytes_transferred < stats.total_sra_size {
+                            eprintln!(
+                                "{}: {} spots, {} reads written, {} of {} transferred from [{}] (resumed)",
+                                style::header(&stats.accession),
+                                style::count(stats.spots_read),
+                                style::count(stats.reads_written),
+                                style::value(format_size(stats.bytes_transferred)),
+                                style::value(format_size(stats.total_sra_size)),
+                                style::value(&source),
+                            );
+                        } else {
+                            eprintln!(
+                                "{}: {} spots, {} reads written, {} downloaded from [{}]",
+                                style::header(&stats.accession),
+                                style::count(stats.spots_read),
+                                style::count(stats.reads_written),
+                                style::value(format_size(stats.total_sra_size)),
+                                style::value(&source),
+                            );
+                        }
+                        if !args.stdout {
+                            for path in &stats.output_files {
+                                eprintln!("  wrote {}", style::path(path.display()));
+                            }
+                        }
+                    }
+                    Err(sracha_core::error::Error::Cancelled { .. }) => {
+                        if args.stdout {
+                            eprintln!(
+                                "Interrupted -- cleaned up partial files for {}.",
+                                style::header(&resolved.accession),
+                            );
+                        } else {
+                            eprintln!(
+                                "Interrupted -- cleaned up partial output for {} \
+                                 (temp SRA kept, next run will skip download).",
+                                style::header(&resolved.accession),
+                            );
+                        }
+                        std::process::exit(130);
+                    }
+                    Err(e) => return Err(e.into()),
+                }
+                return Ok(());
+            }
+            // ----------------------------------------------------------
+
             // Spawn a download task for resolved_all[idx]. Only used for the
             // NCBI path; ENA accessions are handled inline (no decode to
             // overlap with, so prefetching buys nothing).
