@@ -21,11 +21,25 @@
 //! `tokio::sync::Notify`, this guarantees a waiter that wakes up will see
 //! the bit it was waiting on (and any earlier writes from the producer).
 
+use std::collections::VecDeque;
+use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, Ordering};
 
 use tokio::sync::Notify;
 
-/// Lock-free chunk presence map + async wake.
+/// Lock-free chunk presence map + async wake + dispatch queue.
+///
+/// Two responsibilities bundled because they share the same
+/// chunk-index space and lifetime:
+/// 1. **Readiness tracking** (`mark_done` / `wait_range`) — the original
+///    Phase 1-2 role. Decoders block until chunks they need are on disk.
+/// 2. **Dispatch ordering** (`pop_pending` / `prioritize_pending`) —
+///    Phase 3g-2 role. Workers in `download_file_inner` pull the next
+///    chunk to fetch from a shared queue; a streaming consumer can
+///    inject priority chunk indices (e.g. those containing idx files)
+///    so they're fetched ahead of normal numerical-order chunks. The
+///    decoder can then open the cursor and start per-batch decode
+///    while bulk data is still streaming.
 pub struct ChunkReadyTracker {
     /// One slot per chunk index. `true` means the chunk's bytes are
     /// fully written to disk and safe to read.
@@ -41,6 +55,21 @@ pub struct ChunkReadyTracker {
     chunk_size: u64,
     /// Total file size in bytes.
     file_size: u64,
+    /// Chunk indices not yet handed to a worker for download. Workers
+    /// pop_front to claim the next chunk; `prioritize_pending` moves
+    /// matching indices to the front. `None` until the downloader
+    /// initializes the queue (e.g., for the resume-already-complete
+    /// path that doesn't dispatch any new chunks).
+    pending: Mutex<Option<VecDeque<usize>>>,
+    /// Wakes workers when new items are added to `pending` OR when
+    /// the queue is closed. Distinct from `notify` (which is for
+    /// readiness waiters) so that priority injection doesn't spuriously
+    /// re-wake decoders blocked on `wait_range`.
+    pending_notify: Notify,
+    /// Set by `close_pending` when no more chunks will be added.
+    /// Workers exit their loop once they observe pending empty AND
+    /// pending_closed = true.
+    pending_closed: AtomicBool,
 }
 
 impl ChunkReadyTracker {
@@ -65,7 +94,106 @@ impl ChunkReadyTracker {
             notify: Notify::new(),
             chunk_size,
             file_size,
+            pending: Mutex::new(None),
+            pending_notify: Notify::new(),
+            pending_closed: AtomicBool::new(false),
         }
+    }
+
+    // -----------------------------------------------------------------
+    // Phase 3g-2: dispatch queue.
+    //
+    // The downloader puts chunk indices to fetch in `pending`. Workers
+    // pull the next index via `pop_pending` (sync; blocks via the async
+    // `wait_for_pending` if the queue is empty but not closed). A
+    // streaming consumer (decoder) calls `prioritize_pending(&[idx])`
+    // to move specific indices to the front of the queue so they're
+    // fetched ahead of normal numerical order.
+    // -----------------------------------------------------------------
+
+    /// Initialize the pending dispatch queue with chunk indices to
+    /// download in the given order. Typically called by the downloader
+    /// once after chunk planning, with indices in numerical order.
+    pub fn init_pending(&self, indices: impl IntoIterator<Item = usize>) {
+        let mut p = self.pending.lock().unwrap();
+        *p = Some(indices.into_iter().collect());
+        // Wake any workers that started before init; they'll see items now.
+        self.pending_notify.notify_waiters();
+    }
+
+    /// Mark the pending queue as closed: no more chunks will be added.
+    /// Workers that observe an empty queue + closed will exit. Called
+    /// by the downloader after `init_pending`.
+    pub fn close_pending(&self) {
+        self.pending_closed.store(true, Ordering::Release);
+        self.pending_notify.notify_waiters();
+    }
+
+    /// Non-blocking: pop the next chunk index to download. Returns
+    /// `None` if the queue is empty (caller should `wait_for_pending`
+    /// then retry, or exit if the queue is also closed).
+    pub fn pop_pending(&self) -> Option<usize> {
+        self.pending
+            .lock()
+            .unwrap()
+            .as_mut()
+            .and_then(|q| q.pop_front())
+    }
+
+    /// Has the pending queue been closed (no more chunks to come)?
+    pub fn pending_closed(&self) -> bool {
+        self.pending_closed.load(Ordering::Acquire)
+    }
+
+    /// Async: wait until a `prioritize_pending` / `init_pending` /
+    /// `close_pending` call has happened. Used by workers when they
+    /// see an empty queue but `pending_closed` is still false.
+    pub async fn wait_for_pending(&self) {
+        let notified = self.pending_notify.notified();
+        // Re-check after registering interest to avoid a missed wake.
+        if !self
+            .pending
+            .lock()
+            .unwrap()
+            .as_ref()
+            .is_some_and(|q| q.is_empty())
+            || self.pending_closed()
+        {
+            return;
+        }
+        notified.await;
+    }
+
+    /// Re-order the pending queue: any of `indices` currently in the
+    /// queue are moved to the front, preserving the order in `indices`.
+    /// Indices not currently pending (already dispatched, or never
+    /// queued) are silently ignored. Workers currently mid-download
+    /// of a non-priority chunk will pick up priority chunks NEXT (no
+    /// preemption).
+    pub fn prioritize_pending(&self, indices: &[usize]) {
+        let mut p = self.pending.lock().unwrap();
+        let Some(q) = p.as_mut() else { return };
+        let mut prio: Vec<usize> = Vec::with_capacity(indices.len());
+        // Build a HashSet for O(1) contains check inside the retain
+        // loop — `indices` can be large for files with many idx files.
+        let want: std::collections::HashSet<usize> = indices.iter().copied().collect();
+        let mut i = 0;
+        while i < q.len() {
+            if want.contains(&q[i]) {
+                prio.push(q.remove(i).unwrap());
+            } else {
+                i += 1;
+            }
+        }
+        // Reorder `prio` to match the input order so callers can
+        // express preference among priority items themselves.
+        prio.sort_by_key(|idx| indices.iter().position(|i| i == idx).unwrap_or(usize::MAX));
+        for idx in prio.into_iter().rev() {
+            q.push_front(idx);
+        }
+        // Don't notify_waiters — re-ordering doesn't add items, and
+        // workers blocked on wait_for_pending are already going to
+        // re-check the queue when something changes.
     }
 
     /// Number of chunks this tracker covers.
@@ -76,6 +204,18 @@ impl ChunkReadyTracker {
     /// Total file size this tracker covers.
     pub fn file_size(&self) -> u64 {
         self.file_size
+    }
+
+    /// Bytes per chunk (last chunk may be shorter).
+    pub fn chunk_size(&self) -> u64 {
+        self.chunk_size
+    }
+
+    /// Translate a byte offset to the chunk index that contains it.
+    /// Saturates at `total_chunks() - 1` for offsets past file_size.
+    pub fn chunk_index_for_byte(&self, byte: u64) -> usize {
+        let idx = (byte / self.chunk_size) as usize;
+        idx.min(self.ready.len().saturating_sub(1))
     }
 
     /// Mark a chunk as fully downloaded. Idempotent — double-marking is
