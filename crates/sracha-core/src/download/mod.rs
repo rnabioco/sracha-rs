@@ -660,6 +660,10 @@ async fn download_file_inner(
     // path; the single-stream fallback stays None (streaming decode
     // doesn't apply to <SMALL_FILE files anyway).
     let mut chunk_ready_tracker: Option<Arc<ChunkReadyTracker>> = None;
+    // Phase 4a: when streaming MD5 ran (parallel-chunked path), the
+    // hex digest is set here so the post-loop verify code can use it
+    // instead of running another sequential mmap+hash pass.
+    let mut early_md5_hex: Option<String> = None;
 
     if use_parallel {
         // --- Parallel chunked download (with resume support) ---
@@ -792,6 +796,13 @@ async fn download_file_inner(
             let _ = tx.send(tracker.clone());
         }
 
+        // Phase 4a streaming MD5 handle. Declared at outer scope so the
+        // post-worker join code can take it; populated only on the
+        // chunks-to-download branch below (the all-already-done branch
+        // doesn't need a fresh hash — the file is already on disk and
+        // the post-loop compute_md5 fast path handles it).
+        let mut streaming_md5_handle: Option<tokio::task::JoinHandle<Result<String>>> = None;
+
         if chunks_to_download.is_empty() {
             tracing::info!("all chunks already downloaded — verifying");
             bytes_transferred = 0;
@@ -874,6 +885,58 @@ async fn download_file_inner(
                 std::sync::Arc::new(chunks_to_download.iter().copied().collect());
             tracker.init_pending(chunks_to_download.iter().map(|(idx, _)| *idx));
             tracker.close_pending();
+
+            // Phase 4a: streaming MD5. Spawn a hashing task NOW so it
+            // runs in parallel with the workers. It walks chunks in
+            // numerical order, awaits each via the tracker (sync
+            // wait_chunk inside spawn_blocking), and folds them into
+            // an Md5 accumulator. Net effect: MD5 finishes ~when the
+            // last chunk lands instead of 30 s after, since hashing
+            // overlaps with download. For the 16 GB ERR3224585 fixture
+            // the post-download MD5 verify pass was 30 s out of 51 s
+            // total download_file time — this saves that 30 s for any
+            // caller awaiting download_file (including non-streaming
+            // `sracha fetch`).
+            //
+            // Skips itself when validate=false. The single-stream
+            // fallback path (file < SMALL_FILE) doesn't have a tracker,
+            // so it keeps using the post-download `compute_md5` mmap
+            // pass — file is small enough that streaming saves <100 ms.
+            streaming_md5_handle = if config.validate {
+                let tracker_clone = tracker.clone();
+                let path = output_path.to_path_buf();
+                let total_chunks_count = total_chunks;
+                let chunk_size_for_hash = chunk_size;
+                let file_size_for_hash = file_size;
+                Some(tokio::task::spawn_blocking(move || -> Result<String> {
+                    let file = std::fs::File::open(&path).map_err(Error::Io)?;
+                    if file_size_for_hash == 0 {
+                        // MD5 of empty input.
+                        return Ok("d41d8cd98f00b204e9800998ecf8427e".into());
+                    }
+                    // SAFETY: file was pre-allocated to file_size by
+                    // the parent function before the tracker was
+                    // initialized; nothing else writes outside that
+                    // range during our lifetime. Per-chunk pwrites
+                    // populate the bytes; we wait_chunk before
+                    // reading any range so we never observe sparse
+                    // zeros.
+                    let mmap = unsafe { memmap2::Mmap::map(&file).map_err(Error::Io)? };
+                    let mut hasher = Md5::new();
+                    for chunk_idx in 0..total_chunks_count {
+                        tracker_clone.wait_chunk(chunk_idx);
+                        let start =
+                            (chunk_idx as u64 * chunk_size_for_hash).min(file_size_for_hash);
+                        let end = std::cmp::min(start + chunk_size_for_hash, file_size_for_hash);
+                        hasher.update(&mmap[start as usize..end as usize]);
+                    }
+                    let digest = hasher.finalize();
+                    Ok(digest.iter().map(|b| format!("{b:02x}")).collect())
+                }))
+            } else {
+                None
+            };
+
             // Drop the unused semaphore — workers self-limit by spawning
             // exactly `connections` of them.
             drop(semaphore);
@@ -1008,6 +1071,31 @@ async fn download_file_inner(
 
         // Download succeeded — clean up progress sidecar.
         delete_progress(&prog_path);
+
+        // Phase 4a: collect the streaming MD5 result if we spawned a
+        // hashing task. By the time we reach here all workers have
+        // finished and every chunk is mark_done — the hashing task
+        // has either already finished (if it caught up) or has only
+        // its final updates to do (one-shot lock acquisition each).
+        if let Some(handle) = streaming_md5_handle {
+            let computed = handle.await.map_err(|e| Error::Download {
+                accession: String::new(),
+                message: format!("streaming MD5 task panicked: {e}"),
+            })??;
+            // Verify against expected here so we can short-circuit the
+            // post-loop compute_md5 path, AND so a mismatch removes the
+            // bad file before any caller can use it.
+            if let Some(expected) = expected_md5
+                && computed != expected
+            {
+                let _ = tokio::fs::remove_file(output_path).await;
+                return Err(Error::ChecksumMismatch {
+                    expected: expected.to_string(),
+                    actual: computed,
+                });
+            }
+            early_md5_hex = Some(computed);
+        }
     } else {
         // --- Single-stream fallback (with resume support) ---
         // `--force` short-circuits resume: otherwise an already-complete
@@ -1143,8 +1231,16 @@ async fn download_file_inner(
         }
     }
 
-    // Verify MD5 if requested.
-    let md5_hex = if let (true, Some(expected)) = (config.validate, expected_md5) {
+    // Verify MD5 if requested. The parallel-chunked path computes MD5
+    // streaming-style (overlapped with downloads, see Phase 4a above)
+    // and stashes the result in `early_md5_hex` after verifying it
+    // against expected_md5. The single-stream / already-complete-file
+    // paths fall through here and pay the post-download mmap+hash
+    // cost, which is small for the file sizes those paths handle
+    // (<32 MiB or already-on-disk).
+    let md5_hex = if let Some(precomputed) = early_md5_hex {
+        Some(precomputed)
+    } else if let (true, Some(expected)) = (config.validate, expected_md5) {
         let computed = compute_md5(output_path).await?;
         if computed != expected {
             // Clean up the bad file.
