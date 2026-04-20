@@ -324,6 +324,7 @@ async fn main() -> Result<()> {
                     http_client: None,
                     strict: !args.no_strict,
                     keep_sra: false,
+                    progress_parent: None,
                 };
 
                 let stats = sracha_core::pipeline::run_fastq(sra_path, None, &pipeline_config)?;
@@ -513,6 +514,10 @@ async fn main() -> Result<()> {
                     strict: !args.no_strict,
                     http_client: Some(http_client.clone()),
                     keep_sra: args.keep_sra,
+                    // run_get_streaming auto-creates a MultiProgress if
+                    // progress is on and this is None — which is what we
+                    // want for the single-accession streaming fast path.
+                    progress_parent: None,
                 }
             };
 

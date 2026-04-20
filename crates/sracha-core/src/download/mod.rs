@@ -55,6 +55,11 @@ pub struct DownloadConfig {
     /// archive magic (`NCBI.sra`) so a corrupt `.sracha-tmp-*.sra` cannot
     /// silently feed garbage to the VDB decoder.
     pub expected_prefix: Option<Vec<u8>>,
+    /// Optional shared `MultiProgress`. When `Some`, the download's
+    /// progress bar is added to it (coordinated rendering with other
+    /// concurrent bars — e.g. a decode bar from a streaming consumer).
+    /// When `None` and `progress` is true, the bar prints standalone.
+    pub progress_parent: Option<Arc<indicatif::MultiProgress>>,
 }
 
 impl Default for DownloadConfig {
@@ -68,6 +73,7 @@ impl Default for DownloadConfig {
             resume: true,
             client: None,
             expected_prefix: None,
+            progress_parent: None,
         }
     }
 }
@@ -849,7 +855,16 @@ async fn download_file_inner(
             bytes_transferred = bytes_remaining;
 
             let pb: Option<std::sync::Arc<indicatif::ProgressBar>> = if config.progress {
-                let pb = std::sync::Arc::new(make_progress_bar(bytes_remaining));
+                // Build the bar; if a parent MultiProgress is set
+                // (streaming consumer wants to render alongside its
+                // own decode bar), register it there so they coordinate
+                // the terminal cursor.
+                let bar = make_progress_bar(bytes_remaining);
+                let bar = match &config.progress_parent {
+                    Some(mp) => mp.add(bar),
+                    None => bar,
+                };
+                let pb = std::sync::Arc::new(bar);
                 if already_done > 0 {
                     // Show that we're resuming.
                     pb.set_message(format!("resuming ({already_done}/{total_chunks} cached)"));
@@ -1023,7 +1038,12 @@ async fn download_file_inner(
         bytes_transferred = bytes_remaining;
 
         let pb: Option<std::sync::Arc<indicatif::ProgressBar>> = if config.progress {
-            Some(std::sync::Arc::new(make_progress_bar(bytes_remaining)))
+            let bar = make_progress_bar(bytes_remaining);
+            let bar = match &config.progress_parent {
+                Some(mp) => mp.add(bar),
+                None => bar,
+            };
+            Some(std::sync::Arc::new(bar))
         } else {
             None
         };
