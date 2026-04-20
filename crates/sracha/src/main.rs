@@ -324,6 +324,7 @@ async fn main() -> Result<()> {
                     strict: args.strict,
                     keep_sra: false,
                     progress_parent: None,
+                    progress_combined: None,
                 };
 
                 let stats = sracha_core::pipeline::run_fastq(sra_path, None, &pipeline_config)?;
@@ -517,6 +518,7 @@ async fn main() -> Result<()> {
                     // progress is on and this is None — which is what we
                     // want for the single-accession streaming fast path.
                     progress_parent: None,
+                    progress_combined: None,
                 }
             };
 

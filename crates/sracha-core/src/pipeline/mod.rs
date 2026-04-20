@@ -622,7 +622,17 @@ fn decode_and_write(
     );
     tracing::debug!("{accession}: streaming decode of {num_blobs} blobs (batch-parallel)",);
 
-    let decode_pb = if config.progress {
+    // Decode progress: when a combined bar is wired (streaming mode),
+    // we skip the standalone per-decode bar and tick the combined bar
+    // instead — the standalone bar's per_sec/eta are misleading during
+    // streaming per-batch waits (see Phase 4d plan). The combined bar
+    // is ticked by blob share in the writer loop below.
+    //
+    // Non-streaming paths (`sracha fastq` and the legacy
+    // `sracha get` multi-accession) set `progress_combined: None` and
+    // keep the existing blob-count bar with its real per_sec/eta —
+    // those paths never stall, so the rate/eta are accurate.
+    let decode_pb = if config.progress && config.progress_combined.is_none() {
         let bar = make_styled_pb(
             num_blobs as u64,
             "  {elapsed_precise} [{bar:40.cyan}] {pos}/{len} blobs  {per_sec}  eta {eta}",
@@ -634,6 +644,15 @@ fn decode_and_write(
         Some(bar)
     } else {
         None
+    };
+    // Captured by the writer thread; when Some, each blob written ticks
+    // the shared combined bar by `5000 / num_blobs` units (the decode
+    // side's share of the 10000-unit total).
+    let combined_decode_pb = config.progress_combined.clone();
+    let combined_decode_units = if num_blobs > 0 {
+        (5000u64 / num_blobs as u64).max(1)
+    } else {
+        0
     };
 
     /// Number of blobs per batch for parallel decode.
@@ -690,6 +709,12 @@ fn decode_and_write(
 
                     if let Some(ref pb) = decode_pb {
                         pb.inc(1);
+                    }
+                    // Phase 4d: when streaming mode is active, tick the
+                    // shared combined bar by this blob's share of the
+                    // decode-side budget (5000 units / num_blobs).
+                    if let Some(ref combined_pb) = combined_decode_pb {
+                        combined_pb.inc(combined_decode_units);
                     }
 
                     if blob_counter.is_multiple_of(50) || blob_counter == num_blobs {
@@ -1667,6 +1692,7 @@ async fn download_sra_inner(
         resume: config.resume,
         client: config.http_client.clone(),
         progress_parent: config.progress_parent.clone(),
+        progress_combined: config.progress_combined.clone(),
     };
 
     tracing::info!(
@@ -1743,6 +1769,7 @@ pub async fn download_ena_fastq(
         resume: config.resume,
         client: config.http_client.clone(),
         progress_parent: config.progress_parent.clone(),
+        progress_combined: config.progress_combined.clone(),
     };
 
     let mut output_files: Vec<PathBuf> = Vec::with_capacity(ena.fastq_files.len());
@@ -2051,18 +2078,49 @@ pub async fn run_get_streaming(
     resolved: &ResolvedAccession,
     config: &PipelineConfig,
 ) -> Result<PipelineStats> {
-    // If the user wants progress AND no parent MultiProgress was wired
-    // upstream, create one here and stamp it onto the per-task configs.
-    // The download bar (added inside download_file) and the decode bar
-    // (added inside decode_and_write) will both register against this
-    // MultiProgress and render stacked instead of clobbering each other.
-    let mp = if config.progress && config.progress_parent.is_none() {
-        Some(Arc::new(indicatif::MultiProgress::new()))
+    // Phase 4d UX: replace the old dual-bar MultiProgress wiring
+    // (separate download + decode bars, the latter of which stalled
+    // during per-batch waits) with a single combined "work" bar. The
+    // download worker ticks this bar by each chunk's byte share; the
+    // decode writer ticks it by each blob's share. Both sides
+    // contribute to the same 10000-unit total, so the bar advances
+    // monotonically whenever ANY work is happening — no freeze during
+    // streaming decode stalls.
+    //
+    // MultiProgress still gets created when progress is enabled, so
+    // any `tracing` output dumped from the pipeline doesn't overwrite
+    // the bar — the bar is `.add`'d to the MultiProgress and logs
+    // render above it automatically.
+    let combined_pb = if config.progress && config.progress_combined.is_none() {
+        let bar = make_styled_pb(
+            10_000,
+            "  {elapsed_precise} [{bar:40.cyan}] {percent}%  {msg}",
+        );
+        bar.set_message("streaming download + decode");
+        Some(Arc::new(bar))
+    } else {
+        config.progress_combined.clone()
+    };
+    let mp = if config.progress && config.progress_parent.is_none() && combined_pb.is_some() {
+        let new_mp = Arc::new(indicatif::MultiProgress::new());
+        if let Some(ref bar) = combined_pb {
+            // Registering lets `tracing` output interleave cleanly
+            // above the bar rather than clobbering it.
+            new_mp.add((**bar).clone());
+        }
+        Some(new_mp)
     } else {
         config.progress_parent.clone()
     };
     let mut config_with_mp: PipelineConfig = config.clone();
     config_with_mp.progress_parent = mp.clone();
+    config_with_mp.progress_combined = combined_pb.clone();
+    // Suppress the individual per-file download bar when the combined
+    // bar is taking over — otherwise the download bar would render in
+    // parallel with the combined bar, defeating the "single bar" UX.
+    if combined_pb.is_some() {
+        config_with_mp.progress = false;
+    }
 
     let (tracker_tx, tracker_rx) = tokio::sync::oneshot::channel();
     let resolved_owned = resolved.clone();
