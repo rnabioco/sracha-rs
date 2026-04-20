@@ -1,5 +1,6 @@
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 use md5::{Digest, Md5};
 use serde::{Deserialize, Serialize};
@@ -7,6 +8,10 @@ use tokio::io::AsyncWriteExt;
 use tokio::sync::Semaphore;
 
 use crate::error::{Error, Result};
+
+pub mod chunk_ready;
+
+use chunk_ready::ChunkReadyTracker;
 
 /// Size thresholds for adaptive chunk sizing.
 const SMALL_FILE: u64 = 32 * 1024 * 1024; // 32 MiB
@@ -69,6 +74,17 @@ pub struct DownloadResult {
     /// Bytes actually transferred over the network this session.
     /// Zero when the file was already complete (skipped).
     pub bytes_transferred: u64,
+    /// Per-chunk completion tracker. `Some` only on the parallel-chunked
+    /// path (file size >= [`SMALL_FILE`] and server supports Range);
+    /// `None` for the single-stream fallback and early-return paths
+    /// (file already complete on disk). All chunks are marked done by
+    /// the time `download_file` returns successfully.
+    ///
+    /// Streaming consumers (decoder running concurrently with download)
+    /// will, in a later phase, take this tracker as an input parameter
+    /// rather than receiving it on completion. For Phase 2 it's
+    /// returned post-hoc as plumbing/observability.
+    pub chunk_ready: Option<Arc<ChunkReadyTracker>>,
 }
 
 /// Information gathered from probing the server.
@@ -509,6 +525,7 @@ pub async fn download_file(
                             size: existing_size,
                             md5: Some(computed),
                             bytes_transferred: 0,
+                            chunk_ready: None,
                         });
                     }
                     tracing::warn!(
@@ -524,6 +541,7 @@ pub async fn download_file(
                         size: existing_size,
                         md5: None,
                         bytes_transferred: 0,
+                        chunk_ready: None,
                     });
                 }
             }
@@ -589,6 +607,11 @@ pub async fn download_file(
     };
 
     let bytes_transferred: u64;
+    // Phase 2 plumbing: track per-chunk completion so a future streaming
+    // decoder can begin work as bytes land. `Some` only on the parallel
+    // path; the single-stream fallback stays None (streaming decode
+    // doesn't apply to <SMALL_FILE files anyway).
+    let mut chunk_ready_tracker: Option<Arc<ChunkReadyTracker>> = None;
 
     if use_parallel {
         // --- Parallel chunked download (with resume support) ---
@@ -682,6 +705,17 @@ pub async fn download_file(
             delete_progress(&prog_path);
         }
 
+        // Build the per-chunk readiness tracker now that chunk_size,
+        // total_chunks, and the resume state are all known. Pre-mark
+        // chunks already complete from a prior partial download so a
+        // streaming consumer doesn't wait on already-on-disk bytes.
+        // (force_wipe_partial reset progress.completed_chunks above.)
+        let tracker = Arc::new(ChunkReadyTracker::new(total_chunks, chunk_size, file_size));
+        for &done_idx in &progress.completed_chunks {
+            tracker.mark_done(done_idx);
+        }
+        chunk_ready_tracker = Some(tracker.clone());
+
         if chunks_to_download.is_empty() {
             tracing::info!("all chunks already downloaded — verifying");
             bytes_transferred = 0;
@@ -759,6 +793,7 @@ pub async fn download_file(
                 let f = shared_file.clone();
                 let pb_clone = pb.clone();
                 let tx = done_tx.clone();
+                let chunk_tracker = tracker.clone();
 
                 let handle = tokio::spawn(async move {
                     let _permit = sem.acquire().await.map_err(|e| Error::Download {
@@ -768,7 +803,16 @@ pub async fn download_file(
 
                     download_chunk(&cli, &u, chunk, &f, pb_clone.as_deref()).await?;
 
-                    // Notify progress tracker.
+                    // Mark this chunk's bytes as readable. Order matters:
+                    // do this AFTER download_chunk's pwrite returns
+                    // (bytes are durably on disk via the shared fd) so
+                    // any streaming consumer awaiting this byte range
+                    // sees a consistent view.
+                    chunk_tracker.mark_done(chunk_idx);
+
+                    // Notify the progress sidecar saver (separate from the
+                    // streaming tracker — this drives the .sracha-progress
+                    // JSON checkpoint, not decoder readiness).
                     let _ = tx.send(chunk_idx);
                     Ok::<(), Error>(())
                 });
@@ -1011,11 +1055,20 @@ pub async fn download_file(
 
     let metadata = tokio::fs::metadata(output_path).await?;
 
+    // By this point all chunks are on disk and MD5 verified. If a
+    // streaming consumer somehow ran past mark_done (it shouldn't) or
+    // raced with the tail of the loop, mark_all_done as a belt-and-
+    // suspenders safety net. Idempotent.
+    if let Some(t) = &chunk_ready_tracker {
+        t.mark_all_done();
+    }
+
     Ok(DownloadResult {
         path: output_path.to_path_buf(),
         size: metadata.len(),
         md5: md5_hex,
         bytes_transferred,
+        chunk_ready: chunk_ready_tracker,
     })
 }
 
