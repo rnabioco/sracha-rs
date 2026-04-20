@@ -491,6 +491,48 @@ pub async fn download_file(
     output_path: &Path,
     config: &DownloadConfig,
 ) -> Result<DownloadResult> {
+    download_file_inner(urls, expected_size, expected_md5, output_path, config, None).await
+}
+
+/// Streaming variant of [`download_file`]: hands the freshly-constructed
+/// per-chunk readiness tracker out via `tracker_init` as soon as it's
+/// created (well before the download completes), so a streaming
+/// consumer (e.g. a concurrent decoder) can start awaiting byte ranges
+/// immediately.
+///
+/// `tracker_init` is fired only on the parallel-chunked path; on the
+/// single-stream fallback (file < `SMALL_FILE`) the sender is dropped
+/// without sending — receivers should treat `RecvError` as "no
+/// streaming available, fall back to await-then-decode".
+///
+/// All other behavior is identical to [`download_file`].
+pub async fn download_file_streaming(
+    urls: &[String],
+    expected_size: u64,
+    expected_md5: Option<&str>,
+    output_path: &Path,
+    config: &DownloadConfig,
+    tracker_init: tokio::sync::oneshot::Sender<Arc<ChunkReadyTracker>>,
+) -> Result<DownloadResult> {
+    download_file_inner(
+        urls,
+        expected_size,
+        expected_md5,
+        output_path,
+        config,
+        Some(tracker_init),
+    )
+    .await
+}
+
+async fn download_file_inner(
+    urls: &[String],
+    expected_size: u64,
+    expected_md5: Option<&str>,
+    output_path: &Path,
+    config: &DownloadConfig,
+    mut tracker_init: Option<tokio::sync::oneshot::Sender<Arc<ChunkReadyTracker>>>,
+) -> Result<DownloadResult> {
     if urls.is_empty() {
         return Err(Error::Download {
             accession: String::new(),
@@ -715,6 +757,13 @@ pub async fn download_file(
             tracker.mark_done(done_idx);
         }
         chunk_ready_tracker = Some(tracker.clone());
+        // Hand the tracker out to a streaming consumer (if any) BEFORE
+        // we spawn chunk workers. Receiver may have already given up if
+        // we took too long getting here — that's fine, send returns
+        // Err which we ignore.
+        if let Some(tx) = tracker_init.take() {
+            let _ = tx.send(tracker.clone());
+        }
 
         if chunks_to_download.is_empty() {
             tracing::info!("all chunks already downloaded — verifying");

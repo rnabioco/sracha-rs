@@ -11,7 +11,7 @@
 
 use std::collections::HashMap;
 use std::io::Write;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
@@ -1391,6 +1391,67 @@ pub async fn download_sra(
     resolved: &ResolvedAccession,
     config: &PipelineConfig,
 ) -> Result<DownloadedSra> {
+    download_sra_inner(resolved, config, None).await
+}
+
+/// Streaming variant of [`download_sra`]: hands the freshly-constructed
+/// `ChunkReadyTracker` out via `tracker_init` as soon as it's available
+/// (typically <100 ms after function entry, on the parallel-chunked
+/// path). Callers can then await byte-range readiness on the tracker
+/// concurrently with the rest of the download.
+///
+/// On the single-stream fallback (file < `SMALL_FILE`) or an early
+/// failure, the sender is dropped without sending — receivers should
+/// treat `RecvError` as "no streaming available, await this future and
+/// process the result normally."
+pub async fn download_sra_streaming(
+    resolved: &ResolvedAccession,
+    config: &PipelineConfig,
+    tracker_init: tokio::sync::oneshot::Sender<
+        Arc<crate::download::chunk_ready::ChunkReadyTracker>,
+    >,
+) -> Result<DownloadedSra> {
+    download_sra_inner(resolved, config, Some(tracker_init)).await
+}
+
+/// Wrap a download future with the standard cancellation handler:
+/// honor `config.cancelled` if set, removing the temp file + progress
+/// sidecar before bubbling `Error::Cancelled`. Extracted so the two
+/// `match` arms in [`download_sra_inner`] (streaming vs legacy) can
+/// share the cancellation logic.
+async fn await_with_cancel<F>(
+    fut: F,
+    config: &PipelineConfig,
+    temp_path: &Path,
+    accession: &str,
+) -> Result<crate::download::DownloadResult>
+where
+    F: std::future::Future<Output = Result<crate::download::DownloadResult>>,
+{
+    if let Some(ref flag) = config.cancelled {
+        let flag = flag.clone();
+        tokio::select! {
+            result = fut => result,
+            _ = poll_cancelled(flag) => {
+                tracing::info!("{accession}: download cancelled");
+                let _ = tokio::fs::remove_file(temp_path).await;
+                let sidecar = crate::download::progress_path(temp_path);
+                let _ = tokio::fs::remove_file(&sidecar).await;
+                Err(Error::Cancelled { output_files: vec![] })
+            }
+        }
+    } else {
+        fut.await
+    }
+}
+
+async fn download_sra_inner(
+    resolved: &ResolvedAccession,
+    config: &PipelineConfig,
+    tracker_init: Option<
+        tokio::sync::oneshot::Sender<Arc<crate::download::chunk_ready::ChunkReadyTracker>>,
+    >,
+) -> Result<DownloadedSra> {
     let accession = &resolved.accession;
     let total_sra_size = resolved.sra_file.size;
 
@@ -1446,28 +1507,30 @@ pub async fn download_sra(
         temp_path.display(),
     );
 
-    let dl_future = download_file(
-        &urls,
-        total_sra_size,
-        resolved.sra_file.md5.as_deref(),
-        &temp_path,
-        &dl_config,
-    );
-
-    let dl_result = if let Some(ref flag) = config.cancelled {
-        let flag = flag.clone();
-        tokio::select! {
-            result = dl_future => result?,
-            _ = poll_cancelled(flag) => {
-                tracing::info!("{accession}: download cancelled");
-                let _ = tokio::fs::remove_file(&temp_path).await;
-                let sidecar = crate::download::progress_path(&temp_path);
-                let _ = tokio::fs::remove_file(&sidecar).await;
-                return Err(Error::Cancelled { output_files: vec![] });
-            }
+    // Pick the streaming variant when a tracker_init sender was passed
+    // in; otherwise the legacy non-streaming path.
+    let dl_result = match tracker_init {
+        Some(tx) => {
+            let dl_future = crate::download::download_file_streaming(
+                &urls,
+                total_sra_size,
+                resolved.sra_file.md5.as_deref(),
+                &temp_path,
+                &dl_config,
+                tx,
+            );
+            await_with_cancel(dl_future, config, &temp_path, accession).await?
         }
-    } else {
-        dl_future.await?
+        None => {
+            let dl_future = download_file(
+                &urls,
+                total_sra_size,
+                resolved.sra_file.md5.as_deref(),
+                &temp_path,
+                &dl_config,
+            );
+            await_with_cancel(dl_future, config, &temp_path, accession).await?
+        }
     };
 
     tracing::info!(
@@ -1780,6 +1843,57 @@ pub async fn run_get(
     config: &PipelineConfig,
 ) -> Result<PipelineStats> {
     let downloaded = download_sra(resolved, config).await?;
+    tokio::task::block_in_place(|| decode_sra(&downloaded, config))
+}
+
+/// Streaming variant of [`run_get`]: uses [`download_sra_streaming`] so
+/// the chunk-readiness tracker can be observed before download
+/// completes, and orchestrates download + decode as concurrent tasks.
+///
+/// **Phase 3b status:** the orchestration is in place but observable
+/// behavior is identical to [`run_get`]. The decoder still gates
+/// at-entry on `tracker.wait_all()` (which blocks until the download is
+/// done), so wall-clock is unchanged. Phase 3c will replace the
+/// at-entry gate with per-blob `tracker.wait_range(...)` calls; from
+/// that point the spawned decode task makes real progress while the
+/// download is still in flight.
+///
+/// On the single-stream fallback (file < `SMALL_FILE`) the tracker is
+/// never sent — we transparently fall through to the same await-then-
+/// decode flow [`run_get`] uses.
+pub async fn run_get_streaming(
+    resolved: &ResolvedAccession,
+    config: &PipelineConfig,
+) -> Result<PipelineStats> {
+    let (tracker_tx, tracker_rx) = tokio::sync::oneshot::channel();
+    let resolved_owned = resolved.clone();
+    let config_for_dl = config.clone();
+
+    // Spawn the download as a Tokio task. It must be 'static, hence
+    // the clones above. Tracker (if any) flows out via `tracker_rx`.
+    let dl_handle: tokio::task::JoinHandle<Result<DownloadedSra>> = tokio::spawn(async move {
+        download_sra_streaming(&resolved_owned, &config_for_dl, tracker_tx).await
+    });
+
+    // Receive the tracker. Err means the sender was dropped without
+    // firing — either the download took the single-stream path (file <
+    // SMALL_FILE) or it failed before reaching the tracker-construction
+    // site. Either way the right next step is the same: just wait for
+    // download_sra_streaming to finish (it'll return either a result
+    // with chunk_ready=None or the underlying error).
+    let _early_tracker = tracker_rx.await.ok();
+
+    // Phase 3b: decode runs *after* download here because Phase 3c's
+    // granular per-blob gating isn't in yet, so spawning decode in
+    // parallel would just have it block on `wait_all` for the duration
+    // of the download — no win, more complexity. The orchestration
+    // primitive is in place; flipping to truly-concurrent execution is
+    // a Phase 3c follow-up that replaces the at-entry gate with
+    // per-blob waits.
+    let downloaded = dl_handle
+        .await
+        .map_err(|e| Error::Pipeline(format!("download task panicked: {e}")))??;
+
     tokio::task::block_in_place(|| decode_sra(&downloaded, config))
 }
 
