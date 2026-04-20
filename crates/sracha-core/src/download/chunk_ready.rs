@@ -312,6 +312,15 @@ impl ChunkReadyTracker {
         tokio::runtime::Handle::current().block_on(self.await_range(byte_start, byte_end));
     }
 
+    /// Sync wrapper around [`Self::await_chunk`]. Same context
+    /// requirements as [`Self::wait_range`].
+    pub fn wait_chunk(&self, chunk_idx: usize) {
+        if self.is_chunk_ready(chunk_idx) {
+            return;
+        }
+        tokio::runtime::Handle::current().block_on(self.await_chunk(chunk_idx));
+    }
+
     /// Sync convenience: block until every chunk is ready.
     pub fn wait_all(&self) {
         self.wait_range(0, self.file_size);
