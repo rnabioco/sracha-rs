@@ -74,6 +74,33 @@ pub enum Command {
 
     /// Inspect VDB structure of a local .sra file (replacement for vdb-dump)
     Vdb(VdbArgs),
+
+    /// Delete leftover temp/partial-download files from a directory
+    ///
+    /// Removes the debris left by interrupted `sracha get`/`fetch`/`fastq`
+    /// runs: `.sracha-tmp-*.sra` (in-progress SRA), `*.sracha-progress`
+    /// (chunk sidecars), and `*.partial` (partial FASTQ outputs from a
+    /// crashed or Ctrl-C'd decode, e.g. `SRR12345_1.fastq.gz.partial`).
+    ///
+    /// Safe to run anywhere; only touches files matching those patterns.
+    Clean(CleanArgs),
+}
+
+#[derive(Args)]
+pub struct CleanArgs {
+    /// Directory to clean (default: current directory).
+    #[arg(default_value = ".")]
+    pub dir: std::path::PathBuf,
+
+    /// Show what would be deleted without actually removing files.
+    #[arg(long)]
+    pub dry_run: bool,
+
+    /// Also delete `.sracha-done-*` completion markers and the
+    /// `sracha-stats.jsonl` log. By default these are kept (they're
+    /// metadata, not in-progress state).
+    #[arg(long)]
+    pub all: bool,
 }
 
 #[derive(Args)]

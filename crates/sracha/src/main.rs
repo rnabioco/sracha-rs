@@ -1074,7 +1074,92 @@ async fn main() -> Result<()> {
             Ok(())
         }
         Command::Vdb(args) => vdb_cmd::run(args.cmd),
+
+        Command::Clean(args) => run_clean(&args),
     }
+}
+
+/// Delete leftover temp/partial-download files from a directory.
+///
+/// Default-cleaned (in-progress debris):
+///   - `.sracha-tmp-*.sra`   in-progress temp SRA from interrupted get
+///   - `*.sracha-progress`   chunk-completion sidecar
+///   - `*.partial`           partial FASTQ output from crashed decode
+///
+/// With `--all`, also deletes post-success metadata:
+///   - `.sracha-done-*`      completion markers (deleting forces re-decode)
+///   - `sracha-stats.jsonl`  per-accession audit log
+fn run_clean(args: &cli::CleanArgs) -> anyhow::Result<()> {
+    let dir = &args.dir;
+    if !dir.is_dir() {
+        anyhow::bail!("{} is not a directory", dir.display());
+    }
+
+    let mut to_delete: Vec<std::path::PathBuf> = Vec::new();
+    for entry in std::fs::read_dir(dir)? {
+        let entry = entry?;
+        if !entry.file_type()?.is_file() {
+            continue;
+        }
+        let path = entry.path();
+        let name = match path.file_name().and_then(|s| s.to_str()) {
+            Some(n) => n,
+            None => continue,
+        };
+
+        // Default-cleaned: in-progress debris.
+        //   .sracha-tmp-{acc}.sra   — interrupted-download temp SRA
+        //   *.sracha-progress       — chunk-completion sidecar
+        //   *.partial               — partial FASTQ outputs from
+        //                             decode crashes / Ctrl-C
+        //                             (e.g. ERR3224585_1.fastq.gz.partial)
+        let is_tmp_sra = name.starts_with(".sracha-tmp-") && name.ends_with(".sra");
+        let is_progress = name.ends_with(".sracha-progress");
+        let is_partial_output = name.ends_with(".partial");
+
+        // --all-only: post-success metadata (kept by default to support
+        // re-runs that skip completed decodes).
+        let is_done_marker = args.all && name.starts_with(".sracha-done-");
+        let is_stats = args.all && name == "sracha-stats.jsonl";
+
+        if is_tmp_sra || is_progress || is_partial_output || is_done_marker || is_stats {
+            to_delete.push(path);
+        }
+    }
+
+    if to_delete.is_empty() {
+        eprintln!("nothing to clean in {}", dir.display());
+        return Ok(());
+    }
+
+    let action = if args.dry_run {
+        "would delete"
+    } else {
+        "deleting"
+    };
+    let mut total_bytes: u64 = 0;
+    for p in &to_delete {
+        let size = std::fs::metadata(p).map(|m| m.len()).unwrap_or(0);
+        total_bytes += size;
+        eprintln!(
+            "{} {} ({})",
+            action,
+            p.display(),
+            sracha_core::util::format_size(size),
+        );
+        if !args.dry_run
+            && let Err(e) = std::fs::remove_file(p)
+        {
+            eprintln!("  warning: failed to remove {}: {e}", p.display());
+        }
+    }
+    eprintln!(
+        "{} {} file(s), {}",
+        if args.dry_run { "would free" } else { "freed" },
+        to_delete.len(),
+        sracha_core::util::format_size(total_bytes),
+    );
+    Ok(())
 }
 
 /// Collect accessions from positional arguments and an optional file.
