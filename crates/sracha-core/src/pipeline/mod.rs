@@ -585,10 +585,15 @@ fn decode_and_write(
     tracing::debug!("{accession}: streaming decode of {num_blobs} blobs (batch-parallel)",);
 
     let decode_pb = if config.progress {
-        Some(make_styled_pb(
+        let bar = make_styled_pb(
             num_blobs as u64,
             "  {elapsed_precise} [{bar:40.cyan}] {pos}/{len} blobs  {per_sec}  eta {eta}",
-        ))
+        );
+        let bar = match &config.progress_parent {
+            Some(mp) => mp.add(bar),
+            None => bar,
+        };
+        Some(bar)
     } else {
         None
     };
@@ -1623,6 +1628,7 @@ async fn download_sra_inner(
         progress: config.progress,
         resume: config.resume,
         client: config.http_client.clone(),
+        progress_parent: config.progress_parent.clone(),
     };
 
     tracing::info!(
@@ -1698,6 +1704,7 @@ pub async fn download_ena_fastq(
         progress: config.progress,
         resume: config.resume,
         client: config.http_client.clone(),
+        progress_parent: config.progress_parent.clone(),
     };
 
     let mut output_files: Vec<PathBuf> = Vec::with_capacity(ena.fastq_files.len());
@@ -1993,9 +2000,22 @@ pub async fn run_get_streaming(
     resolved: &ResolvedAccession,
     config: &PipelineConfig,
 ) -> Result<PipelineStats> {
+    // If the user wants progress AND no parent MultiProgress was wired
+    // upstream, create one here and stamp it onto the per-task configs.
+    // The download bar (added inside download_file) and the decode bar
+    // (added inside decode_and_write) will both register against this
+    // MultiProgress and render stacked instead of clobbering each other.
+    let mp = if config.progress && config.progress_parent.is_none() {
+        Some(Arc::new(indicatif::MultiProgress::new()))
+    } else {
+        config.progress_parent.clone()
+    };
+    let mut config_with_mp: PipelineConfig = config.clone();
+    config_with_mp.progress_parent = mp.clone();
+
     let (tracker_tx, tracker_rx) = tokio::sync::oneshot::channel();
     let resolved_owned = resolved.clone();
-    let config_for_dl = config.clone();
+    let config_for_dl = config_with_mp.clone();
 
     // Spawn the download as a Tokio task. Args must be 'static.
     let dl_handle: tokio::task::JoinHandle<Result<DownloadedSra>> = tokio::spawn(async move {
@@ -2012,7 +2032,7 @@ pub async fn run_get_streaming(
         let downloaded = dl_handle
             .await
             .map_err(|e| Error::Pipeline(format!("download task panicked: {e}")))??;
-        return tokio::task::block_in_place(|| decode_sra(&downloaded, config));
+        return tokio::task::block_in_place(|| decode_sra(&downloaded, &config_with_mp));
     };
 
     // Synthesize the DownloadedSra fields the decoder needs upfront.
@@ -2037,7 +2057,7 @@ pub async fn run_get_streaming(
     // off the Tokio worker pool). It runs concurrently with the
     // download task — its metadata + per-batch gates inside
     // `decode_and_write` block on chunk readiness as needed.
-    let config_for_decode = config.clone();
+    let config_for_decode = config_with_mp.clone();
     let decode_handle: tokio::task::JoinHandle<Result<PipelineStats>> =
         tokio::task::spawn_blocking(move || decode_sra(&synthetic, &config_for_decode));
 

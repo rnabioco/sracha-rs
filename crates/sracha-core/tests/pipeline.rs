@@ -124,6 +124,7 @@ fn test_config(
         strict: false,
         http_client: None,
         keep_sra: false,
+        progress_parent: None,
     }
 }
 

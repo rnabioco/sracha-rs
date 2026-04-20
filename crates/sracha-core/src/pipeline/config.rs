@@ -54,6 +54,13 @@ pub struct PipelineConfig {
     /// decode instead of deleting it. Useful for validation runs that
     /// want to compare against another tool on the same input file.
     pub keep_sra: bool,
+    /// Optional shared `MultiProgress`. When `Some`, the download bar
+    /// AND the decode bar are added to it so they render side-by-side
+    /// instead of clobbering each other on the terminal. Wired by
+    /// `run_get_streaming` so the user sees concurrent download +
+    /// decode progress in one tidy stack. `None` keeps the bars as
+    /// independent (legacy single-bar) renderers.
+    pub progress_parent: Option<Arc<indicatif::MultiProgress>>,
 }
 
 /// Statistics from a completed pipeline run.

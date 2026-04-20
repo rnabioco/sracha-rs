@@ -22,6 +22,7 @@ fn test_config() -> DownloadConfig {
         progress: false,
         resume: false,
         client: None,
+        progress_parent: None,
     }
 }
 
