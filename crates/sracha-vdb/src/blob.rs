@@ -341,6 +341,89 @@ impl PageMap {
         Ok(out)
     }
 
+    /// Variable-target version of [`pad_trimmed_rows_fixed`].
+    ///
+    /// Used for columns whose logical rows have non-uniform true widths —
+    /// e.g. ALTREAD on Illumina runs after adapter trimming, where each
+    /// spot's base count matches that spot's `READ_LEN` sum. The stored
+    /// bytes are still left- or right-aligned inside each row depending
+    /// on `side`; the difference from the fixed variant is that every
+    /// logical row pads to its own `row_lens[logical_row]` target instead
+    /// of a single shared `row_bytes`.
+    ///
+    /// `row_lens` must have `self.total_rows()` entries (one per logical
+    /// row, after `data_runs` replication). Returns a buffer of size
+    /// `sum(row_lens)` — a flat concatenation of every logical row's
+    /// padded bytes — so callers merging against another variable-row
+    /// column can just iterate byte-for-byte.
+    ///
+    /// Fails if `row_lens` has the wrong length, if a stored record's
+    /// bytes exceed the target for any of its replicated rows, or if
+    /// `data` is shorter than the sum of per-record stored lengths.
+    pub fn pad_trimmed_rows_variable(
+        &self,
+        data: &[u8],
+        row_lens: &[u32],
+        side: TrimSide,
+    ) -> Result<Vec<u8>> {
+        let total_rows = self.total_rows() as usize;
+        if row_lens.len() != total_rows {
+            return Err(Error::Format(format!(
+                "page_map: row_lens has {} entries, expected {} (total_rows)",
+                row_lens.len(),
+                total_rows,
+            )));
+        }
+        let total_bytes: usize = row_lens.iter().map(|&l| l as usize).sum();
+        let mut out = vec![0u8; total_bytes];
+        let record_lens = self.data_record_lengths();
+
+        let mut in_off = 0usize;
+        let mut out_off = 0usize;
+        let mut logical_row = 0usize;
+        for (rec_idx, &rec_len_u32) in record_lens.iter().enumerate() {
+            let rec_len = rec_len_u32 as usize;
+            if in_off + rec_len > data.len() {
+                return Err(Error::Format(format!(
+                    "page_map: record {rec_idx} wants {rec_len} bytes at offset \
+                     {in_off} but data has only {}",
+                    data.len()
+                )));
+            }
+            let rec_data = &data[in_off..in_off + rec_len];
+            let repeat = if self.data_runs.is_empty() {
+                1
+            } else {
+                self.data_runs.get(rec_idx).copied().unwrap_or(1) as usize
+            };
+            for _ in 0..repeat {
+                if logical_row >= total_rows {
+                    return Ok(out);
+                }
+                let row_bytes = row_lens[logical_row] as usize;
+                if rec_len > row_bytes {
+                    return Err(Error::Format(format!(
+                        "page_map: record {rec_idx} stored {rec_len} bytes \
+                         exceeds row {logical_row} target {row_bytes}"
+                    )));
+                }
+                match side {
+                    TrimSide::Leading => {
+                        let offset = row_bytes - rec_len;
+                        out[out_off + offset..out_off + row_bytes].copy_from_slice(rec_data);
+                    }
+                    TrimSide::Trailing => {
+                        out[out_off..out_off + rec_len].copy_from_slice(rec_data);
+                    }
+                }
+                out_off += row_bytes;
+                logical_row += 1;
+            }
+            in_off += rec_len;
+        }
+        Ok(out)
+    }
+
     /// Expand variable-length data via data_runs.
     ///
     /// Unlike [`expand_data_runs_bytes`](Self::expand_data_runs_bytes) which
@@ -2747,6 +2830,99 @@ mod tests {
         // row_bytes=3 is shorter than the 5-byte record — must error.
         assert!(
             pm.pad_trimmed_rows_fixed(&data, 3, TrimSide::Leading)
+                .is_err()
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // pad_trimmed_rows_variable — Illumina adapter-trim ALTREAD case
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn pad_trimmed_rows_variable_leading_handles_mixed_row_widths() {
+        // Three logical rows, three distinct true widths (4, 6, 3).
+        // Each logical row stores its own 2-byte ALTREAD suffix; the
+        // variable pad must right-align each suffix inside its own
+        // target width, not a shared one.
+        let pm = PageMap {
+            data_recs: 3,
+            lengths: vec![2],
+            leng_runs: vec![3],
+            data_runs: vec![],
+        };
+        let data = vec![0x0A, 0x0B, 0x0C, 0x0D, 0x0E, 0x0F];
+        let row_lens = vec![4u32, 6, 3];
+        let padded = pm
+            .pad_trimmed_rows_variable(&data, &row_lens, TrimSide::Leading)
+            .unwrap();
+        assert_eq!(
+            padded,
+            vec![
+                0x00, 0x00, 0x0A, 0x0B, // row 0 (width 4)
+                0x00, 0x00, 0x00, 0x00, 0x0C, 0x0D, // row 1 (width 6)
+                0x00, 0x0E, 0x0F, // row 2 (width 3, stored 2)
+            ]
+        );
+    }
+
+    #[test]
+    fn pad_trimmed_rows_variable_replicates_via_data_runs() {
+        // Two data records (3-byte, 2-byte). data_runs replicate record 0
+        // across two logical rows and record 1 across three. Each
+        // replicated logical row gets its own target width — mimics the
+        // ALTREAD case where deduplicated records expand into rows of
+        // differing true lengths.
+        let pm = PageMap {
+            data_recs: 2,
+            lengths: vec![3, 2],
+            leng_runs: vec![2, 3],
+            data_runs: vec![2, 3],
+        };
+        let data = vec![0xAA, 0xBB, 0xCC, 0xDD, 0xEE];
+        let row_lens = vec![5u32, 4, 3, 2, 4];
+        let padded = pm
+            .pad_trimmed_rows_variable(&data, &row_lens, TrimSide::Leading)
+            .unwrap();
+        assert_eq!(
+            padded,
+            vec![
+                0x00, 0x00, 0xAA, 0xBB, 0xCC, // row 0 (width 5, stored 3)
+                0x00, 0xAA, 0xBB, 0xCC, // row 1 (width 4, stored 3)
+                0x00, 0xDD, 0xEE, // row 2 (width 3, stored 2)
+                0xDD, 0xEE, // row 3 (width 2, stored 2 fills exactly)
+                0x00, 0x00, 0xDD, 0xEE, // row 4 (width 4, stored 2)
+            ]
+        );
+    }
+
+    #[test]
+    fn pad_trimmed_rows_variable_rejects_oversized_record() {
+        let pm = PageMap {
+            data_recs: 1,
+            lengths: vec![5],
+            leng_runs: vec![1],
+            data_runs: vec![],
+        };
+        let data = vec![1u8, 2, 3, 4, 5];
+        // Target row width 3 < stored record length 5.
+        assert!(
+            pm.pad_trimmed_rows_variable(&data, &[3], TrimSide::Leading)
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn pad_trimmed_rows_variable_rejects_wrong_row_lens_length() {
+        let pm = PageMap {
+            data_recs: 2,
+            lengths: vec![1],
+            leng_runs: vec![2],
+            data_runs: vec![],
+        };
+        let data = vec![0x01, 0x02];
+        // total_rows is 2 but caller supplied only one length.
+        assert!(
+            pm.pad_trimmed_rows_variable(&data, &[4], TrimSide::Leading)
                 .is_err()
         );
     }
