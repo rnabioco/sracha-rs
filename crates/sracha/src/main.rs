@@ -44,8 +44,9 @@ where
 
 use cli::{Cli, Command, InfoFormat};
 use sracha_core::accession::{self, InputAccession};
+use sracha_core::info::InfoEntry;
 use sracha_core::sdl::{ResolvedAccession, SdlClient};
-use sracha_core::util::format_size;
+use sracha_core::util::{format_bases, format_size, thousands};
 
 #[tokio::main]
 async fn main() -> Result<()> {
@@ -806,8 +807,14 @@ async fn main() -> Result<()> {
                         print_resolved(r);
                     }
                 }
-                InfoFormat::Tsv => print_info_delim(&entries, b'\t'),
-                InfoFormat::Csv => print_info_delim(&entries, b','),
+                InfoFormat::Tsv => {
+                    let stdout = std::io::stdout();
+                    sracha_core::info::write_delim(&mut stdout.lock(), &entries, b'\t');
+                }
+                InfoFormat::Csv => {
+                    let stdout = std::io::stdout();
+                    sracha_core::info::write_delim(&mut stdout.lock(), &entries, b',');
+                }
             }
 
             if args.prefer_ena {
@@ -1396,43 +1403,6 @@ fn print_ena_section(accession: &str, resolved: Option<&sracha_core::ena::EnaRes
     }
 }
 
-/// Insert thousands separators into an integer (e.g. 1234567 → "1,234,567").
-fn thousands<T: Into<u64>>(n: T) -> String {
-    let s = n.into().to_string();
-    let bytes = s.as_bytes();
-    let mut out = String::with_capacity(s.len() + s.len() / 3);
-    for (i, b) in bytes.iter().enumerate() {
-        if i > 0 && (bytes.len() - i) % 3 == 0 {
-            out.push(',');
-        }
-        out.push(*b as char);
-    }
-    out
-}
-
-/// Format a base count as Mbp / Gbp for readability.
-fn format_bases(b: u64) -> String {
-    const M: u64 = 1_000_000;
-    const G: u64 = 1_000_000_000;
-    if b >= G {
-        format!("{:.2} Gbp", b as f64 / G as f64)
-    } else if b >= M {
-        format!("{:.2} Mbp", b as f64 / M as f64)
-    } else if b >= 1_000 {
-        format!("{:.1} Kbp", b as f64 / 1_000.0)
-    } else {
-        format!("{b} bp")
-    }
-}
-
-/// One row's worth of `sracha info` state: either a fully resolved record
-/// (from SDL/S3) or an error captured during resolution so it can still be
-/// rendered as a table row.
-pub enum InfoEntry<'a> {
-    Ok(&'a ResolvedAccession),
-    Error { accession: String, message: String },
-}
-
 /// Print a compact table for multiple accessions. Errored entries appear
 /// as rows with an `error` status (other columns dashed) and the error
 /// message is printed beneath the table.
@@ -1590,131 +1560,6 @@ fn print_info_table(entries: &[InfoEntry<'_>]) {
             eprintln!("  {}: {message}", style::header(accession));
         }
     }
-}
-
-/// Emit one header row + one record per entry in TSV (`delim = b'\t'`) or CSV
-/// (`delim = b','`) for pipeline consumption. Errored entries keep their
-/// accession column populated; other columns are left empty.
-fn print_info_delim(entries: &[InfoEntry<'_>], delim: u8) {
-    use std::io::Write;
-
-    let stdout = std::io::stdout();
-    let mut w = stdout.lock();
-
-    const COLUMNS: &[&str] = &[
-        "accession",
-        "archive_type",
-        "layout",
-        "nreads",
-        "spots",
-        "size_bytes",
-        "platform",
-        "md5",
-    ];
-    write_delim_row(&mut w, COLUMNS, delim);
-
-    for entry in entries {
-        match entry {
-            InfoEntry::Ok(r) => {
-                let archive_type = if r.vdbcache_file.is_some() {
-                    "cSRA"
-                } else {
-                    "SRA"
-                };
-                let (layout, nreads) = r
-                    .run_info
-                    .as_ref()
-                    .map(|ri| {
-                        let layout = match ri.nreads {
-                            1 => "SINGLE".to_string(),
-                            2 => "PAIRED".to_string(),
-                            n => format!("{n}-read"),
-                        };
-                        (layout, ri.nreads.to_string())
-                    })
-                    .unwrap_or_default();
-                let spots = r
-                    .run_info
-                    .as_ref()
-                    .and_then(|ri| ri.spots)
-                    .map(|s| s.to_string())
-                    .unwrap_or_default();
-                let size_bytes = r.sra_file.size.to_string();
-                let platform = r
-                    .run_info
-                    .as_ref()
-                    .and_then(|ri| ri.platform.clone())
-                    .unwrap_or_default();
-                let md5 = r.sra_file.md5.clone().unwrap_or_default();
-
-                write_delim_row(
-                    &mut w,
-                    &[
-                        r.accession.as_str(),
-                        archive_type,
-                        layout.as_str(),
-                        nreads.as_str(),
-                        spots.as_str(),
-                        size_bytes.as_str(),
-                        platform.as_str(),
-                        md5.as_str(),
-                    ],
-                    delim,
-                );
-            }
-            InfoEntry::Error { accession, .. } => {
-                write_delim_row(
-                    &mut w,
-                    &[accession.as_str(), "", "", "", "", "", "", ""],
-                    delim,
-                );
-            }
-        }
-    }
-    let _ = w.flush();
-}
-
-fn write_delim_row<W: std::io::Write>(w: &mut W, fields: &[&str], delim: u8) {
-    for (i, field) in fields.iter().enumerate() {
-        if i > 0 {
-            let _ = w.write_all(&[delim]);
-        }
-        if delim == b',' {
-            write_csv_field(w, field);
-        } else {
-            // TSV: collapse any embedded tab/newline to a single space so each
-            // record stays on one line and column alignment is preserved.
-            for ch in field.chars() {
-                let out = match ch {
-                    '\t' | '\n' | '\r' => ' ',
-                    c => c,
-                };
-                let mut buf = [0u8; 4];
-                let _ = w.write_all(out.encode_utf8(&mut buf).as_bytes());
-            }
-        }
-    }
-    let _ = writeln!(w);
-}
-
-fn write_csv_field<W: std::io::Write>(w: &mut W, field: &str) {
-    let needs_quote = field
-        .bytes()
-        .any(|b| b == b',' || b == b'"' || b == b'\n' || b == b'\r');
-    if !needs_quote {
-        let _ = w.write_all(field.as_bytes());
-        return;
-    }
-    let _ = w.write_all(b"\"");
-    for ch in field.chars() {
-        if ch == '"' {
-            let _ = w.write_all(b"\"\"");
-        } else {
-            let mut buf = [0u8; 4];
-            let _ = w.write_all(ch.encode_utf8(&mut buf).as_bytes());
-        }
-    }
-    let _ = w.write_all(b"\"");
 }
 
 /// Size threshold (in bytes) above which downloads require `--yes` confirmation.

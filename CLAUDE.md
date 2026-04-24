@@ -36,10 +36,11 @@ The project uses `pixi` for environment management (Rust 1.92+, Python 3.14+, sr
 
 ## Workspace layout
 
-Two crates in `crates/`:
+Three crates in `crates/`:
 
 - **`sracha`** — CLI binary. Argument parsing (`cli.rs`), command orchestration and Ctrl-C handling (`main.rs`), ANSI styling (`style.rs`). User-facing output goes to stderr via `eprintln!`; tracing goes to stderr via `tracing::info!/debug!`.
-- **`sracha-core`** — Library. All domain logic lives here.
+- **`sracha-core`** — Pipeline, download, FASTQ, compression, SDL/EUtils, and info-table formatting. Depends on `sracha-vdb`.
+- **`sracha-vdb`** — Pure-Rust VDB/KAR parser, extracted from sracha-core. Internal-only (no semver guarantee across minor releases).
 
 ## Architecture (data flow for `sracha get`)
 
@@ -52,7 +53,7 @@ Two crates in `crates/`:
    Parallel chunked HTTP Range requests → adaptive chunk sizing (8-64 MiB) →
    resume via .sracha-progress sidecar → MD5 validation → temp file
 
-3. Decode + output (pipeline/mod.rs → vdb/ → fastq/mod.rs → compress/mod.rs)
+3. Decode + output (pipeline/mod.rs → sracha-vdb → fastq/mod.rs → compress/mod.rs)
    Open KAR archive → VdbCursor over SEQUENCE table → batch-parallel blob decode
    via rayon → format FASTQ records → parallel gzip/zstd compression → output files
 ```
@@ -61,13 +62,24 @@ Key design: download of accession N+1 overlaps with decode of accession N (prefe
 
 ## Core modules in sracha-core
 
-- **`pipeline/mod.rs`** (~3000 lines) — Orchestrates download→decode→output. `PipelineConfig`, `PipelineStats`, `download_sra()`, `decode_sra()`, progress bars, cancellation polling.
-- **`download/mod.rs`** — Parallel chunked HTTP downloads with resume support, retries with exponential backoff, adaptive chunk sizing.
-- **`vdb/`** — Pure Rust VDB format parser. `kar.rs` (KAR archive/TOC), `kdb.rs` (column index/blob addressing), `cursor.rs` (high-level SEQUENCE table cursor), `blob.rs` (variable-length encoding, izip decompression, page maps), `metadata.rs` (table metadata).
+- **`pipeline/mod.rs`** (~2200 lines) — Orchestrates download→decode→output. `PipelineConfig`, `PipelineStats`, `download_sra()`, `decode_sra()`, progress bars, cancellation polling. Submodules: `blob_decode.rs`, `config.rs`, `validate.rs`.
+- **`download/mod.rs`** — Parallel chunked HTTP downloads with resume support, retries with exponential backoff, adaptive chunk sizing, `pwrite` writer on a shared fd.
 - **`sdl/mod.rs`** — NCBI SDL locate API client + EUtils (ESearch/EFetch) for project-to-run resolution and RunInfo metadata.
+- **`ena.rs`** — ENA filereport client for the `--prefer-ena` fast path.
 - **`s3.rs`** — Direct S3 HEAD probes to `sra-pub-run-odp` bucket (fast path, avoids SDL round-trip).
 - **`fastq/mod.rs`** — FASTQ/FASTA formatting, split modes (split-3/split-files/split-spot/interleaved), output slot routing, quality fallback for SRA-lite.
 - **`compress/mod.rs`** — Block-based parallel gzip (libdeflater) and zstd compression with backpressure queue.
+
+## Core modules in sracha-vdb
+
+- **`kar.rs`** — KAR archive container / TOC parser.
+- **`kdb.rs`** — Column index / blob addressing.
+- **`cursor.rs`** — High-level `VdbCursor` over the SEQUENCE table.
+- **`blob.rs`** — Variable-length encoding, izip/iunzip/irzip decompression, page maps, row-padding helpers.
+- **`blob_codecs.rs`** — Codec dispatch (zlib, bzip2, iunzip raw passthrough, etc.).
+- **`cache.rs`** — Per-column decoded-blob cache with prefix-sum lookup; used by `alignment.rs`, `reference.rs`, and `csra.rs`.
+- **`csra.rs`**, **`alignment.rs`**, **`reference.rs`** — cSRA (reference-compressed SRA) decode path: PRIMARY_ALIGNMENT → REFERENCE → restored SEQUENCE basecalls.
+- **`metadata.rs`**, **`inspect.rs`**, **`dump.rs`** — metadata tree walking, `VdbKind` detection, and the `sracha vdb` subcommand backing.
 
 ## Key conventions
 

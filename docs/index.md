@@ -9,6 +9,8 @@ Fast SRA downloader and FASTQ converter, written in pure Rust.
 - **Parallel downloads** -- chunked HTTP Range requests with multiple connections
 - **Native VDB parsing** -- pure Rust, zero C dependencies
 - **Integrated pipeline** -- download, convert, and compress in one command
+- **cSRA decode** -- reference-compressed / aligned SRA archives decoded in pure Rust
+- **ENA fast path** -- `--prefer-ena` pulls pre-computed FASTQ.gz from ENA when available
 - **Project-level accessions** -- pass a BioProject (PRJNA) or study (SRP) to download all runs
 - **Accession lists** -- batch download from a file with `--accession-list`
 - **Parallel gzip or zstd** -- pigz-style block compression via rayon

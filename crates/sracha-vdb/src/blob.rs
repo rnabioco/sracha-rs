@@ -1562,7 +1562,10 @@ fn variant_from_elem_bits(elem_bits: u32) -> Result<u32> {
 /// Returns `Error::Format` on out-of-bounds access — a truncated / corrupted
 /// izip buffer (e.g. from a stale `.sracha-tmp` file matched only by size)
 /// surfaces as a clean error rather than a thread panic.
-fn nbuf_read(data: &[u8], idx: usize, variant: u32) -> Result<i64> {
+///
+/// `name` is included in the error message so the caller knows which
+/// nbuf buffer (length, outlier, dx, dy, a, diff, simple) was truncated.
+fn nbuf_read(data: &[u8], idx: usize, variant: u32, name: &str) -> Result<i64> {
     let (off, width) = match variant {
         4 => (idx, 1),
         3 => (idx * 2, 2),
@@ -1571,12 +1574,12 @@ fn nbuf_read(data: &[u8], idx: usize, variant: u32) -> Result<i64> {
     };
     let end = off.checked_add(width).ok_or_else(|| {
         Error::Format(format!(
-            "izip: nbuf offset overflow (idx={idx}, variant={variant})"
+            "izip: {name} nbuf offset overflow (idx={idx}, variant={variant})"
         ))
     })?;
     if end > data.len() {
         return Err(Error::Format(format!(
-            "izip: nbuf read out of bounds (idx={idx}, variant={variant}, need {end} bytes, have {})",
+            "izip: {name} nbuf read out of bounds (idx={idx}, variant={variant}, need {end} bytes, have {})",
             data.len()
         )));
     }
@@ -1602,10 +1605,35 @@ fn nbuf_read(data: &[u8], idx: usize, variant: u32) -> Result<i64> {
     })
 }
 
-/// Read a single element from an nbuf, adding `min`.
-#[inline(always)]
-fn nbuf_read_min(data: &[u8], idx: usize, variant: u32, min: i64) -> Result<i64> {
-    Ok(nbuf_read(data, idx, variant)?.wrapping_add(min))
+/// Bundle of (data, variant, min, name) for a single izip nbuf buffer.
+///
+/// The izip type-0 (line-segment) reconstruction reads from six distinct
+/// nbuf buffers (length, outlier, dx, dy, a, diff), each with its own
+/// encoding and min-offset. Carrying those four values as positional
+/// arguments through every `nbuf_read_min` call was noisy and made error
+/// messages ambiguous. `NbufStream` bundles them so each read becomes
+/// `stream.read(idx)?`, and the `name` field flows into error messages.
+struct NbufStream<'a> {
+    data: &'a [u8],
+    variant: u32,
+    min: i64,
+    name: &'static str,
+}
+
+impl<'a> NbufStream<'a> {
+    fn new(data: &'a [u8], variant: u32, min: i64, name: &'static str) -> Self {
+        Self {
+            data,
+            variant,
+            min,
+            name,
+        }
+    }
+
+    #[inline(always)]
+    fn read(&self, idx: usize) -> Result<i64> {
+        Ok(nbuf_read(self.data, idx, self.variant, self.name)?.wrapping_add(self.min))
+    }
 }
 
 /// Decode types bitmap: each bit in `src` maps to one segment type (0=line, 1=outlier).
@@ -1667,7 +1695,7 @@ pub fn izip_decode(data: &[u8], elem_bits: u32, _num_elements_hint: u32) -> Resu
             let min = if enc_type == 3 { encoded.simple_min } else { 0 };
 
             for i in 0..n {
-                let raw = nbuf_read(&decompressed, i, var)?;
+                let raw = nbuf_read(&decompressed, i, var, "simple")?;
                 let val = (raw as i64).wrapping_add(min);
                 write_element(&mut output, i, val, elem_bits);
             }
@@ -1678,7 +1706,7 @@ pub fn izip_decode(data: &[u8], elem_bits: u32, _num_elements_hint: u32) -> Resu
             let var = variant_from_elem_bits(elem_size_bits as u32)?;
 
             for i in 0..n {
-                let raw = nbuf_read(encoded.simple_data, i, var)?;
+                let raw = nbuf_read(encoded.simple_data, i, var, "simple")?;
                 let val = (raw as i64).wrapping_add(encoded.simple_min);
                 write_element(&mut output, i, val, elem_bits);
             }
@@ -1721,8 +1749,8 @@ pub fn izip_decode(data: &[u8], elem_bits: u32, _num_elements_hint: u32) -> Resu
             let lines = segment_types.iter().filter(|&&t| t == 0).count();
             let outlier_count = segment_types.iter().filter(|&&t| t != 0).count();
 
-            // Decode raw byte buffers for each component.  The packed values
-            // are read inline during reconstruction via nbuf_read_min(),
+            // Decode raw byte buffers for each component. The packed values
+            // are read inline during reconstruction via NbufStream::read(),
             // avoiding intermediate Vec<i64> allocations.
             let flag_length = flag_extract(iz.data_flags, 2 * FLAG_BITS);
             let total_segs = lines + outlier_count;
@@ -1794,6 +1822,16 @@ pub fn izip_decode(data: &[u8], elem_bits: u32, _num_elements_hint: u32) -> Resu
                 (vec![], 4)
             };
 
+            // Bundle each nbuf buffer with its variant, min offset, and a
+            // stable name so call sites read naturally and out-of-bounds
+            // errors identify which buffer was truncated.
+            let length = NbufStream::new(&length_raw, length_var, iz.min_length, "length");
+            let outlier = NbufStream::new(&outlier_raw, outlier_var, iz.min_outlier, "outlier");
+            let dx = NbufStream::new(&dx_raw, dx_var, iz.min_dx, "dx");
+            let dy = NbufStream::new(&dy_raw, dy_var, iz.min_dy, "dy");
+            let a = NbufStream::new(&a_raw, a_var, iz.min_a, "a");
+            let diff = NbufStream::new(&diff_raw, diff_var, iz.min_diff, "diff");
+
             // Reconstruct output, reading packed values inline to avoid
             // materializing intermediate Vec<i64> buffers.
             let mut k = 0usize; // output element index
@@ -1801,8 +1839,7 @@ pub fn izip_decode(data: &[u8], elem_bits: u32, _num_elements_hint: u32) -> Resu
             let mut v = 0usize; // outlier value index
 
             for (seg_idx, &seg_type) in segment_types.iter().enumerate() {
-                let seg_len =
-                    nbuf_read_min(&length_raw, seg_idx, length_var, iz.min_length)? as usize;
+                let seg_len = length.read(seg_idx)? as usize;
 
                 if seg_type != 0 {
                     // Outlier segment: copy values directly.
@@ -1810,16 +1847,16 @@ pub fn izip_decode(data: &[u8], elem_bits: u32, _num_elements_hint: u32) -> Resu
                         if k + j >= n {
                             break;
                         }
-                        let val = nbuf_read_min(&outlier_raw, v + j, outlier_var, iz.min_outlier)?;
+                        let val = outlier.read(v + j)?;
                         write_element(&mut output, k + j, val, elem_bits);
                     }
                     k += seg_len;
                     v += seg_len;
                 } else {
                     // Line segment: reconstruct using diff + linear model.
-                    let dx_val = nbuf_read_min(&dx_raw, u, dx_var, iz.min_dx)?;
-                    let dy_val = nbuf_read_min(&dy_raw, u, dy_var, iz.min_dy)?;
-                    let a_val = nbuf_read_min(&a_raw, u, a_var, iz.min_a)?;
+                    let dx_val = dx.read(u)?;
+                    let dy_val = dy.read(u)?;
+                    let a_val = a.read(u)?;
 
                     let m = if dx_val != 0 {
                         dy_val as f64 / dx_val as f64
@@ -1832,7 +1869,7 @@ pub fn izip_decode(data: &[u8], elem_bits: u32, _num_elements_hint: u32) -> Resu
                             break;
                         }
                         let predicted = a_val as f64 + j as f64 * m;
-                        let diff_val = nbuf_read_min(&diff_raw, k + j, diff_var, iz.min_diff)?;
+                        let diff_val = diff.read(k + j)?;
                         let val = diff_val.wrapping_add(predicted as i64);
                         write_element(&mut output, k + j, val, elem_bits);
                     }

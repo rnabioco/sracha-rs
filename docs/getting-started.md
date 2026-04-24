@@ -78,6 +78,45 @@ sracha fastq /data/sra/SRR28588231.sra -O /data/fastq/
 sracha fastq SRR28588231.sra --no-gzip
 ```
 
+## ENA FASTQ mirrors
+
+The European Nucleotide Archive publishes pre-computed FASTQ.gz for most
+public accessions. When the split/compression you asked for matches what
+ENA serves (typically `split-3` gzip), skip the VDB decode step and pull
+the FASTQs directly:
+
+```bash
+sracha get SRR28588231 --prefer-ena
+```
+
+sracha falls back to the NCBI SRA path automatically if ENA has no FASTQ
+for the accession or the run layout is incompatible with your output
+configuration. `sracha fetch --prefer-ena` downloads ENA's FASTQ.gz
+instead of the `.sra` binary. `sracha info --prefer-ena` appends ENA's
+filereport alongside the NCBI info table.
+
+## Data integrity
+
+Strict integrity checking is on by default. sracha fails the run when it
+detects quality length mismatches, invalid quality bytes, quality
+overruns, or paired-spot violations in the decoded data. Pass
+`--no-strict` to downgrade these anomalies to warnings and keep going:
+
+```bash
+sracha get SRR28588231 --no-strict
+```
+
+Benign-fallback counters (SRA-lite all-zero quality blobs, truncated-spot
+recovery) remain informational either way.
+
+## cSRA (aligned SRA)
+
+sracha decodes compressed/aligned SRA archives (cSRA) in pure Rust,
+producing byte-identical FASTQ to fasterq-dump. No special flag is
+required — sracha detects the schema and switches decoders automatically.
+See [Implementation](implementation.md) for the decode strategy and
+limitations.
+
 ## SRA-lite
 
 SRA-lite files are smaller (4-10x) because they use simplified quality
@@ -165,6 +204,24 @@ sracha get SRR28588231 --connections 12
 
 # More threads for decode and compression (default: 8)
 sracha get SRR28588231 --threads 16
+
+# Prefetch more accessions ahead of the decoder (default: 2)
+# Useful on slow networks where decode consistently outpaces download.
+sracha get --accession-list big_list.txt --prefetch-depth 4
+```
+
+`--prefetch-depth` only applies to multi-accession `sracha get`. Each
+unit of depth costs one extra temp SRA file on disk while that run is
+being decoded.
+
+## Keeping the SRA file
+
+By default `sracha get` deletes the temporary `.sra` after conversion.
+Keep it around (e.g., to re-run with different tools or hand it off to
+`sracha validate`) with `--keep-sra`:
+
+```bash
+sracha get SRR28588231 --keep-sra -O /data/
 ```
 
 ## Download behavior
