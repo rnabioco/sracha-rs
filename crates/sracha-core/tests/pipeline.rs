@@ -1319,18 +1319,18 @@ fn ls454_platform_is_rejected_end_to_end() {
 
 #[ignore]
 #[test]
-fn ctrl_c_mid_decode_cleans_up_partials() {
+fn ctrl_c_mid_decode_returns_partial_paths() {
     // Complementary to the pre-flipped cancel test: here the pipeline has
     // genuinely started writing output when the flag flips, exercising the
-    // "ran for a while then cancelled" cleanup path rather than the
-    // "abort at first poll" path.
+    // "ran for a while then cancelled" path rather than the "abort at
+    // first poll" path.
     //
     // A watcher thread polls the output directory and flips the flag the
     // first time it sees a `.partial` file appear — so cancellation lands
     // strictly after the pipeline has created at least one output handle.
     // On a very fast machine the whole decode may finish before the first
     // poll sees anything; we tolerate that by accepting `Ok(_)` with a
-    // warning, and only assert the cleanup invariant when cancellation
+    // warning, and only assert the partial-path contract when cancellation
     // actually fired.
     use std::sync::Arc;
     use std::sync::atomic::{AtomicBool, Ordering};
@@ -1369,17 +1369,29 @@ fn ctrl_c_mid_decode_cleans_up_partials() {
     let fired = watcher.join().unwrap();
 
     match result {
-        Err(sracha_core::error::Error::Cancelled { .. }) => {
+        Err(sracha_core::error::Error::Cancelled { output_files }) => {
             assert!(fired, "cancel fired without a prior .partial sighting");
-            let partials: Vec<_> = std::fs::read_dir(&out_dir)
+            // `run_fastq` contract (pipeline/mod.rs:856): it does NOT delete
+            // partial files itself — it returns `Error::Cancelled` with the
+            // list of partials so the higher-level `run_get` wrapper can
+            // clean them up (see pipeline/mod.rs:1641). The contract we
+            // fence here is that the error actually names the partials that
+            // were on disk when cancellation fired.
+            let on_disk: std::collections::HashSet<PathBuf> = std::fs::read_dir(&out_dir)
                 .unwrap()
                 .filter_map(|e| e.ok())
                 .filter(|e| e.file_name().to_string_lossy().ends_with(".partial"))
+                .map(|e| e.path())
                 .collect();
             assert!(
-                partials.is_empty(),
-                "mid-decode cancellation must delete .partial files, found: {:?}",
-                partials.iter().map(|e| e.file_name()).collect::<Vec<_>>()
+                !on_disk.is_empty(),
+                "watcher fired on .partial but they're gone — unexpected",
+            );
+            let named: std::collections::HashSet<PathBuf> = output_files.iter().cloned().collect();
+            assert_eq!(
+                on_disk, named,
+                "Error::Cancelled.output_files must match the .partial files left \
+                 on disk so the CLI can clean them up",
             );
         }
         Ok(_) => {
