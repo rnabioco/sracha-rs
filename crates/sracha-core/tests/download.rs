@@ -268,3 +268,14 @@ async fn download_file_force_overwrites_existing_even_when_complete() {
     );
     assert_eq!(std::fs::read(&out).unwrap(), payload);
 }
+
+// NOTE — a full sidecar-driven resume test (pre-populated `.sracha-progress`
+// + partial file → only missing chunks re-fetched) is deliberately absent.
+// The sidecar-aware branch in `download_file` only engages when
+// `file_size >= SMALL_FILE` (32 MiB) so the parallel path is chosen, AND
+// when the existing file doesn't already pass the pre-download MD5
+// shortcut. Crossing both thresholds with an in-process mock requires a
+// Range-aware HTTP server (wiremock's matchers can't condition the
+// response body on the `Range` header), plus a 32+ MiB payload per
+// invocation. Left as a follow-up once either constraint is addressed
+// (custom hyper-based mock, or a tunable SMALL_FILE exposed in config).

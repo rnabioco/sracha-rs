@@ -140,6 +140,98 @@ fn ensure_srr33907345() -> PathBuf {
     path
 }
 
+/// Ensure the SRR000001 fixture (LS454 / 454 GS FLX).
+///
+/// Covers the legacy-platform rejection path end-to-end: 454 is in the
+/// `UNSUPPORTED_PLATFORMS` list in pipeline/mod.rs, and decode_and_write
+/// must surface `Error::UnsupportedPlatform` when it encounters one
+/// rather than panicking or producing garbage FASTQ. The unit test at
+/// `unsupported_platforms_rejected` only covers the string check in
+/// isolation; this test exercises the rejection against a real archive's
+/// parsed platform code.
+fn ensure_srr000001() -> PathBuf {
+    static DOWNLOAD: Once = Once::new();
+    let path = fixtures_dir().join("SRR000001.sra");
+
+    DOWNLOAD.call_once(|| {
+        if path.exists() {
+            return;
+        }
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+
+        let url = "https://sra-pub-run-odp.s3.amazonaws.com/sra/SRR000001/SRR000001";
+        eprintln!("downloading SRR000001 fixture from {url} ... (large, 312 MiB)");
+
+        let resp = reqwest::blocking::get(url)
+            .unwrap_or_else(|e| panic!("failed to download SRR000001: {e}"));
+        assert!(
+            resp.status().is_success(),
+            "HTTP {} downloading SRR000001 fixture",
+            resp.status()
+        );
+        let bytes = resp.bytes().unwrap();
+        std::fs::write(&path, &bytes).unwrap();
+    });
+
+    assert!(path.exists(), "fixture not found at {}", path.display());
+    path
+}
+
+/// Ensure the VDB-3418 fixture (BAM-loaded cSRA, 12 MiB, 985 SEQUENCE /
+/// 938 PRIMARY_ALIGNMENT rows; schema `NCBI:align:db:alignment_sorted#1.3`).
+///
+/// Used by every `csra_*` test to exercise reference-compressed alignment
+/// decode (HAS_MISMATCH / REF_OFFSET / align_restore_read) end-to-end.
+/// The fixture is shipped with ncbi-vdb's test suite and fetched from its
+/// GitHub mirror; pinning to `master` is tolerable since this is a long-
+/// lived test asset — if upstream deletes or reshapes it the download 404s
+/// and we notice at test time rather than silently skipping.
+fn ensure_vdb_3418() -> PathBuf {
+    static DOWNLOAD: Once = Once::new();
+    let path = fixtures_dir().join("VDB-3418.sra");
+    const EXPECTED_SIZE: u64 = 12_887_839;
+    const EXPECTED_MD5: &str = "7d66f3f346db0f916a8c723d40087b6c";
+
+    DOWNLOAD.call_once(|| {
+        if path.exists() {
+            return;
+        }
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+
+        let url = "https://raw.githubusercontent.com/ncbi/ncbi-vdb/master/test/vdb/db/VDB-3418.sra";
+        eprintln!("downloading VDB-3418 fixture from {url} ...");
+
+        let resp = reqwest::blocking::get(url)
+            .unwrap_or_else(|e| panic!("failed to download VDB-3418: {e}"));
+        assert!(
+            resp.status().is_success(),
+            "HTTP {} downloading VDB-3418 fixture",
+            resp.status()
+        );
+        let bytes = resp.bytes().unwrap();
+        assert_eq!(
+            bytes.len() as u64,
+            EXPECTED_SIZE,
+            "VDB-3418 size changed upstream — expected {EXPECTED_SIZE}, got {}",
+            bytes.len()
+        );
+        std::fs::write(&path, &bytes).unwrap();
+    });
+
+    assert!(path.exists(), "fixture not found at {}", path.display());
+    // Cross-check content on every call — cheap (12 MiB) and catches
+    // truncated-download artifacts that the Once block would otherwise
+    // cache. md5 mismatch here means either upstream edited the file or a
+    // partial write landed on disk; either way the cSRA tests below would
+    // start producing garbage we'd have to debug, so fail loud now.
+    let got_md5 = md5_file(&path);
+    assert_eq!(
+        got_md5, EXPECTED_MD5,
+        "VDB-3418 fixture md5 mismatch — upstream changed or file is corrupt"
+    );
+    path
+}
+
 /// Build a `PipelineConfig` suitable for testing.
 fn test_config(
     output_dir: &std::path::Path,
@@ -698,15 +790,7 @@ fn csra_alignment_columns_open() {
     use sracha_core::vdb::alignment::AlignmentCursor;
     use sracha_core::vdb::kar::KarArchive;
 
-    let path = fixtures_dir().join("VDB-3418.sra");
-    if !path.exists() {
-        eprintln!(
-            "skipping csra_alignment_columns_open: {} not present",
-            path.display()
-        );
-        return;
-    }
-
+    let path = ensure_vdb_3418();
     let file = std::fs::File::open(&path).unwrap();
     let mut archive = KarArchive::open(std::io::BufReader::new(file)).unwrap();
     let cur = AlignmentCursor::open(&mut archive, &path).unwrap();
@@ -755,15 +839,7 @@ fn csra_reference_fetch_span() {
     use sracha_core::vdb::kar::KarArchive;
     use sracha_core::vdb::reference::ReferenceCursor;
 
-    let path = fixtures_dir().join("VDB-3418.sra");
-    if !path.exists() {
-        eprintln!(
-            "skipping csra_reference_fetch_span: {} not present",
-            path.display()
-        );
-        return;
-    }
-
+    let path = ensure_vdb_3418();
     let file = std::fs::File::open(&path).unwrap();
     let mut archive = KarArchive::open(std::io::BufReader::new(file)).unwrap();
     let refs = ReferenceCursor::open(&mut archive, &path).unwrap();
@@ -819,12 +895,7 @@ fn csra_align_restore_read_row_1() {
     use sracha_core::vdb::reference::ReferenceCursor;
     use sracha_core::vdb::restore::{align_restore_read, fourna_to_ascii};
 
-    let path = fixtures_dir().join("VDB-3418.sra");
-    if !path.exists() {
-        eprintln!("skipping: {} not present", path.display());
-        return;
-    }
-
+    let path = ensure_vdb_3418();
     let file = std::fs::File::open(&path).unwrap();
     let mut archive = KarArchive::open(std::io::BufReader::new(file)).unwrap();
     let align = AlignmentCursor::open(&mut archive, &path).unwrap();
@@ -873,12 +944,7 @@ fn csra_seq_restore_read_row_1() {
         SRA_READ_TYPE_REVERSE, align_restore_read, fourna_to_ascii, seq_restore_read,
     };
 
-    let path = fixtures_dir().join("VDB-3418.sra");
-    if !path.exists() {
-        eprintln!("skipping: {} not present", path.display());
-        return;
-    }
-
+    let path = ensure_vdb_3418();
     let file = std::fs::File::open(&path).unwrap();
     let mut archive = KarArchive::open(std::io::BufReader::new(file)).unwrap();
     let align = AlignmentCursor::open(&mut archive, &path).unwrap();
@@ -936,12 +1002,7 @@ fn csra_cursor_read_spot_row_1() {
     use sracha_core::vdb::kar::KarArchive;
     use sracha_core::vdb::restore::fourna_to_ascii;
 
-    let path = fixtures_dir().join("VDB-3418.sra");
-    if !path.exists() {
-        eprintln!("skipping: {} not present", path.display());
-        return;
-    }
-
+    let path = ensure_vdb_3418();
     let file = std::fs::File::open(&path).unwrap();
     let mut archive = KarArchive::open(std::io::BufReader::new(file)).unwrap();
     let csra = CsraCursor::open(&mut archive, &path).unwrap();
@@ -973,12 +1034,7 @@ fn csra_full_archive_matches_fasterq_dump() {
     use sracha_core::vdb::csra::CsraCursor;
     use sracha_core::vdb::kar::KarArchive;
 
-    let path = fixtures_dir().join("VDB-3418.sra");
-    if !path.exists() {
-        eprintln!("skipping: {} not present", path.display());
-        return;
-    }
-
+    let path = ensure_vdb_3418();
     let file = std::fs::File::open(&path).unwrap();
     let mut archive = KarArchive::open(std::io::BufReader::new(file)).unwrap();
     let csra = CsraCursor::open(&mut archive, &path).unwrap();
@@ -1214,6 +1270,138 @@ fn ctrl_c_before_decode_aborts_with_cancelled_error() {
     );
     // Sanity: flag was observed.
     assert!(cancelled.load(Ordering::Relaxed));
+}
+
+#[ignore]
+#[test]
+fn ls454_platform_is_rejected_end_to_end() {
+    // Legacy-platform hard reject: 454 (`LS454`) is in the
+    // UNSUPPORTED_PLATFORMS set. The existing unit test covers the
+    // string-match helper in isolation; this test drives run_fastq against
+    // a real 454 archive (SRR000001) to verify the rejection is actually
+    // wired into the decode_and_write entry point — a refactor that moved
+    // the platform check past first decode would pass the unit test but
+    // fail here.
+    let sra_path = ensure_srr000001();
+    let tmp = tempfile::tempdir().unwrap();
+    let config = test_config(tmp.path(), SplitMode::Split3, CompressionMode::None);
+
+    let result = sracha_core::pipeline::run_fastq(&sra_path, Some("SRR000001"), &config);
+    match result {
+        Err(sracha_core::error::Error::UnsupportedPlatform { platform }) => {
+            assert_eq!(
+                platform, "LS454",
+                "expected LS454 rejection, got {platform}",
+            );
+        }
+        Ok(stats) => panic!(
+            "LS454 must be rejected, but decode succeeded with {} spots",
+            stats.spots_read,
+        ),
+        Err(e) => panic!("unexpected non-UnsupportedPlatform error: {e}"),
+    }
+
+    // No output files should have been created.
+    let files: Vec<_> = std::fs::read_dir(tmp.path())
+        .unwrap()
+        .filter_map(|e| e.ok())
+        .filter(|e| {
+            let n = e.file_name().to_string_lossy().into_owned();
+            n.ends_with(".fastq") || n.ends_with(".partial")
+        })
+        .collect();
+    assert!(
+        files.is_empty(),
+        "no FASTQ output should be written for rejected platform, found: {:?}",
+        files.iter().map(|e| e.file_name()).collect::<Vec<_>>(),
+    );
+}
+
+#[ignore]
+#[test]
+fn ctrl_c_mid_decode_returns_partial_paths() {
+    // Complementary to the pre-flipped cancel test: here the pipeline has
+    // genuinely started writing output when the flag flips, exercising the
+    // "ran for a while then cancelled" path rather than the "abort at
+    // first poll" path.
+    //
+    // A watcher thread polls the output directory and flips the flag the
+    // first time it sees a `.partial` file appear — so cancellation lands
+    // strictly after the pipeline has created at least one output handle.
+    // On a very fast machine the whole decode may finish before the first
+    // poll sees anything; we tolerate that by accepting `Ok(_)` with a
+    // warning, and only assert the partial-path contract when cancellation
+    // actually fired.
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::time::{Duration, Instant};
+
+    let path = ensure_srr33907345(); // larger fixture — more likely to race
+    let out = tempfile::tempdir().unwrap();
+    let out_dir = out.path().to_path_buf();
+    let cancelled = Arc::new(AtomicBool::new(false));
+
+    let mut config = test_config(&out_dir, SplitMode::Split3, CompressionMode::None);
+    config.cancelled = Some(Arc::clone(&cancelled));
+
+    // Spawn a thread that polls for a `.partial` file and flips cancel the
+    // first time it sees one. Bounded so the test can't hang if decode
+    // never produces partials for some reason.
+    let flag = Arc::clone(&cancelled);
+    let poll_dir = out_dir.clone();
+    let watcher = std::thread::spawn(move || {
+        let deadline = Instant::now() + Duration::from_secs(30);
+        while Instant::now() < deadline {
+            if let Ok(entries) = std::fs::read_dir(&poll_dir) {
+                for e in entries.flatten() {
+                    if e.file_name().to_string_lossy().ends_with(".partial") {
+                        flag.store(true, Ordering::Relaxed);
+                        return true;
+                    }
+                }
+            }
+            std::thread::sleep(Duration::from_millis(2));
+        }
+        false
+    });
+
+    let result = sracha_core::pipeline::run_fastq(&path, Some("SRR33907345"), &config);
+    let fired = watcher.join().unwrap();
+
+    match result {
+        Err(sracha_core::error::Error::Cancelled { output_files }) => {
+            assert!(fired, "cancel fired without a prior .partial sighting");
+            // `run_fastq` contract (pipeline/mod.rs:856): it does NOT delete
+            // partial files itself — it returns `Error::Cancelled` with the
+            // list of partials so the higher-level `run_get` wrapper can
+            // clean them up (see pipeline/mod.rs:1641). The contract we
+            // fence here is that the error actually names the partials that
+            // were on disk when cancellation fired.
+            let on_disk: std::collections::HashSet<PathBuf> = std::fs::read_dir(&out_dir)
+                .unwrap()
+                .filter_map(|e| e.ok())
+                .filter(|e| e.file_name().to_string_lossy().ends_with(".partial"))
+                .map(|e| e.path())
+                .collect();
+            assert!(
+                !on_disk.is_empty(),
+                "watcher fired on .partial but they're gone — unexpected",
+            );
+            let named: std::collections::HashSet<PathBuf> = output_files.iter().cloned().collect();
+            assert_eq!(
+                on_disk, named,
+                "Error::Cancelled.output_files must match the .partial files left \
+                 on disk so the CLI can clean them up",
+            );
+        }
+        Ok(_) => {
+            // Decode completed before the watcher could observe a .partial
+            // — rare but possible on fast machines; the cleanup invariant
+            // isn't exercised here. Not a failure.
+            eprintln!("decode completed before mid-decode cancel could fire");
+        }
+        Err(e) => panic!("unexpected non-cancel error: {e}"),
+    }
 }
 
 #[ignore]
