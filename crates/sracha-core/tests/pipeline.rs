@@ -100,6 +100,46 @@ fn ensure_srr10358300() -> PathBuf {
     path
 }
 
+/// Ensure the SRR33907345 fixture (Illumina paired-end, 77 MiB).
+///
+/// This accession regression-tests issue #22: one READ blob (blob 46) uses a
+/// `data_runs` page map with variable per-row base counts, so the decoder
+/// must expand the stored 2na buffer via `PageMap::expand_variable_data_runs`.
+/// The earlier fixed-row-length-only guard silently skipped expansion,
+/// dropping one spot and producing asymmetric paired output.
+fn ensure_srr33907345() -> PathBuf {
+    static DOWNLOAD: Once = Once::new();
+    let path = fixtures_dir().join("SRR33907345.sra");
+
+    DOWNLOAD.call_once(|| {
+        if path.exists() {
+            return;
+        }
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+
+        let url = "https://sra-pub-run-odp.s3.amazonaws.com/sra/SRR33907345/SRR33907345";
+        eprintln!("downloading SRR33907345 fixture from {url} ...");
+
+        let resp = reqwest::blocking::get(url)
+            .unwrap_or_else(|e| panic!("failed to download SRR33907345: {e}"));
+        assert!(
+            resp.status().is_success(),
+            "HTTP {} downloading fixture",
+            resp.status()
+        );
+        let bytes = resp.bytes().unwrap();
+        std::fs::write(&path, &bytes).unwrap();
+        eprintln!(
+            "fixture saved to {} ({} bytes)",
+            path.display(),
+            bytes.len()
+        );
+    });
+
+    assert!(path.exists(), "fixture not found at {}", path.display());
+    path
+}
+
 /// Build a `PipelineConfig` suitable for testing.
 fn test_config(
     output_dir: &std::path::Path,
@@ -314,6 +354,41 @@ fn md5_file(path: &std::path::Path) -> String {
     let data = std::fs::read(path).unwrap();
     let hash = Md5::digest(&data);
     hash.iter().map(|b| format!("{b:02x}")).collect()
+}
+
+#[ignore] // requires network on first run; regression test for issue #22
+#[test]
+fn variable_length_data_runs_spot_count() {
+    // SRR33907345 has 305,571 spots × 2 reads = 611,142 reads. Blob 46's
+    // READ column uses a `data_runs` page map with variable per-row
+    // base counts; before the fix the decoder silently skipped expansion
+    // whenever `pm.lengths` wasn't all equal, dropping one spot and
+    // producing `_1 ≠ _2` asymmetry.
+    let sra_path = ensure_srr33907345();
+    let tmp = tempfile::tempdir().unwrap();
+    let config = test_config(tmp.path(), SplitMode::Split3, CompressionMode::None);
+
+    let stats = sracha_core::pipeline::run_fastq(&sra_path, Some("SRR33907345"), &config).unwrap();
+
+    assert_eq!(stats.spots_read, 305_571, "expected 305,571 spots");
+    assert_eq!(stats.reads_written, 611_142, "expected 611,142 reads");
+    assert_eq!(
+        stats.output_files.len(),
+        2,
+        "paired-end should produce _1 and _2 files"
+    );
+
+    for path in &stats.output_files {
+        let data = std::fs::read(path).unwrap();
+        assert_valid_fastq(&data);
+        let line_count = data.iter().filter(|&&b| b == b'\n').count();
+        assert_eq!(
+            line_count,
+            305_571 * 4,
+            "each paired file should have 305,571 records, got {} lines",
+            line_count,
+        );
+    }
 }
 
 #[ignore] // requires network on first run

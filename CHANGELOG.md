@@ -1,5 +1,23 @@
 # Changelog
 
+## Unreleased
+
+### Fixes
+
+- **READ 2na `data_runs` expansion for variable-length rows (#22)**:
+  when a READ blob's page map has a non-empty `data_runs` run-length
+  table, consecutive stored rows with identical 2na bytes are written
+  once and replicated on read. The expansion path previously
+  short-circuited whenever `lengths` wasn't uniform, silently
+  dropping the duplicated row and producing a `SpotCountMismatch`
+  plus asymmetric paired output. SRR33907345 blob 46 is the in-tree
+  repro: 4,095 stored rows with variable 70–502-base lengths
+  covering 4,096 logical rows via one `data_runs[i]=2` entry. The
+  decoder now delegates to `PageMap::expand_variable_data_runs` —
+  same path the QUALITY column already uses — which handles both
+  uniform and variable per-row lengths correctly. Covered by the
+  new `variable_length_data_runs_spot_count` regression test.
+
 ## 0.3.2 (2026-04-24)
 
 ### Fixes
