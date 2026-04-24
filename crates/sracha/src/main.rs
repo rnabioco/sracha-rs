@@ -321,7 +321,7 @@ async fn main() -> Result<()> {
                     stdout: args.stdout,
                     cancelled: None,
                     http_client: None,
-                    strict: args.strict,
+                    strict: !args.no_strict,
                     keep_sra: false,
                 };
 
@@ -509,7 +509,7 @@ async fn main() -> Result<()> {
                     resume: !args.no_resume,
                     stdout: args.stdout,
                     cancelled: Some(cancelled.clone()),
-                    strict: args.strict,
+                    strict: !args.no_strict,
                     http_client: Some(http_client.clone()),
                     keep_sra: args.keep_sra,
                 }

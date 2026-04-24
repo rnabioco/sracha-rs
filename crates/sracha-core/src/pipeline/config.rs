@@ -70,7 +70,8 @@ pub struct PipelineStats {
     pub total_sra_size: u64,
     /// Paths of all output files created.
     pub output_files: Vec<PathBuf>,
-    /// Data-integrity counters captured during decode. Inspect these (or
-    /// run with `--strict`) to detect silent corruption.
+    /// Data-integrity counters captured during decode. Strict mode is the
+    /// default; pass `--no-strict` to downgrade any non-zero counter from a
+    /// hard failure to a warning and inspect these values instead.
     pub integrity: Arc<IntegrityDiag>,
 }
