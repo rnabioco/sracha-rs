@@ -330,24 +330,20 @@ pub(crate) fn decode_blob_to_fastq(
 
     // V2 blobs may deduplicate identical rows via the page map's
     // `data_runs` — e.g., two spots with identical base calls get
-    // written once and replicated on read. For fixed-row-length
-    // columns we replicate the 2na-decoded ASCII bytes accordingly so
-    // downstream slicing sees the full logical row count; without this
-    // trailing duplicate rows would drop out at blob boundaries and
-    // every subsequent spot would drift.
+    // written once and replicated on read. Without expansion the
+    // trailing duplicate rows drop out at blob boundaries and every
+    // subsequent spot drifts. Variable per-row lengths (Illumina reads
+    // vary after adapter trim) are the common case, so delegate to
+    // `expand_variable_data_runs` — same approach as the QUALITY path
+    // below. On the unpacked 2na buffer, page_map `lengths` are in
+    // bases per row, matching one byte per base in `read_data`.
     if let Some(ref pm) = read_page_map
         && !pm.data_runs.is_empty()
-        && !pm.lengths.is_empty()
-        && pm.lengths.iter().all(|&l| l == pm.lengths[0])
-        && pm.lengths[0] > 0
     {
-        let row_bytes = pm.lengths[0] as usize;
-        if read_data.len().is_multiple_of(row_bytes) {
-            match pm.expand_data_runs_bytes(&read_data, row_bytes) {
-                Ok(expanded) => read_data = expanded,
-                Err(e) => {
-                    tracing::debug!("blob {blob_idx}: READ expand_data_runs_bytes skipped: {e}");
-                }
+        match pm.expand_variable_data_runs(&read_data) {
+            Ok(expanded) => read_data = expanded,
+            Err(e) => {
+                tracing::debug!("blob {blob_idx}: READ expand_variable_data_runs skipped: {e}");
             }
         }
     }
