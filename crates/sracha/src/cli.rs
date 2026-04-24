@@ -319,10 +319,14 @@ pub struct FastqArgs {
     #[arg(long)]
     pub no_progress: bool,
 
-    /// Fail on any data-integrity anomaly (quality length mismatch,
-    /// paired-spot violations, truncated reads). Off by default.
+    /// Disable strict integrity checking. By default, sracha fails on any
+    /// data-integrity anomaly it cannot silently fall back on (quality length
+    /// mismatch, invalid quality bytes, quality overruns, paired-spot
+    /// violations); pass this flag to downgrade those failures to warnings.
+    /// Benign-fallback counters (SRA-lite all-zero quality blobs and
+    /// truncated-spot recovery) stay informational either way.
     #[arg(long, help_heading = "Advanced")]
-    pub strict: bool,
+    pub no_strict: bool,
 }
 
 #[derive(Args)]
@@ -436,10 +440,14 @@ pub struct GetArgs {
     #[arg(long, help_heading = "Advanced")]
     pub prefer_sdl: bool,
 
-    /// Fail on any data-integrity anomaly (quality length mismatch,
-    /// paired-spot violations, truncated reads). Off by default.
+    /// Disable strict integrity checking. By default, sracha fails on any
+    /// data-integrity anomaly it cannot silently fall back on (quality length
+    /// mismatch, invalid quality bytes, quality overruns, paired-spot
+    /// violations); pass this flag to downgrade those failures to warnings.
+    /// Benign-fallback counters (SRA-lite all-zero quality blobs and
+    /// truncated-spot recovery) stay informational either way.
     #[arg(long, help_heading = "Advanced")]
-    pub strict: bool,
+    pub no_strict: bool,
 
     /// Keep the downloaded SRA file in the output directory instead of
     /// deleting it after decode. Useful for validation runs that want

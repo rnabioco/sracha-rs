@@ -12,8 +12,12 @@ use std::sync::atomic::{AtomicU64, Ordering};
 /// Populated by [`format_read`] / [`format_spot`] and aggregated upstream by
 /// the pipeline. A non-zero count indicates that the run produced output that
 /// had to be repaired (quality padded, invalid bytes coerced to Q30, mate
-/// invariants violated, etc.); surface these to the user and, in
-/// `--strict` mode, treat any non-zero count as a hard failure.
+/// invariants violated, etc.). Under default (strict) mode the pipeline treats
+/// any counter flagged by [`IntegrityDiag::any_strict_fatal`] as a hard failure
+/// and the remaining benign-fallback counters
+/// ([`all_zero_quality_blobs`](Self::all_zero_quality_blobs),
+/// [`truncated_spots`](Self::truncated_spots)) as warnings.
+/// `--no-strict` downgrades all counters to warnings.
 #[derive(Default, Debug)]
 pub struct IntegrityDiag {
     /// Reads whose quality length did not match their sequence length.
@@ -42,6 +46,18 @@ impl IntegrityDiag {
             || self.all_zero_quality_blobs.load(Ordering::Relaxed) != 0
             || self.paired_spot_violations.load(Ordering::Relaxed) != 0
             || self.truncated_spots.load(Ordering::Relaxed) != 0
+    }
+
+    /// Return `true` if any counter that should abort a strict-mode run is
+    /// non-zero. Excludes [`Self::all_zero_quality_blobs`] (expected for
+    /// SRA-lite archives, which ship synthesized quality by design) and
+    /// [`Self::truncated_spots`] (decoder-side truncation fallback — small
+    /// non-zero counts are noise rather than silent corruption).
+    pub fn any_strict_fatal(&self) -> bool {
+        self.quality_length_mismatches.load(Ordering::Relaxed) != 0
+            || self.quality_invalid_bytes.load(Ordering::Relaxed) != 0
+            || self.quality_overruns.load(Ordering::Relaxed) != 0
+            || self.paired_spot_violations.load(Ordering::Relaxed) != 0
     }
 
     /// Human-readable summary used by pipeline stats and stats.json.

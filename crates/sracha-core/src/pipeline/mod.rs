@@ -1013,7 +1013,7 @@ pub fn run_fastq(
 
     if diag.any() {
         let summary = diag.summary();
-        if config.strict {
+        if config.strict && diag.any_strict_fatal() {
             return Err(Error::IntegrityFailure {
                 accession: acc,
                 summary,
@@ -1747,7 +1747,7 @@ pub fn decode_sra(downloaded: &DownloadedSra, config: &PipelineConfig) -> Result
 
     if diag.any() {
         let summary = diag.summary();
-        if config.strict {
+        if config.strict && diag.any_strict_fatal() {
             return Err(Error::IntegrityFailure {
                 accession: downloaded.accession.clone(),
                 summary,

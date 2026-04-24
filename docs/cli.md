@@ -102,7 +102,7 @@ sracha get [OPTIONS] [ACCESSION]...
 | `--prefetch-depth <N>` | `2` | Number of accessions to download ahead of the decoder. Larger values hide slow networks behind decode at the cost of one extra temp SRA file per step. Multi-accession `get` only |
 | `--keep-sra` | | Keep the downloaded SRA file in the output directory instead of deleting it after decode |
 | `--no-progress` | | Disable progress bar |
-| `--strict` | | Fail on data-integrity anomalies (quality length mismatch, paired-spot violations, truncated reads) |
+| `--no-strict` | | Downgrade strict-fatal data-integrity anomalies (quality length mismatch, invalid quality bytes, quality overruns, paired-spot violations) from hard failures to warnings. Strict is the default. Benign-fallback counters (SRA-lite all-zero quality blobs, truncated-spot recovery) stay informational either way |
 
 ---
 
@@ -180,7 +180,7 @@ sracha fastq [OPTIONS] <INPUT>...
 | `-O, --output-dir <DIR>` | `.` | Output directory |
 | `-f, --force` | | Overwrite existing files |
 | `--no-progress` | | Disable progress bar |
-| `--strict` | | Fail on data-integrity anomalies (quality length mismatch, paired-spot violations, truncated reads) |
+| `--no-strict` | | Downgrade strict-fatal data-integrity anomalies (quality length mismatch, invalid quality bytes, quality overruns, paired-spot violations) from hard failures to warnings. Strict is the default. Benign-fallback counters (SRA-lite all-zero quality blobs, truncated-spot recovery) stay informational either way |
 
 ---
 
