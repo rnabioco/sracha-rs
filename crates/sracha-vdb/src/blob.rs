@@ -2851,4 +2851,143 @@ mod tests {
             .collect();
         assert_eq!(vals, vec![1000, 2000, 1015, 1990]);
     }
+
+    // -----------------------------------------------------------------------
+    // PageMap property tests — regression fence for issue-#22 class bugs
+    //
+    // Every `expand_*` method had silent-wrong-output failure modes when
+    // variable `data_runs` interacted with heterogeneous row lengths. These
+    // tests compare against a naive "obvious" reference expansion over
+    // randomly-shaped page maps to catch any such divergence.
+    // -----------------------------------------------------------------------
+
+    use proptest::prelude::*;
+
+    /// Build a PageMap from `(data_run, length)` pairs — one per data record.
+    /// The on-disk format assumes rows within the same data-run share a
+    /// length, so we expand + RLE to produce canonical `lengths`/`leng_runs`.
+    fn page_map_from_pairs(pairs: &[(u32, u32)]) -> PageMap {
+        let mut logical_lens: Vec<u32> = Vec::new();
+        for &(run, len) in pairs {
+            for _ in 0..run {
+                logical_lens.push(len);
+            }
+        }
+        let mut lengths: Vec<u32> = Vec::new();
+        let mut leng_runs: Vec<u32> = Vec::new();
+        for &l in &logical_lens {
+            match lengths.last() {
+                Some(&last) if last == l => *leng_runs.last_mut().unwrap() += 1,
+                _ => {
+                    lengths.push(l);
+                    leng_runs.push(1);
+                }
+            }
+        }
+        PageMap {
+            data_recs: pairs.len() as u64,
+            lengths,
+            leng_runs,
+            data_runs: pairs.iter().map(|&(r, _)| r).collect(),
+        }
+    }
+
+    proptest! {
+        /// expand_variable_data_runs matches the naive "emit record i's
+        /// bytes data_runs[i] times" expansion for every well-formed page
+        /// map. Direct fence against issue #22: the original bug silently
+        /// skipped expansion whenever `lengths` wasn't all-equal, and a
+        /// property test like this one would have caught it before landing.
+        #[test]
+        fn prop_expand_variable_matches_reference(
+            pairs in proptest::collection::vec(
+                (1u32..=4u32, 0u32..=8u32),
+                1..12,
+            ),
+        ) {
+            let pm = page_map_from_pairs(&pairs);
+            let record_lens: Vec<u32> = pairs.iter().map(|&(_, l)| l).collect();
+            let data_runs: Vec<u32> = pairs.iter().map(|&(r, _)| r).collect();
+
+            // data: record i is `length` bytes of value `i as u8`. Picking
+            // per-record distinct bytes lets a mis-stitched output be
+            // detected by vec-equality alone.
+            let mut data = Vec::new();
+            for (i, &len) in record_lens.iter().enumerate() {
+                for _ in 0..len {
+                    data.push(i as u8);
+                }
+            }
+
+            let got = pm.expand_variable_data_runs(&data).unwrap();
+
+            let mut expected = Vec::new();
+            let mut cursor = 0usize;
+            for (i, &len) in record_lens.iter().enumerate() {
+                let chunk = &data[cursor..cursor + len as usize];
+                for _ in 0..data_runs[i] as usize {
+                    expected.extend_from_slice(chunk);
+                }
+                cursor += len as usize;
+            }
+            prop_assert_eq!(got, expected);
+        }
+
+        /// expand_data_runs (fixed-element) matches a flat_map expansion
+        /// for every well-formed `data_runs`.
+        #[test]
+        fn prop_expand_data_runs_fixed_matches_reference(
+            runs in proptest::collection::vec(1u32..=4u32, 1..15),
+        ) {
+            let data: Vec<u32> = (0..runs.len() as u32).collect();
+            let total_rows: u32 = runs.iter().sum();
+            // expand_data_runs doesn't consult `lengths`, so the trivial
+            // (lengths=[1], leng_runs=[total]) parametrisation suffices.
+            let pm = PageMap {
+                data_recs: data.len() as u64,
+                lengths: vec![1],
+                leng_runs: vec![total_rows],
+                data_runs: runs.clone(),
+            };
+            let got = pm.expand_data_runs(&data);
+            let expected: Vec<u32> = data
+                .iter()
+                .zip(runs.iter())
+                .flat_map(|(&v, &r)| std::iter::repeat_n(v, r as usize))
+                .collect();
+            prop_assert_eq!(got, expected);
+        }
+
+        /// data_record_lengths reproduces the per-record `length` input.
+        /// Round-trip over the RLE (`lengths`/`leng_runs`) + `data_runs`.
+        #[test]
+        fn prop_data_record_lengths_round_trip(
+            pairs in proptest::collection::vec(
+                (1u32..=4u32, 0u32..=8u32),
+                1..12,
+            ),
+        ) {
+            let pm = page_map_from_pairs(&pairs);
+            let got = pm.data_record_lengths();
+            let expected: Vec<u32> = pairs.iter().map(|&(_, l)| l).collect();
+            prop_assert_eq!(got, expected);
+        }
+
+        /// total_rows always equals both sum(leng_runs) and sum(data_runs)
+        /// for well-formed page maps. Cross-checks the two RLE encodings.
+        #[test]
+        fn prop_total_rows_consistent(
+            pairs in proptest::collection::vec(
+                (1u32..=4u32, 0u32..=8u32),
+                1..12,
+            ),
+        ) {
+            let pm = page_map_from_pairs(&pairs);
+            let total = pm.total_rows();
+            let sum_leng: u64 = pm.leng_runs.iter().map(|&r| u64::from(r)).sum();
+            let sum_data: u64 = pm.data_runs.iter().map(|&r| u64::from(r)).sum();
+            prop_assert_eq!(total, sum_leng);
+            prop_assert_eq!(total, sum_data);
+        }
+    }
 }
