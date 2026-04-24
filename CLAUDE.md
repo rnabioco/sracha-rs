@@ -18,7 +18,21 @@ cargo clippy --all-targets --all-features -- -D warnings
 cargo fmt --all -- --check
 ```
 
-The project uses `pixi` for environment management (Rust 1.92+, Python 3.14+, sra-tools for validation reference). All the above are also available as `pixi run build`, `pixi run test`, etc.
+Fast local dev builds via mold (pixi env: `dev`). `mold -run` intercepts the
+linker exec via `LD_PRELOAD` and works with the compute nodes' system gcc
+11.5 — no `-fuse-ld=mold` support or glibc-static needed. Release binaries
+shipped via GitHub Releases are built in CI against musl targets; these
+local builds remain dynamic gnu.
+
+```bash
+pixi run -e dev build          # cargo build
+pixi run -e dev release        # cargo build --profile release
+pixi run -e dev test           # cargo test
+pixi run -e dev check          # cargo check
+pixi run -e dev clippy         # cargo clippy --all-targets --all-features -- -D warnings
+```
+
+The project uses `pixi` for environment management (Rust 1.92+, Python 3.14+, sra-tools for validation reference). All the above are also available as `pixi run build`, `pixi run test`, etc. Swap `pixi run` for `pixi run -e dev` on any linking task to pick up mold.
 
 ## Workspace layout
 

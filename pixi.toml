@@ -32,3 +32,21 @@ docs-serve = "zensical serve"
 docs-build = "zensical build"
 tapes = { cmd = "docs/tapes/generate.sh", depends-on = ["release"] }
 install-sratools = { cmd = "bash validation/install-sratools.sh", description = "Download NCBI sra-tools (default 3.4.1) into validation/sra-tools/" }
+
+# Fast local dev builds via mold. `mold -run` intercepts the linker exec via
+# LD_PRELOAD and works with the compute nodes' system gcc 11.5 — no
+# `-fuse-ld=mold` support required, and no glibc-static. GitHub Release
+# binaries are built in CI against musl targets and are unaffected.
+[feature.dev.dependencies]
+mold = ">=2.4"
+
+[feature.dev.tasks]
+build         = "mold -run cargo build"
+release       = "mold -run cargo build --profile release"
+release-debug = "mold -run cargo build --profile release-with-debug"
+test          = "mold -run cargo test"
+check         = "mold -run cargo check"
+clippy        = "mold -run cargo clippy --all-targets --all-features -- -D warnings"
+
+[environments]
+dev = { features = ["dev"], solve-group = "default" }
