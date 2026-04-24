@@ -31,16 +31,28 @@ pub fn decode_irzip_column(decoded: &blob::DecodedBlob<'_>) -> Result<Vec<u8>> {
     let hdr_version = decoded.headers.first().map(|h| h.version).unwrap_or(0);
     let decoded_ints = if hdr_version >= 1 {
         let hdr = &decoded.headers[0];
-        let planes = hdr.ops.first().copied().unwrap_or(0xFF);
-        let min = hdr.args.first().copied().unwrap_or(0);
-        let slope = hdr.args.get(1).copied().unwrap_or(0);
-        let num_elems = (hdr.osize as u32) / 4;
-        // Dual-series (irzip v3): 4 args = min[0], slope[0], min[1], slope[1].
-        let series2 = hdr
-            .args
-            .get(2)
-            .and_then(|&min2| hdr.args.get(3).map(|&slope2| (min2, slope2)));
-        blob::irzip_decode(&decoded.data, 32, num_elems, min, slope, planes, series2)?
+        // Raw passthrough case: when an iunzip-eligible blob compresses to
+        // `osize == data_len` bytes with no ops/args, the reference encoder
+        // skipped the bit-plane step — the data is the output verbatim.
+        // This pattern shows up on ENA-origin long-read runs (ERR15141550,
+        // issue #20) whose small-n blobs bypass plane encoding entirely.
+        // Without this check we'd fall through to `irzip_decode` with
+        // `planes = 0xFF` (our bogus default) and fail to deflate-decode
+        // the raw integer bytes as a compressed stream.
+        if hdr.ops.is_empty() && hdr.args.is_empty() && hdr.osize as usize == decoded.data.len() {
+            decoded.data.to_vec()
+        } else {
+            let planes = hdr.ops.first().copied().unwrap_or(0xFF);
+            let min = hdr.args.first().copied().unwrap_or(0);
+            let slope = hdr.args.get(1).copied().unwrap_or(0);
+            let num_elems = (hdr.osize as u32) / 4;
+            // Dual-series (irzip v3): 4 args = min[0], slope[0], min[1], slope[1].
+            let series2 = hdr
+                .args
+                .get(2)
+                .and_then(|&min2| hdr.args.get(3).map(|&slope2| (min2, slope2)));
+            blob::irzip_decode(&decoded.data, 32, num_elems, min, slope, planes, series2)?
+        }
     } else {
         let num_elems = decoded
             .row_length
@@ -391,6 +403,38 @@ mod tests {
         let err =
             expand_via_page_map(data, &Some(pm)).expect_err("out-of-bounds offset must error");
         assert!(matches!(err, Error::Format(_)), "got {err:?}");
+    }
+
+    #[test]
+    fn decode_irzip_column_raw_passthrough_when_ops_empty_and_sizes_match() {
+        // Simulates the iunzip blob layout seen on issue #20 / ERR15141550:
+        // a v2 header with no ops/args where `osize` equals `data.len()`.
+        // The encoder skipped the bit-plane + deflate step entirely — the
+        // data is raw u32 output. We must pass it through, not attempt to
+        // deflate-decode it as an irzip payload (which would fail with
+        // "corrupt deflate stream").
+        use crate::blob::BlobHeaderFrame;
+        let raw = vec![
+            0xc6, 0x1a, 0x01, 0x00, 0x6f, 0x29, 0x00, 0x00, 0x60, 0x1e, 0x00, 0x00, 0x9f, 0x33,
+            0x00, 0x00, 0x46, 0x01, 0x00, 0x00, 0x7a, 0x07, 0x00, 0x00, 0xfe, 0x53, 0x02, 0x00,
+        ];
+        let decoded = DecodedBlob {
+            data: Cow::Owned(raw.clone()),
+            adjust: 0,
+            big_endian: false,
+            headers: vec![BlobHeaderFrame {
+                flags: 0,
+                version: 2,
+                fmt: 0,
+                osize: raw.len() as u64,
+                ops: vec![],
+                args: vec![],
+            }],
+            page_map: None,
+            row_length: None,
+        };
+        let got = decode_irzip_column(&decoded).expect("passthrough must succeed");
+        assert_eq!(got, raw);
     }
 
     #[test]

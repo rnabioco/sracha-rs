@@ -570,9 +570,25 @@ fn decode_and_write(
     // writer work (e.g. gzip vs plain).
     let (batch_tx, batch_rx) = crossbeam_channel::bounded::<Vec<Result<FormattedBlob>>>(4);
 
+    // Rebind the shared state the writer thread touches as explicit
+    // `&mut` / `&` references BEFORE the scope, then the writer's `move`
+    // closure captures each reference (a copy) plus `batch_rx` by value.
+    // Moving the receiver into the writer is what matters: if we captured
+    // it by reference, the `Receiver` would stay owned by this stack frame
+    // and dropping it on writer exit would be impossible — meaning a
+    // writer that returns `Err` early could not disconnect the channel,
+    // and the decode loop would deadlock on a full `batch_tx.send()`
+    // (see #20).
+    let writers_ref = &mut writers;
+    let output_paths_ref = &mut output_paths;
+    let reads_written_ref = &mut reads_written;
+    let per_slot_counts_ref = &mut per_slot_counts;
+    let stdout_writer_ref = &mut stdout_writer;
+    let spots_read_ref = &spots_read;
+    let decode_pb_ref = &decode_pb;
     let write_result: Result<()> = std::thread::scope(|scope| {
         // ---- Writer thread ----
-        let writer_handle = scope.spawn(|| -> Result<()> {
+        let writer_handle = scope.spawn(move || -> Result<()> {
             let mut blob_counter: usize = 0;
             while let Ok(formatted_batches) = batch_rx.recv() {
                 for result in formatted_batches {
@@ -582,30 +598,30 @@ fn decode_and_write(
                     // orders of magnitude fewer write calls, and the Vec<u8>
                     // allocation happens at most 4× per blob, not per record.
                     for slot_out in &slot_outputs {
-                        let writer = if let Some(ref mut sw) = stdout_writer {
+                        let writer = if let Some(sw) = stdout_writer_ref {
                             sw
                         } else {
-                            writers.entry(slot_out.slot).or_insert_with(|| {
+                            writers_ref.entry(slot_out.slot).or_insert_with(|| {
                                 let (writer, final_path, tmp_path) = create_output_writer_for_slot(
                                     accession,
                                     slot_out.slot,
                                     config,
                                     &compress_pool,
                                 );
-                                output_paths.push((final_path, tmp_path));
+                                output_paths_ref.push((final_path, tmp_path));
                                 writer
                             })
                         };
 
                         writer.write_all(&slot_out.bytes).map_err(Error::Io)?;
-                        reads_written += slot_out.records;
-                        *per_slot_counts.entry(slot_out.slot).or_insert(0) += slot_out.records;
+                        *reads_written_ref += slot_out.records;
+                        *per_slot_counts_ref.entry(slot_out.slot).or_insert(0) += slot_out.records;
                     }
 
-                    spots_read.fetch_add(num_spots, std::sync::atomic::Ordering::Relaxed);
+                    spots_read_ref.fetch_add(num_spots, std::sync::atomic::Ordering::Relaxed);
                     blob_counter += 1;
 
-                    if let Some(ref pb) = decode_pb {
+                    if let Some(pb) = decode_pb_ref.as_ref() {
                         pb.inc(1);
                     }
 
@@ -613,7 +629,7 @@ fn decode_and_write(
                         tracing::debug!(
                             "{accession}: decoded {blob_counter}/{num_blobs} blobs, \
                              {} spots so far",
-                            spots_read.load(std::sync::atomic::Ordering::Relaxed),
+                            spots_read_ref.load(std::sync::atomic::Ordering::Relaxed),
                         );
                     }
                 }
@@ -811,7 +827,8 @@ fn decode_and_write(
 
             // Send to writer thread (blocks if writer is behind by 2 batches).
             if batch_tx.send(formatted_batches).is_err() {
-                break; // Writer thread exited (error).
+                break; // Writer thread exited (error) — rx is dropped
+                // because the writer closure captured it by value (move).
             }
 
             blob_idx = batch_end;
@@ -1426,6 +1443,10 @@ pub async fn download_sra(
         progress: config.progress,
         resume: config.resume,
         client: config.http_client.clone(),
+        // KAR magic: "NCBI" + ".sra". Guards the size-match-skip path when
+        // SDL didn't supply an MD5, so a corrupt temp SRA from a crashed
+        // prior run can't feed garbage into the VDB decoder.
+        expected_prefix: Some(b"NCBI.sra".to_vec()),
     };
 
     tracing::info!(
@@ -1498,6 +1519,9 @@ pub async fn download_ena_fastq(
         progress: config.progress,
         resume: config.resume,
         client: config.http_client.clone(),
+        // ENA paths always supply MD5s for resume verification, so the
+        // prefix fallback isn't needed here.
+        expected_prefix: None,
     };
 
     let mut output_files: Vec<PathBuf> = Vec::with_capacity(ena.fastq_files.len());

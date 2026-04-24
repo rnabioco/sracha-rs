@@ -1475,46 +1475,67 @@ fn variant_from_elem_bits(elem_bits: u32) -> Result<u32> {
 }
 
 /// Read a raw value from a buffer using the nbuf variant encoding.
-fn nbuf_read(data: &[u8], idx: usize, variant: u32) -> i64 {
-    match variant {
-        4 => i64::from(data[idx]),
-        3 => {
-            let off = idx * 2;
-            i64::from(u16::from_le_bytes([data[off], data[off + 1]]))
-        }
-        2 => {
-            let off = idx * 4;
-            i64::from(u32::from_le_bytes([
-                data[off],
-                data[off + 1],
-                data[off + 2],
-                data[off + 3],
-            ]))
-        }
-        _ => {
-            let off = idx * 8;
-            i64::from_le_bytes([
-                data[off],
-                data[off + 1],
-                data[off + 2],
-                data[off + 3],
-                data[off + 4],
-                data[off + 5],
-                data[off + 6],
-                data[off + 7],
-            ])
-        }
+///
+/// Returns `Error::Format` on out-of-bounds access — a truncated / corrupted
+/// izip buffer (e.g. from a stale `.sracha-tmp` file matched only by size)
+/// surfaces as a clean error rather than a thread panic.
+fn nbuf_read(data: &[u8], idx: usize, variant: u32) -> Result<i64> {
+    let (off, width) = match variant {
+        4 => (idx, 1),
+        3 => (idx * 2, 2),
+        2 => (idx * 4, 4),
+        _ => (idx * 8, 8),
+    };
+    let end = off.checked_add(width).ok_or_else(|| {
+        Error::Format(format!(
+            "izip: nbuf offset overflow (idx={idx}, variant={variant})"
+        ))
+    })?;
+    if end > data.len() {
+        return Err(Error::Format(format!(
+            "izip: nbuf read out of bounds (idx={idx}, variant={variant}, need {end} bytes, have {})",
+            data.len()
+        )));
     }
+    Ok(match variant {
+        4 => i64::from(data[off]),
+        3 => i64::from(u16::from_le_bytes([data[off], data[off + 1]])),
+        2 => i64::from(u32::from_le_bytes([
+            data[off],
+            data[off + 1],
+            data[off + 2],
+            data[off + 3],
+        ])),
+        _ => i64::from_le_bytes([
+            data[off],
+            data[off + 1],
+            data[off + 2],
+            data[off + 3],
+            data[off + 4],
+            data[off + 5],
+            data[off + 6],
+            data[off + 7],
+        ]),
+    })
 }
 
 /// Read a single element from an nbuf, adding `min`.
 #[inline(always)]
-fn nbuf_read_min(data: &[u8], idx: usize, variant: u32, min: i64) -> i64 {
-    nbuf_read(data, idx, variant).wrapping_add(min)
+fn nbuf_read_min(data: &[u8], idx: usize, variant: u32, min: i64) -> Result<i64> {
+    Ok(nbuf_read(data, idx, variant)?.wrapping_add(min))
 }
 
 /// Decode types bitmap: each bit in `src` maps to one segment type (0=line, 1=outlier).
-fn decode_types(n: usize, src: &[u8]) -> Vec<u8> {
+///
+/// Returns `Error::Format` when `src` is shorter than `ceil(n / 8)` bytes.
+fn decode_types(n: usize, src: &[u8]) -> Result<Vec<u8>> {
+    let needed = n.div_ceil(8);
+    if src.len() < needed {
+        return Err(Error::Format(format!(
+            "izip: type bitmap truncated (need {needed} bytes for {n} segments, have {})",
+            src.len()
+        )));
+    }
     let mut dst = vec![0u8; n];
     let mut j: u32 = 1;
     let mut k: u8 = 0;
@@ -1528,7 +1549,7 @@ fn decode_types(n: usize, src: &[u8]) -> Vec<u8> {
             j = 1;
         }
     }
-    dst
+    Ok(dst)
 }
 
 /// Decode izip-compressed integers.
@@ -1563,7 +1584,7 @@ pub fn izip_decode(data: &[u8], elem_bits: u32, _num_elements_hint: u32) -> Resu
             let min = if enc_type == 3 { encoded.simple_min } else { 0 };
 
             for i in 0..n {
-                let raw = nbuf_read(&decompressed, i, var);
+                let raw = nbuf_read(&decompressed, i, var)?;
                 let val = (raw as i64).wrapping_add(min);
                 write_element(&mut output, i, val, elem_bits);
             }
@@ -1574,7 +1595,7 @@ pub fn izip_decode(data: &[u8], elem_bits: u32, _num_elements_hint: u32) -> Resu
             let var = variant_from_elem_bits(elem_size_bits as u32)?;
 
             for i in 0..n {
-                let raw = nbuf_read(encoded.simple_data, i, var);
+                let raw = nbuf_read(encoded.simple_data, i, var)?;
                 let val = (raw as i64).wrapping_add(encoded.simple_min);
                 write_element(&mut output, i, val, elem_bits);
             }
@@ -1609,7 +1630,7 @@ pub fn izip_decode(data: &[u8], elem_bits: u32, _num_elements_hint: u32) -> Resu
                 } else {
                     iz.type_data.to_vec()
                 };
-                decode_types(iz.segments as usize, &type_raw)
+                decode_types(iz.segments as usize, &type_raw)?
             } else {
                 vec![0u8; iz.segments as usize]
             };
@@ -1698,7 +1719,7 @@ pub fn izip_decode(data: &[u8], elem_bits: u32, _num_elements_hint: u32) -> Resu
 
             for (seg_idx, &seg_type) in segment_types.iter().enumerate() {
                 let seg_len =
-                    nbuf_read_min(&length_raw, seg_idx, length_var, iz.min_length) as usize;
+                    nbuf_read_min(&length_raw, seg_idx, length_var, iz.min_length)? as usize;
 
                 if seg_type != 0 {
                     // Outlier segment: copy values directly.
@@ -1706,16 +1727,16 @@ pub fn izip_decode(data: &[u8], elem_bits: u32, _num_elements_hint: u32) -> Resu
                         if k + j >= n {
                             break;
                         }
-                        let val = nbuf_read_min(&outlier_raw, v + j, outlier_var, iz.min_outlier);
+                        let val = nbuf_read_min(&outlier_raw, v + j, outlier_var, iz.min_outlier)?;
                         write_element(&mut output, k + j, val, elem_bits);
                     }
                     k += seg_len;
                     v += seg_len;
                 } else {
                     // Line segment: reconstruct using diff + linear model.
-                    let dx_val = nbuf_read_min(&dx_raw, u, dx_var, iz.min_dx);
-                    let dy_val = nbuf_read_min(&dy_raw, u, dy_var, iz.min_dy);
-                    let a_val = nbuf_read_min(&a_raw, u, a_var, iz.min_a);
+                    let dx_val = nbuf_read_min(&dx_raw, u, dx_var, iz.min_dx)?;
+                    let dy_val = nbuf_read_min(&dy_raw, u, dy_var, iz.min_dy)?;
+                    let a_val = nbuf_read_min(&a_raw, u, a_var, iz.min_a)?;
 
                     let m = if dx_val != 0 {
                         dy_val as f64 / dx_val as f64
@@ -1728,7 +1749,7 @@ pub fn izip_decode(data: &[u8], elem_bits: u32, _num_elements_hint: u32) -> Resu
                             break;
                         }
                         let predicted = a_val as f64 + j as f64 * m;
-                        let diff_val = nbuf_read_min(&diff_raw, k + j, diff_var, iz.min_diff);
+                        let diff_val = nbuf_read_min(&diff_raw, k + j, diff_var, iz.min_diff)?;
                         let val = diff_val.wrapping_add(predicted as i64);
                         write_element(&mut output, k + j, val, elem_bits);
                     }
@@ -1835,14 +1856,39 @@ pub fn irzip_decode(
             continue;
         }
 
-        // Each plane is a separate raw-deflate stream producing N bytes.
-        let remaining = &data[offset..];
-        let (plane_bytes, consumed) = deflate_decompress_ex(remaining, n)?;
+        // Each plane is a separate raw-deflate stream expected to produce N
+        // bytes. Some archives (observed on ENA-origin runs like
+        // ERR15141550) legitimately produce a short stream — the reference
+        // ncbi-vdb decoder reads `scratch[N]` from a malloc'd buffer, which
+        // happens to be zero on a fresh allocation, so trailing indices are
+        // effectively zero-filled. Mirror that: pad short planes with zero
+        // bytes up to `n` before OR'ing into `values`. Avoids the panic
+        // that used to fire on these archives (issue #20).
+        let remaining = data.get(offset..).ok_or_else(|| {
+            Error::Format(format!(
+                "irzip: plane {bit} offset {offset} past data end ({})",
+                data.len()
+            ))
+        })?;
+        let (mut plane_bytes, consumed) = deflate_decompress_ex(remaining, n).map_err(|e| {
+            let dump_len = remaining.len().min(64);
+            let hex: String = remaining[..dump_len]
+                .iter()
+                .map(|b| format!("{b:02x}"))
+                .collect::<Vec<_>>()
+                .join(" ");
+            Error::Format(format!(
+                "irzip plane {bit} at offset {offset} (remaining {} of {}, n={n}, planes={planes:#x}): {e}\n  bytes: {hex}",
+                remaining.len(),
+                data.len()
+            ))
+        })?;
         if plane_bytes.len() < n {
             tracing::debug!(
-                "irzip plane {bit}: decompressed {} of {n} expected bytes",
+                "irzip plane {bit}: decompressed {} of {n} expected bytes — zero-filling trailing bytes",
                 plane_bytes.len()
             );
+            plane_bytes.resize(n, 0);
         }
         offset += consumed;
 

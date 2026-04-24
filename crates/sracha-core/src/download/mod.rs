@@ -42,6 +42,14 @@ pub struct DownloadConfig {
     /// The orchestrator should pass the same client it uses for SDL/S3 so
     /// TLS sessions and connection pools are reused.
     pub client: Option<reqwest::Client>,
+    /// Optional byte prefix to verify on cached files whose MD5 is unknown.
+    /// When set, the size-match-skip path reads this many bytes from the
+    /// existing file and rejects it on mismatch — catches stale/truncated
+    /// temp files from prior interrupted runs that happen to match the
+    /// expected size. Currently wired up by `download_sra` with the KAR
+    /// archive magic (`NCBI.sra`) so a corrupt `.sracha-tmp-*.sra` cannot
+    /// silently feed garbage to the VDB decoder.
+    pub expected_prefix: Option<Vec<u8>>,
 }
 
 impl Default for DownloadConfig {
@@ -54,6 +62,7 @@ impl Default for DownloadConfig {
             progress: true,
             resume: true,
             client: None,
+            expected_prefix: None,
         }
     }
 }
@@ -390,6 +399,22 @@ async fn compute_md5(path: &Path) -> Result<String> {
     })?
 }
 
+/// Read the first `prefix.len()` bytes of `path` and compare to `prefix`.
+///
+/// Returns `false` when the file is shorter than `prefix` or the bytes
+/// differ. Used to cheaply reject a size-matching cached file whose content
+/// is clearly wrong (e.g. a truncated SRA written before the KAR header).
+async fn prefix_matches(path: &Path, prefix: &[u8]) -> Result<bool> {
+    use tokio::io::AsyncReadExt;
+    let mut file = tokio::fs::File::open(path).await.map_err(Error::Io)?;
+    let mut buf = vec![0u8; prefix.len()];
+    match file.read_exact(&mut buf).await {
+        Ok(_) => Ok(buf == prefix),
+        Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => Ok(false),
+        Err(e) => Err(Error::Io(e)),
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Download resume: progress sidecar
 // ---------------------------------------------------------------------------
@@ -513,6 +538,26 @@ pub async fn download_file(
                     }
                     tracing::warn!(
                         "file exists at expected size but MD5 mismatch — re-downloading",
+                    );
+                } else if let Some(prefix) = config.expected_prefix.as_deref() {
+                    // No MD5 to cross-check — fall back to a cheap prefix probe.
+                    // Catches the common case of a truncated/garbage
+                    // `.sracha-tmp-*.sra` left behind by a crashed prior run.
+                    if prefix_matches(output_path, prefix).await? {
+                        tracing::info!(
+                            "file already exists at expected size with matching header, skipping: {}",
+                            output_path.display(),
+                        );
+                        return Ok(DownloadResult {
+                            path: output_path.to_path_buf(),
+                            size: existing_size,
+                            md5: None,
+                            bytes_transferred: 0,
+                        });
+                    }
+                    tracing::warn!(
+                        "file exists at expected size but header prefix mismatch — re-downloading: {}",
+                        output_path.display(),
                     );
                 } else {
                     tracing::info!(
@@ -1115,6 +1160,31 @@ mod tests {
             prog,
             std::path::PathBuf::from("/tmp/.SRR000001.sra.sracha-progress")
         );
+    }
+
+    #[tokio::test]
+    async fn prefix_matches_accepts_exact_prefix() {
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path().join("ok.sra");
+        std::fs::write(&p, b"NCBI.sra<body>").unwrap();
+        assert!(prefix_matches(&p, b"NCBI.sra").await.unwrap());
+    }
+
+    #[tokio::test]
+    async fn prefix_matches_rejects_wrong_bytes() {
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path().join("bad.sra");
+        std::fs::write(&p, b"GARBAGE_<body>").unwrap();
+        assert!(!prefix_matches(&p, b"NCBI.sra").await.unwrap());
+    }
+
+    #[tokio::test]
+    async fn prefix_matches_rejects_too_short_file() {
+        // Truncated temp file: shorter than the probe length.
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path().join("short.sra");
+        std::fs::write(&p, b"NCB").unwrap();
+        assert!(!prefix_matches(&p, b"NCBI.sra").await.unwrap());
     }
 
     #[test]
