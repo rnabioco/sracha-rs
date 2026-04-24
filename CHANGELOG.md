@@ -1,5 +1,35 @@
 # Changelog
 
+## 0.3.2 (2026-04-24)
+
+### Fixes
+
+- **iunzip raw-passthrough decode (#20)**: some v2 iunzip blobs — seen
+  on long-read ENA archives like ERR15141550 — carry `osize ==
+  data.len()` with no `ops`/`args` because the encoder skipped the
+  bit-plane + deflate step. `decode_irzip_column` now detects this
+  shape and returns the bytes verbatim instead of force-routing them
+  through `irzip_decode` with a default `planes = 0xFF` and failing
+  with "corrupt deflate stream". Verified byte-identical against
+  `fasterq-dump --split-3` on ERR15141550 (MD5
+  `a063af39f57e9a09edae697fc99674a1`).
+- **Writer-closure capture deadlock**: when a decode blob returned
+  `Err`, the `decode_and_write` writer thread's early return left
+  `batch_rx` alive in the parent stack frame (borrow-capture), so the
+  decode loop deadlocked on a full `batch_tx.send()` instead of
+  propagating the error. Writer now takes `batch_rx` by `move`; the
+  error surfaces cleanly to the caller.
+- **Decoder bounds hardening**: `nbuf_read`, `decode_types`, and the
+  `izip_decode` segment reconstruction loop now return
+  `Error::Format` on out-of-bounds / misaligned buffers instead of
+  panicking a rayon worker.
+- **KAR magic prefix probe on cached skip**: `download_file` accepts
+  an optional `expected_prefix`; when the cached `.sracha-tmp-*.sra`
+  matches on size but SDL gave no MD5 (multipart upload), sracha now
+  verifies the first 8 bytes are `NCBI.sra` before skipping the
+  download. Closes a secondary path from #20 where a stale temp file
+  from a crashed prior run fed garbage into the decoder.
+
 ## 0.3.1 (2026-04-19)
 
 ### Performance
