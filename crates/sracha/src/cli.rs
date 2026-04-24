@@ -467,6 +467,21 @@ pub struct InfoArgs {
     /// (URLs, sizes, MD5s) alongside NCBI info.
     #[arg(long)]
     pub prefer_ena: bool,
+
+    /// Output format. `table` is human-readable; `tsv`/`csv` emit a single
+    /// header row plus one record per accession for pipeline use.
+    #[arg(long, value_enum, default_value_t = InfoFormat::Table)]
+    pub format: InfoFormat,
+}
+
+#[derive(Clone, Copy, ValueEnum, PartialEq, Eq)]
+pub enum InfoFormat {
+    /// Human-readable table (default)
+    Table,
+    /// Tab-separated values, one record per accession
+    Tsv,
+    /// Comma-separated values, one record per accession
+    Csv,
 }
 
 #[derive(Args)]

@@ -32,3 +32,8 @@ pub fn path<T: Display>(s: T) -> String {
 pub fn error_label<T: Display>(s: T) -> String {
     format!("{}", s.red().bold())
 }
+
+/// Style for warning prefix "warning:"
+pub fn warn_label<T: Display>(s: T) -> String {
+    format!("{}", s.yellow().bold())
+}

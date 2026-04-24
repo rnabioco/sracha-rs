@@ -203,6 +203,8 @@ sracha info [OPTIONS] [ACCESSION_OR_PATH]...
 | Option | Default | Description |
 |--------|---------|-------------|
 | `--accession-list <FILE>` | | Read accessions from a file (one per line) |
+| `--prefer-ena` | | Also fetch ENA's FASTQ filereport and show it alongside the NCBI info |
+| `--format <FMT>` | `table` | Output format: `table` (human-readable), `tsv`, or `csv` |
 
 For accessions, displays file sizes, available formats, download mirrors,
 and quality information. Study and BioProject accessions are resolved to
@@ -211,6 +213,19 @@ runs first.
 For local file paths, opens the KAR archive directly (no network) and
 prints its table of contents, schema, and metadata. Paths starting with
 `~/` are expanded to `$HOME`.
+
+`--format tsv` and `--format csv` emit a single header row followed by one
+record per accession. Columns: `accession`, `archive_type` (`SRA`/`cSRA`),
+`layout` (`SINGLE`/`PAIRED`/`N-read`), `nreads`, `spots`, `size_bytes`,
+`platform`, `md5`. Missing fields are empty strings. Local `.sra` paths and
+`--prefer-ena` are ignored with a stderr warning in these formats.
+
+```
+$ sracha info --format tsv SRR2584863 SRR14724462
+accession	archive_type	layout	nreads	spots	size_bytes	platform	md5
+SRR2584863	SRA	PAIRED	2	1553259	302057279	ILLUMINA	c486ca786ca83ec3cef04b7e32e1aa08
+SRR14724462	SRA	PAIRED	2	41135235	4057553143	ILLUMINA	cfb98d8db26ad9ad28c501a4115f0cc5
+```
 
 ---
 
