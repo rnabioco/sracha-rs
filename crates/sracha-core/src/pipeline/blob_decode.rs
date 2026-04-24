@@ -177,10 +177,18 @@ pub(crate) struct BlobDecodeCtx<'a> {
 /// [`sracha_vdb::Error::UnsupportedFormat`] (surfaced as [`Error::Vdb`])
 /// so we never emit wrong FASTQ.
 ///
-/// Extracted from [`decode_blob_to_fastq`] — behavior unchanged.
+/// `read_page_map` is the (post-data_runs) READ page_map for this blob;
+/// when ALTREAD and READ blobs share row boundaries, its per-logical-row
+/// lengths feed `pad_trimmed_rows_variable` so each padded ALTREAD row
+/// matches its READ row's true width. Without this, variable-length
+/// Illumina runs (adapter-trimmed reads, SRR33907345 et al.) either
+/// erred inside `pad_trimmed_rows_fixed` or misaligned the padded
+/// buffer against READ, and the fallback silently leaked N annotations
+/// through as raw 2na bases (AAAAA vs NNNNN in the diff).
 fn apply_altread_merge(
     read_data: &mut [u8],
     raw: &RawBlobData<'_>,
+    read_page_map: Option<&crate::vdb::blob::PageMap>,
     actual_bases: usize,
     blob_idx: usize,
 ) -> Result<()> {
@@ -250,31 +258,85 @@ fn apply_altread_merge(
     // but ALTREAD in 8192-row blobs — pairing by blob index
     // merges ALTREAD rows 1..4096 against READ rows 4097..8192,
     // producing N's at random positions in unrelated records.
+    //
+    // When ALTREAD and READ blob rows align 1:1 (the common case),
+    // feed READ's per-logical-row lengths into the variable-target
+    // pad so each ALTREAD row matches its READ row's true width.
+    // Otherwise fall back to the uniform `row_bases` fixed path,
+    // which still covers DRR035866-style 2:1 ALTREAD-blob cases
+    // where rows are fixed-length anyway.
     let row_bases = actual_bases / raw.read_id_range.max(1) as usize;
-    let padded_ok = alt_page_map.as_ref().and_then(|pm| {
-        if row_bases > 0 && !altread_data.is_empty() {
-            match pm.pad_trimmed_rows_fixed(
-                &altread_data,
-                row_bases,
-                crate::vdb::blob::TrimSide::Leading,
-            ) {
-                Ok(v) => Some(v),
-                Err(e) => {
-                    tracing::debug!("blob {blob_idx}: ALTREAD pad_trimmed_rows_fixed err: {e}");
-                    None
+    let per_row_lens = alt_page_map.as_ref().and_then(|alt_pm| {
+        let read_pm = read_page_map?;
+        (alt_pm.total_rows() == read_pm.total_rows()).then(|| {
+            // Expand READ's per-data-record lengths via READ's own
+            // data_runs to get one entry per logical row — matches
+            // the row-by-row layout of `read_data` after the
+            // `expand_variable_data_runs` step above.
+            let rec_lens = read_pm.data_record_lengths();
+            let mut lens = Vec::with_capacity(read_pm.total_rows() as usize);
+            if read_pm.data_runs.is_empty() {
+                lens.extend_from_slice(&rec_lens);
+            } else {
+                for (i, &len) in rec_lens.iter().enumerate() {
+                    let repeat = read_pm.data_runs.get(i).copied().unwrap_or(1) as usize;
+                    for _ in 0..repeat {
+                        lens.push(len);
+                    }
                 }
             }
-        } else {
-            None
+            lens
+        })
+    });
+    let padded_ok = alt_page_map.as_ref().and_then(|pm| {
+        if altread_data.is_empty() {
+            return None;
+        }
+        if let Some(lens) = per_row_lens.as_ref() {
+            match pm.pad_trimmed_rows_variable(
+                &altread_data,
+                lens,
+                crate::vdb::blob::TrimSide::Leading,
+            ) {
+                Ok(v) => return Some(v),
+                Err(e) => {
+                    tracing::debug!("blob {blob_idx}: ALTREAD pad_trimmed_rows_variable err: {e}");
+                    return None;
+                }
+            }
+        }
+        if row_bases == 0 {
+            return None;
+        }
+        match pm.pad_trimmed_rows_fixed(
+            &altread_data,
+            row_bases,
+            crate::vdb::blob::TrimSide::Leading,
+        ) {
+            Ok(v) => Some(v),
+            Err(e) => {
+                tracing::debug!("blob {blob_idx}: ALTREAD pad_trimmed_rows_fixed err: {e}");
+                None
+            }
         }
     });
 
     match padded_ok {
         Some(padded) => {
-            // Offset into padded for READ's starting row within
-            // the ALTREAD blob. 0 when the two blobs align 1:1.
+            // 1:1 alignment (variable-length path): padded length
+            // equals `actual_bases` and row_offset is zero, so the
+            // merge runs over the whole buffer.
+            //
+            // Mismatched-blob-size alignment (fixed-length fallback):
+            // padded is `alt_total_rows * row_bases` with uniform
+            // rows, so skip `row_offset * row_bases` bytes to reach
+            // READ's first row inside the padded ALTREAD buffer.
             let row_offset = (raw.read_start_id - raw.altread_start_id).max(0) as usize;
-            let byte_offset = row_offset * row_bases;
+            let byte_offset = if per_row_lens.is_some() {
+                0
+            } else {
+                row_offset * row_bases
+            };
             if byte_offset < padded.len() {
                 let slice_end = byte_offset + actual_bases.min(padded.len() - byte_offset);
                 crate::vdb::encoding::merge_altread_bin(
@@ -406,7 +468,13 @@ pub(crate) fn decode_blob_to_fastq(
     // FAIL_SEQ divergences validated on accessions like DRR006688.
     // ------------------------------------------------------------------
     if raw.has_altread && !raw.altread_raw.is_empty() {
-        apply_altread_merge(&mut read_data, raw, actual_bases, blob_idx)?;
+        apply_altread_merge(
+            &mut read_data,
+            raw,
+            read_page_map.as_ref(),
+            actual_bases,
+            blob_idx,
+        )?;
     }
 
     // Quality fallback buffer for SRA-lite / empty quality. Default to the

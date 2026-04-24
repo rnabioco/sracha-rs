@@ -4,6 +4,24 @@
 
 ### Fixes
 
+- **ALTREAD variable-row padding for N-mask byte-identity**:
+  `apply_altread_merge` was calling `pad_trimmed_rows_fixed` with a
+  uniform `row_bases = actual_bases / read_id_range` — the average row
+  length. On Illumina runs with adapter-trimmed reads (per-row base
+  counts differing by 10–200 bases) any stored record whose trimmed
+  size exceeded the average errored inside the fixed-pad helper, the
+  merge silently skipped, and ALTREAD's 4na N annotations leaked
+  through as raw 2na bases — the `N_MASK_ONLY` divergences the
+  mismatch-report harness (#26) captured on DRR035183, SRR33907345,
+  and every `FAIL_SEQ` accession reclassified after PR #24.
+  New `PageMap::pad_trimmed_rows_variable` takes per-logical-row
+  targets so each padded row matches its READ row's true width;
+  `apply_altread_merge` threads READ's page_map through and feeds its
+  expanded per-row widths in whenever ALTREAD and READ rows align
+  1:1. The old fixed path remains the fallback for mismatched-blob-
+  size layouts (DRR035866's 2:1 ALTREAD-blob case). Verified 100.0%
+  `IDENTICAL` on DRR035183 and SRR33907345 vs `fasterq-dump` 3.2.1
+  (previously 73.7% / 94.5% `N_MASK_ONLY` on DRR035183).
 - **READ 2na `data_runs` expansion for variable-length rows (#22)**:
   when a READ blob's page map has a non-empty `data_runs` run-length
   table, consecutive stored rows with identical 2na bytes are written
