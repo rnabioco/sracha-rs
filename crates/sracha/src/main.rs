@@ -42,7 +42,7 @@ where
     }
 }
 
-use cli::{Cli, Command};
+use cli::{Cli, Command, InfoFormat};
 use sracha_core::accession::{self, InputAccession};
 use sracha_core::sdl::{ResolvedAccession, SdlClient};
 use sracha_core::util::format_size;
@@ -738,8 +738,16 @@ async fn main() -> Result<()> {
                 .map(|s| expand_tilde(&s))
                 .partition(|s| std::path::Path::new(s).is_file());
 
-            for p in &paths {
-                print_local_file_info(std::path::Path::new(p));
+            if matches!(args.format, InfoFormat::Tsv | InfoFormat::Csv) && !paths.is_empty() {
+                eprintln!(
+                    "{} --format tsv/csv does not support local .sra paths; skipping {} file(s)",
+                    style::warn_label("warning:"),
+                    paths.len(),
+                );
+            } else {
+                for p in &paths {
+                    print_local_file_info(std::path::Path::new(p));
+                }
             }
 
             if accessions.is_empty() {
@@ -789,18 +797,31 @@ async fn main() -> Result<()> {
 
             let entries: Vec<InfoEntry> = resolved.iter().map(InfoEntry::Ok).collect();
 
-            if entries.len() > 1 {
-                // Project/multi-accession: summary table.
-                print_info_table(&entries);
-            } else if let Some(InfoEntry::Ok(r)) = entries.first() {
-                print_resolved(r);
+            match args.format {
+                InfoFormat::Table => {
+                    if entries.len() > 1 {
+                        // Project/multi-accession: summary table.
+                        print_info_table(&entries);
+                    } else if let Some(InfoEntry::Ok(r)) = entries.first() {
+                        print_resolved(r);
+                    }
+                }
+                InfoFormat::Tsv => print_info_delim(&entries, b'\t'),
+                InfoFormat::Csv => print_info_delim(&entries, b','),
             }
 
             if args.prefer_ena {
-                let accs: Vec<String> = resolved.iter().map(|r| r.accession.clone()).collect();
-                let ena = sracha_core::ena::resolve_ena_many(&http_client, &accs).await;
-                for (acc, r) in &ena {
-                    print_ena_section(acc, r.as_ref());
+                if matches!(args.format, InfoFormat::Tsv | InfoFormat::Csv) {
+                    eprintln!(
+                        "{} --prefer-ena is ignored with --format tsv/csv",
+                        style::warn_label("warning:"),
+                    );
+                } else {
+                    let accs: Vec<String> = resolved.iter().map(|r| r.accession.clone()).collect();
+                    let ena = sracha_core::ena::resolve_ena_many(&http_client, &accs).await;
+                    for (acc, r) in &ena {
+                        print_ena_section(acc, r.as_ref());
+                    }
                 }
             }
             Ok(())
@@ -1569,6 +1590,131 @@ fn print_info_table(entries: &[InfoEntry<'_>]) {
             eprintln!("  {}: {message}", style::header(accession));
         }
     }
+}
+
+/// Emit one header row + one record per entry in TSV (`delim = b'\t'`) or CSV
+/// (`delim = b','`) for pipeline consumption. Errored entries keep their
+/// accession column populated; other columns are left empty.
+fn print_info_delim(entries: &[InfoEntry<'_>], delim: u8) {
+    use std::io::Write;
+
+    let stdout = std::io::stdout();
+    let mut w = stdout.lock();
+
+    const COLUMNS: &[&str] = &[
+        "accession",
+        "archive_type",
+        "layout",
+        "nreads",
+        "spots",
+        "size_bytes",
+        "platform",
+        "md5",
+    ];
+    write_delim_row(&mut w, COLUMNS, delim);
+
+    for entry in entries {
+        match entry {
+            InfoEntry::Ok(r) => {
+                let archive_type = if r.vdbcache_file.is_some() {
+                    "cSRA"
+                } else {
+                    "SRA"
+                };
+                let (layout, nreads) = r
+                    .run_info
+                    .as_ref()
+                    .map(|ri| {
+                        let layout = match ri.nreads {
+                            1 => "SINGLE".to_string(),
+                            2 => "PAIRED".to_string(),
+                            n => format!("{n}-read"),
+                        };
+                        (layout, ri.nreads.to_string())
+                    })
+                    .unwrap_or_default();
+                let spots = r
+                    .run_info
+                    .as_ref()
+                    .and_then(|ri| ri.spots)
+                    .map(|s| s.to_string())
+                    .unwrap_or_default();
+                let size_bytes = r.sra_file.size.to_string();
+                let platform = r
+                    .run_info
+                    .as_ref()
+                    .and_then(|ri| ri.platform.clone())
+                    .unwrap_or_default();
+                let md5 = r.sra_file.md5.clone().unwrap_or_default();
+
+                write_delim_row(
+                    &mut w,
+                    &[
+                        r.accession.as_str(),
+                        archive_type,
+                        layout.as_str(),
+                        nreads.as_str(),
+                        spots.as_str(),
+                        size_bytes.as_str(),
+                        platform.as_str(),
+                        md5.as_str(),
+                    ],
+                    delim,
+                );
+            }
+            InfoEntry::Error { accession, .. } => {
+                write_delim_row(
+                    &mut w,
+                    &[accession.as_str(), "", "", "", "", "", "", ""],
+                    delim,
+                );
+            }
+        }
+    }
+    let _ = w.flush();
+}
+
+fn write_delim_row<W: std::io::Write>(w: &mut W, fields: &[&str], delim: u8) {
+    for (i, field) in fields.iter().enumerate() {
+        if i > 0 {
+            let _ = w.write_all(&[delim]);
+        }
+        if delim == b',' {
+            write_csv_field(w, field);
+        } else {
+            // TSV: collapse any embedded tab/newline to a single space so each
+            // record stays on one line and column alignment is preserved.
+            for ch in field.chars() {
+                let out = match ch {
+                    '\t' | '\n' | '\r' => ' ',
+                    c => c,
+                };
+                let mut buf = [0u8; 4];
+                let _ = w.write_all(out.encode_utf8(&mut buf).as_bytes());
+            }
+        }
+    }
+    let _ = writeln!(w);
+}
+
+fn write_csv_field<W: std::io::Write>(w: &mut W, field: &str) {
+    let needs_quote = field
+        .bytes()
+        .any(|b| b == b',' || b == b'"' || b == b'\n' || b == b'\r');
+    if !needs_quote {
+        let _ = w.write_all(field.as_bytes());
+        return;
+    }
+    let _ = w.write_all(b"\"");
+    for ch in field.chars() {
+        if ch == '"' {
+            let _ = w.write_all(b"\"\"");
+        } else {
+            let mut buf = [0u8; 4];
+            let _ = w.write_all(ch.encode_utf8(&mut buf).as_bytes());
+        }
+    }
+    let _ = w.write_all(b"\"");
 }
 
 /// Size threshold (in bytes) above which downloads require `--yes` confirmation.
