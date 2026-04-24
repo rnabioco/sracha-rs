@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+## 0.3.3 (2026-04-24)
+
 ### Fixes
 
 - **ALTREAD variable-row padding for N-mask byte-identity**:
@@ -35,6 +37,33 @@
   same path the QUALITY column already uses — which handles both
   uniform and variable per-row lengths correctly. Covered by the
   new `variable_length_data_runs_spot_count` regression test.
+
+### Refactors
+
+- **CLI utilities moved to `sracha-core`**: `thousands` and
+  `format_bases` live in `sracha_core::util` alongside `format_size`;
+  `InfoEntry` and the TSV/CSV writer moved into a new
+  `sracha_core::info` module with dedicated unit tests. The
+  `tabled`-rendered human `sracha info` table stays in the CLI crate.
+  Drops ~150 lines from `sracha/src/main.rs`.
+- **Izip type-0 reconstruction readability**: introduced
+  `NbufStream` in `sracha-vdb::blob` to bundle
+  `(data, variant, min, name)` so the reconstruction loop reads
+  naturally (`stream.read(idx)?`) and out-of-bounds errors identify
+  which buffer (length / outlier / dx / dy / a / diff / simple) was
+  truncated.
+
+### Documentation
+
+- `docs/cli.md` documents `--prefer-ena` on `sracha get` and
+  `sracha fetch`; `docs/getting-started.md` covers the ENA fast path,
+  strict-integrity default / `--no-strict`, cSRA decoding,
+  `--prefetch-depth`, and `--keep-sra`.
+- `docs/changelog.md` now includes the repo-root `CHANGELOG.md` via
+  the correct snippet path, and `docs/implementation.md` is registered
+  in the zensical nav (previously orphaned).
+- `CLAUDE.md` updated for the three-crate workspace; prior doc
+  described a two-crate layout and hid `sracha-vdb`.
 
 ## 0.3.2 (2026-04-24)
 
