@@ -59,9 +59,8 @@
   `sracha fetch`; `docs/getting-started.md` covers the ENA fast path,
   strict-integrity default / `--no-strict`, cSRA decoding,
   `--prefetch-depth`, and `--keep-sra`.
-- `docs/changelog.md` now includes the repo-root `CHANGELOG.md` via
-  the correct snippet path, and `docs/implementation.md` is registered
-  in the zensical nav (previously orphaned).
+- Removed the orphan `docs/implementation.md` page; cSRA notes live
+  in `docs/internal/csra-format-notes.md` for developers.
 - `CLAUDE.md` updated for the three-crate workspace; prior doc
   described a two-crate layout and hid `sracha-vdb`.
 

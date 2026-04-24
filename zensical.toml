@@ -74,7 +74,4 @@ Home = "index.md"
 "CLI Reference" = "cli.md"
 
 [[project.nav]]
-"Implementation" = "implementation.md"
-
-[[project.nav]]
 "Changelog" = "changelog.md"

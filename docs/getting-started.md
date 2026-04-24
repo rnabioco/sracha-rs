@@ -114,8 +114,6 @@ recovery) remain informational either way.
 sracha decodes compressed/aligned SRA archives (cSRA) in pure Rust,
 producing byte-identical FASTQ to fasterq-dump. No special flag is
 required — sracha detects the schema and switches decoders automatically.
-See [Implementation](implementation.md) for the decode strategy and
-limitations.
 
 ## SRA-lite
 
