@@ -292,7 +292,8 @@ impl VdbCursor {
 
     /// Load NAME_FMT templates from the skey index.
     ///
-    /// The skey file at `tbl/SEQUENCE/idx/skey` contains name format templates
+    /// The skey file at `tbl/SEQUENCE/idx/skey` (database layout) or
+    /// `idx/skey` (flat-table layout) contains name format templates
     /// (e.g. `M05881:542:...:$X:$Y`) that map spot ranges to template strings.
     ///
     /// Returns `(templates, spot_starts)` where `spot_starts[i]` is the first
@@ -301,8 +302,15 @@ impl VdbCursor {
     pub fn load_name_templates<R: Read + Seek>(
         archive: &mut KarArchive<R>,
     ) -> (Vec<Vec<u8>>, Vec<i64>) {
+        // Flat-table archives (e.g. fastq-load-origin DRR019046) drop the
+        // `tbl/SEQUENCE/` prefix, so try both layouts before giving up.
+        // Without the fallback, name reconstruction silently no-ops on
+        // every flat-table accession with X/Y/ALTREAD columns and the
+        // defline falls back to "<spot> <spot>" instead of the original
+        // Illumina machine ID.
         let skey_data = archive
             .read_file("tbl/SEQUENCE/idx/skey")
+            .or_else(|_| archive.read_file("idx/skey"))
             .ok()
             .unwrap_or_default();
 
@@ -311,13 +319,26 @@ impl VdbCursor {
         }
 
         // Extract template strings by scanning for "$X" placeholders.
+        //
+        // Templates are stored adjacent in the skey blob with short
+        // separator bytes that may themselves be ASCII printable (e.g.
+        // DRR053011: `…:$X:$Y\x00\x02kH HISEQ-MFG:343:…:$X:$Y…` — the
+        // `kH` between two templates is printable junk, not part of
+        // either string). Clamping the backward walk at the previous
+        // template's end keeps those bytes out — without this, the
+        // second template comes out as `kHHISEQ-MFG:343:…` and every
+        // record that ends up in that template emits a corrupted defline.
         let mut templates = Vec::new();
         let mut template_offsets = Vec::new(); // byte offset within skey data
+        let mut last_end: usize = 0;
         let mut i = 0;
         while i < skey_data.len() {
             if skey_data[i] == b'$' && i + 1 < skey_data.len() && skey_data[i + 1] == b'X' {
                 let mut start = i;
-                while start > 0 && skey_data[start - 1] >= 32 && skey_data[start - 1] < 127 {
+                while start > last_end
+                    && skey_data[start - 1] >= 32
+                    && skey_data[start - 1] < 127
+                {
                     start -= 1;
                 }
                 let mut end = i;
@@ -327,6 +348,7 @@ impl VdbCursor {
                 if end > start {
                     template_offsets.push(start);
                     templates.push(skey_data[start..end].to_vec());
+                    last_end = end;
                 }
                 i = end;
             } else {
@@ -335,6 +357,48 @@ impl VdbCursor {
         }
 
         templates.dedup();
+
+        // Trim template prefixes that swept up adjacent inter-template
+        // separator bytes. Skey stores templates back-to-back with a few
+        // separator bytes (typically a u32 length prefix) between them;
+        // when those separator bytes happen to be ASCII-printable the
+        // backward `$X` walk above includes them as part of the next
+        // template (DRR053011: `kHHISEQ-MFG:343:…`, `8HISEQ-MFG:343:…`).
+        //
+        // Recover by finding the longest prefix shared by a majority of
+        // templates and dropping any leading bytes before that prefix on
+        // each individual template. This is robust to a couple of
+        // contaminated templates as long as most are clean.
+        if templates.len() >= 3 {
+            // Build candidate prefixes from each template at decreasing
+            // length and pick the longest one held by >= half of templates.
+            let counts: std::collections::HashMap<&[u8], usize> = templates
+                .iter()
+                .flat_map(|t| (1..=t.len()).rev().map(move |n| &t[..n]))
+                .fold(std::collections::HashMap::new(), |mut m, p| {
+                    *m.entry(p).or_insert(0) += 1;
+                    m
+                });
+            let majority = templates.len().div_ceil(2);
+            let consensus_prefix: Vec<u8> = counts
+                .iter()
+                .filter(|&(_, &c)| c >= majority)
+                .max_by_key(|(p, _)| p.len())
+                .map(|(p, _)| p.to_vec())
+                .unwrap_or_default();
+            if !consensus_prefix.is_empty() {
+                for t in templates.iter_mut() {
+                    if let Some(pos) = t
+                        .windows(consensus_prefix.len())
+                        .position(|w| w == consensus_prefix.as_slice())
+                        && pos > 0
+                    {
+                        t.drain(..pos);
+                    }
+                }
+                templates.dedup();
+            }
+        }
 
         // Parse the skey header to get first spot_id and count.
         // The header is at the start of skey_data. Try v4 (40 bytes) then v2 (32 bytes).
