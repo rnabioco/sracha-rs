@@ -45,7 +45,8 @@ MEM="16G"
 # TmpDisk=0 to slurm even though physical /tmp exists, so a non-empty
 # default makes the whole array un-schedulable.
 TMP=""
-PARTITION="normal"
+PARTITION="rna"
+JOB_NAME="sracha-corpus"
 
 while [[ $# -gt 0 ]]; do
     case "$1" in
@@ -164,11 +165,14 @@ if [[ "$SBATCH_SUBMIT" -eq 1 ]]; then
     SLURM_TIME=$(( TIMEOUT_MIN * 2 + 10 ))
     echo "# results dir:  $RESULTS_DIR"
     echo "# accessions:   $TOTAL"
+    echo "# job name:     $JOB_NAME"
+    echo "# partition:    $PARTITION"
     echo "# concurrency:  $CONCURRENCY (max simultaneous array tasks)"
     echo "# per-task:     ${CPUS_PER_TASK}cpu ${MEM}${TMP:+ ${TMP}tmp} ${SLURM_TIME}min"
     echo
     SBATCH_ARGS=(
-        --job-name=sracha-corpus
+        --job-name="$JOB_NAME"
+        --comment="$JOB_NAME"
         --partition="$PARTITION"
         --array="1-${TOTAL}%${CONCURRENCY}"
         --cpus-per-task="$CPUS_PER_TASK"
@@ -178,10 +182,11 @@ if [[ "$SBATCH_SUBMIT" -eq 1 ]]; then
         --parsable
     )
     [[ -n "$TMP" ]] && SBATCH_ARGS+=(--tmp="$TMP")
-    sbatch "${SBATCH_ARGS[@]}" \
-        "$SCRIPT_SELF" --resume-dir "$RESULTS_DIR" --split "$SPLIT" --timeout "$TIMEOUT_MIN"
+    JOB_ID=$(sbatch "${SBATCH_ARGS[@]}" \
+        "$SCRIPT_SELF" --resume-dir "$RESULTS_DIR" --split "$SPLIT" --timeout "$TIMEOUT_MIN")
+    echo "# submitted:    $JOB_NAME ($JOB_ID)"
     echo
-    echo "to watch: squeue -u \$USER -n sracha-corpus"
+    echo "to watch: squeue -u \$USER -n $JOB_NAME   # or: squeue -j $JOB_ID"
     echo "to summarize: bash $0 --summary --resume-dir $RESULTS_DIR"
     exit 0
 fi
