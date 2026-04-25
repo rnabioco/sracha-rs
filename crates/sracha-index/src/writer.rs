@@ -73,19 +73,24 @@ impl ShardWriter {
     /// Materialize the in-memory records into Vortex arrays and
     /// write the shard as a directory of .vortex files.
     ///
-    /// Schema (v2 ruthless layout):
+    /// Schema (v4 ruthless: no per-blob storage):
     /// - `accessions.vortex` — one row per accession.
     /// - `col_extents.vortex` — one row per (accession, column).
-    ///   Carries `n_blobs`, `first_blob_offset`, `first_start_id`,
-    ///   `uniform_id_range`. Reader uses these to reconstruct each
-    ///   blob's `start_id` and `blob_offset` from cumulative sums.
-    /// - `blobs.vortex` — one row per blob, **`blob_size` only**.
-    ///   Sorted by (accession_idx, column_id, blob_position).
+    ///   Carries `n_blobs`, `data_slab_offset`, `data_slab_size`,
+    ///   `first_start_id`, `uniform_id_range`. NO per-blob data
+    ///   stored.
     /// - `schemas.vortex` — deduped column-layout templates.
+    ///
+    /// Reader can compute approximate blob boundaries assuming
+    /// uniform per-blob size (`data_slab_size / n_blobs`) — good
+    /// enough for streaming-download chunk-priority planning. For
+    /// EXACT blob boundaries (decode), sracha re-fetches the (tiny,
+    /// few-KB) idx files from S3 directly. The catalog tells it
+    /// where to find them via `data_slab_offset`.
     pub async fn finish(self, session: &VortexSession) -> Result<WriteSummary> {
         std::fs::create_dir_all(&self.path)?;
         let accessions_array = build_accessions_array(&self.records, &self.schemas)?;
-        let (col_extents_array, blobs_array) = build_col_extents_and_blobs(&self.records)?;
+        let col_extents_array = build_col_extents(&self.records)?;
         let schemas_array = build_schemas_array(&self.schemas)?;
 
         // Compact-mode BtrBlocks compressor: enables aggressive
@@ -97,7 +102,6 @@ impl ShardWriter {
         for (name, array) in [
             ("accessions.vortex", accessions_array),
             ("col_extents.vortex", col_extents_array),
-            ("blobs.vortex", blobs_array),
             ("schemas.vortex", schemas_array),
         ] {
             // Strategy is one-shot — `build()` consumes the builder,
@@ -215,29 +219,13 @@ fn build_accessions_array(
         .into_array())
 }
 
-/// Build both the col_extents table (one row per (accession,
-/// column)) and the blobs table (one row per blob, just blob_size).
+/// Build the col_extents table (one row per (accession, column)),
+/// with no per-blob data — only summary metadata sufficient to
+/// compute approximate blob boundaries.
 ///
-/// Reader reconstructs per-blob start_id and blob_offset by walking
-/// col_extents to find the (accession, column)'s row range in
-/// `blobs`, then accumulating cumsum(blob_size) from
-/// `first_blob_offset` and adding `i * uniform_id_range` to
-/// `first_start_id` for the i-th blob.
-///
-/// Assumption: within each (accession, column), all blobs share the
-/// same `id_range`. This is empirically true for SEQUENCE-table
-/// columns (every blob holds the same uniform row count, typically
-/// 8192). If the assumption is violated, we record `uniform_id_range
-/// = 0` as a sentinel — readers fall back to fetching the actual
-/// SRA bytes for that accession (rare path).
-fn build_col_extents_and_blobs(
-    records: &[AccessionRecord],
-) -> Result<(ArrayRef, ArrayRef)> {
-    // First pass: group blobs by (record_idx, column_id) and
-    // detect non-uniform id_range cases. Maintain a stable order
-    // so the blobs table aligns row-for-row with the col_extents
-    // ranges.
-    let total_blobs: usize = records.iter().map(|r| r.blobs.len()).sum();
+/// For exact decode, sracha re-fetches the idx files from S3 using
+/// `data_slab_offset` as the column data slab base.
+fn build_col_extents(records: &[AccessionRecord]) -> Result<ArrayRef> {
     let total_extents: usize = records
         .iter()
         .map(|r| {
@@ -249,22 +237,17 @@ fn build_col_extents_and_blobs(
         })
         .sum();
 
-    // col_extents builders.
     let mut ext_acc_idx: Vec<u32> = Vec::with_capacity(total_extents);
     let mut ext_col_id: Vec<u8> = Vec::with_capacity(total_extents);
     let mut ext_n_blobs: Vec<u32> = Vec::with_capacity(total_extents);
-    let mut ext_first_blob_offset: Vec<u64> = Vec::with_capacity(total_extents);
+    let mut ext_data_slab_offset: Vec<u64> = Vec::with_capacity(total_extents);
+    let mut ext_data_slab_size: Vec<u64> = Vec::with_capacity(total_extents);
     let mut ext_first_start_id: Vec<i64> = Vec::with_capacity(total_extents);
     let mut ext_uniform_id_range: Vec<u32> = Vec::with_capacity(total_extents);
-
-    // blobs builder — only blob_size.
-    let mut blob_size: Vec<u32> = Vec::with_capacity(total_blobs);
 
     for (i, r) in records.iter().enumerate() {
         let idx = u32::try_from(i).map_err(|_| Error::Writer("accession idx overflow".into()))?;
 
-        // Group blobs by column_id, sorted ascending. Within each
-        // group, sort by start_id to preserve monotonic order.
         let mut by_col: std::collections::BTreeMap<u8, Vec<&crate::record::BlobLocator>> =
             std::collections::BTreeMap::new();
         for b in &r.blobs {
@@ -277,62 +260,53 @@ fn build_col_extents_and_blobs(
                 continue;
             }
             let first = blobs[0];
+            let last = blobs.last().unwrap();
             let uniform_ir = if blobs.iter().all(|b| b.id_range == first.id_range) {
                 first.id_range
             } else {
-                // Non-uniform sentinel. v2 doesn't carry the
-                // override list; reader treats this entry as
-                // "must re-fetch from .sra to get accurate blob
-                // boundaries". Logged at write time.
                 tracing::debug!(
                     "{}: column_id {col_id} has non-uniform id_range",
                     r.accession,
                 );
                 0
             };
+            // Data slab spans from the first blob's offset to the
+            // end of the last blob.
+            let data_slab_offset = first.blob_offset;
+            let data_slab_size = (last.blob_offset + u64::from(last.blob_size))
+                .saturating_sub(first.blob_offset);
             ext_acc_idx.push(idx);
             ext_col_id.push(col_id);
             ext_n_blobs.push(u32::try_from(blobs.len()).map_err(|_| {
                 Error::Writer("blob count overflow".into())
             })?);
-            ext_first_blob_offset.push(first.blob_offset);
+            ext_data_slab_offset.push(data_slab_offset);
+            ext_data_slab_size.push(data_slab_size);
             ext_first_start_id.push(first.start_id);
             ext_uniform_id_range.push(uniform_ir);
-
-            for b in blobs {
-                blob_size.push(b.blob_size);
-            }
         }
     }
 
-    // col_extents StructArray.
     let ext_acc_arr: PrimitiveArray = ext_acc_idx.into_iter().collect();
     let ext_col_arr: PrimitiveArray = ext_col_id.into_iter().collect();
     let ext_n_arr: PrimitiveArray = ext_n_blobs.into_iter().collect();
-    let ext_off_arr: PrimitiveArray = ext_first_blob_offset.into_iter().collect();
+    let ext_off_arr: PrimitiveArray = ext_data_slab_offset.into_iter().collect();
+    let ext_size_arr: PrimitiveArray = ext_data_slab_size.into_iter().collect();
     let ext_sid_arr: PrimitiveArray = ext_first_start_id.into_iter().collect();
     let ext_ir_arr: PrimitiveArray = ext_uniform_id_range.into_iter().collect();
 
-    let extents_fields: [(&str, ArrayRef); 6] = [
+    let extents_fields: [(&str, ArrayRef); 7] = [
         ("accession_idx", ext_acc_arr.into_array()),
         ("column_id", ext_col_arr.into_array()),
         ("n_blobs", ext_n_arr.into_array()),
-        ("first_blob_offset", ext_off_arr.into_array()),
+        ("data_slab_offset", ext_off_arr.into_array()),
+        ("data_slab_size", ext_size_arr.into_array()),
         ("first_start_id", ext_sid_arr.into_array()),
         ("uniform_id_range", ext_ir_arr.into_array()),
     ];
-    let col_extents_array = StructArray::from_fields(&extents_fields)
+    Ok(StructArray::from_fields(&extents_fields)
         .map_err(|e| Error::Writer(format!("col_extents struct: {e}")))?
-        .into_array();
-
-    // blobs StructArray (single field).
-    let bs_arr: PrimitiveArray = blob_size.into_iter().collect();
-    let blobs_fields: [(&str, ArrayRef); 1] = [("blob_size", bs_arr.into_array())];
-    let blobs_array = StructArray::from_fields(&blobs_fields)
-        .map_err(|e| Error::Writer(format!("blobs struct: {e}")))?
-        .into_array();
-
-    Ok((col_extents_array, blobs_array))
+        .into_array())
 }
 
 fn build_schemas_array(

@@ -88,24 +88,22 @@ pub enum Platform {
 /// One row of the `blobs` table — locates a single blob within its
 /// column's data slab.
 ///
-/// Compact form: `blob_idx` and `pg` are NOT stored — both are
-/// derivable. `blob_idx` = row-position within the table for a given
-/// (accession, column) run. `pg` = `blob_offset / page_size` (page
-/// size lives in the schemas table). Reader recomputes both on
-/// load.
+/// Compact form: `blob_idx` and `pg` are derivable and not stored.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct BlobLocator {
-    /// Index into the schema's column list (compact int, dictionary-encoded).
+    /// Index into the schema's column list.
     pub column_id: u8,
     /// First row id in this blob.
     pub start_id: i64,
-    /// Number of rows. Typically 8192 or similar small set of values
-    /// — dictionary-encodes well.
+    /// Number of rows. Typically 8192 or similar small set of values.
     pub id_range: u32,
-    /// Absolute byte offset in the .sra file. Monotonic per
-    /// (accession, column) so delta-encodes to small values.
+    /// Absolute byte offset in the .sra file.
     pub blob_offset: u64,
-    /// Compressed size in bytes.
+    /// Compressed size in bytes. Used by extractor + writer; the
+    /// index does NOT persist this per-blob — sracha refetches the
+    /// (tiny) idx files for exact boundaries when decoding. For
+    /// streaming-download planning the writer derives a per-(acc,
+    /// col) approximation.
     pub blob_size: u32,
 }
 
