@@ -38,6 +38,7 @@ RESUME_DIR=""
 WORK_DIR=""
 SBATCH_SUBMIT=0
 SUMMARY_ONLY=0
+STREAM=0
 CONCURRENCY=10
 CPUS_PER_TASK=8
 MEM="16G"
@@ -62,6 +63,7 @@ while [[ $# -gt 0 ]]; do
         --work-dir)           WORK_DIR="$2"; shift 2 ;;
         --sbatch)             SBATCH_SUBMIT=1; shift ;;
         --summary)            SUMMARY_ONLY=1; shift ;;
+        --stream)             STREAM=1; shift ;;
         --concurrency)        CONCURRENCY="$2"; shift 2 ;;
         --cpus)               CPUS_PER_TASK="$2"; shift 2 ;;
         --mem)                MEM="$2"; shift 2 ;;
@@ -182,8 +184,11 @@ if [[ "$SBATCH_SUBMIT" -eq 1 ]]; then
         --parsable
     )
     [[ -n "$TMP" ]] && SBATCH_ARGS+=(--tmp="$TMP")
+    STREAM_FORWARD=()
+    [[ "$STREAM" -eq 1 ]] && STREAM_FORWARD=(--stream)
     JOB_ID=$(sbatch "${SBATCH_ARGS[@]}" \
-        "$SCRIPT_SELF" --resume-dir "$RESULTS_DIR" --split "$SPLIT" --timeout "$TIMEOUT_MIN")
+        "$SCRIPT_SELF" --resume-dir "$RESULTS_DIR" --split "$SPLIT" --timeout "$TIMEOUT_MIN" \
+        "${STREAM_FORWARD[@]}")
     echo "# submitted:    $JOB_NAME ($JOB_ID)"
     echo
     echo "to watch: squeue -u \$USER -n $JOB_NAME   # or: squeue -j $JOB_ID"
@@ -280,8 +285,108 @@ merge_status() {
     echo "PASS_MD5"
 }
 
+# Streaming variant: pipe both tools through `| md5sum` instead of
+# materialising FASTQs on disk. Cuts ~2 GiB of disk I/O per ~500 MiB
+# SRA, but on a mismatch we only learn "differs" — no per-record diff
+# is possible without re-running with disk output. Uses interleaved
+# (`--split-spot`) so a single stream covers all reads of every spot.
+process_accession_stream() {
+    local ACC="$1"
+    CURRENT_ACC="$ACC"
+    local LOG="$RESULTS_DIR/logs/${ACC}.log"
+    : > "$LOG"
+
+    local SRA_DIR="$WORK_DIR/sra/$ACC"
+    mkdir -p "$SRA_DIR"
+
+    echo "=== sracha fetch (stream) ===" >> "$LOG"
+    local rc status
+    if ! timeout "${TIMEOUT_MIN}m" "$SRACHA" fetch "$ACC" -O "$SRA_DIR" --no-progress >> "$LOG" 2>&1; then
+        rc=$?
+        status="ERROR_FETCH"
+        [[ $rc -eq 124 ]] && status="TIMEOUT"
+        echo "  $ACC: $status"
+        record "$ACC" "$status" "sracha fetch rc=$rc" "" "" ""
+        cleanup_current; CURRENT_ACC=""
+        return
+    fi
+
+    local SRA_FILE
+    SRA_FILE=$(find "$SRA_DIR" -maxdepth 2 -type f \( -name '*.sra' -o -name '*.sralite' \) | head -1)
+    if [[ -z "$SRA_FILE" || ! -f "$SRA_FILE" ]]; then
+        echo "  $ACC: ERROR_FETCH (no .sra file found)"
+        record "$ACC" "ERROR_FETCH" "no sra file after prefetch" "" "" ""
+        cleanup_current; CURRENT_ACC=""
+        return
+    fi
+    local SRA_SIZE
+    SRA_SIZE=$(du -h "$SRA_FILE" | awk '{print $1}')
+    echo "  $ACC: sra=$SRA_SIZE"
+
+    # sracha: interleaved+stdout → md5
+    local SRACHA_MD5 SRACHA_RC SRACHA_SECS T0
+    T0=$(date +%s)
+    SRACHA_MD5=$(timeout "${TIMEOUT_MIN}m" "$SRACHA" fastq "$SRA_FILE" \
+                    --split interleaved -Z --no-progress 2>>"$LOG" | md5sum | awk '{print $1}')
+    SRACHA_RC=${PIPESTATUS[0]}
+    SRACHA_SECS=$(( $(date +%s) - T0 ))
+    if [[ $SRACHA_RC -ne 0 || -z "$SRACHA_MD5" ]]; then
+        if grep -qE "aligned SRA|cSRA" "$LOG"; then
+            status="REJECT_CSRA"
+        elif grep -qE "platform.*reject|LS454|ION_TORRENT" "$LOG"; then
+            status="REJECT_PLATFORM"
+        elif grep -qE "page_map v1 variant 2" "$LOG"; then
+            status="REJECT_VARIANT2"
+        else
+            status="FAIL_SRACHA"
+        fi
+        [[ $SRACHA_RC -eq 124 ]] && status="TIMEOUT"
+        echo "  $ACC: $status (rc=$SRACHA_RC, ${SRACHA_SECS}s)"
+        record "$ACC" "$status" "sracha rc=$SRACHA_RC" "$SRACHA_SECS" "" ""
+        cleanup_current; CURRENT_ACC=""
+        return
+    fi
+
+    # fasterq-dump: --split-spot stdout → md5
+    local FASTERQ_MD5 FASTERQ_RC FASTERQ_SECS
+    mkdir -p "$WORK_DIR/fasterq-tmp/$ACC"
+    T0=$(date +%s)
+    FASTERQ_MD5=$(timeout "${TIMEOUT_MIN}m" "$FASTERQ_DUMP" "$SRA_FILE" \
+                    --split-spot --stdout -t "$WORK_DIR/fasterq-tmp/$ACC" 2>>"$LOG" \
+                    | md5sum | awk '{print $1}')
+    FASTERQ_RC=${PIPESTATUS[0]}
+    FASTERQ_SECS=$(( $(date +%s) - T0 ))
+    rm -rf "$WORK_DIR/fasterq-tmp/$ACC" 2>/dev/null
+    if [[ $FASTERQ_RC -ne 0 || -z "$FASTERQ_MD5" ]]; then
+        status="FAIL_FASTERQ"
+        [[ $FASTERQ_RC -eq 124 ]] && status="TIMEOUT"
+        echo "  $ACC: $status (rc=$FASTERQ_RC, ${FASTERQ_SECS}s) — reference tool failure"
+        record "$ACC" "$status" "fasterq-dump rc=$FASTERQ_RC" "$SRACHA_SECS" "$FASTERQ_SECS" ""
+        cleanup_current; CURRENT_ACC=""
+        return
+    fi
+
+    if [[ "$SRACHA_MD5" == "$FASTERQ_MD5" ]]; then
+        status="PASS_MD5"
+        echo "  $ACC: PASS_MD5 (sracha=${SRACHA_SECS}s, fasterq=${FASTERQ_SECS}s)"
+        record "$ACC" "$status" "stream md5=$SRACHA_MD5" "$SRACHA_SECS" "$FASTERQ_SECS" 1
+        rm -f "$LOG"
+    else
+        status="FAIL_STREAM_MD5"
+        echo "  $ACC: FAIL_STREAM_MD5 sracha=$SRACHA_MD5 fasterq=$FASTERQ_MD5 (sracha=${SRACHA_SECS}s, fasterq=${FASTERQ_SECS}s)"
+        echo "stream md5 mismatch: sracha=$SRACHA_MD5 fasterq=$FASTERQ_MD5" >> "$LOG"
+        record "$ACC" "$status" "sracha=$SRACHA_MD5 fasterq=$FASTERQ_MD5" "$SRACHA_SECS" "$FASTERQ_SECS" 1
+    fi
+
+    cleanup_current; CURRENT_ACC=""
+}
+
 # Process one accession. Writes one row to results.tsv and one log file.
 process_accession() {
+    if [[ "$STREAM" -eq 1 ]]; then
+        process_accession_stream "$1"
+        return
+    fi
     local ACC="$1"
     CURRENT_ACC="$ACC"
     local LOG="$RESULTS_DIR/logs/${ACC}.log"
