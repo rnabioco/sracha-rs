@@ -882,10 +882,16 @@ pub(crate) fn decode_blob_to_fastq(
     let mut itoa_buf = itoa::Buffer::new();
 
     // Per-spot segment list reused across spots — allocated once per blob
-    // instead of once per spot. `rps` is typically 1 or 2.
+    // instead of once per spot. `rps` is typically 1 or 2. `mate_idx` is
+    // the original 1-based read index in the spot (before technical /
+    // zero-length / min-length filtering); fasterq-dump's `--split-spot`
+    // uses it as the `/N` suffix in interleaved deflines so e.g. a run
+    // whose read 1 is technical-only emits the biological read as `/2`,
+    // not `/1`.
     struct ReadSeg {
         start: usize,
         len: usize,
+        mate_idx: u32,
     }
     let mut segments: Vec<ReadSeg> = Vec::with_capacity(rps);
 
@@ -1012,14 +1018,22 @@ pub(crate) fn decode_blob_to_fastq(
             segments.push(ReadSeg {
                 start: read_offset,
                 len: rlen_usize,
+                mate_idx: (i + 1) as u32,
             });
             read_offset = end;
         }
 
         if !segments.is_empty() {
             // Append a segment's formatted record to the slot's accumulated
-            // buffer, inserting a new slot on first use.
-            let mut emit = |slot: OutputSlot, seg: &ReadSeg| {
+            // buffer, inserting a new slot on first use. `spot_label` is
+            // the `@RUN.<label>` field — interleaved/split-spot pass a
+            // `<spot>/<mate>` form for multi-read spots; other modes pass
+            // the bare spot number. `desc` is the second defline field
+            // (the original Illumina name when present, else the bare
+            // spot number — never the mate-suffixed label, which is why
+            // we accept it as an explicit parameter rather than letting
+            // `append_fastq_record` derive it from `spot_label`).
+            let mut emit = |slot: OutputSlot, seg: &ReadSeg, spot_label: &[u8], desc: Option<&[u8]>| {
                 let buf = match records.iter_mut().find(|s| s.slot == slot) {
                     Some(s) => s,
                     None => {
@@ -1033,14 +1047,14 @@ pub(crate) fn decode_blob_to_fastq(
                 };
                 let seq = &sequence[seg.start..seg.start + seg.len];
                 if config.fasta {
-                    append_fasta_record(&mut buf.bytes, run_name, spot_number, original_name, seq);
+                    append_fasta_record(&mut buf.bytes, run_name, spot_label, desc, seq);
                 } else {
                     let qual = &quality[seg.start..seg.start + seg.len];
                     append_fastq_record(
                         &mut buf.bytes,
                         run_name,
-                        spot_number,
-                        original_name,
+                        spot_label,
+                        desc,
                         seq,
                         qual,
                         Some(diag),
@@ -1052,22 +1066,40 @@ pub(crate) fn decode_blob_to_fastq(
             match config.split_mode {
                 SplitMode::Split3 => {
                     if segments.len() == 2 {
-                        emit(OutputSlot::Read1, &segments[0]);
-                        emit(OutputSlot::Read2, &segments[1]);
+                        emit(OutputSlot::Read1, &segments[0], spot_number, original_name);
+                        emit(OutputSlot::Read2, &segments[1], spot_number, original_name);
                     } else {
                         for seg in &segments {
-                            emit(OutputSlot::Unpaired, seg);
+                            emit(OutputSlot::Unpaired, seg, spot_number, original_name);
                         }
                     }
                 }
                 SplitMode::Interleaved | SplitMode::SplitSpot => {
+                    // fasterq-dump's --split-spot writes deflines as
+                    // `@RUN.SPOT/MATE DESC …` so mates of a paired read
+                    // are distinguishable in a single stream. The /MATE
+                    // suffix uses the read's *original* spot-read index
+                    // (1-based, pre-filter) so an archive whose read 1
+                    // is technical-only still emits the biological read
+                    // as `/2` (matches fasterq behavior on DRR004435 et
+                    // al). Force a concrete description (original name
+                    // or bare spot number) so the suffix doesn't leak
+                    // into the description via `append_fastq_record`'s
+                    // default fallback.
+                    let mut name_buf: Vec<u8> = Vec::with_capacity(spot_number.len() + 4);
+                    let mut mate_buf = itoa::Buffer::new();
                     for seg in &segments {
-                        emit(OutputSlot::Single, seg);
+                        name_buf.clear();
+                        name_buf.extend_from_slice(spot_number);
+                        name_buf.push(b'/');
+                        name_buf.extend_from_slice(mate_buf.format(seg.mate_idx).as_bytes());
+                        let desc = original_name.or(Some(spot_number));
+                        emit(OutputSlot::Single, seg, &name_buf, desc);
                     }
                 }
                 SplitMode::SplitFiles => {
                     for (file_idx, seg) in segments.iter().enumerate() {
-                        emit(OutputSlot::ReadN(file_idx as u32), seg);
+                        emit(OutputSlot::ReadN(file_idx as u32), seg, spot_number, original_name);
                     }
                 }
             }
