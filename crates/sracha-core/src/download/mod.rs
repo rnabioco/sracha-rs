@@ -2,6 +2,8 @@ use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
+pub mod in_memory;
+
 use md5::{Digest, Md5};
 use serde::{Deserialize, Serialize};
 use tokio::io::AsyncWriteExt;

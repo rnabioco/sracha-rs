@@ -3364,6 +3364,7 @@ dependencies = [
  "flate2",
  "indicatif",
  "itoa",
+ "libc",
  "libdeflate-sys",
  "libdeflater",
  "md-5",

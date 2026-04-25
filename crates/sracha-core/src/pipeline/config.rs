@@ -70,6 +70,15 @@ pub struct PipelineConfig {
     /// feed the same bar. Non-streaming paths (`sracha fetch`,
     /// `sracha fastq`) leave this None and keep the legacy bars.
     pub progress_combined: Option<Arc<indicatif::ProgressBar>>,
+    /// Stream the .sra into anonymous memory instead of a temp file
+    /// on disk. The download/decode pipeline is unchanged: the
+    /// in-memory backing exposes a `/proc/self/fd/<n>` path on Linux
+    /// (or a NamedTempFile path on other OSes) so existing mmap
+    /// codepaths work without modification. FASTQ output is
+    /// byte-identical to the disk-backed path. Memory usage ≈ file
+    /// size; for genuinely huge accessions, fall back to the disk
+    /// path. Set by `sracha get --stream`.
+    pub in_memory: bool,
 }
 
 /// Statistics from a completed pipeline run.

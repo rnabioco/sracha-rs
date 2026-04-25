@@ -326,6 +326,7 @@ async fn main() -> Result<()> {
                     keep_sra: false,
                     progress_parent: None,
                     progress_combined: None,
+                    in_memory: false,
                 };
 
                 let stats = sracha_core::pipeline::run_fastq(sra_path, None, &pipeline_config)?;
@@ -510,7 +511,10 @@ async fn main() -> Result<()> {
                     run_info: resolved.run_info.clone(),
                     fasta: args.fasta,
                     resume: !args.no_resume,
-                    stdout: args.stdout,
+                    // `--stream` implies stdout output (the in-memory
+                    // backing has no real path on disk; writing FASTQ
+                    // there would be confusing).
+                    stdout: args.stdout || args.stream,
                     cancelled: Some(cancelled.clone()),
                     strict: !args.no_strict,
                     http_client: Some(http_client.clone()),
@@ -520,6 +524,7 @@ async fn main() -> Result<()> {
                     // want for the single-accession streaming fast path.
                     progress_parent: None,
                     progress_combined: None,
+                    in_memory: args.stream,
                 }
             };
 

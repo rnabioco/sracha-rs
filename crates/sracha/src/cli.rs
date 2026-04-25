@@ -482,6 +482,14 @@ pub struct GetArgs {
     #[arg(long, help_heading = "Advanced")]
     pub keep_sra: bool,
 
+    /// Stream the .sra into anonymous memory (memfd_create on Linux,
+    /// NamedTempFile elsewhere) instead of a temp file under the
+    /// output directory. Forces `--stdout` interleaved FASTQ output.
+    /// FASTQ bytes are identical to the disk-backed path; only the
+    /// .sra storage backend differs. Memory peak ≈ file size.
+    #[arg(long, help_heading = "Advanced", conflicts_with = "keep_sra")]
+    pub stream: bool,
+
     /// Try ENA FASTQ mirrors first; fall back to NCBI if ENA has no FASTQ
     /// or the output config is incompatible. Requires gzip compression and
     /// split-3 or split-files (Phase 1 scope). Skips VDB decode entirely.

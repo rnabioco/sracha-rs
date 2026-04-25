@@ -30,6 +30,7 @@ tempfile.workspace = true
 bytes.workspace = true
 tracing.workspace = true
 sracha-vdb.workspace = true
+libc = "0.2"
 
 [dev-dependencies]
 reqwest = { workspace = true, features = ["blocking"] }

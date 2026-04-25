@@ -1658,6 +1658,12 @@ fn run_fastq_csra(
 }
 
 /// Result of the download phase of `run_get`.
+/// In-memory SRA backing kept alive across download + decode. Drop
+/// releases the memfd / removes the temp file. Held inside
+/// [`DownloadedSra`] so the path remains valid until the cursor is
+/// done with it.
+pub struct InMemoryHandle(pub crate::download::in_memory::BackingStore);
+
 pub struct DownloadedSra {
     /// Path to the temporary SRA file on disk.
     pub temp_path: PathBuf,
@@ -1680,6 +1686,13 @@ pub struct DownloadedSra {
     /// just call `tracker.await_all()` at decode entry as a no-op
     /// gate that proves the wiring works without changing behavior.
     pub chunk_ready: Option<Arc<crate::download::chunk_ready::ChunkReadyTracker>>,
+    /// In-memory backing for `--stream` mode. `Some` when the
+    /// pipeline opened a memfd (or NamedTempFile fallback) instead
+    /// of a path-backed temp .sra. Held here so the fd stays open
+    /// across decode (`temp_path` is `/proc/self/fd/<n>` on Linux,
+    /// only valid while the fd is alive). Dropping the
+    /// `DownloadedSra` releases the memfd and reclaims its memory.
+    pub in_memory: Option<Arc<InMemoryHandle>>,
 }
 
 /// Download an SRA file to a temporary location.
@@ -1802,6 +1815,7 @@ async fn download_sra_inner(
             // Outputs already exist; no download happened, so no
             // streaming tracker is meaningful.
             chunk_ready: None,
+            in_memory: None,
         });
     }
 
@@ -1810,23 +1824,44 @@ async fn download_sra_inner(
 
     tracing::debug!("{accession}: starting full download from {url}");
 
-    let temp_filename = format!(".sracha-tmp-{accession}.sra");
-    let temp_path = config.output_dir.join(&temp_filename);
-
-    tokio::fs::create_dir_all(&config.output_dir).await?;
+    // In `--stream` mode, the .sra is materialized into anonymous
+    // memory (memfd on Linux) and its `/proc/self/fd/N` alias is
+    // used as the temp_path so the existing mmap/decode codepaths
+    // open it unchanged. The handle stays in `DownloadedSra` so the
+    // fd remains valid for the cursor.
+    let (temp_path, in_memory_handle): (PathBuf, Option<Arc<InMemoryHandle>>) =
+        if config.in_memory {
+            let store = crate::download::in_memory::BackingStore::open(total_sra_size)
+                .map_err(Error::Io)?;
+            let path = store.path.clone();
+            tracing::info!(
+                "{accession}: streaming via anonymous memory ({})",
+                path.display(),
+            );
+            (path, Some(Arc::new(InMemoryHandle(store))))
+        } else {
+            let temp_filename = format!(".sracha-tmp-{accession}.sra");
+            let temp_path = config.output_dir.join(&temp_filename);
+            tokio::fs::create_dir_all(&config.output_dir).await?;
+            (temp_path, None)
+        };
 
     let dl_config = DownloadConfig {
         connections: config.connections,
         chunk_size: 0,
-        force: config.force,
+        // In-memory mode: skip resume + skip prefix verification,
+        // since the path is a fresh fd with no history. force=true
+        // bypasses the resume/MD5/prefix branches in download_file.
+        force: if config.in_memory { true } else { config.force },
         validate: true,
         progress: config.progress,
-        resume: config.resume,
+        resume: if config.in_memory { false } else { config.resume },
         client: config.http_client.clone(),
-        // KAR magic: "NCBI" + ".sra". Guards the size-match-skip path when
-        // SDL didn't supply an MD5, so a corrupt temp SRA from a crashed
-        // prior run can't feed garbage into the VDB decoder.
-        expected_prefix: Some(b"NCBI.sra".to_vec()),
+        expected_prefix: if config.in_memory {
+            None
+        } else {
+            Some(b"NCBI.sra".to_vec())
+        },
         progress_parent: config.progress_parent.clone(),
         progress_combined: config.progress_combined.clone(),
     };
@@ -1876,6 +1911,7 @@ async fn download_sra_inner(
         accession: accession.clone(),
         sra_md5: dl_result.md5,
         chunk_ready: dl_result.chunk_ready,
+        in_memory: in_memory_handle,
     })
 }
 
@@ -2217,6 +2253,17 @@ pub async fn run_get_streaming(
     resolved: &ResolvedAccession,
     config: &PipelineConfig,
 ) -> Result<PipelineStats> {
+    // In `--stream` (in_memory) mode, fall back to the legacy
+    // download-then-decode flow. The streaming-decode path
+    // pre-constructs a temp_path before the download task runs,
+    // which is incompatible with memfd whose path is created
+    // INSIDE download_sra. A future iteration can pre-create the
+    // BackingStore and share its path; for now we accept losing
+    // the in-flight overlap to gain "no disk".
+    if config.in_memory {
+        let downloaded = download_sra(resolved, config).await?;
+        return tokio::task::block_in_place(|| decode_sra(&downloaded, config));
+    }
     // Phase 4d UX: replace the old dual-bar MultiProgress wiring
     // (separate download + decode bars, the latter of which stalled
     // during per-batch waits) with a single combined "work" bar. The
@@ -2298,6 +2345,7 @@ pub async fn run_get_streaming(
         accession: resolved.accession.clone(),
         sra_md5: resolved.sra_file.md5.clone(),
         chunk_ready: Some(tracker),
+        in_memory: None,
     };
 
     // Spawn decode on a blocking thread (decode_sra is sync and uses
