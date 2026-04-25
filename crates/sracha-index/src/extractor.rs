@@ -41,9 +41,9 @@ pub async fn extract(accession: &str) -> Result<AccessionRecord> {
         .pool_idle_timeout(std::time::Duration::from_secs(60))
         .build()
         .map_err(Error::Http)?;
-    let resolved = s3core::resolve_direct(&client, accession).await.map_err(|e| {
-        Error::Extractor(format!("resolve {accession}: {e}"))
-    })?;
+    let resolved = s3core::resolve_direct(&client, accession)
+        .await
+        .map_err(|e| Error::Extractor(format!("resolve {accession}: {e}")))?;
     let url = resolved
         .sra_file
         .mirrors
@@ -128,8 +128,8 @@ pub async fn extract(accession: &str) -> Result<AccessionRecord> {
     }
 
     let mut idx_buffers: BTreeMap<String, Vec<u8>> = BTreeMap::new();
-    let fetched: Vec<(String, Vec<u8>)> = futures_join_all_ranges(&client, &url, idx_fetch_plan)
-        .await?;
+    let fetched: Vec<(String, Vec<u8>)> =
+        futures_join_all_ranges(&client, &url, idx_fetch_plan).await?;
     for (path, buf) in fetched {
         bytes_fetched += buf.len() as u64;
         idx_buffers.insert(path, buf);
@@ -177,9 +177,7 @@ pub async fn extract(accession: &str) -> Result<AccessionRecord> {
         let reader = match ColumnReader::from_parts(&idx1, &idx0, &idx, &idx2, Vec::new()) {
             Ok(r) => r,
             Err(e) => {
-                tracing::debug!(
-                    "{accession}: column {col} from_parts failed: {e} (skipping)"
-                );
+                tracing::debug!("{accession}: column {col} from_parts failed: {e} (skipping)");
                 continue;
             }
         };
@@ -189,15 +187,14 @@ pub async fn extract(accession: &str) -> Result<AccessionRecord> {
         // empty SPOT_GROUP), data_off = 0; consumers should treat that
         // as "no data slab" by checking blob_size.
         let data_path = format!("{col}/data");
-        let data_off = archive.file_location(&data_path).map(|(o, _)| o).unwrap_or(0);
+        let data_off = archive
+            .file_location(&data_path)
+            .map(|(o, _)| o)
+            .unwrap_or(0);
 
         // Capture per-column metadata for the schema fingerprint.
         let meta_view = reader.meta();
-        let column_name = col
-            .rsplit('/')
-            .next()
-            .unwrap_or(col.as_str())
-            .to_string();
+        let column_name = col.rsplit('/').next().unwrap_or(col.as_str()).to_string();
         column_meta.push(ColumnMetaEntry {
             name: column_name,
             version: meta_view.version,
@@ -214,7 +211,7 @@ pub async fn extract(accession: &str) -> Result<AccessionRecord> {
             // blob_data_offset is `pg * page_size` (or just `pg` if
             // page_size <= 1). Derive from blob.pg + meta.page_size.
             let off_within = if meta_view.page_size <= 1 {
-                blob.pg as u64
+                blob.pg
             } else {
                 blob.pg * u64::from(meta_view.page_size)
             };
@@ -261,9 +258,14 @@ pub async fn extract(accession: &str) -> Result<AccessionRecord> {
         schema: SchemaEntry {
             fingerprint: schema_fingerprint,
             columns: column_meta,
-            is_csra: archive.list_files().iter().any(|p| p.contains("PRIMARY_ALIGNMENT")),
+            is_csra: archive
+                .list_files()
+                .iter()
+                .any(|p| p.contains("PRIMARY_ALIGNMENT")),
         },
-        name_fmt: extract_name_fmt(&archive, &header_toc, &idx_buffers).ok().flatten(),
+        name_fmt: extract_name_fmt(&archive, &header_toc, &idx_buffers)
+            .ok()
+            .flatten(),
         extract_secs: started.elapsed().as_secs_f32(),
         bytes_fetched,
     };
@@ -279,9 +281,7 @@ pub async fn extract(accession: &str) -> Result<AccessionRecord> {
 /// (`col/*`) layouts — see `cursor::find_sequence_col_base` for the
 /// canonical version. We don't import that helper because it's
 /// private; this function makes its own pass over `list_files`.
-fn find_seq_columns<R: std::io::Read + std::io::Seek>(
-    archive: &KarArchive<R>,
-) -> Vec<String> {
+fn find_seq_columns<R: std::io::Read + std::io::Seek>(archive: &KarArchive<R>) -> Vec<String> {
     let mut cols: Vec<String> = Vec::new();
     let mut seen = std::collections::HashSet::new();
     for path in archive.list_files() {
@@ -336,7 +336,10 @@ async fn futures_join_all_ranges(
     }
     let mut out = Vec::with_capacity(handles.len());
     for h in handles {
-        out.push(h.await.map_err(|e| Error::Extractor(format!("join: {e}")))??);
+        out.push(
+            h.await
+                .map_err(|e| Error::Extractor(format!("join: {e}")))??,
+        );
     }
     Ok(out)
 }

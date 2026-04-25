@@ -8,7 +8,10 @@ use vortex::io::session::RuntimeSessionExt;
 use vortex::session::VortexSession;
 
 #[derive(Parser)]
-#[command(name = "sracha-index", about = "Build/query the sracha SRA metadata catalog")]
+#[command(
+    name = "sracha-index",
+    about = "Build/query the sracha SRA metadata catalog"
+)]
 struct Cli {
     #[command(subcommand)]
     cmd: Cmd,
@@ -72,8 +75,7 @@ fn init_logging(v: u8) {
     tracing_subscriber::fmt()
         .with_writer(std::io::stderr)
         .with_env_filter(
-            tracing_subscriber::EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| level.into()),
+            tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| level.into()),
         )
         .init();
 }
@@ -199,7 +201,9 @@ async fn run_build(
     let mut last_log = Instant::now();
 
     for (i, h) in handles.into_iter().enumerate() {
-        let (acc, res) = h.await.map_err(|e| Error::Extractor(format!("join: {e}")))?;
+        let (acc, res) = h
+            .await
+            .map_err(|e| Error::Extractor(format!("join: {e}")))?;
         match res {
             Ok(rec) => {
                 total_bytes_fetched += rec.bytes_fetched;
@@ -281,5 +285,5 @@ fn days_to_ymd(mut days: i64) -> (i32, u32, u32) {
     let d = doy - (153 * mp + 2) / 5 + 1;
     let m = if mp < 10 { mp + 3 } else { mp - 9 };
     let y = if m <= 2 { y + 1 } else { y };
-    (y, m as u32, d as u32)
+    (y, m, d)
 }

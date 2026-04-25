@@ -113,9 +113,7 @@ impl ShardWriter {
 
         // Compact-mode BtrBlocks compressor: enables aggressive
         // cascaded encodings (FoR + Delta + Dict + RLE + bit-pack).
-        let compressor = BtrBlocksCompressorBuilder::default()
-            .with_compact()
-            .build();
+        let compressor = BtrBlocksCompressorBuilder::default().with_compact().build();
         let mut total_bytes = 0;
         for (name, array) in [
             ("accessions.vortex", accessions_array),
@@ -176,7 +174,8 @@ fn build_accessions_array(
     let mut schema_id: Vec<u32> = Vec::with_capacity(n);
 
     for (i, r) in records.iter().enumerate() {
-        accession_idx.push(u32::try_from(i).map_err(|_| Error::Writer("accession idx overflow".into()))?);
+        accession_idx
+            .push(u32::try_from(i).map_err(|_| Error::Writer("accession idx overflow".into()))?);
         accession_id_bytes.push(r.accession.as_bytes().to_vec());
         file_size.push(r.file_size);
         kar_data_offset.push(r.kar_data_offset);
@@ -188,9 +187,8 @@ fn build_accessions_array(
     }
 
     let acc_idx_arr: PrimitiveArray = accession_idx.into_iter().collect();
-    let acc_arr =
-        VarBinArray::from_vec(accession_id_bytes, DType::Utf8(Nullability::NonNullable))
-            .into_array();
+    let acc_arr = VarBinArray::from_vec(accession_id_bytes, DType::Utf8(Nullability::NonNullable))
+        .into_array();
     let fs_arr: PrimitiveArray = file_size.into_iter().collect();
     let kar_arr: PrimitiveArray = kar_data_offset.into_iter().collect();
     let sch_arr: PrimitiveArray = schema_id.into_iter().collect();
@@ -262,13 +260,14 @@ fn build_col_extents(records: &[AccessionRecord]) -> Result<ArrayRef> {
             // Data slab spans from the first blob's offset to the
             // end of the last blob.
             let data_slab_offset = first.blob_offset;
-            let data_slab_size = (last.blob_offset + u64::from(last.blob_size))
-                .saturating_sub(first.blob_offset);
+            let data_slab_size =
+                (last.blob_offset + u64::from(last.blob_size)).saturating_sub(first.blob_offset);
             ext_acc_idx.push(idx);
             ext_col_id.push(col_id);
-            ext_n_blobs.push(u32::try_from(blobs.len()).map_err(|_| {
-                Error::Writer("blob count overflow".into())
-            })?);
+            ext_n_blobs.push(
+                u32::try_from(blobs.len())
+                    .map_err(|_| Error::Writer("blob count overflow".into()))?,
+            );
             ext_data_slab_offset.push(data_slab_offset);
             ext_data_slab_size.push(data_slab_size);
             ext_first_start_id.push(first.start_id);
@@ -298,9 +297,7 @@ fn build_col_extents(records: &[AccessionRecord]) -> Result<ArrayRef> {
         .into_array())
 }
 
-fn build_schemas_array(
-    schemas: &HashMap<[u8; 32], (u32, SchemaEntry)>,
-) -> Result<ArrayRef> {
+fn build_schemas_array(schemas: &HashMap<[u8; 32], (u32, SchemaEntry)>) -> Result<ArrayRef> {
     let mut entries: Vec<&(u32, SchemaEntry)> = schemas.values().collect();
     entries.sort_by_key(|(id, _)| *id);
 
@@ -322,8 +319,8 @@ fn build_schemas_array(
     }
 
     let id_arr: PrimitiveArray = schema_id.into_iter().collect();
-    let fp_arr =
-        VarBinArray::from_vec(fingerprint_rows, DType::Binary(Nullability::NonNullable)).into_array();
+    let fp_arr = VarBinArray::from_vec(fingerprint_rows, DType::Binary(Nullability::NonNullable))
+        .into_array();
     let csra_arr: PrimitiveArray = is_csra.into_iter().collect();
     let cols_arr = VarBinArray::from_vec(
         columns_json.into_iter().map(String::into_bytes).collect(),

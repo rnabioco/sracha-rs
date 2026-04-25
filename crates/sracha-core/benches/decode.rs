@@ -55,6 +55,7 @@ fn config(out: &std::path::Path, threads: usize, compression: CompressionMode) -
         keep_sra: false,
         progress_parent: None,
         progress_combined: None,
+        in_memory: false,
     }
 }
 

@@ -15,15 +15,14 @@ use vortex::file::{OpenOptionsSessionExt, VortexFile};
 use vortex::io::session::RuntimeSessionExt;
 use vortex::session::VortexSession;
 
-use crate::record::{
-    AccessionRecord, BlobLocator, ColumnMetaEntry, Layout, Platform, SchemaEntry,
-};
+use crate::record::{AccessionRecord, BlobLocator, ColumnMetaEntry, Layout, Platform, SchemaEntry};
 use crate::{Error, Result};
 
 /// One self-contained shard: three Vortex files
 /// (accessions/col_extents/schemas) where all foreign keys
 /// (`schema_id`, `accession_idx`) resolve within the shard.
 pub struct ShardReader {
+    #[allow(dead_code)]
     session: VortexSession,
     accessions_file: VortexFile,
     col_extents_file: VortexFile,
@@ -132,9 +131,10 @@ impl ShardReader {
             .as_struct_opt()
             .ok_or_else(|| Error::Reader("schemas row not a struct".into()))?;
         let fp_bytes = field_binary(&s, "fingerprint")?;
-        let fingerprint: [u8; 32] = fp_bytes.as_slice().try_into().map_err(|_| {
-            Error::Reader(format!("fingerprint length {} != 32", fp_bytes.len()))
-        })?;
+        let fingerprint: [u8; 32] = fp_bytes
+            .as_slice()
+            .try_into()
+            .map_err(|_| Error::Reader(format!("fingerprint length {} != 32", fp_bytes.len())))?;
         let is_csra = field_u8(&s, "is_csra")? != 0;
         let cols_json = field_string(&s, "columns_json")?;
         let columns: Vec<ColumnMetaEntry> = serde_json::from_str(&cols_json)?;
@@ -145,10 +145,7 @@ impl ShardReader {
         })
     }
 
-    async fn collect_blobs_for_accession(
-        &self,
-        accession_idx: u32,
-    ) -> Result<Vec<BlobLocator>> {
+    async fn collect_blobs_for_accession(&self, accession_idx: u32) -> Result<Vec<BlobLocator>> {
         let chunks = scan_with_filter(
             &self.col_extents_file,
             eq(get_item("accession_idx", root()), lit(accession_idx)),
@@ -159,9 +156,9 @@ impl ShardReader {
             let n = chunk.len();
             for row in 0..n {
                 let r = chunk.scalar_at(row).map_err(vortex_err)?;
-                let r = r.as_struct_opt().ok_or_else(|| {
-                    Error::Reader("col_extents row not a struct".into())
-                })?;
+                let r = r
+                    .as_struct_opt()
+                    .ok_or_else(|| Error::Reader("col_extents row not a struct".into()))?;
                 let column_id = field_u8(&r, "column_id")?;
                 let n_blobs = field_u32(&r, "n_blobs")?;
                 let data_slab_offset = field_u64(&r, "data_slab_offset")?;
@@ -171,13 +168,11 @@ impl ShardReader {
                 if n_blobs == 0 {
                     continue;
                 }
-                let approx_size = u32::try_from(data_slab_size / u64::from(n_blobs))
-                    .unwrap_or(u32::MAX);
+                let approx_size =
+                    u32::try_from(data_slab_size / u64::from(n_blobs)).unwrap_or(u32::MAX);
                 for i in 0..n_blobs {
-                    let blob_offset =
-                        data_slab_offset + u64::from(i) * u64::from(approx_size);
-                    let start_id = first_start_id
-                        + i64::from(i) * i64::from(uniform_id_range);
+                    let blob_offset = data_slab_offset + u64::from(i) * u64::from(approx_size);
+                    let start_id = first_start_id + i64::from(i) * i64::from(uniform_id_range);
                     out.push(BlobLocator {
                         column_id,
                         start_id,
@@ -216,7 +211,7 @@ async fn scan_with_filter(
 
 fn first_row(chunks: &[ArrayRef]) -> Result<Option<ArrayRef>> {
     for chunk in chunks {
-        if chunk.len() > 0 {
+        if !chunk.is_empty() {
             return Ok(Some(chunk.slice(0..1).map_err(vortex_err)?));
         }
     }
@@ -225,10 +220,7 @@ fn first_row(chunks: &[ArrayRef]) -> Result<Option<ArrayRef>> {
 
 // Field accessors take a StructScalar by value (it's a thin view).
 
-fn field_string(
-    s: &vortex::array::scalar::StructScalar,
-    name: &str,
-) -> Result<String> {
+fn field_string(s: &vortex::array::scalar::StructScalar, name: &str) -> Result<String> {
     let f = s
         .field(name)
         .ok_or_else(|| Error::Reader(format!("missing field {name}")))?;
@@ -241,10 +233,7 @@ fn field_string(
         .to_string())
 }
 
-fn field_binary(
-    s: &vortex::array::scalar::StructScalar,
-    name: &str,
-) -> Result<Vec<u8>> {
+fn field_binary(s: &vortex::array::scalar::StructScalar, name: &str) -> Result<Vec<u8>> {
     let f = s
         .field(name)
         .ok_or_else(|| Error::Reader(format!("missing field {name}")))?;
@@ -344,7 +333,9 @@ impl CatalogReader {
         // through the multi-shard reader.
         if !manifest_path.exists() && catalog_dir.join("accessions.vortex").exists() {
             let shard = ShardReader::open_local(catalog_dir).await?;
-            return Ok(Self { shards: vec![shard] });
+            return Ok(Self {
+                shards: vec![shard],
+            });
         }
         let manifest_bytes = std::fs::read(&manifest_path)
             .map_err(|e| Error::Reader(format!("read manifest: {e}")))?;

@@ -1664,6 +1664,7 @@ fn run_fastq_csra(
 /// done with it.
 pub struct InMemoryHandle(pub crate::download::in_memory::BackingStore);
 
+#[derive(Clone)]
 pub struct DownloadedSra {
     /// Path to the temporary SRA file on disk.
     pub temp_path: PathBuf,
@@ -1740,7 +1741,13 @@ pub async fn download_sra_streaming_with_handle(
     >,
     existing_in_memory: Arc<InMemoryHandle>,
 ) -> Result<DownloadedSra> {
-    download_sra_inner(resolved, config, Some(tracker_init), Some(existing_in_memory)).await
+    download_sra_inner(
+        resolved,
+        config,
+        Some(tracker_init),
+        Some(existing_in_memory),
+    )
+    .await
 }
 
 /// First-stage metadata gate for streaming decode. Waits for the bytes
@@ -1882,7 +1889,11 @@ async fn download_sra_inner(
         force: if config.in_memory { true } else { config.force },
         validate: true,
         progress: config.progress,
-        resume: if config.in_memory { false } else { config.resume },
+        resume: if config.in_memory {
+            false
+        } else {
+            config.resume
+        },
         client: config.http_client.clone(),
         expected_prefix: if config.in_memory {
             None
@@ -2298,6 +2309,86 @@ pub async fn run_get_streaming(
     // for --stream; FASTQ output is byte-identical to disk path
     // either way.
     if config.in_memory {
+        // Task #17 diagnosis ladder. Two debug modes:
+        //
+        // SRACHA_DEBUG_COMPOSED=1: composed path (pre-alloc memfd,
+        //   spawn download), but DECODE waits for full download
+        //   first AND uses chunk_ready=Some(tracker). If this
+        //   passes, chunk_ready integration with memfd is fine
+        //   when not racing.
+        //
+        // SRACHA_DEBUG_CONCURRENT=1: full concurrent composed path
+        //   (the originally-failing scenario). Reproduces the bug.
+        if std::env::var("SRACHA_DEBUG_COMPOSED").is_ok()
+            || std::env::var("SRACHA_DEBUG_CONCURRENT").is_ok()
+        {
+            let concurrent = std::env::var("SRACHA_DEBUG_CONCURRENT").is_ok();
+            let store = crate::download::in_memory::BackingStore::open(resolved.sra_file.size)
+                .map_err(Error::Io)?;
+            let handle = Arc::new(InMemoryHandle(store));
+            let path = handle.0.path.clone();
+
+            let (tracker_tx, tracker_rx) = tokio::sync::oneshot::channel();
+            let resolved_owned = resolved.clone();
+            let config_for_dl = config.clone();
+            let handle_for_dl = handle.clone();
+            let dl_handle: tokio::task::JoinHandle<Result<DownloadedSra>> =
+                tokio::spawn(async move {
+                    download_sra_streaming_with_handle(
+                        &resolved_owned,
+                        &config_for_dl,
+                        tracker_tx,
+                        handle_for_dl,
+                    )
+                    .await
+                });
+            let early_tracker = tracker_rx.await.ok();
+            let Some(tracker) = early_tracker else {
+                let downloaded = dl_handle
+                    .await
+                    .map_err(|e| Error::Pipeline(format!("download task panicked: {e}")))??;
+                return tokio::task::block_in_place(|| decode_sra(&downloaded, config));
+            };
+
+            let synthetic = DownloadedSra {
+                temp_path: path,
+                bytes_transferred: 0,
+                total_sra_size: resolved.sra_file.size,
+                is_lite: resolved.sra_file.is_lite,
+                accession: resolved.accession.clone(),
+                sra_md5: resolved.sra_file.md5.clone(),
+                chunk_ready: Some(tracker.clone()),
+                in_memory: Some(handle),
+            };
+
+            if concurrent {
+                tracing::info!("composed-debug: CONCURRENT decode + chunk_ready");
+                let cfg_for_decode = config.clone();
+                let synthetic_for_decode = synthetic.clone();
+                let decode_handle: tokio::task::JoinHandle<Result<PipelineStats>> =
+                    tokio::task::spawn_blocking(move || {
+                        decode_sra(&synthetic_for_decode, &cfg_for_decode)
+                    });
+                // Both run; await both.
+                let dl_done = dl_handle
+                    .await
+                    .map_err(|e| Error::Pipeline(format!("download task panicked: {e}")))??;
+                let mut stats = decode_handle
+                    .await
+                    .map_err(|e| Error::Pipeline(format!("decode task panicked: {e}")))??;
+                stats.bytes_transferred = dl_done.bytes_transferred;
+                return Ok(stats);
+            } else {
+                tracing::info!(
+                    "composed-debug: SEQUENTIAL decode after download (chunk_ready=Some)"
+                );
+                let _ = dl_handle
+                    .await
+                    .map_err(|e| Error::Pipeline(format!("download task panicked: {e}")))??;
+                tracker.wait_all();
+                return tokio::task::block_in_place(|| decode_sra(&synthetic, config));
+            }
+        }
         let downloaded = download_sra(resolved, config).await?;
         return tokio::task::block_in_place(|| decode_sra(&downloaded, config));
     }

@@ -258,6 +258,7 @@ fn test_config(
         keep_sra: false,
         progress_parent: None,
         progress_combined: None,
+        in_memory: false,
     }
 }
 
