@@ -89,6 +89,13 @@ pub struct ColumnMeta {
     pub checksum_type: u8,
     /// Number of block entries in idx1.
     pub num_blocks: u32,
+    /// Number of entries in idx0. v3+ stores this in the `idx`
+    /// file; v1/v2 set it to 0 and the parser falls back to
+    /// "however many fit in the file". For v3+, the on-disk idx0
+    /// may have trailing junk past the first `idx0_count*24`
+    /// bytes (ncbi-vdb's reader trusts this count and ignores the
+    /// rest); we honor the same convention.
+    pub idx0_count: u32,
     /// Block locators parsed from idx1 (v1 legacy: used directly as BlobLocs).
     pub block_locs: Vec<BlobLoc>,
 }
@@ -243,6 +250,7 @@ fn parse_idx1(buf: &[u8]) -> Result<ColumnMeta> {
             page_size: if page_size == 0 { 1 } else { page_size },
             checksum_type,
             num_blocks,
+            idx0_count: 0, // populated by update_meta_from_idx_file for v3+
             block_locs,
         })
     } else {
@@ -262,6 +270,7 @@ fn parse_idx1(buf: &[u8]) -> Result<ColumnMeta> {
             page_size: 1, // will be overridden from `idx` file if available
             checksum_type: 0,
             num_blocks: num_blocks_in_idx1 as u32,
+            idx0_count: 0,          // populated by update_meta_from_idx_file for v3+
             block_locs: Vec::new(), // v2+ uses BlockLoc + idx2 instead
         })
     }
@@ -567,7 +576,7 @@ fn update_meta_from_idx_file(meta: &mut ColumnMeta, buf: &[u8]) {
         3 | 4 if buf.len() >= 40 => {
             meta.data_eof = read_u64(8);
             meta.idx2_eof = read_u64(16);
-            // idx0_count at 24
+            meta.idx0_count = read_u32(24);
             meta.num_blocks = read_u32(28);
             meta.page_size = read_u32(32);
             if meta.page_size == 0 {
@@ -579,15 +588,36 @@ fn update_meta_from_idx_file(meta: &mut ColumnMeta, buf: &[u8]) {
     }
 }
 
-fn parse_idx0(buf: &[u8]) -> Result<Vec<BlobLoc>> {
-    if !buf.len().is_multiple_of(BLOB_LOC_SIZE) {
+fn parse_idx0(buf: &[u8], known_count: u32) -> Result<Vec<BlobLoc>> {
+    // ncbi-vdb's KColumn v3+ idx0 reader takes an entry count from
+    // the `idx` file's `idx0_count` header field and reads exactly
+    // that many 24-byte records — the on-disk file can have
+    // trailing bytes past that point (from prior writes/cleanup)
+    // and the reader ignores them. For v1/v2 (`known_count == 0`)
+    // the legacy behavior applies: the file is exactly N*24 bytes.
+    let count = if known_count > 0 {
+        known_count as usize
+    } else {
+        if !buf.len().is_multiple_of(BLOB_LOC_SIZE) {
+            return Err(Error::Format(format!(
+                "idx0 size {} is not a multiple of {BLOB_LOC_SIZE} (and no v3+ count was \
+                 supplied via the `idx` header)",
+                buf.len()
+            )));
+        }
+        buf.len() / BLOB_LOC_SIZE
+    };
+
+    let needed = count
+        .checked_mul(BLOB_LOC_SIZE)
+        .ok_or_else(|| Error::Format(format!("idx0_count overflow: {count} * {BLOB_LOC_SIZE}")))?;
+    if buf.len() < needed {
         return Err(Error::Format(format!(
-            "idx0 size {} is not a multiple of {BLOB_LOC_SIZE}",
+            "idx0 short read: have {} bytes, need {needed} for {count} entries",
             buf.len()
         )));
     }
 
-    let count = buf.len() / BLOB_LOC_SIZE;
     let mut blobs = Vec::with_capacity(count);
 
     for i in 0..count {
@@ -663,12 +693,17 @@ impl ColumnReader {
         data_bytes: Vec<u8>,
     ) -> Result<Self> {
         let mut meta = parse_idx1(idx1_bytes)?;
-        let mut blobs = parse_idx0(idx0_bytes)?;
 
-        // For v2+, update metadata from the `idx` file (which has the full header).
+        // For v2+, the `idx` file carries the full KColumnHdr —
+        // including (for v3+) the `idx0_count` field that the
+        // parser needs to know how many entries are valid in idx0
+        // (the file may have trailing junk past that count). Read
+        // it BEFORE parse_idx0 so we can pass it through.
         if !idx_bytes.is_empty() && meta.version >= 2 {
             update_meta_from_idx_file(&mut meta, idx_bytes);
         }
+
+        let mut blobs = parse_idx0(idx0_bytes, meta.idx0_count)?;
 
         // For v2+ columns with idx2 data, parse block locators from idx1 and
         // decode idx2 to get individual blob locations.
@@ -1006,14 +1041,14 @@ mod tests {
 
     #[test]
     fn parse_idx0_empty() {
-        let blobs = parse_idx0(&[]).unwrap();
+        let blobs = parse_idx0(&[], 0).unwrap();
         assert!(blobs.is_empty());
     }
 
     #[test]
     fn parse_idx0_single_blob() {
         let buf = build_blob_loc(0, 100, 10, 1);
-        let blobs = parse_idx0(&buf).unwrap();
+        let blobs = parse_idx0(&buf, 0).unwrap();
         assert_eq!(blobs.len(), 1);
         assert_eq!(blobs[0].pg, 0);
         assert_eq!(blobs[0].size, 100);
@@ -1027,7 +1062,7 @@ mod tests {
         buf.extend_from_slice(&build_blob_loc(50, 60, 5, 6));
         buf.extend_from_slice(&build_blob_loc(110, 40, 3, 11));
 
-        let blobs = parse_idx0(&buf).unwrap();
+        let blobs = parse_idx0(&buf, 0).unwrap();
         assert_eq!(blobs.len(), 3);
         assert_eq!(blobs[0].start_id, 1);
         assert_eq!(blobs[1].start_id, 6);
@@ -1040,7 +1075,7 @@ mod tests {
         buf.extend_from_slice(&build_removed_blob_loc(50, 60, 5, 6));
         buf.extend_from_slice(&build_blob_loc(110, 40, 3, 11));
 
-        let blobs = parse_idx0(&buf).unwrap();
+        let blobs = parse_idx0(&buf, 0).unwrap();
         assert_eq!(blobs.len(), 2);
         assert_eq!(blobs[0].start_id, 1);
         assert_eq!(blobs[1].start_id, 11);
@@ -1053,7 +1088,7 @@ mod tests {
         buf.extend_from_slice(&build_blob_loc(0, 50, 5, 1));
         buf.extend_from_slice(&build_blob_loc(50, 60, 5, 6));
 
-        let blobs = parse_idx0(&buf).unwrap();
+        let blobs = parse_idx0(&buf, 0).unwrap();
         assert_eq!(blobs[0].start_id, 1);
         assert_eq!(blobs[1].start_id, 6);
         assert_eq!(blobs[2].start_id, 11);
@@ -1063,7 +1098,7 @@ mod tests {
     fn parse_idx0_invalid_size() {
         // 10 bytes is not a multiple of 24.
         let buf = vec![0u8; 10];
-        assert!(parse_idx0(&buf).is_err());
+        assert!(parse_idx0(&buf, 0).is_err());
     }
 
     // -----------------------------------------------------------------------
@@ -1154,6 +1189,7 @@ mod tests {
                 checksum_type: 0,
                 num_blocks: 0,
                 block_locs: vec![],
+                idx0_count: 0,
             },
             blobs,
             data: DataSource::InMemory(vec![0u8; 110]),
@@ -1191,6 +1227,7 @@ mod tests {
                 checksum_type: 0,
                 num_blocks: 0,
                 block_locs: vec![],
+                idx0_count: 0,
             },
             blobs,
             data: DataSource::InMemory(vec![0u8; 110]),
@@ -1220,6 +1257,7 @@ mod tests {
                 checksum_type: 0,
                 num_blocks: 0,
                 block_locs: vec![],
+                idx0_count: 0,
             },
             blobs,
             data: DataSource::InMemory(vec![0u8; 50]),
@@ -1242,6 +1280,7 @@ mod tests {
                 checksum_type: 0,
                 num_blocks: 0,
                 block_locs: vec![],
+                idx0_count: 0,
             },
             blobs: Vec::new(),
             data: DataSource::InMemory(Vec::new()),
@@ -1278,6 +1317,7 @@ mod tests {
                 checksum_type: 0,
                 num_blocks: 0,
                 block_locs: vec![],
+                idx0_count: 0,
             },
             blobs,
             data: DataSource::InMemory(vec![0u8; 30]),
@@ -1310,6 +1350,7 @@ mod tests {
                 checksum_type: 0,
                 num_blocks: 0,
                 block_locs: vec![],
+                idx0_count: 0,
             },
             blobs,
             data: DataSource::InMemory(vec![0u8; 30]),
@@ -1328,6 +1369,7 @@ mod tests {
                 checksum_type: 0,
                 num_blocks: 0,
                 block_locs: vec![],
+                idx0_count: 0,
             },
             blobs: Vec::new(),
             data: DataSource::InMemory(Vec::new()),
@@ -1366,6 +1408,7 @@ mod tests {
                 checksum_type: 0,
                 num_blocks: 0,
                 block_locs: vec![],
+                idx0_count: 0,
             },
             blobs,
             data: DataSource::InMemory(vec![0u8; 45]),
@@ -1388,6 +1431,7 @@ mod tests {
                 checksum_type: 0,
                 num_blocks: 0,
                 block_locs: vec![],
+                idx0_count: 0,
             },
             blobs: Vec::new(),
             data: DataSource::InMemory(vec![0u8; 200]),
@@ -1412,6 +1456,7 @@ mod tests {
                 checksum_type: 0,
                 num_blocks: 0,
                 block_locs: vec![],
+                idx0_count: 0,
             },
             blobs: Vec::new(),
             data: DataSource::InMemory(vec![0u8; 200]),
@@ -1447,6 +1492,7 @@ mod tests {
                 checksum_type: 0,
                 num_blocks: 0,
                 block_locs: vec![],
+                idx0_count: 0,
             },
             blobs,
             data: DataSource::InMemory(data.to_vec()),
@@ -1482,6 +1528,7 @@ mod tests {
                 checksum_type: 0,
                 num_blocks: 0,
                 block_locs: vec![],
+                idx0_count: 0,
             },
             blobs,
             data: DataSource::InMemory(compressed),
@@ -1502,6 +1549,7 @@ mod tests {
                 checksum_type: 0,
                 num_blocks: 0,
                 block_locs: vec![],
+                idx0_count: 0,
             },
             blobs: Vec::new(),
             data: DataSource::InMemory(Vec::new()),
@@ -1526,6 +1574,7 @@ mod tests {
                 checksum_type: 0,
                 num_blocks: 0,
                 block_locs: vec![],
+                idx0_count: 0,
             },
             blobs,
             data: DataSource::InMemory(vec![0u8; 10]), // data is too small
