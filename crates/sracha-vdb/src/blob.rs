@@ -1700,11 +1700,15 @@ pub(crate) const MAX_DECODE_RATIO: usize = 1024;
 
 /// Reject a header-driven allocation that exceeds `src.len() * MAX_DECODE_RATIO`.
 ///
-/// Used at every `vec![0u8; N]` whose `N` derives from on-wire bytes — the
-/// shared bound prevents a malformed `data_count` / size field from
-/// triggering `handle_alloc_error` before we ever look at the payload.
+/// `src_len` is clamped up to a 4 KiB floor so legitimate "no-payload,
+/// small element count" cases still pass — cSRA paths can invoke
+/// `irzip_decode` with `data.len() == 0` when the encoder elided the
+/// deflate stream and the plane loop zero-fills the output.
 pub(crate) fn check_alloc_bytes(n_bytes: usize, src_len: usize, ctx: &str) -> Result<()> {
-    let limit = src_len.saturating_mul(MAX_DECODE_RATIO);
+    const MIN_INPUT_FLOOR: usize = 4096;
+    let limit = src_len
+        .max(MIN_INPUT_FLOOR)
+        .saturating_mul(MAX_DECODE_RATIO);
     if n_bytes > limit {
         return Err(Error::Format(format!(
             "{ctx}: requested {n_bytes}-byte allocation exceeds {limit}-byte cap \
