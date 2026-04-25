@@ -705,7 +705,8 @@ fn decode_and_write(
                         // the wrong lengths and overruns the READ buffer
                         // mid-blob, dropping every spot afterward. Mirrors
                         // the ALTREAD pattern below.
-                        let (rl_raw, rl_id_range, rl_start_id): (&[u8], u64, i64) = if has_read_len {
+                        let (rl_raw, rl_id_range, rl_start_id): (&[u8], u64, i64) = if has_read_len
+                        {
                             let rlcol = cursor.read_len_col().unwrap();
                             match rlcol.find_blob(read_start_id) {
                                 Some(blob) => (

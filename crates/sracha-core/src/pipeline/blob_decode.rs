@@ -541,8 +541,7 @@ pub(crate) fn decode_blob_to_fastq(
         // `(read_start_id - read_len_start_id) * rps` values from the
         // front and keep `read_id_range * rps` values. Required when
         // READ_LEN's blob covers more rows than READ's (DRR023226).
-        let row_offset =
-            (raw.read_start_id - raw.read_len_start_id).max(0) as usize * rps;
+        let row_offset = (raw.read_start_id - raw.read_len_start_id).max(0) as usize * rps;
         let row_take = raw.read_id_range as usize * rps;
         if row_offset > 0 || lengths.len() > row_offset + row_take {
             let end = (row_offset + row_take).min(lengths.len());
@@ -828,76 +827,76 @@ pub(crate) fn decode_blob_to_fastq(
         //     leng_runs and overlays it on the data_run slot). Each row
         //     pulls its own slice from a deduplicated pool of unique
         //     templates.
-        let name_fmt_per_row: Option<Vec<Vec<u8>>> = if raw.has_name_fmt
-            && !raw.name_fmt_raw.is_empty()
-        {
-            decode_raw(raw.name_fmt_raw, raw.name_fmt_cs, raw.name_fmt_id_range)
-                .ok()
-                .and_then(|nfd| {
-                    let pm = nfd.page_map.clone();
-                    let bytes = decode_zip_encoding(&nfd).ok()?;
-                    let pm = pm?;
-                    let total_rows = pm.total_rows() as usize;
-                    let random_access =
-                        pm.data_runs.len() == total_rows && total_rows > 0;
-                    let mut rows: Vec<Vec<u8>> = Vec::with_capacity(total_rows);
-                    if random_access {
-                        // Per-row byte offsets: each row pulls its own
-                        // slice from `bytes` at offset data_runs[i] of
-                        // length determined by leng_runs expansion.
-                        let mut row_lens: Vec<u32> = Vec::with_capacity(total_rows);
-                        for (length, &run) in pm.lengths.iter().zip(pm.leng_runs.iter())
-                        {
-                            for _ in 0..run {
-                                row_lens.push(*length);
+        let name_fmt_per_row: Option<Vec<Vec<u8>>> =
+            if raw.has_name_fmt && !raw.name_fmt_raw.is_empty() {
+                decode_raw(raw.name_fmt_raw, raw.name_fmt_cs, raw.name_fmt_id_range)
+                    .ok()
+                    .and_then(|nfd| {
+                        let pm = nfd.page_map.clone();
+                        let bytes = decode_zip_encoding(&nfd).ok()?;
+                        let pm = pm?;
+                        let total_rows = pm.total_rows() as usize;
+                        let random_access = pm.data_runs.len() == total_rows && total_rows > 0;
+                        let mut rows: Vec<Vec<u8>> = Vec::with_capacity(total_rows);
+                        if random_access {
+                            // Per-row byte offsets: each row pulls its own
+                            // slice from `bytes` at offset data_runs[i] of
+                            // length determined by leng_runs expansion.
+                            let mut row_lens: Vec<u32> = Vec::with_capacity(total_rows);
+                            for (length, &run) in pm.lengths.iter().zip(pm.leng_runs.iter()) {
+                                for _ in 0..run {
+                                    row_lens.push(*length);
+                                }
+                            }
+                            for (i, &len) in row_lens.iter().enumerate() {
+                                let len = len as usize;
+                                if len == 0 {
+                                    rows.push(Vec::new());
+                                    continue;
+                                }
+                                let off = pm.data_runs.get(i).copied().unwrap_or(0) as usize;
+                                if off + len > bytes.len() {
+                                    return None;
+                                }
+                                rows.push(bytes[off..off + len].to_vec());
+                            }
+                        } else {
+                            // Run-length variant: one chunk per data record,
+                            // replicated `data_runs[i]` times (defaults to 1
+                            // when data_runs is empty).
+                            let rec_lens = pm.data_record_lengths();
+                            let mut cursor = 0usize;
+                            for (i, &len) in rec_lens.iter().enumerate() {
+                                let len = len as usize;
+                                let repeat = pm.data_runs.get(i).copied().unwrap_or(1) as usize;
+                                if cursor + len > bytes.len() {
+                                    return None;
+                                }
+                                let chunk = bytes[cursor..cursor + len].to_vec();
+                                for _ in 0..repeat {
+                                    rows.push(chunk.clone());
+                                }
+                                cursor += len;
                             }
                         }
-                        for (i, &len) in row_lens.iter().enumerate() {
-                            let len = len as usize;
-                            if len == 0 {
-                                rows.push(Vec::new());
-                                continue;
-                            }
-                            let off = pm.data_runs.get(i).copied().unwrap_or(0) as usize;
-                            if off + len > bytes.len() {
-                                return None;
-                            }
-                            rows.push(bytes[off..off + len].to_vec());
+                        if blob_idx == 0 {
+                            let nonempty = rows.iter().filter(|r| !r.is_empty()).count();
+                            tracing::debug!(
+                                "NAME_FMT blob 0: {} rows ({}), {} non-empty overrides",
+                                rows.len(),
+                                if random_access {
+                                    "random-access"
+                                } else {
+                                    "run-length"
+                                },
+                                nonempty,
+                            );
                         }
-                    } else {
-                        // Run-length variant: one chunk per data record,
-                        // replicated `data_runs[i]` times (defaults to 1
-                        // when data_runs is empty).
-                        let rec_lens = pm.data_record_lengths();
-                        let mut cursor = 0usize;
-                        for (i, &len) in rec_lens.iter().enumerate() {
-                            let len = len as usize;
-                            let repeat =
-                                pm.data_runs.get(i).copied().unwrap_or(1) as usize;
-                            if cursor + len > bytes.len() {
-                                return None;
-                            }
-                            let chunk = bytes[cursor..cursor + len].to_vec();
-                            for _ in 0..repeat {
-                                rows.push(chunk.clone());
-                            }
-                            cursor += len;
-                        }
-                    }
-                    if blob_idx == 0 {
-                        let nonempty = rows.iter().filter(|r| !r.is_empty()).count();
-                        tracing::debug!(
-                            "NAME_FMT blob 0: {} rows ({}), {} non-empty overrides",
-                            rows.len(),
-                            if random_access { "random-access" } else { "run-length" },
-                            nonempty,
-                        );
-                    }
-                    Some(rows)
-                })
-        } else {
-            None
-        };
+                        Some(rows)
+                    })
+            } else {
+                None
+            };
 
         if has_templates && !x_vals.is_empty() && !y_vals.is_empty() {
             let mut names = Vec::with_capacity(num_spots);
@@ -1150,35 +1149,36 @@ pub(crate) fn decode_blob_to_fastq(
             // spot number — never the mate-suffixed label, which is why
             // we accept it as an explicit parameter rather than letting
             // `append_fastq_record` derive it from `spot_label`).
-            let mut emit = |slot: OutputSlot, seg: &ReadSeg, spot_label: &[u8], desc: Option<&[u8]>| {
-                let buf = match records.iter_mut().find(|s| s.slot == slot) {
-                    Some(s) => s,
-                    None => {
-                        records.push(BlobSlotOutput {
-                            slot,
-                            bytes: Vec::new(),
-                            records: 0,
-                        });
-                        records.last_mut().unwrap()
+            let mut emit =
+                |slot: OutputSlot, seg: &ReadSeg, spot_label: &[u8], desc: Option<&[u8]>| {
+                    let buf = match records.iter_mut().find(|s| s.slot == slot) {
+                        Some(s) => s,
+                        None => {
+                            records.push(BlobSlotOutput {
+                                slot,
+                                bytes: Vec::new(),
+                                records: 0,
+                            });
+                            records.last_mut().unwrap()
+                        }
+                    };
+                    let seq = &sequence[seg.start..seg.start + seg.len];
+                    if config.fasta {
+                        append_fasta_record(&mut buf.bytes, run_name, spot_label, desc, seq);
+                    } else {
+                        let qual = &quality[seg.start..seg.start + seg.len];
+                        append_fastq_record(
+                            &mut buf.bytes,
+                            run_name,
+                            spot_label,
+                            desc,
+                            seq,
+                            qual,
+                            Some(diag),
+                        );
                     }
+                    buf.records += 1;
                 };
-                let seq = &sequence[seg.start..seg.start + seg.len];
-                if config.fasta {
-                    append_fasta_record(&mut buf.bytes, run_name, spot_label, desc, seq);
-                } else {
-                    let qual = &quality[seg.start..seg.start + seg.len];
-                    append_fastq_record(
-                        &mut buf.bytes,
-                        run_name,
-                        spot_label,
-                        desc,
-                        seq,
-                        qual,
-                        Some(diag),
-                    );
-                }
-                buf.records += 1;
-            };
 
             match config.split_mode {
                 SplitMode::Split3 => {
@@ -1216,7 +1216,12 @@ pub(crate) fn decode_blob_to_fastq(
                 }
                 SplitMode::SplitFiles => {
                     for (file_idx, seg) in segments.iter().enumerate() {
-                        emit(OutputSlot::ReadN(file_idx as u32), seg, spot_number, original_name);
+                        emit(
+                            OutputSlot::ReadN(file_idx as u32),
+                            seg,
+                            spot_number,
+                            original_name,
+                        );
                     }
                 }
             }

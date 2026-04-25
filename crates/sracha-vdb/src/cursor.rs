@@ -148,8 +148,7 @@ impl VdbCursor {
         let x_col = ColumnReader::open(archive, &format!("{seq_col_base}/{COL_X}"), sra_path).ok();
         let y_col = ColumnReader::open(archive, &format!("{seq_col_base}/{COL_Y}"), sra_path).ok();
         let name_fmt_col =
-            ColumnReader::open(archive, &format!("{seq_col_base}/{COL_NAME_FMT}"), sra_path)
-                .ok();
+            ColumnReader::open(archive, &format!("{seq_col_base}/{COL_NAME_FMT}"), sra_path).ok();
 
         if name_col.is_some() {
             tracing::debug!("found physical NAME/SPOT_NAME column");
@@ -361,8 +360,8 @@ impl VdbCursor {
         // id2ord) maps directly into it without any sort or rename.
         // Falls back to the older byte-scan-for-`$X` heuristic if the
         // offset-table doesn't validate (foreign archive layouts).
-        let templates: Vec<Vec<u8>> = parse_skey_offset_table(&skey_data)
-            .unwrap_or_else(|| parse_skey_byte_scan(&skey_data));
+        let templates: Vec<Vec<u8>> =
+            parse_skey_offset_table(&skey_data).unwrap_or_else(|| parse_skey_byte_scan(&skey_data));
 
         // Parse the skey header to get first spot_id and count.
         // The header is at the start of skey_data. Try v4 (40 bytes) then v2 (32 bytes).
@@ -423,9 +422,8 @@ impl VdbCursor {
         };
 
         'skey_search: for scan_pos in 0..skey_data.len().saturating_sub(4) {
-            let candidate = u32::from_le_bytes(
-                skey_data[scan_pos..scan_pos + 4].try_into().unwrap(),
-            );
+            let candidate =
+                u32::from_le_bytes(skey_data[scan_pos..scan_pos + 4].try_into().unwrap());
             // Heuristic: candidate must be >= templates.len() (at least one
             // ord2node entry per template) and cover at most ~10x — the
             // continuation entries we've observed never approach that
@@ -510,7 +508,9 @@ impl VdbCursor {
             let mut effective: Vec<u32> = Vec::with_capacity(proj_count);
             let mut last_node: u32 = 0;
             for &n in &ord2node {
-                let v = if n == 0 { last_node } else {
+                let v = if n == 0 {
+                    last_node
+                } else {
                     last_node = n;
                     n
                 };
@@ -696,7 +696,10 @@ fn parse_skey_offset_table(skey_data: &[u8]) -> Option<Vec<Vec<u8>>> {
     // Sanity: every template should contain `$X` (the position
     // placeholder fasterq-dump also looks for); reject the parse if
     // most don't.
-    let with_placeholder = templates.iter().filter(|t| t.windows(2).any(|w| w == b"$X")).count();
+    let with_placeholder = templates
+        .iter()
+        .filter(|t| t.windows(2).any(|w| w == b"$X"))
+        .count();
     if with_placeholder * 2 < templates.len() {
         return None;
     }
@@ -715,10 +718,7 @@ fn parse_skey_byte_scan(skey_data: &[u8]) -> Vec<Vec<u8>> {
     while i < skey_data.len() {
         if skey_data[i] == b'$' && i + 1 < skey_data.len() && skey_data[i + 1] == b'X' {
             let mut start = i;
-            while start > last_end
-                && skey_data[start - 1] >= 32
-                && skey_data[start - 1] < 127
-            {
+            while start > last_end && skey_data[start - 1] >= 32 && skey_data[start - 1] < 127 {
                 start -= 1;
             }
             let mut end = i;
