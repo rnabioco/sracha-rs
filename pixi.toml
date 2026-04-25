@@ -39,6 +39,10 @@ install-sratools = { cmd = "bash validation/install-sratools.sh", description = 
 # binaries are built in CI against musl targets and are unaffected.
 [feature.dev.dependencies]
 mold = ">=2.4"
+# clangdev provides libclang for bindgen — pulled in by vortex-metrics
+# → customlabels transitive dep in the sracha-index crate. CI builds
+# with --no-default-features for sracha-index to skip this.
+clangdev = ">=18"
 
 [feature.dev.tasks]
 build         = "mold -run cargo build"
