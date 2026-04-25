@@ -2,6 +2,7 @@
 //! shards.
 
 use clap::{Parser, Subcommand};
+use sracha_index::record::Platform;
 use sracha_index::{Error, Result, extractor, reader, writer};
 use vortex::VortexSessionDefault;
 use vortex::io::session::RuntimeSessionExt;
@@ -40,6 +41,12 @@ enum Cmd {
         /// Parallel extractor workers.
         #[arg(short = 'j', long, default_value = "32")]
         workers: usize,
+        /// Keep records for platforms sracha can't decode (default
+        /// drops them — the extractor will still pull metadata for
+        /// every accession, but only Illumina/PacBio/ONT/IonTorrent
+        /// rows land in the catalog).
+        #[arg(long)]
+        include_unsupported_platforms: bool,
     },
     /// Append a new delta shard to an existing catalog. Re-uses the
     /// same shard format; readers union over all shards in the
@@ -57,6 +64,10 @@ enum Cmd {
         /// Parallel extractor workers.
         #[arg(short = 'j', long, default_value = "32")]
         workers: usize,
+        /// Keep records for platforms sracha can't decode (default
+        /// drops them).
+        #[arg(long)]
+        include_unsupported_platforms: bool,
     },
     /// Query a catalog (single shard or multi-shard manifest) by
     /// accession id.
@@ -95,17 +106,35 @@ async fn main() -> Result<()> {
             output,
             shard_name,
             workers,
+            include_unsupported_platforms,
         } => {
-            run_build(&accession_list, &output, &shard_name, workers, false).await?;
+            run_build(
+                &accession_list,
+                &output,
+                &shard_name,
+                workers,
+                false,
+                !include_unsupported_platforms,
+            )
+            .await?;
         }
         Cmd::Append {
             accession_list,
             catalog,
             shard_name,
             workers,
+            include_unsupported_platforms,
         } => {
             let name = shard_name.unwrap_or_else(today_yyyy_mm_dd);
-            run_build(&accession_list, &catalog, &name, workers, true).await?;
+            run_build(
+                &accession_list,
+                &catalog,
+                &name,
+                workers,
+                true,
+                !include_unsupported_platforms,
+            )
+            .await?;
         }
         Cmd::Query { catalog, accession } => {
             let started = std::time::Instant::now();
@@ -144,6 +173,7 @@ async fn run_build(
     shard_name: &str,
     workers: usize,
     is_append: bool,
+    skip_unsupported_platforms: bool,
 ) -> Result<()> {
     use std::sync::Arc;
     use std::time::Instant;
@@ -193,6 +223,7 @@ async fn run_build(
     let mut total_extract_secs: f32 = 0.0;
     let mut n_ok = 0usize;
     let mut n_err = 0usize;
+    let mut n_skipped_platform = 0usize;
     // Log progress every PROGRESS_EVERY accessions so the user can
     // see the build moving without enabling -vv. Roughly aligned
     // with cluster job watching cadence (~once per few seconds at
@@ -208,8 +239,13 @@ async fn run_build(
             Ok(rec) => {
                 total_bytes_fetched += rec.bytes_fetched;
                 total_extract_secs += rec.extract_secs;
-                writer_obj.append(rec)?;
-                n_ok += 1;
+                if skip_unsupported_platforms && rec.platform == Platform::Other {
+                    tracing::debug!("{acc}: skipped (unsupported platform)");
+                    n_skipped_platform += 1;
+                } else {
+                    writer_obj.append(rec)?;
+                    n_ok += 1;
+                }
             }
             Err(e) => {
                 tracing::warn!("{acc}: extract failed: {e}");
@@ -227,6 +263,7 @@ async fn run_build(
             };
             tracing::info!(
                 "progress: done={done}/{total} ok={n_ok} err={n_err} \
+                 skipped_platform={n_skipped_platform} \
                  rate={rate:.1}/s elapsed={elapsed:.0}s eta={eta:.0}s \
                  fetched={}MB",
                 total_bytes_fetched / (1024 * 1024),
@@ -251,7 +288,8 @@ async fn run_build(
         wall,
     );
     tracing::info!(
-        "extracted {n_ok} ok / {n_err} err — {}MB pulled from S3 across all extractors, \
+        "extracted {n_ok} ok / {n_err} err / {n_skipped_platform} skipped (unsupported platform) — \
+         {}MB pulled from S3 across all extractors, \
          {:.1}s aggregate extractor wall ({:.1}x parallel speedup)",
         total_bytes_fetched / (1024 * 1024),
         total_extract_secs,
