@@ -697,17 +697,25 @@ fn decode_and_write(
                                 (&[], 0)
                             };
 
-                        let (rl_raw, rl_id_range): (&[u8], u64) =
-                            if has_read_len && bi < read_len_blob_count {
-                                let rlcol = cursor.read_len_col().unwrap();
-                                let rlblob = &rlcol.blobs()[bi];
-                                (
-                                    rlcol.read_raw_blob_slice(rlblob.start_id)?,
-                                    rlblob.id_range as u64,
-                                )
-                            } else {
-                                (&[], 0)
-                            };
+                        // READ_LEN by row id, not blob index: READ_LEN's
+                        // blobs may span more rows than READ's (DRR023226:
+                        // 4,726 vs 4,908 blobs), so index pairing fetches
+                        // the wrong lengths and overruns the READ buffer
+                        // mid-blob, dropping every spot afterward. Mirrors
+                        // the ALTREAD pattern below.
+                        let (rl_raw, rl_id_range, rl_start_id): (&[u8], u64, i64) = if has_read_len {
+                            let rlcol = cursor.read_len_col().unwrap();
+                            match rlcol.find_blob(read_start_id) {
+                                Some(blob) => (
+                                    rlcol.read_raw_blob_slice(blob.start_id)?,
+                                    blob.id_range as u64,
+                                    blob.start_id,
+                                ),
+                                None => (&[], 0, 0),
+                            }
+                        } else {
+                            (&[], 0, 0)
+                        };
 
                         let (n_raw, n_id_range): (&[u8], u64) = if has_name && bi < name_blob_count
                         {
@@ -790,6 +798,7 @@ fn decode_and_write(
                             quality_cs,
                             read_len_raw: rl_raw,
                             read_len_id_range: rl_id_range,
+                            read_len_start_id: rl_start_id,
                             read_len_cs,
                             name_raw: n_raw,
                             name_id_range: n_id_range,

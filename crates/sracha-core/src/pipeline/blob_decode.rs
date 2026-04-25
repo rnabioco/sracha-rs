@@ -88,6 +88,13 @@ pub(crate) struct RawBlobData<'a> {
     pub(crate) read_len_raw: &'a [u8],
     /// Row count for the READ_LEN blob (0 if absent).
     pub(crate) read_len_id_range: u64,
+    /// Start row id of the READ_LEN blob — needed when READ_LEN and READ
+    /// have different blob boundaries (e.g. DRR023226: READ has 4,908
+    /// blobs of 2,048 rows, READ_LEN has 4,726 blobs starting with one
+    /// of 374,784 rows). Look up by READ's starting row id and skip
+    /// `(read_start_id - read_len_start_id) * rps` length values to
+    /// reach the values that pair with this READ blob's spots.
+    pub(crate) read_len_start_id: i64,
     /// Checksum type for the READ_LEN column.
     pub(crate) read_len_cs: u8,
     /// NAME column raw bytes (empty if column absent).
@@ -508,10 +515,23 @@ pub(crate) fn decode_blob_to_fastq(
 
         let rl_bytes = decode_irzip_column(&rldecoded)?;
 
-        let lengths: Vec<u32> = rl_bytes
+        let mut lengths: Vec<u32> = rl_bytes
             .chunks_exact(4)
             .map(|chunk| u32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]))
             .collect();
+
+        // Trim to just the rows that pair with this READ blob: skip
+        // `(read_start_id - read_len_start_id) * rps` values from the
+        // front and keep `read_id_range * rps` values. Required when
+        // READ_LEN's blob covers more rows than READ's (DRR023226).
+        let row_offset =
+            (raw.read_start_id - raw.read_len_start_id).max(0) as usize * rps;
+        let row_take = raw.read_id_range as usize * rps;
+        if row_offset > 0 || lengths.len() > row_offset + row_take {
+            let end = (row_offset + row_take).min(lengths.len());
+            let start = row_offset.min(end);
+            lengths = lengths[start..end].to_vec();
+        }
 
         if blob_idx == 0 {
             tracing::debug!(
