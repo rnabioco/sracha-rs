@@ -2,7 +2,10 @@
 //! shards.
 
 use clap::{Parser, Subcommand};
-use sracha_index::{Result, extractor};
+use sracha_index::{Error, Result, extractor, writer};
+use vortex::VortexSessionDefault;
+use vortex::io::session::RuntimeSessionExt;
+use vortex::session::VortexSession;
 
 #[derive(Parser)]
 #[command(name = "sracha-index", about = "Build/query the sracha SRA metadata catalog")]
@@ -68,11 +71,7 @@ async fn main() -> Result<()> {
             output,
             workers,
         } => {
-            tracing::warn!(
-                "build is not yet implemented (would read {}, write {}, with {workers} workers)",
-                accession_list.display(),
-                output.display(),
-            );
+            run_build(&accession_list, &output, workers).await?;
         }
         Cmd::Query { shard, accession } => {
             tracing::warn!(
@@ -81,5 +80,81 @@ async fn main() -> Result<()> {
             );
         }
     }
+    Ok(())
+}
+
+async fn run_build(
+    accession_list: &std::path::Path,
+    output: &std::path::Path,
+    workers: usize,
+) -> Result<()> {
+    use std::sync::Arc;
+    use std::time::Instant;
+    use tokio::sync::Semaphore;
+
+    let raw = std::fs::read_to_string(accession_list)?;
+    let accessions: Vec<String> = raw
+        .lines()
+        .map(str::trim)
+        .filter(|l| !l.is_empty() && !l.starts_with('#'))
+        .map(String::from)
+        .collect();
+    let total = accessions.len();
+    if total == 0 {
+        return Err(Error::Extractor("empty accession list".into()));
+    }
+    tracing::info!("building shard for {total} accessions with {workers} parallel workers");
+
+    let started = Instant::now();
+    let sem = Arc::new(Semaphore::new(workers));
+    let mut handles = Vec::with_capacity(total);
+    for acc in accessions {
+        let permit = sem.clone();
+        handles.push(tokio::spawn(async move {
+            let _p = permit.acquire().await.unwrap();
+            (acc.clone(), extractor::extract(&acc).await)
+        }));
+    }
+
+    let mut writer_obj = writer::ShardWriter::create(output)?;
+    let mut total_bytes_fetched: u64 = 0;
+    let mut total_extract_secs: f32 = 0.0;
+    let mut n_ok = 0usize;
+    let mut n_err = 0usize;
+
+    for h in handles {
+        let (acc, res) = h.await.map_err(|e| Error::Extractor(format!("join: {e}")))?;
+        match res {
+            Ok(rec) => {
+                total_bytes_fetched += rec.bytes_fetched;
+                total_extract_secs += rec.extract_secs;
+                writer_obj.append(rec)?;
+                n_ok += 1;
+            }
+            Err(e) => {
+                tracing::warn!("{acc}: extract failed: {e}");
+                n_err += 1;
+            }
+        }
+    }
+
+    let session = VortexSession::default().with_tokio();
+    let summary = writer_obj.finish(&session).await?;
+
+    let wall = started.elapsed().as_secs_f32();
+    eprintln!(
+        "built {} ({} accessions, {} schemas, {} bytes shard) in {:.1}s wall",
+        summary.path.display(),
+        summary.n_accessions,
+        summary.n_schemas,
+        summary.bytes,
+        wall,
+    );
+    eprintln!(
+        "extracted {n_ok} ok / {n_err} err — {} MB pulled from S3 across all extractors, {:.1}s aggregate extractor wall ({:.1}x parallel speedup)",
+        total_bytes_fetched / (1024 * 1024),
+        total_extract_secs,
+        total_extract_secs / wall.max(0.001),
+    );
     Ok(())
 }

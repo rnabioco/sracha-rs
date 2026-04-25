@@ -22,8 +22,9 @@ clap.workspace = true
 md-5.workspace = true
 sha2 = "0.11"
 
-# Storage format: Vortex first, fall back to Parquet only if file I/O proves too thin.
-vortex = "0.68"
+# Storage format. `tokio` feature enables RuntimeSessionExt::with_tokio
+# so the writer/reader can attach to the existing #[tokio::main] runtime.
+vortex = { version = "0.68", features = ["tokio"] }
 
 [[bin]]
 name = "sracha-index"

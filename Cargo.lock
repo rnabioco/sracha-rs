@@ -4166,6 +4166,7 @@ dependencies = [
  "flatbuffers",
  "jiff",
  "prost",
+ "tokio",
 ]
 
 [[package]]
@@ -4203,6 +4204,7 @@ dependencies = [
  "oneshot",
  "parking_lot",
  "pin-project-lite",
+ "tokio",
  "tracing",
  "uuid",
  "vortex-alp",
@@ -4331,6 +4333,7 @@ dependencies = [
  "rustc-hash",
  "sketches-ddsketch",
  "termtree 1.0.0",
+ "tokio",
  "tracing",
  "vortex-array",
  "vortex-btrblocks",
