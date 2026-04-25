@@ -119,10 +119,12 @@ pub struct SchemaEntry {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ColumnMetaEntry {
     pub name: String,
-    pub codec: u32,         // checksum_type / codec id
-    pub page_size: u32,     // 0 means byte-addressed
-    pub element_bits: u32,  // bits per element
-    pub default_value: Option<Vec<u8>>,
+    /// VDB schema version (1 / 2+).
+    pub version: u32,
+    /// Codec / checksum_type id (see `sracha-vdb::kdb::ColumnMeta`).
+    pub codec: u32,
+    /// Page size in bytes; 0/1 means byte-addressed (no paging).
+    pub page_size: u32,
 }
 
 /// Illumina skey templates. Stored in a separate, narrow table.
