@@ -1,8 +1,9 @@
 //! Vortex shard reader / query API.
 //!
-//! Opens a shard (or set of shards via a manifest) and supports
-//! point-lookup by accession id plus simple range filters. Designed
-//! for HTTP Range queries against a remote-hosted Vortex file.
+//! v0 stub. Reader implementation iterates after we have a real
+//! populated shard to test against — the writer + build path comes
+//! first so we can validate the index format on a few-thousand-
+//! accession corpus.
 
 use crate::record::AccessionRecord;
 use crate::{Error, Result};

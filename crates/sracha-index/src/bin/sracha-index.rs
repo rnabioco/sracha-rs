@@ -121,8 +121,14 @@ async fn run_build(
     let mut total_extract_secs: f32 = 0.0;
     let mut n_ok = 0usize;
     let mut n_err = 0usize;
+    // Log progress every PROGRESS_EVERY accessions so the user can
+    // see the build moving without enabling -vv. Roughly aligned
+    // with cluster job watching cadence (~once per few seconds at
+    // 16 workers × 1 sec/accession).
+    const PROGRESS_EVERY: usize = 100;
+    let mut last_log = Instant::now();
 
-    for h in handles {
+    for (i, h) in handles.into_iter().enumerate() {
         let (acc, res) = h.await.map_err(|e| Error::Extractor(format!("join: {e}")))?;
         match res {
             Ok(rec) => {
@@ -136,13 +142,31 @@ async fn run_build(
                 n_err += 1;
             }
         }
+        let done = i + 1;
+        if done % PROGRESS_EVERY == 0 || done == total {
+            let elapsed = started.elapsed().as_secs_f32();
+            let rate = done as f32 / elapsed.max(0.001);
+            let eta = if rate > 0.0 {
+                (total - done) as f32 / rate
+            } else {
+                0.0
+            };
+            tracing::info!(
+                "progress: done={done}/{total} ok={n_ok} err={n_err} \
+                 rate={rate:.1}/s elapsed={elapsed:.0}s eta={eta:.0}s \
+                 fetched={}MB",
+                total_bytes_fetched / (1024 * 1024),
+            );
+            last_log = Instant::now();
+        }
+        let _ = last_log;
     }
 
     let session = VortexSession::default().with_tokio();
     let summary = writer_obj.finish(&session).await?;
 
     let wall = started.elapsed().as_secs_f32();
-    eprintln!(
+    tracing::info!(
         "built {} ({} accessions, {} schemas, {} bytes shard) in {:.1}s wall",
         summary.path.display(),
         summary.n_accessions,
@@ -150,8 +174,9 @@ async fn run_build(
         summary.bytes,
         wall,
     );
-    eprintln!(
-        "extracted {n_ok} ok / {n_err} err — {} MB pulled from S3 across all extractors, {:.1}s aggregate extractor wall ({:.1}x parallel speedup)",
+    tracing::info!(
+        "extracted {n_ok} ok / {n_err} err — {}MB pulled from S3 across all extractors, \
+         {:.1}s aggregate extractor wall ({:.1}x parallel speedup)",
         total_bytes_fetched / (1024 * 1024),
         total_extract_secs,
         total_extract_secs / wall.max(0.001),

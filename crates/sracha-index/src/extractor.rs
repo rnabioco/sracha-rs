@@ -166,8 +166,23 @@ pub async fn extract(accession: &str) -> Result<AccessionRecord> {
             continue;
         }
 
-        let reader = ColumnReader::from_parts(&idx1, &idx0, &idx, &idx2, Vec::new())
-            .map_err(Error::Vdb)?;
+        // Some columns hit `idx0 size N is not a multiple of 24` on
+        // newer VDB schema variants (the idx0 layout differs from the
+        // legacy fixed-24-byte BlobLoc table). Skip those columns
+        // rather than fail the whole accession — we still emit
+        // partial blob locators for the columns that did parse, and
+        // sracha-core's full ColumnReader::open path handles these
+        // accessions correctly so the index data gap is recoverable
+        // at decode time. Tracked as a sracha-vdb hardening TODO.
+        let reader = match ColumnReader::from_parts(&idx1, &idx0, &idx, &idx2, Vec::new()) {
+            Ok(r) => r,
+            Err(e) => {
+                tracing::debug!(
+                    "{accession}: column {col} from_parts failed: {e} (skipping)"
+                );
+                continue;
+            }
+        };
 
         // Resolve the absolute byte offset of THIS column's data slab.
         // For accessions where the column has no `data` entry (e.g.
