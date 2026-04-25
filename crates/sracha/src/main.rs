@@ -1,4 +1,6 @@
 mod cli;
+#[cfg(feature = "catalog")]
+mod index_cmd;
 mod progress;
 mod style;
 mod vdb_cmd;
@@ -171,6 +173,7 @@ async fn main() -> Result<()> {
                 args.prefer_sdl,
                 false,
                 args.format.into(),
+                sracha_core::s3::DEFAULT_PROBE_CONCURRENCY,
             )
             .await?;
             sp.finish(format!(
@@ -351,7 +354,13 @@ async fn main() -> Result<()> {
                 cli::resolve_split_mode(args.split, args.stdout).map_err(|e| anyhow::anyhow!(e))?;
 
             let raw = collect_accessions(&args.accessions, args.accession_list.as_deref())?;
-            let http_client = sracha_core::http::default_client();
+            // Size the per-host pool to whichever is larger: the user's
+            // chosen `--head-concurrency` or the default pool size, so
+            // the resolve-phase semaphore isn't pool-limited.
+            let pool_size = args
+                .head_concurrency
+                .max(sracha_core::http::DEFAULT_POOL_MAX_IDLE_PER_HOST);
+            let http_client = sracha_core::http::client_with_pool(pool_size);
             let sdl_client = SdlClient::with_client(http_client.clone());
 
             let compression = cli::resolve_compression(
@@ -402,12 +411,14 @@ async fn main() -> Result<()> {
             // catalog hits — visible mostly on small or first-
             // byte-latency-sensitive `--stream` invocations.
             #[cfg(feature = "catalog")]
-            let catalog_hits: Vec<Option<ResolvedAccession>> =
-                if let Some(catalog_dir) = args.catalog.as_ref() {
-                    catalog_resolve(catalog_dir, &run_accessions).await
+            let catalog_hits: Vec<Option<ResolvedAccession>> = {
+                let resolved = resolve_catalog_dir(args.catalog.as_deref());
+                if let Some(catalog_dir) = resolved {
+                    catalog_resolve(&catalog_dir, &run_accessions).await
                 } else {
                     vec![None; run_accessions.len()]
-                };
+                }
+            };
             #[cfg(not(feature = "catalog"))]
             let catalog_hits: Vec<Option<ResolvedAccession>> = vec![None; run_accessions.len()];
 
@@ -429,6 +440,7 @@ async fn main() -> Result<()> {
                     args.prefer_sdl,
                     !args.no_runinfo,
                     args.format.into(),
+                    args.head_concurrency,
                 )
                 .await?
             };
@@ -908,6 +920,7 @@ async fn main() -> Result<()> {
                 false, // prefer_sdl
                 true,  // need_run_info
                 sracha_core::sdl::FormatPreference::Sra,
+                sracha_core::s3::DEFAULT_PROBE_CONCURRENCY,
             )
             .await
             {
@@ -1117,6 +1130,9 @@ async fn main() -> Result<()> {
             Ok(())
         }
         Command::Vdb(args) => vdb_cmd::run(args.cmd),
+
+        #[cfg(feature = "catalog")]
+        Command::Index(args) => index_cmd::run(args.cmd).await,
 
         Command::Clean(args) => run_clean(&args),
     }
@@ -1786,6 +1802,26 @@ const LARGE_DOWNLOAD_THRESHOLD: u64 = 100 * 1024 * 1024 * 1024; // 100 GiB
 /// When `need_run_info` is `true`, fetches read structure metadata via EUtils
 /// for FASTQ conversion (needed by the `get` command).
 /// When `format` is `Sralite`, skips S3 (SRA-lite files are not on the ODP bucket).
+/// Resolve which catalog dir, if any, the resolver should consult.
+///
+/// Priority: explicit `--catalog DIR` wins. Otherwise, fall back to
+/// the user's cache dir (`$XDG_CACHE_HOME/sracha/catalog/` or
+/// `~/.cache/sracha/catalog/`) if a `manifest.json` is present —
+/// i.e. the user has run `sracha index update`. Returns `None` if
+/// nothing is usable; callers go straight to S3/SDL.
+#[cfg(feature = "catalog")]
+fn resolve_catalog_dir(explicit: Option<&Path>) -> Option<std::path::PathBuf> {
+    if let Some(p) = explicit {
+        return Some(p.to_path_buf());
+    }
+    let cache_dir = sracha_index::cache::resolve_cache_dir().ok()?;
+    if cache_dir.join("manifest.json").is_file() {
+        Some(cache_dir)
+    } else {
+        None
+    }
+}
+
 /// Look up every accession in a sracha-index catalog. Returns one
 /// element per input — `Some(ResolvedAccession)` for hits,
 /// `None` for misses (caller falls back to S3/SDL).
@@ -1857,6 +1893,7 @@ async fn resolve_accessions(
     prefer_sdl: bool,
     need_run_info: bool,
     format: sracha_core::sdl::FormatPreference,
+    head_concurrency: usize,
 ) -> Result<Vec<ResolvedAccession>> {
     // SRA-lite files are not on the free S3 ODP bucket, so we must use SDL.
     if prefer_sdl || format == sracha_core::sdl::FormatPreference::Sralite {
@@ -1881,7 +1918,11 @@ async fn resolve_accessions(
         "probing direct S3 for {} accession(s)...",
         run_accessions.len()
     );
-    let s3_future = sracha_core::s3::resolve_direct_many(client.http_client(), run_accessions);
+    let s3_future = sracha_core::s3::resolve_direct_many_with_concurrency(
+        client.http_client(),
+        run_accessions,
+        head_concurrency,
+    );
     let run_info_future = async {
         if need_run_info {
             Some(client.fetch_run_info_batch(run_accessions).await)

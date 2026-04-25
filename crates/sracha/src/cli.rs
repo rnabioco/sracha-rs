@@ -75,6 +75,10 @@ pub enum Command {
     /// Inspect VDB structure of a local .sra file (replacement for vdb-dump)
     Vdb(VdbArgs),
 
+    /// Manage the local catalog cache (download, status, clear)
+    #[cfg(feature = "catalog")]
+    Index(IndexArgs),
+
     /// Delete leftover temp/partial-download files from a directory
     ///
     /// Removes the debris left by interrupted `sracha get`/`fetch`/`fastq`
@@ -505,6 +509,35 @@ pub struct GetArgs {
     /// split-3 or split-files (Phase 1 scope). Skips VDB decode entirely.
     #[arg(long, help_heading = "Advanced")]
     pub prefer_ena: bool,
+
+    /// Max concurrent S3 HEAD probes during accession resolution.
+    /// Default 64; clamped to 1–256. The HTTP client's per-host
+    /// connection pool is sized to match this value at startup, so
+    /// raising it actually opens more sockets to the SRA bucket
+    /// (rather than queueing on the pool). Values above ~128 rarely
+    /// help and risk hitting bucket-side rate limits.
+    #[arg(
+        long,
+        help_heading = "Advanced",
+        value_name = "N",
+        default_value_t = sracha_core::s3::DEFAULT_PROBE_CONCURRENCY,
+        value_parser = parse_head_concurrency,
+    )]
+    pub head_concurrency: usize,
+}
+
+const HEAD_CONCURRENCY_MAX: usize = 256;
+
+fn parse_head_concurrency(s: &str) -> Result<usize, String> {
+    let n: usize = s
+        .parse()
+        .map_err(|_| format!("`{s}` is not a non-negative integer"))?;
+    if !(1..=HEAD_CONCURRENCY_MAX).contains(&n) {
+        return Err(format!(
+            "head-concurrency must be between 1 and {HEAD_CONCURRENCY_MAX} (got {n})",
+        ));
+    }
+    Ok(n)
 }
 
 #[derive(Args)]
@@ -639,4 +672,64 @@ pub fn resolve_compression(
             level: gzip_level.unwrap_or(6),
         }
     }
+}
+
+#[cfg(feature = "catalog")]
+#[derive(Args)]
+pub struct IndexArgs {
+    #[command(subcommand)]
+    pub cmd: IndexCmd,
+}
+
+#[cfg(feature = "catalog")]
+#[derive(Subcommand)]
+pub enum IndexCmd {
+    /// Download the hosted catalog into the local cache
+    ///
+    /// Pulls the manifest plus any shards not already on disk. Use
+    /// `--force` to re-download everything. The cache lives in
+    /// `$XDG_CACHE_HOME/sracha/catalog/` (override with
+    /// `--cache-dir` or `$SRACHA_CATALOG_DIR`).
+    Update {
+        /// Override the catalog base URL (also via `$SRACHA_INDEX_URL`).
+        #[arg(long, value_name = "URL")]
+        index_url: Option<String>,
+
+        /// Override the cache directory (also via `$SRACHA_CATALOG_DIR`).
+        #[arg(long, value_name = "DIR")]
+        cache_dir: Option<PathBuf>,
+
+        /// Re-download shards even if they already exist locally.
+        #[arg(long)]
+        force: bool,
+
+        /// Disable progress bar.
+        #[arg(long)]
+        no_progress: bool,
+    },
+
+    /// Show local catalog version, shard count, age, and on-disk size
+    Status {
+        /// Override the cache directory.
+        #[arg(long, value_name = "DIR")]
+        cache_dir: Option<PathBuf>,
+    },
+
+    /// Print the resolved cache directory path (scriptable; no other output)
+    Path {
+        /// Override the cache directory (echoed verbatim if set).
+        #[arg(long, value_name = "DIR")]
+        cache_dir: Option<PathBuf>,
+    },
+
+    /// Delete the local catalog cache
+    Clear {
+        /// Override the cache directory.
+        #[arg(long, value_name = "DIR")]
+        cache_dir: Option<PathBuf>,
+
+        /// Show what would be deleted without removing anything.
+        #[arg(long)]
+        dry_run: bool,
+    },
 }

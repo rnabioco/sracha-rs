@@ -13,8 +13,10 @@
 //! - [`writer`] / [`reader`] — Vortex shard I/O.
 //! - [`schema`] — column-by-column encoding strategy notes.
 
+pub mod cache;
 pub mod error;
 pub mod extractor;
+pub mod fetch;
 pub mod reader;
 pub mod record;
 pub mod schema;
