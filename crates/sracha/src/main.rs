@@ -171,6 +171,7 @@ async fn main() -> Result<()> {
                 args.prefer_sdl,
                 false,
                 args.format.into(),
+                sracha_core::s3::DEFAULT_PROBE_CONCURRENCY,
             )
             .await?;
             sp.finish(format!(
@@ -348,7 +349,13 @@ async fn main() -> Result<()> {
                 cli::resolve_split_mode(args.split, args.stdout).map_err(|e| anyhow::anyhow!(e))?;
 
             let raw = collect_accessions(&args.accessions, args.accession_list.as_deref())?;
-            let http_client = sracha_core::http::default_client();
+            // Size the per-host pool to whichever is larger: the user's
+            // chosen `--head-concurrency` or the default pool size, so
+            // the resolve-phase semaphore isn't pool-limited.
+            let pool_size = args
+                .head_concurrency
+                .max(sracha_core::http::DEFAULT_POOL_MAX_IDLE_PER_HOST);
+            let http_client = sracha_core::http::client_with_pool(pool_size);
             let sdl_client = SdlClient::with_client(http_client.clone());
 
             let compression = cli::resolve_compression(
@@ -399,6 +406,7 @@ async fn main() -> Result<()> {
                 args.prefer_sdl,
                 !args.no_runinfo,
                 args.format.into(),
+                args.head_concurrency,
             )
             .await?;
             sp.finish(format!(
@@ -778,6 +786,7 @@ async fn main() -> Result<()> {
                 false, // prefer_sdl
                 true,  // need_run_info
                 sracha_core::sdl::FormatPreference::Sra,
+                sracha_core::s3::DEFAULT_PROBE_CONCURRENCY,
             )
             .await
             {
@@ -1577,6 +1586,7 @@ async fn resolve_accessions(
     prefer_sdl: bool,
     need_run_info: bool,
     format: sracha_core::sdl::FormatPreference,
+    head_concurrency: usize,
 ) -> Result<Vec<ResolvedAccession>> {
     // SRA-lite files are not on the free S3 ODP bucket, so we must use SDL.
     if prefer_sdl || format == sracha_core::sdl::FormatPreference::Sralite {
@@ -1601,7 +1611,11 @@ async fn resolve_accessions(
         "probing direct S3 for {} accession(s)...",
         run_accessions.len()
     );
-    let s3_future = sracha_core::s3::resolve_direct_many(client.http_client(), run_accessions);
+    let s3_future = sracha_core::s3::resolve_direct_many_with_concurrency(
+        client.http_client(),
+        run_accessions,
+        head_concurrency,
+    );
     let run_info_future = async {
         if need_run_info {
             Some(client.fetch_run_info_batch(run_accessions).await)
