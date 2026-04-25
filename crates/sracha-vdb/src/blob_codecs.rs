@@ -159,6 +159,23 @@ pub fn decode_zip_encoding(decoded: &blob::DecodedBlob<'_>) -> Result<Vec<u8>> {
         .filter(|&s| s > 0);
     let estimated = osize.unwrap_or(decoded.data.len() * 4);
 
+    // Raw passthrough: when the encoder skipped compression (ops/args empty
+    // and the header's osize matches the on-disk byte count), the payload
+    // is already the uncompressed data. This shows up on small ALTREAD
+    // blobs (DRR019046 blob 160 — 16 raw 4na bytes for 32,768 rows whose
+    // page_map expands them into one trailing N per spot) where deflate
+    // and zlib would both fail and the previous size-only fallback only
+    // covered ≤12-byte payloads, silently dropping every N. Mirrors the
+    // pattern already used by `decode_irzip_column`.
+    if hdr_version >= 1
+        && let Some(hdr) = decoded.headers.first()
+        && hdr.ops.is_empty()
+        && hdr.args.is_empty()
+        && hdr.osize as usize == decoded.data.len()
+    {
+        return Ok(decoded.data.to_vec());
+    }
+
     if let Ok(mut out) = blob::deflate_decompress(&decoded.data, estimated)
         && !out.is_empty()
     {
@@ -442,6 +459,39 @@ mod tests {
         let blob = make_blob(vec![], None);
         let out = decode_zip_encoding(&blob).unwrap();
         assert!(out.is_empty());
+    }
+
+    #[test]
+    fn decode_zip_encoding_raw_passthrough_when_ops_empty_and_sizes_match() {
+        // Reproduces DRR019046 ALTREAD blob 160: a v1 zip_encoding header
+        // with no ops/args where the 16-byte payload is the uncompressed
+        // 4na overlay. Both deflate and zlib reject the bytes (0x0F is not
+        // a valid header), and the previous size-only ≤12-byte fallback
+        // didn't catch it — silently dropping every N annotation in the
+        // blob's 32,768 spots. The header's `osize == data.len()` signal
+        // is the canonical "encoder skipped compression" tell.
+        use crate::blob::BlobHeaderFrame;
+        let raw = vec![
+            0x0f, 0x0f, 0x00, 0x00, 0x0f, 0x0f, 0x0f, 0x00, 0x00, 0x0f, 0x0f, 0x0f, 0x00, 0x00,
+            0x0f, 0x0f,
+        ];
+        let blob = DecodedBlob {
+            data: Cow::Owned(raw.clone()),
+            adjust: 0,
+            big_endian: false,
+            headers: vec![BlobHeaderFrame {
+                flags: 0,
+                version: 1,
+                fmt: 0,
+                osize: raw.len() as u64,
+                ops: vec![],
+                args: vec![],
+            }],
+            page_map: None,
+            row_length: None,
+        };
+        let out = decode_zip_encoding(&blob).expect("raw passthrough must succeed");
+        assert_eq!(out, raw);
     }
 
     #[test]
