@@ -3345,6 +3345,7 @@ dependencies = [
  "predicates",
  "serde_json",
  "sracha-core",
+ "sracha-index",
  "tabled",
  "tempfile",
  "tokio",

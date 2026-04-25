@@ -1704,7 +1704,7 @@ pub async fn download_sra(
     resolved: &ResolvedAccession,
     config: &PipelineConfig,
 ) -> Result<DownloadedSra> {
-    download_sra_inner(resolved, config, None).await
+    download_sra_inner(resolved, config, None, None).await
 }
 
 /// Streaming variant of [`download_sra`]: hands the freshly-constructed
@@ -1724,7 +1724,23 @@ pub async fn download_sra_streaming(
         Arc<crate::download::chunk_ready::ChunkReadyTracker>,
     >,
 ) -> Result<DownloadedSra> {
-    download_sra_inner(resolved, config, Some(tracker_init)).await
+    download_sra_inner(resolved, config, Some(tracker_init), None).await
+}
+
+/// Variant of [`download_sra_streaming`] that uses a pre-allocated
+/// [`InMemoryHandle`] (typically a memfd opened by
+/// [`run_get_streaming`] before the download task starts) instead
+/// of creating a new one. Lets the caller reserve the path early
+/// so the decode task can mmap it concurrently with the download.
+pub async fn download_sra_streaming_with_handle(
+    resolved: &ResolvedAccession,
+    config: &PipelineConfig,
+    tracker_init: tokio::sync::oneshot::Sender<
+        Arc<crate::download::chunk_ready::ChunkReadyTracker>,
+    >,
+    existing_in_memory: Arc<InMemoryHandle>,
+) -> Result<DownloadedSra> {
+    download_sra_inner(resolved, config, Some(tracker_init), Some(existing_in_memory)).await
 }
 
 /// First-stage metadata gate for streaming decode. Waits for the bytes
@@ -1788,6 +1804,7 @@ async fn download_sra_inner(
     tracker_init: Option<
         tokio::sync::oneshot::Sender<Arc<crate::download::chunk_ready::ChunkReadyTracker>>,
     >,
+    existing_in_memory: Option<Arc<InMemoryHandle>>,
 ) -> Result<DownloadedSra> {
     let accession = &resolved.accession;
     let total_sra_size = resolved.sra_file.size;
@@ -1830,7 +1847,17 @@ async fn download_sra_inner(
     // open it unchanged. The handle stays in `DownloadedSra` so the
     // fd remains valid for the cursor.
     let (temp_path, in_memory_handle): (PathBuf, Option<Arc<InMemoryHandle>>) =
-        if config.in_memory {
+        if let Some(existing) = existing_in_memory {
+            // Caller (e.g. run_get_streaming) pre-allocated the
+            // memfd. Reuse its path so the decode task can mmap the
+            // same fd while we pwrite into it from the worker pool.
+            let path = existing.0.path.clone();
+            tracing::info!(
+                "{accession}: streaming via caller-provided memory ({})",
+                path.display(),
+            );
+            (path, Some(existing))
+        } else if config.in_memory {
             let store = crate::download::in_memory::BackingStore::open(total_sra_size)
                 .map_err(Error::Io)?;
             let path = store.path.clone();
@@ -2122,6 +2149,11 @@ pub fn decode_sra(downloaded: &DownloadedSra, config: &PipelineConfig) -> Result
         // Drop the progress sidecar — download is fully verified at this point.
         let sidecar = crate::download::progress_path(&downloaded.temp_path);
         let _ = std::fs::remove_file(&sidecar);
+    } else if downloaded.in_memory.is_some() {
+        // In-memory mode: the BackingStore drop will release the
+        // memfd / NamedTempFile. Don't try to unlink
+        // /proc/self/fd/N — that's a procfs pseudofile and
+        // remove_file would EPERM.
     } else if let Err(e) = std::fs::remove_file(&downloaded.temp_path) {
         tracing::warn!(
             "{}: failed to remove temp file {}: {e}",
@@ -2253,13 +2285,18 @@ pub async fn run_get_streaming(
     resolved: &ResolvedAccession,
     config: &PipelineConfig,
 ) -> Result<PipelineStats> {
-    // In `--stream` (in_memory) mode, fall back to the legacy
-    // download-then-decode flow. The streaming-decode path
-    // pre-constructs a temp_path before the download task runs,
-    // which is incompatible with memfd whose path is created
-    // INSIDE download_sra. A future iteration can pre-create the
-    // BackingStore and share its path; for now we accept losing
-    // the in-flight overlap to gain "no disk".
+    // `--stream` (in_memory) currently falls back to legacy
+    // download-then-decode. The composed flow (pre-allocate memfd,
+    // run download + decode concurrently against the same fd) hit
+    // a correctness regression on ERR1018173-class fixtures —
+    // decode read zeros from un-pwritten regions despite the
+    // chunk_ready tracker. Likely a coherence quirk between
+    // multi-fd memfd writes and mmap-cached reads on shmfs that
+    // doesn't manifest on smaller fixtures (SRR2584863 passed). The
+    // fix needs proper diagnosis; until then we ship the correct
+    // download-then-decode path. Trade: lose the in-flight overlap
+    // for --stream; FASTQ output is byte-identical to disk path
+    // either way.
     if config.in_memory {
         let downloaded = download_sra(resolved, config).await?;
         return tokio::task::block_in_place(|| decode_sra(&downloaded, config));
@@ -2337,6 +2374,7 @@ pub async fn run_get_streaming(
     let temp_path = config
         .output_dir
         .join(format!(".sracha-tmp-{}.sra", resolved.accession));
+    let synthetic_in_memory: Option<Arc<InMemoryHandle>> = None;
     let synthetic = DownloadedSra {
         temp_path,
         bytes_transferred: 0,
@@ -2345,7 +2383,7 @@ pub async fn run_get_streaming(
         accession: resolved.accession.clone(),
         sra_md5: resolved.sra_file.md5.clone(),
         chunk_ready: Some(tracker),
-        in_memory: None,
+        in_memory: synthetic_in_memory,
     };
 
     // Spawn decode on a blocking thread (decode_sra is sync and uses

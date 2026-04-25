@@ -13,6 +13,7 @@ path = "src/main.rs"
 
 [dependencies]
 sracha-core.workspace = true
+sracha-index = { path = "../sracha-index", optional = true }
 chrono.workspace = true
 clap.workspace = true
 serde_json.workspace = true
@@ -23,6 +24,13 @@ tracing-subscriber.workspace = true
 indicatif.workspace = true
 owo-colors.workspace = true
 tabled.workspace = true
+
+[features]
+default = ["catalog"]
+# Pull in the sracha-index crate (vortex, ~50 transitive deps) for
+# `--catalog` fast-resolve. Build with --no-default-features to
+# strip it for slimmer release binaries.
+catalog = ["dep:sracha-index"]
 
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"

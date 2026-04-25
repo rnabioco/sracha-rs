@@ -396,14 +396,50 @@ async fn main() -> Result<()> {
                 "Resolving {} accession(s)",
                 style::count(run_accessions.len()),
             ));
-            let resolved_all = resolve_accessions(
-                &run_accessions,
-                &sdl_client,
-                args.prefer_sdl,
-                !args.no_runinfo,
-                args.format.into(),
-            )
-            .await?;
+            // Catalog fast-path: when --catalog is set, look up
+            // every accession there first; only fall through to
+            // S3+SDL for misses. Saves the HEAD round-trip on
+            // catalog hits — visible mostly on small or first-
+            // byte-latency-sensitive `--stream` invocations.
+            #[cfg(feature = "catalog")]
+            let catalog_hits: Vec<Option<ResolvedAccession>> =
+                if let Some(catalog_dir) = args.catalog.as_ref() {
+                    catalog_resolve(catalog_dir, &run_accessions).await
+                } else {
+                    vec![None; run_accessions.len()]
+                };
+            #[cfg(not(feature = "catalog"))]
+            let catalog_hits: Vec<Option<ResolvedAccession>> = vec![None; run_accessions.len()];
+
+            let miss_indices: Vec<usize> = catalog_hits
+                .iter()
+                .enumerate()
+                .filter_map(|(i, h)| if h.is_none() { Some(i) } else { None })
+                .collect();
+            let miss_accessions: Vec<String> = miss_indices
+                .iter()
+                .map(|i| run_accessions[*i].clone())
+                .collect();
+            let miss_resolved = if miss_accessions.is_empty() {
+                Vec::new()
+            } else {
+                resolve_accessions(
+                    &miss_accessions,
+                    &sdl_client,
+                    args.prefer_sdl,
+                    !args.no_runinfo,
+                    args.format.into(),
+                )
+                .await?
+            };
+            let mut miss_iter = miss_resolved.into_iter();
+            let resolved_all: Vec<ResolvedAccession> = catalog_hits
+                .into_iter()
+                .map(|h| match h {
+                    Some(r) => r,
+                    None => miss_iter.next().expect("miss/iter mismatch"),
+                })
+                .collect();
             sp.finish(format!(
                 "Resolved {} accession(s)",
                 style::count(resolved_all.len()),
@@ -1750,6 +1786,71 @@ const LARGE_DOWNLOAD_THRESHOLD: u64 = 100 * 1024 * 1024 * 1024; // 100 GiB
 /// When `need_run_info` is `true`, fetches read structure metadata via EUtils
 /// for FASTQ conversion (needed by the `get` command).
 /// When `format` is `Sralite`, skips S3 (SRA-lite files are not on the ODP bucket).
+/// Look up every accession in a sracha-index catalog. Returns one
+/// element per input — `Some(ResolvedAccession)` for hits,
+/// `None` for misses (caller falls back to S3/SDL).
+///
+/// Catalog data lacks `md5` (extractor TODO) and run_info, so the
+/// returned ResolvedAccession has `md5: None` (download skips MD5
+/// verification) and `run_info: None` (decoder derives layout
+/// from VDB metadata). Both are recoverable; the catalog only
+/// shortcuts the S3 HEAD probe.
+#[cfg(feature = "catalog")]
+async fn catalog_resolve(
+    catalog_dir: &Path,
+    accessions: &[String],
+) -> Vec<Option<ResolvedAccession>> {
+    use sracha_core::sdl::{ResolvedFile, ResolvedMirror};
+
+    let reader = match sracha_index::reader::CatalogReader::open_local(catalog_dir).await {
+        Ok(r) => r,
+        Err(e) => {
+            tracing::warn!(
+                "catalog open failed for {}: {e} — falling back to S3/SDL",
+                catalog_dir.display(),
+            );
+            return vec![None; accessions.len()];
+        }
+    };
+
+    let mut out = Vec::with_capacity(accessions.len());
+    let mut hits = 0usize;
+    for acc in accessions {
+        let rec = reader.lookup(acc).await.ok().flatten();
+        match rec {
+            Some(r) => {
+                hits += 1;
+                let url = format!(
+                    "https://sra-pub-run-odp.s3.amazonaws.com/sra/{acc}/{acc}",
+                    acc = acc
+                );
+                out.push(Some(ResolvedAccession {
+                    accession: acc.clone(),
+                    sra_file: ResolvedFile {
+                        mirrors: vec![ResolvedMirror {
+                            url,
+                            service: "catalog".into(),
+                        }],
+                        size: r.file_size,
+                        md5: None,
+                        is_lite: false,
+                    },
+                    vdbcache_file: None,
+                    run_info: None,
+                }));
+            }
+            None => out.push(None),
+        }
+    }
+    if hits > 0 {
+        tracing::info!(
+            "catalog hit on {hits}/{} accession(s) (skipped S3 HEAD probe)",
+            accessions.len()
+        );
+    }
+    out
+}
+
 async fn resolve_accessions(
     run_accessions: &[String],
     client: &SdlClient,

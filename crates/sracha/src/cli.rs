@@ -490,6 +490,16 @@ pub struct GetArgs {
     #[arg(long, help_heading = "Advanced", conflicts_with = "keep_sra")]
     pub stream: bool,
 
+    /// Path to a sracha-index catalog directory (built via
+    /// `sracha-index build`). When set, sracha looks up the
+    /// accession in the catalog before probing S3/SDL — saves the
+    /// HEAD round-trip on first-byte latency. Falls back to the
+    /// usual resolve path on a miss. Requires the `catalog`
+    /// build feature (default-on).
+    #[arg(long, help_heading = "Advanced", value_name = "DIR")]
+    #[cfg(feature = "catalog")]
+    pub catalog: Option<PathBuf>,
+
     /// Try ENA FASTQ mirrors first; fall back to NCBI if ENA has no FASTQ
     /// or the output config is incompatible. Requires gzip compression and
     /// split-3 or split-files (Phase 1 scope). Skips VDB decode entirely.
