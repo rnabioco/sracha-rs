@@ -629,6 +629,7 @@ async fn download_file_inner(
                             size: existing_size,
                             md5: None,
                             bytes_transferred: 0,
+                            chunk_ready: None,
                         });
                     }
                     tracing::warn!(
