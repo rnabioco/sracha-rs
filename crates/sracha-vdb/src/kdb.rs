@@ -585,8 +585,19 @@ fn update_meta_from_idx_file(meta: &mut ColumnMeta, buf: &[u8]) {
 
 fn parse_idx0(buf: &[u8]) -> Result<Vec<BlobLoc>> {
     if !buf.len().is_multiple_of(BLOB_LOC_SIZE) {
+        // Newer SRA writers (observed on the SRR15000xxx range)
+        // emit a different idx0 layout that's `4 + 24*N` bytes
+        // long. Reverse-engineering the exact field encoding hit
+        // a wall — interpretations that fit the start of the file
+        // produce nonsensical row ids near the end. Until the
+        // layout is properly decoded against the ncbi-vdb writer
+        // source, we error cleanly here so callers get a
+        // recoverable failure (sracha-index extractor skips the
+        // column; sracha get refuses to decode rather than
+        // emitting wrong output). Tracked at task #18.
         return Err(Error::Format(format!(
-            "idx0 size {} is not a multiple of {BLOB_LOC_SIZE}",
+            "idx0 size {} is not a multiple of {BLOB_LOC_SIZE} (likely the v2 layout used \
+             on recent SRR submissions; not yet supported — see task #18)",
             buf.len()
         )));
     }
