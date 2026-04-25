@@ -290,6 +290,9 @@ impl VdbCursor {
         self.is_sra_lite
     }
 
+    // (helpers `parse_skey_offset_table` / `parse_skey_byte_scan` defined
+    // at module scope below.)
+
     /// Load NAME_FMT templates from the skey index.
     ///
     /// The skey file at `tbl/SEQUENCE/idx/skey` (database layout) or
@@ -318,87 +321,24 @@ impl VdbCursor {
             return (Vec::new(), Vec::new());
         }
 
-        // Extract template strings by scanning for "$X" placeholders.
+        // Read templates from the skey "PTrie" wrapper. Despite the name,
+        // the on-disk layout we see in real archives is a flat
+        // offset-indexed string table starting at byte 0x44:
         //
-        // Templates are stored adjacent in the skey blob with short
-        // separator bytes that may themselves be ASCII printable (e.g.
-        // DRR053011: `…:$X:$Y\x00\x02kH HISEQ-MFG:343:…:$X:$Y…` — the
-        // `kH` between two templates is printable junk, not part of
-        // either string). Clamping the backward walk at the previous
-        // template's end keeps those bytes out — without this, the
-        // second template comes out as `kHHISEQ-MFG:343:…` and every
-        // record that ends up in that template emits a corrupted defline.
-        let mut templates = Vec::new();
-        let mut template_offsets = Vec::new(); // byte offset within skey data
-        let mut last_end: usize = 0;
-        let mut i = 0;
-        while i < skey_data.len() {
-            if skey_data[i] == b'$' && i + 1 < skey_data.len() && skey_data[i + 1] == b'X' {
-                let mut start = i;
-                while start > last_end
-                    && skey_data[start - 1] >= 32
-                    && skey_data[start - 1] < 127
-                {
-                    start -= 1;
-                }
-                let mut end = i;
-                while end < skey_data.len() && skey_data[end] >= 32 && skey_data[end] < 127 {
-                    end += 1;
-                }
-                if end > start {
-                    template_offsets.push(start);
-                    templates.push(skey_data[start..end].to_vec());
-                    last_end = end;
-                }
-                i = end;
-            } else {
-                i += 1;
-            }
-        }
-
-        templates.dedup();
-
-        // Trim template prefixes that swept up adjacent inter-template
-        // separator bytes. Skey stores templates back-to-back with a few
-        // separator bytes (typically a u32 length prefix) between them;
-        // when those separator bytes happen to be ASCII-printable the
-        // backward `$X` walk above includes them as part of the next
-        // template (DRR053011: `kHHISEQ-MFG:343:…`, `8HISEQ-MFG:343:…`).
+        //   0x44: count        (u32)        — number of templates
+        //   0x48: data_bytes   (u32)        — total bytes in template payload
+        //   0x4C: offsets      ([u16; cnt]) — start offset of each template
+        //                                     within the payload
+        //   0x4C + cnt*2: payload          — concatenated null-terminated
+        //                                     template strings
         //
-        // Recover by finding the longest prefix shared by a majority of
-        // templates and dropping any leading bytes before that prefix on
-        // each individual template. This is robust to a couple of
-        // contaminated templates as long as most are clean.
-        if templates.len() >= 3 {
-            // Build candidate prefixes from each template at decreasing
-            // length and pick the longest one held by >= half of templates.
-            let counts: std::collections::HashMap<&[u8], usize> = templates
-                .iter()
-                .flat_map(|t| (1..=t.len()).rev().map(move |n| &t[..n]))
-                .fold(std::collections::HashMap::new(), |mut m, p| {
-                    *m.entry(p).or_insert(0) += 1;
-                    m
-                });
-            let majority = templates.len().div_ceil(2);
-            let consensus_prefix: Vec<u8> = counts
-                .iter()
-                .filter(|&(_, &c)| c >= majority)
-                .max_by_key(|(p, _)| p.len())
-                .map(|(p, _)| p.to_vec())
-                .unwrap_or_default();
-            if !consensus_prefix.is_empty() {
-                for t in templates.iter_mut() {
-                    if let Some(pos) = t
-                        .windows(consensus_prefix.len())
-                        .position(|w| w == consensus_prefix.as_slice())
-                        && pos > 0
-                    {
-                        t.drain(..pos);
-                    }
-                }
-                templates.dedup();
-            }
-        }
+        // Template index in this array equals PTrie node_id - 1, so the
+        // projection block at the end of the file (count + ord2node +
+        // id2ord) maps directly into it without any sort or rename.
+        // Falls back to the older byte-scan-for-`$X` heuristic if the
+        // offset-table doesn't validate (foreign archive layouts).
+        let templates: Vec<Vec<u8>> = parse_skey_offset_table(&skey_data)
+            .unwrap_or_else(|| parse_skey_byte_scan(&skey_data));
 
         // Parse the skey header to get first spot_id and count.
         // The header is at the start of skey_data. Try v4 (40 bytes) then v2 (32 bytes).
@@ -431,12 +371,17 @@ impl VdbCursor {
             templates.len()
         );
 
-        let expected_count = count as u32;
-
         // Parse the skey projection data (ord2node + id2ord).
-        // Layout after PTrie: count(u32) + ord2node[count](u32) + packed_deltas
-        // The packed deltas use span_bits per element with count-1 entries.
-        // After unpacking, integrate (prefix sum) to get spot_id offsets.
+        // Layout after the template table: count(u32) + ord2node[count](u32)
+        // + packed_deltas, where packed_deltas is `ceil(span_bits*(count-1)/8)`
+        // bytes of MSB-first bit-packed deltas (matches ncbi-vdb's
+        // libs/klib/unpack.c). The projection's `count` is **not always**
+        // equal to `templates.len()` — DRR040793-style archives carry
+        // 188 entries for 96 templates, with `ord2node[i] == 0` marking
+        // continuations of the previous non-zero node. Scan every
+        // u32-aligned offset and accept the first one whose
+        // `(skey_len - offset - 4 - count*4)` matches the expected
+        // packed_size for some sensible count.
         //
         // span_bits offset depends on header version:
         //   v2: offset 26 (8-byte base header)
@@ -453,39 +398,48 @@ impl VdbCursor {
             }
         };
 
-        // Search for ord2node count in the skey data.
-        // The remaining bytes after ord2node should equal ceil(span_bits * (count-1) / 8).
-        let packed_size = if count > 1 && span_bits > 0 {
-            (span_bits * (count - 1)).div_ceil(8)
-        } else {
-            0
-        };
-
         'skey_search: for scan_pos in 0..skey_data.len().saturating_sub(4) {
-            let candidate =
-                u32::from_le_bytes(skey_data[scan_pos..scan_pos + 4].try_into().unwrap());
-            if candidate != expected_count || candidate == 0 {
+            let candidate = u32::from_le_bytes(
+                skey_data[scan_pos..scan_pos + 4].try_into().unwrap(),
+            );
+            // Heuristic: candidate must be >= templates.len() (at least one
+            // ord2node entry per template) and cover at most ~10x — the
+            // continuation entries we've observed never approach that
+            // multiple. Bound keeps the scan from latching onto random
+            // u32 noise in the template payload.
+            if candidate < templates.len() as u32
+                || candidate as usize > templates.len().saturating_mul(10).max(16)
+            {
                 continue;
             }
-
+            let proj_count = candidate as usize;
             let ord2node_start = scan_pos + 4;
-            let ord2node_end = ord2node_start + count * 4;
-            let remaining = skey_data.len().saturating_sub(ord2node_end);
-
+            let ord2node_end = ord2node_start + proj_count * 4;
+            if ord2node_end > skey_data.len() {
+                continue;
+            }
+            let remaining = skey_data.len() - ord2node_end;
+            let packed_size = if proj_count > 1 && span_bits > 0 {
+                (span_bits * (proj_count - 1)).div_ceil(8)
+            } else {
+                0
+            };
             if remaining != packed_size {
                 continue;
             }
 
             tracing::debug!(
-                "skey: found count={} at offset {}, packed_size={}, span_bits={}",
-                candidate,
+                "skey: found projection count={} at offset {}, packed_size={}, \
+                 span_bits={}, templates={}",
+                proj_count,
                 scan_pos,
                 packed_size,
                 span_bits,
+                templates.len(),
             );
 
             // Read ord2node entries.
-            let ord2node: Vec<u32> = (0..count)
+            let ord2node: Vec<u32> = (0..proj_count)
                 .map(|j| {
                     u32::from_le_bytes(
                         skey_data[ord2node_start + j * 4..ord2node_start + j * 4 + 4]
@@ -495,20 +449,16 @@ impl VdbCursor {
                 })
                 .collect();
 
-            // Unpack id2ord deltas from span_bits-packed data.
-            // The packed data is a big-endian bitstream: element[0] occupies
-            // the most-significant bits of byte[0], matching the ncbi-vdb
-            // Unpack function (libs/klib/unpack.c) which reads right-to-left
-            // with byte-swapped 32-bit chunks.
+            // Unpack id2ord deltas from span_bits-packed data
+            // (MSB-first big-endian bitstream).
             let packed_data = &skey_data[ord2node_end..];
-            let mut id2ord: Vec<i64> = vec![0i64; count];
-            if count > 1 && span_bits > 0 {
+            let mut id2ord: Vec<i64> = vec![0i64; proj_count];
+            if proj_count > 1 && span_bits > 0 {
                 let mask = (1u64 << span_bits) - 1;
-                for i in 0..count - 1 {
+                for i in 0..proj_count - 1 {
                     let bit_offset = i * span_bits;
                     let first_byte = bit_offset / 8;
                     let last_byte = (bit_offset + span_bits - 1) / 8;
-                    // Accumulate relevant bytes in big-endian order.
                     let mut raw: u128 = 0;
                     for j in first_byte..=last_byte {
                         if j < packed_data.len() {
@@ -520,15 +470,27 @@ impl VdbCursor {
                     let delta = ((raw >> shift) as u64 & mask) as i64;
                     id2ord[i + 1] = delta;
                 }
-                // Integrate (prefix sum).
-                for i in 1..count {
+                for i in 1..proj_count {
                     id2ord[i] += id2ord[i - 1];
                 }
             }
-
-            // Convert offsets to absolute spot_ids.
             for v in &mut id2ord {
                 *v += first_spot;
+            }
+
+            // Carry-forward zero ord2node values: a zero marks "same
+            // template as the previous entry"; this happens on archives
+            // where a single tile re-appears in multiple sub-ranges
+            // along the spot id axis (DRR040793: 188 sub-ranges across
+            // 96 unique tile templates).
+            let mut effective: Vec<u32> = Vec::with_capacity(proj_count);
+            let mut last_node: u32 = 0;
+            for &n in &ord2node {
+                let v = if n == 0 { last_node } else {
+                    last_node = n;
+                    n
+                };
+                effective.push(v);
             }
 
             tracing::debug!(
@@ -537,28 +499,29 @@ impl VdbCursor {
                 &id2ord[..id2ord.len().min(5)],
             );
 
-            // Build sorted (template, spot_start) using ord2node → template mapping.
-            // node_id N maps to template[N-1] (1-indexed in PTrie).
+            // Build sorted (template, spot_start) using
+            // ord2node → template mapping. node_id N → template[N-1].
             let mut pairs: Vec<(i64, usize)> = id2ord
                 .iter()
-                .zip(ord2node.iter())
-                .map(|(&spot_start, &node_id)| (spot_start, node_id.saturating_sub(1) as usize))
+                .zip(effective.iter())
+                .filter(|&(_, &n)| n > 0 && (n as usize) <= templates.len())
+                .map(|(&s, &n)| (s, n as usize - 1))
                 .collect();
             pairs.sort_by_key(|&(s, _)| s);
+            // Collapse runs that map to the same template — only the
+            // first spot_start in each run matters for binary search.
+            pairs.dedup_by_key(|&mut (_, t)| t);
 
-            let mut sorted_templates = Vec::with_capacity(count);
-            let mut sorted_starts = Vec::with_capacity(count);
-            for (spot_start, tmpl_idx) in &pairs {
-                if *tmpl_idx < templates.len() {
-                    sorted_templates.push(templates[*tmpl_idx].clone());
-                    sorted_starts.push(*spot_start);
-                }
-            }
+            let sorted_templates: Vec<Vec<u8>> =
+                pairs.iter().map(|&(_, t)| templates[t].clone()).collect();
+            let sorted_starts: Vec<i64> = pairs.iter().map(|&(s, _)| s).collect();
 
             if !sorted_templates.is_empty() {
                 tracing::debug!(
-                    "skey: {} entries, first spot_start={}, first template={:?}",
+                    "skey: {} entries (from {} projection rows), first \
+                     spot_start={}, first template={:?}",
                     sorted_templates.len(),
+                    proj_count,
                     sorted_starts.first().unwrap_or(&0),
                     String::from_utf8_lossy(&sorted_templates[0]),
                 );
@@ -642,6 +605,142 @@ impl VdbCursor {
 // ---------------------------------------------------------------------------
 // Internal helpers
 // ---------------------------------------------------------------------------
+
+/// Skey offset of the "PTrie wrapper" preamble inside the skey blob.
+/// 0x44 = 40-byte v3/v4 index header + 28 bytes of secondary descriptors.
+/// All real archives we've inspected (DRR019046/053011/040793/035881)
+/// start the count+offsets+payload trio at exactly this offset.
+const SKEY_TABLE_OFFSET: usize = 0x44;
+
+/// Parse skey templates from the flat offset-indexed string table at
+/// byte 0x44 of the skey blob. Returns `None` (caller falls back to the
+/// byte-scan heuristic) when the layout doesn't validate — short files,
+/// nonsense counts, or out-of-range offsets.
+fn parse_skey_offset_table(skey_data: &[u8]) -> Option<Vec<Vec<u8>>> {
+    if skey_data.len() < SKEY_TABLE_OFFSET + 8 {
+        return None;
+    }
+    let count = u32::from_le_bytes(
+        skey_data[SKEY_TABLE_OFFSET..SKEY_TABLE_OFFSET + 4]
+            .try_into()
+            .ok()?,
+    ) as usize;
+    let data_bytes = u32::from_le_bytes(
+        skey_data[SKEY_TABLE_OFFSET + 4..SKEY_TABLE_OFFSET + 8]
+            .try_into()
+            .ok()?,
+    ) as usize;
+    if count == 0 || count > 1_000_000 || data_bytes == 0 || data_bytes > 100 * 1024 * 1024 {
+        return None;
+    }
+    let offsets_start = SKEY_TABLE_OFFSET + 8;
+    let offsets_end = offsets_start + count * 2;
+    let payload_start = offsets_end;
+    let payload_end = payload_start + data_bytes;
+    if payload_end > skey_data.len() {
+        return None;
+    }
+    let offsets: Vec<usize> = (0..count)
+        .map(|i| {
+            u16::from_le_bytes(
+                skey_data[offsets_start + i * 2..offsets_start + i * 2 + 2]
+                    .try_into()
+                    .unwrap(),
+            ) as usize
+        })
+        .collect();
+    // First offset must be 0 and offsets must be strictly increasing.
+    if offsets[0] != 0 {
+        return None;
+    }
+    for w in offsets.windows(2) {
+        if w[1] <= w[0] || w[1] >= data_bytes {
+            return None;
+        }
+    }
+    let payload = &skey_data[payload_start..payload_end];
+    let mut templates = Vec::with_capacity(count);
+    for i in 0..count {
+        let s = offsets[i];
+        let e = offsets.get(i + 1).copied().unwrap_or(data_bytes);
+        // Strip trailing zero-padding (templates are stored padded to a
+        // fixed stride per archive but real content is null-terminated).
+        let bytes = &payload[s..e];
+        let nul = bytes.iter().position(|&b| b == 0).unwrap_or(bytes.len());
+        templates.push(bytes[..nul].to_vec());
+    }
+    // Sanity: every template should contain `$X` (the position
+    // placeholder fasterq-dump also looks for); reject the parse if
+    // most don't.
+    let with_placeholder = templates.iter().filter(|t| t.windows(2).any(|w| w == b"$X")).count();
+    if with_placeholder * 2 < templates.len() {
+        return None;
+    }
+    Some(templates)
+}
+
+/// Legacy fallback: byte-scan for `$X` placeholders, walking back to
+/// the previous extracted template's end and trimming a consensus
+/// prefix. Used when [`parse_skey_offset_table`] doesn't recognise the
+/// layout — kept around for archives whose skey doesn't follow the
+/// 0x44-anchored offset-table shape we see on Illumina runs.
+fn parse_skey_byte_scan(skey_data: &[u8]) -> Vec<Vec<u8>> {
+    let mut templates = Vec::new();
+    let mut last_end: usize = 0;
+    let mut i = 0;
+    while i < skey_data.len() {
+        if skey_data[i] == b'$' && i + 1 < skey_data.len() && skey_data[i + 1] == b'X' {
+            let mut start = i;
+            while start > last_end
+                && skey_data[start - 1] >= 32
+                && skey_data[start - 1] < 127
+            {
+                start -= 1;
+            }
+            let mut end = i;
+            while end < skey_data.len() && skey_data[end] >= 32 && skey_data[end] < 127 {
+                end += 1;
+            }
+            if end > start {
+                templates.push(skey_data[start..end].to_vec());
+                last_end = end;
+            }
+            i = end;
+        } else {
+            i += 1;
+        }
+    }
+    templates.dedup();
+    if templates.len() >= 3 {
+        let counts: std::collections::HashMap<&[u8], usize> = templates
+            .iter()
+            .flat_map(|t| (1..=t.len()).rev().map(move |n| &t[..n]))
+            .fold(std::collections::HashMap::new(), |mut m, p| {
+                *m.entry(p).or_insert(0) += 1;
+                m
+            });
+        let majority = templates.len().div_ceil(2);
+        let consensus_prefix: Vec<u8> = counts
+            .iter()
+            .filter(|&(_, &c)| c >= majority)
+            .max_by_key(|(p, _)| p.len())
+            .map(|(p, _)| p.to_vec())
+            .unwrap_or_default();
+        if !consensus_prefix.is_empty() {
+            for t in templates.iter_mut() {
+                if let Some(pos) = t
+                    .windows(consensus_prefix.len())
+                    .position(|w| w == consensus_prefix.as_slice())
+                    && pos > 0
+                {
+                    t.drain(..pos);
+                }
+            }
+            templates.dedup();
+        }
+    }
+    templates
+}
 
 /// Find the base path for columns in the SEQUENCE table.
 ///
