@@ -2,6 +2,44 @@
 
 ## Unreleased
 
+## 0.3.4 (2026-04-25)
+
+### Fixes
+
+- Bound header-driven allocations to prevent SIGABRT on SRA-Lite
+  quality blobs (#30). All 8 flagged accessions in PRJNA542889
+  decode under `ulimit -v 4000000`.
+- Decode random-access variant-2 page maps by reading the trailing
+  `data_offset[row_count]` overlay into `data_runs`. 6 PASS_CONTENT →
+  PASS_MD5 in the 100-accession corpus (DRR040793, DRR050206,
+  DRR036255, DRR036514, DRR040777, DRR041132).
+- Align READ_LEN with READ by row id rather than blob index. Fixes
+  truncation on archives where the two columns have mismatched blob
+  counts; DRR023226 and DRR023232 go from FAIL_COUNT to PASS_MD5.
+- Read skey templates directly from the offset-indexed string table
+  and loosen projection-count matching, replacing the byte-scan +
+  dedup heuristics. DRR035881 and DRR026998 reach PASS_MD5.
+- Support skey on flat-table archives (DRR019046) and trim adjacent-
+  template prefix bytes that the backward `$X` walk swept into the
+  next template (DRR053011). ~44 PASS_CONTENT → PASS_MD5 in the
+  random corpus.
+- Treat ALTREAD raw-passthrough zip blobs (no ops/args, header
+  `osize` == on-disk size) as data instead of failing decode. Fixes
+  DRR019046's lost trailing-N annotations.
+
+### Features
+
+- NAME_FMT column support: per-spot template overrides reproduce
+  fine-grained tile interleave on HiSeq archives (DRR040793-class)
+  that the skey range mapping can't capture. DRR002715 and DRR021982
+  newly byte-identical.
+- Emit `/N` mate suffix in interleaved and split-spot output for
+  fasterq-dump byte parity in single-stream mode. Split-3 /
+  split-files paths unchanged.
+- `--stream` mode for `validation/random_corpus.sh`: pipe both
+  decoders through `md5sum` instead of writing FASTQs to disk.
+  4.2× faster (13.6k → 3.3k s on the 100-accession corpus).
+
 ## 0.3.3 (2026-04-24)
 
 ### Fixes

@@ -3,7 +3,7 @@ resolver = "2"
 members = ["crates/sracha", "crates/sracha-core", "crates/sracha-vdb"]
 
 [workspace.package]
-version = "0.3.3"
+version = "0.3.4"
 edition = "2024"
 rust-version = "1.92"
 license = "MIT"
