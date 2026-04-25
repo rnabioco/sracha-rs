@@ -148,6 +148,7 @@ fn build_accessions_array(
     // for v0 — simpler than threading Vortex Validity through each
     // builder. Reader unflattens via the *_present column.
     let n = records.len();
+    let mut accession_idx: Vec<u32> = Vec::with_capacity(n);
     let mut accession_id_bytes: Vec<Vec<u8>> = Vec::with_capacity(n);
     let mut file_size: Vec<u64> = Vec::with_capacity(n);
     let mut spots: Vec<u64> = Vec::with_capacity(n);
@@ -162,7 +163,8 @@ fn build_accessions_array(
     let mut md5_rows: Vec<Vec<u8>> = Vec::with_capacity(n);
     let mut md5_present: Vec<u8> = Vec::with_capacity(n);
 
-    for r in records {
+    for (i, r) in records.iter().enumerate() {
+        accession_idx.push(u32::try_from(i).map_err(|_| Error::Writer("accession idx overflow".into()))?);
         accession_id_bytes.push(r.accession.as_bytes().to_vec());
         file_size.push(r.file_size);
         spots.push(r.spots.unwrap_or(0));
@@ -187,6 +189,7 @@ fn build_accessions_array(
         }
     }
 
+    let acc_idx_arr: PrimitiveArray = accession_idx.into_iter().collect();
     let acc_arr =
         VarBinArray::from_vec(accession_id_bytes, DType::Utf8(Nullability::NonNullable))
             .into_array();
@@ -201,7 +204,8 @@ fn build_accessions_array(
         VarBinArray::from_vec(md5_rows, DType::Binary(Nullability::NonNullable)).into_array();
     let md5_present_arr: PrimitiveArray = md5_present.into_iter().collect();
 
-    let fields: [(&str, ArrayRef); 10] = [
+    let fields: [(&str, ArrayRef); 11] = [
+        ("accession_idx", acc_idx_arr.into_array()),
         ("accession", acc_arr),
         ("file_size", fs_arr.into_array()),
         ("spots", spots_arr.into_array()),

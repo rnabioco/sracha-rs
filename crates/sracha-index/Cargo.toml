@@ -26,6 +26,7 @@ sha2 = "0.11"
 # so the writer/reader can attach to the existing #[tokio::main] runtime.
 vortex = { version = "0.68", features = ["tokio", "unstable_encodings"] }
 vortex-btrblocks = { version = "0.68", features = ["unstable_encodings"] }
+futures = "0.3"
 
 [[bin]]
 name = "sracha-index"

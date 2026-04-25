@@ -2,7 +2,7 @@
 //! shards.
 
 use clap::{Parser, Subcommand};
-use sracha_index::{Error, Result, extractor, writer};
+use sracha_index::{Error, Result, extractor, reader, writer};
 use vortex::VortexSessionDefault;
 use vortex::io::session::RuntimeSessionExt;
 use vortex::session::VortexSession;
@@ -74,10 +74,25 @@ async fn main() -> Result<()> {
             run_build(&accession_list, &output, workers).await?;
         }
         Cmd::Query { shard, accession } => {
-            tracing::warn!(
-                "query is not yet implemented (would lookup {accession} in {})",
-                shard.display(),
+            let started = std::time::Instant::now();
+            let cat = reader::CatalogReader::open_local(&shard).await?;
+            let opened = started.elapsed();
+            let lookup_start = std::time::Instant::now();
+            let rec = cat.lookup(&accession).await?;
+            let lookup = lookup_start.elapsed();
+            tracing::info!(
+                "opened catalog ({} accessions) in {:.1}ms; point lookup in {:.3}ms",
+                cat.len(),
+                opened.as_secs_f64() * 1000.0,
+                lookup.as_secs_f64() * 1000.0,
             );
+            match rec {
+                Some(r) => println!("{}", serde_json::to_string_pretty(&r)?),
+                None => {
+                    eprintln!("not found: {accession}");
+                    std::process::exit(1);
+                }
+            }
         }
     }
     Ok(())

@@ -3387,6 +3387,7 @@ name = "sracha-index"
 version = "0.3.4"
 dependencies = [
  "clap",
+ "futures",
  "md-5",
  "reqwest",
  "serde",
