@@ -289,6 +289,27 @@ impl ChunkReadyTracker {
         }
     }
 
+    /// Async: wait until every chunk in `indices` is ready. Multi-chunk
+    /// counterpart to [`Self::await_range`] that does NOT block on bytes
+    /// between the requested chunks. Used by streaming consumers (e.g.
+    /// the per-batch decode gate) when chunk prioritization causes
+    /// downloads to land out of file order: a contiguous wait would
+    /// still wait for the in-between sequential chunks even though those
+    /// bytes aren't actually needed for the current batch.
+    pub async fn await_chunks(&self, indices: &[usize]) {
+        // Cheap fast path: every requested chunk already ready.
+        if indices.iter().all(|&i| self.is_chunk_ready(i)) {
+            return;
+        }
+        loop {
+            let notified = self.notify.notified();
+            if indices.iter().all(|&i| self.is_chunk_ready(i)) {
+                return;
+            }
+            notified.await;
+        }
+    }
+
     /// Async: wait until *every* chunk is ready (download fully
     /// complete). Useful as a fallback for code paths that haven't been
     /// converted to streaming yet.
@@ -319,6 +340,15 @@ impl ChunkReadyTracker {
             return;
         }
         tokio::runtime::Handle::current().block_on(self.await_chunk(chunk_idx));
+    }
+
+    /// Sync wrapper around [`Self::await_chunks`]. Same context
+    /// requirements as [`Self::wait_range`].
+    pub fn wait_chunks(&self, indices: &[usize]) {
+        if indices.iter().all(|&i| self.is_chunk_ready(i)) {
+            return;
+        }
+        tokio::runtime::Handle::current().block_on(self.await_chunks(indices));
     }
 
     /// Sync convenience: block until every chunk is ready.

@@ -436,6 +436,80 @@ fn decode_and_write(
         });
     }
 
+    // Column-priority chunk hint: prioritize the chunks containing the
+    // first BATCH_SIZE blobs of every column's data slab. Without this,
+    // sequential download lands READ's data slab first (low byte
+    // offsets) and the decode loop's per-batch gate sits idle waiting
+    // for the LAST column's data slab to be reached at the end of the
+    // file (multi-GB into the download for big SEQUENCE tables — see
+    // issue #19 analysis). With this, the chunks needed for batch 0 of
+    // every column jump to the front of the dispatch queue and arrive
+    // interleaved at the start of the download.
+    //
+    // Pairs with the per-batch `wait_chunks` switch below: the prior
+    // contiguous `wait_range(min, max)` would still have blocked on the
+    // sequentially-downloaded bytes between columns even after these
+    // chunks landed, defeating the priority hint.
+    if let Some(tracker) = chunk_ready {
+        const PRIO_BLOBS_PER_COL: usize = 1024;
+        let mut col_prio: Vec<usize> = Vec::new();
+        let mut seen: std::collections::HashSet<usize> = std::collections::HashSet::new();
+        let mut push_col =
+            |blobs: &[crate::vdb::kdb::BlobLoc],
+             range_for: &dyn Fn(&crate::vdb::kdb::BlobLoc) -> Option<(u64, u64)>| {
+                let take = PRIO_BLOBS_PER_COL.min(blobs.len());
+                for blob in &blobs[..take] {
+                    let Some((s, e)) = range_for(blob) else {
+                        continue;
+                    };
+                    if e <= s {
+                        continue;
+                    }
+                    let first = tracker.chunk_index_for_byte(s);
+                    let last = tracker.chunk_index_for_byte(e - 1);
+                    for c in first..=last {
+                        if seen.insert(c) {
+                            col_prio.push(c);
+                        }
+                    }
+                }
+            };
+        push_col(cursor.read_col().blobs(), &|b| {
+            cursor.read_col().blob_absolute_range(b)
+        });
+        if let Some(c) = cursor.quality_col() {
+            push_col(c.blobs(), &|b| c.blob_absolute_range(b));
+        }
+        if let Some(c) = cursor.read_len_col() {
+            push_col(c.blobs(), &|b| c.blob_absolute_range(b));
+        }
+        if let Some(c) = cursor.name_col() {
+            push_col(c.blobs(), &|b| c.blob_absolute_range(b));
+        }
+        if let Some(c) = cursor.read_type_col() {
+            push_col(c.blobs(), &|b| c.blob_absolute_range(b));
+        }
+        if let Some(c) = cursor.altread_col() {
+            push_col(c.blobs(), &|b| c.blob_absolute_range(b));
+        }
+        if let Some(c) = cursor.x_col() {
+            push_col(c.blobs(), &|b| c.blob_absolute_range(b));
+        }
+        if let Some(c) = cursor.y_col() {
+            push_col(c.blobs(), &|b| c.blob_absolute_range(b));
+        }
+        if let Some(c) = cursor.name_fmt_col() {
+            push_col(c.blobs(), &|b| c.blob_absolute_range(b));
+        }
+        if !col_prio.is_empty() {
+            tracing::info!(
+                "{accession}: prioritizing {} chunks containing first-batch column data",
+                col_prio.len(),
+            );
+            tracker.prioritize_pending(&col_prio);
+        }
+    }
+
     // Detect SRA-lite from actual file: the QUALITY column is absent
     // (classic variant) or the VDB metadata carries the `SOFTWARE/delite`
     // stamp (delite-processed variant — QUALITY column is present but
@@ -787,23 +861,31 @@ fn decode_and_write(
 
             // Phase 3c gate (per-batch): if streaming, wait for the
             // bytes the upcoming rayon decode will read. We compute the
-            // union of [min_start, max_end) across every blob the batch
-            // will touch (READ + all auxiliary columns; ALTREAD blob
-            // boundaries can differ from READ's so use find_blob).
-            // Per-batch is the right granularity: the rayon workers
-            // aren't in a tokio context (so calling `wait_range` from
-            // inside the parallel iterator would panic), and the
-            // overshoot from waiting on a contiguous superset rather
-            // than a precise multi-range set is small in practice
-            // because adjacent blobs of the same column are
-            // sequentially placed.
+            // exact set of chunks each blob in the batch will touch
+            // (READ + all auxiliary columns; ALTREAD blob boundaries
+            // can differ from READ's so use find_blob) and wait on
+            // exactly those chunks via `wait_chunks`.
+            //
+            // Multi-chunk (was: contiguous `wait_range(min, max)`)
+            // matters because the column-priority hint above pulls
+            // bytes for the FIRST batch of every column to the front
+            // of the dispatch queue, so they arrive out of file order.
+            // A contiguous wait would still block on the in-between
+            // sequential bytes that aren't actually needed for this
+            // batch, defeating the priority hint. With multi-chunk
+            // wait the gate releases as soon as exactly the chunks
+            // this batch needs are present.
             if let Some(tracker) = chunk_ready {
-                let mut min_byte = u64::MAX;
-                let mut max_byte = 0u64;
+                let mut chunks: std::collections::HashSet<usize> = std::collections::HashSet::new();
                 let mut accumulate = |range: Option<(u64, u64)>| {
-                    if let Some((s, e)) = range {
-                        min_byte = min_byte.min(s);
-                        max_byte = max_byte.max(e);
+                    let Some((s, e)) = range else { return };
+                    if e <= s {
+                        return;
+                    }
+                    let first = tracker.chunk_index_for_byte(s);
+                    let last = tracker.chunk_index_for_byte(e - 1);
+                    for c in first..=last {
+                        chunks.insert(c);
                     }
                 };
                 for bi in blob_idx..batch_end {
@@ -840,8 +922,10 @@ fn decode_and_write(
                         accumulate(c.blob_absolute_range(&c.blobs()[bi]));
                     }
                 }
-                if max_byte > min_byte {
-                    tracker.wait_range(min_byte, max_byte);
+                if !chunks.is_empty() {
+                    let mut sorted: Vec<usize> = chunks.into_iter().collect();
+                    sorted.sort_unstable();
+                    tracker.wait_chunks(&sorted);
                 }
             }
 
