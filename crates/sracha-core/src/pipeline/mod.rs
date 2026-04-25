@@ -486,6 +486,8 @@ fn decode_and_write(
     let x_cs = cursor.x_col().map_or(0, |c| c.meta().checksum_type);
     let y_blob_count = cursor.y_col().map_or(0, |c| c.blob_count());
     let y_cs = cursor.y_col().map_or(0, |c| c.meta().checksum_type);
+    let has_name_fmt = cursor.name_fmt_col().is_some();
+    let name_fmt_cs = cursor.name_fmt_col().map_or(0, |c| c.meta().checksum_type);
 
     let metadata_reads_per_spot = cursor.metadata_reads_per_spot();
 
@@ -788,6 +790,21 @@ fn decode_and_write(
                         } else {
                             (&[], 0)
                         };
+                        // NAME_FMT by row id — its blob layout doesn't
+                        // necessarily align 1:1 with READ's, similar to
+                        // ALTREAD.
+                        let (nfr, nfi): (&[u8], u64) = if has_name_fmt {
+                            let col = cursor.name_fmt_col().unwrap();
+                            match col.find_blob(read_start_id) {
+                                Some(blob) => (
+                                    col.read_raw_blob_slice(blob.start_id)?,
+                                    blob.id_range as u64,
+                                ),
+                                None => (&[], 0),
+                            }
+                        } else {
+                            (&[], 0)
+                        };
 
                         let raw = RawBlobData {
                             read_raw,
@@ -820,6 +837,10 @@ fn decode_and_write(
                             has_illumina_name_parts,
                             name_templates: &name_templates,
                             name_spot_starts: &name_spot_starts,
+                            name_fmt_raw: nfr,
+                            name_fmt_id_range: nfi,
+                            name_fmt_cs,
+                            has_name_fmt,
                             has_read_len,
                             has_name,
                             has_read_type,

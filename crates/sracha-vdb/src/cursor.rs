@@ -27,6 +27,7 @@ const COL_SPOT_GROUP: &str = "SPOT_GROUP";
 const COL_ALTREAD: &str = "ALTREAD";
 const COL_X: &str = "X";
 const COL_Y: &str = "Y";
+const COL_NAME_FMT: &str = "NAME_FMT";
 
 // ---------------------------------------------------------------------------
 // VdbCursor
@@ -51,6 +52,13 @@ pub struct VdbCursor {
     x_col: Option<ColumnReader>,
     /// Per-spot Y coordinate (Illumina tile Y position).
     y_col: Option<ColumnReader>,
+    /// Per-spot NAME_FMT — when present, holds the (variable-length)
+    /// template string that fasterq-dump uses for that specific spot.
+    /// Authoritative source of the per-spot template; takes precedence
+    /// over the skey-derived spot-range mapping for archives that
+    /// store it (typical of Illumina HiSeq archives where two tiles
+    /// interleave at fine granularity along the spot axis).
+    name_fmt_col: Option<ColumnReader>,
     first_row: i64,
     row_count: u64,
     /// Read descriptors inferred from table metadata (used when READ_LEN
@@ -139,11 +147,20 @@ impl VdbCursor {
             ColumnReader::open(archive, &format!("{seq_col_base}/{COL_ALTREAD}"), sra_path).ok();
         let x_col = ColumnReader::open(archive, &format!("{seq_col_base}/{COL_X}"), sra_path).ok();
         let y_col = ColumnReader::open(archive, &format!("{seq_col_base}/{COL_Y}"), sra_path).ok();
+        let name_fmt_col =
+            ColumnReader::open(archive, &format!("{seq_col_base}/{COL_NAME_FMT}"), sra_path)
+                .ok();
 
         if name_col.is_some() {
             tracing::debug!("found physical NAME/SPOT_NAME column");
         } else if altread_col.is_some() && x_col.is_some() && y_col.is_some() {
-            tracing::debug!("found ALTREAD + X + Y columns for Illumina name reconstruction");
+            if name_fmt_col.is_some() {
+                tracing::debug!(
+                    "found ALTREAD + X + Y + NAME_FMT columns for Illumina name reconstruction"
+                );
+            } else {
+                tracing::debug!("found ALTREAD + X + Y columns for Illumina name reconstruction");
+            }
         }
 
         let first_row = read_col.first_row_id().unwrap_or(1);
@@ -160,6 +177,7 @@ impl VdbCursor {
             altread_col,
             x_col,
             y_col,
+            name_fmt_col,
             first_row,
             row_count,
             metadata_read_descs,
@@ -233,6 +251,12 @@ impl VdbCursor {
     /// Reference to the Y column reader (Illumina tile Y), if present.
     pub fn y_col(&self) -> Option<&ColumnReader> {
         self.y_col.as_ref()
+    }
+
+    /// Reference to the NAME_FMT column reader (per-spot template
+    /// authority), if present.
+    pub fn name_fmt_col(&self) -> Option<&ColumnReader> {
+        self.name_fmt_col.as_ref()
     }
 
     /// Whether Illumina name reconstruction is possible (ALTREAD + X + Y columns present).

@@ -144,6 +144,17 @@ pub(crate) struct RawBlobData<'a> {
     pub(crate) name_templates: &'a [Vec<u8>],
     /// Starting spot_id for each name template (parallel to name_templates).
     pub(crate) name_spot_starts: &'a [i64],
+    /// NAME_FMT column raw bytes (empty if column absent). When present,
+    /// overrides the skey-based spot-range mapping with a per-spot
+    /// template string — required for archives whose tiles interleave
+    /// at fine granularity along the spot axis (DRR040793 et al).
+    pub(crate) name_fmt_raw: &'a [u8],
+    /// Row count for the NAME_FMT blob (0 if absent).
+    pub(crate) name_fmt_id_range: u64,
+    /// Checksum type for the NAME_FMT column.
+    pub(crate) name_fmt_cs: u8,
+    /// Whether the NAME_FMT column exists.
+    pub(crate) has_name_fmt: bool,
     /// Reads-per-spot from table metadata (fallback when READ_LEN absent).
     pub(crate) metadata_reads_per_spot: Option<usize>,
     /// Fixed spot length in bases (from READ column page_size).
@@ -793,17 +804,77 @@ pub(crate) fn decode_blob_to_fastq(
             );
         }
 
+        // Decode NAME_FMT (when present) for per-spot template overrides.
+        // NAME_FMT stores variable-length strings per row: empty means
+        // "use the skey range mapping," non-empty means "use this exact
+        // template for this spot." Required to reproduce fasterq's
+        // interleaved-tile assignments on Illumina HiSeq archives where
+        // two tiles alternate at fine granularity along the spot axis
+        // (DRR040793: tile 1101/1102 interleave starting at spot 7637).
+        let name_fmt_per_row: Option<Vec<Vec<u8>>> = if raw.has_name_fmt
+            && !raw.name_fmt_raw.is_empty()
+        {
+            decode_raw(raw.name_fmt_raw, raw.name_fmt_cs, raw.name_fmt_id_range)
+                .ok()
+                .and_then(|nfd| {
+                    let pm = nfd.page_map.clone();
+                    let bytes = decode_zip_encoding(&nfd).ok()?;
+                    let pm = pm?;
+                    // Build per-row strings using data_record_lengths +
+                    // data_runs. Each (record_len, repeat) emits `repeat`
+                    // copies of `record_len` bytes from the data buffer.
+                    let rec_lens = pm.data_record_lengths();
+                    let mut rows: Vec<Vec<u8>> =
+                        Vec::with_capacity(pm.total_rows() as usize);
+                    let mut cursor = 0usize;
+                    for (i, &len) in rec_lens.iter().enumerate() {
+                        let len = len as usize;
+                        let repeat = pm.data_runs.get(i).copied().unwrap_or(1) as usize;
+                        if cursor + len > bytes.len() {
+                            return None;
+                        }
+                        let chunk = bytes[cursor..cursor + len].to_vec();
+                        for _ in 0..repeat {
+                            rows.push(chunk.clone());
+                        }
+                        cursor += len;
+                    }
+                    if blob_idx == 0 {
+                        let nonempty = rows.iter().filter(|r| !r.is_empty()).count();
+                        tracing::debug!(
+                            "NAME_FMT blob 0: {} rows, {} non-empty overrides",
+                            rows.len(),
+                            nonempty,
+                        );
+                    }
+                    Some(rows)
+                })
+        } else {
+            None
+        };
+
         if has_templates && !x_vals.is_empty() && !y_vals.is_empty() {
             let mut names = Vec::with_capacity(num_spots);
             let mut itoa_x = itoa::Buffer::new();
             let mut itoa_y = itoa::Buffer::new();
             for spot_i in 0..num_spots {
                 let spot_id = spots_before as i64 + spot_i as i64 + 1;
-                let tmpl_idx = match raw.name_spot_starts.binary_search(&spot_id) {
-                    Ok(i) => i,
-                    Err(i) => i.saturating_sub(1),
+                // NAME_FMT override (when present and non-empty) wins
+                // over the skey range mapping.
+                let nf_override: Option<&[u8]> = name_fmt_per_row
+                    .as_ref()
+                    .and_then(|rows| rows.get(spot_i))
+                    .filter(|r| !r.is_empty())
+                    .map(|r| r.as_slice());
+                let tmpl: &[u8] = if let Some(t) = nf_override {
+                    t
+                } else {
+                    let tmpl_idx = match raw.name_spot_starts.binary_search(&spot_id) {
+                        Ok(i) => i,
+                        Err(i) => i.saturating_sub(1),
+                    };
+                    &all_templates[tmpl_idx.min(all_templates.len() - 1)]
                 };
-                let tmpl = &all_templates[tmpl_idx.min(all_templates.len() - 1)];
                 let x = x_vals.get(spot_i).copied().unwrap_or(0);
                 let y = y_vals.get(spot_i).copied().unwrap_or(0);
 
