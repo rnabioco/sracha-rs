@@ -1,6 +1,6 @@
 [workspace]
 resolver = "2"
-members = ["crates/sracha", "crates/sracha-core", "crates/sracha-vdb"]
+members = ["crates/sracha", "crates/sracha-core", "crates/sracha-index", "crates/sracha-vdb"]
 
 [workspace.package]
 version = "0.3.4"

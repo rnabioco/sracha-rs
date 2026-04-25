@@ -1,0 +1,33 @@
+[package]
+name = "sracha-index"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Hosted Vortex catalog of SRA accession metadata for fast lookup and streaming-decode planning"
+publish = false
+
+[dependencies]
+sracha-core = { path = "../sracha-core" }
+sracha-vdb = { path = "../sracha-vdb" }
+tokio.workspace = true
+reqwest.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+clap.workspace = true
+md-5.workspace = true
+sha2 = "0.11"
+
+# Storage format. `tokio` feature enables RuntimeSessionExt::with_tokio
+# so the writer/reader can attach to the existing #[tokio::main] runtime.
+vortex = { version = "0.68", features = ["tokio", "unstable_encodings"] }
+vortex-btrblocks = { version = "0.68", features = ["unstable_encodings"] }
+futures = "0.3"
+
+[[bin]]
+name = "sracha-index"
+path = "src/bin/sracha-index.rs"
