@@ -424,6 +424,111 @@ impl PageMap {
         Ok(out)
     }
 
+    /// Reconstruct per-row bytes from a variant-2 random-access page map
+    /// (variable row lengths + per-row `data_offset[]`) used by trim-then-zip
+    /// physical columns like `.ALTREAD`.
+    ///
+    /// The on-disk layout in this variant: `lengths[]/leng_runs[]` describes
+    /// each row's *trimmed* byte count (after `trim<0,0>` stripped leading
+    /// zeros at write time), and the field this code calls `data_runs` is
+    /// actually `data_offset[row_count]` — the byte offset of each row's
+    /// trimmed bytes inside the decompressed `data` buffer. Multiple rows
+    /// may share the same offset (write-time deduplication), so the data
+    /// buffer can be much smaller than `sum(lengths × leng_runs)`.
+    ///
+    /// `row_logical_lens[r]` is the row's full pre-trim width (e.g. the
+    /// READ column's per-row base count for ALTREAD). The trimmed bytes are
+    /// placed inside a `row_logical_lens[r]` slot, right-aligned for
+    /// `TrimSide::Leading` (the trim<0,0> case) so the leading zeros that
+    /// were stripped are restored as zero bytes. Returns
+    /// `sum(row_logical_lens)` bytes — one row after another in a single
+    /// flat buffer, ready to merge byte-for-byte against another column.
+    ///
+    /// Errors when `row_logical_lens` length doesn't match `total_rows()`,
+    /// when `data_runs` (= `data_offset[]`) length doesn't match
+    /// `total_rows()` (i.e. this isn't a variant-2 RA page map), when a
+    /// trimmed length exceeds the corresponding logical width (would mean
+    /// the trim wrote more bytes than its input held), or when a row's
+    /// `(offset, trimmed_len)` slice would read past the end of `data`.
+    pub fn pad_random_access_rows(
+        &self,
+        data: &[u8],
+        row_logical_lens: &[u32],
+        side: TrimSide,
+    ) -> Result<Vec<u8>> {
+        let total_rows = self.total_rows() as usize;
+        if row_logical_lens.len() != total_rows {
+            return Err(Error::Format(format!(
+                "page_map: row_logical_lens has {} entries, expected {} (total_rows)",
+                row_logical_lens.len(),
+                total_rows,
+            )));
+        }
+        if self.data_runs.len() != total_rows {
+            return Err(Error::Format(format!(
+                "page_map: pad_random_access_rows requires data_offset[] of length \
+                 {total_rows}, got {} entries",
+                self.data_runs.len(),
+            )));
+        }
+
+        // Expand `lengths`/`leng_runs` to per-row trimmed lengths.
+        let mut row_trimmed_lens = Vec::with_capacity(total_rows);
+        for (length, &run) in self.lengths.iter().zip(self.leng_runs.iter()) {
+            for _ in 0..run {
+                row_trimmed_lens.push(*length);
+            }
+        }
+        if row_trimmed_lens.len() != total_rows {
+            return Err(Error::Format(format!(
+                "page_map: leng_runs sum to {} but total_rows() = {total_rows}",
+                row_trimmed_lens.len(),
+            )));
+        }
+
+        let total_bytes: usize = row_logical_lens.iter().map(|&l| l as usize).sum();
+        let mut out = vec![0u8; total_bytes];
+
+        let mut out_off = 0usize;
+        for r in 0..total_rows {
+            let logical = row_logical_lens[r] as usize;
+            let trimmed = row_trimmed_lens[r] as usize;
+            let offset = self.data_runs[r] as usize;
+
+            if trimmed > logical {
+                return Err(Error::Format(format!(
+                    "page_map: row {r} trimmed_len {trimmed} > logical {logical}"
+                )));
+            }
+            if trimmed > 0 {
+                let end = offset.checked_add(trimmed).ok_or_else(|| {
+                    Error::Format(format!(
+                        "page_map: row {r} offset {offset} + trimmed {trimmed} overflows usize"
+                    ))
+                })?;
+                if end > data.len() {
+                    return Err(Error::Format(format!(
+                        "page_map: row {r} wants data[{offset}..{end}] but data has only {} bytes",
+                        data.len(),
+                    )));
+                }
+                let bytes = &data[offset..end];
+                match side {
+                    TrimSide::Leading => {
+                        let pad = logical - trimmed;
+                        out[out_off + pad..out_off + logical].copy_from_slice(bytes);
+                    }
+                    TrimSide::Trailing => {
+                        out[out_off..out_off + trimmed].copy_from_slice(bytes);
+                    }
+                }
+            }
+            out_off += logical;
+        }
+
+        Ok(out)
+    }
+
     /// Expand variable-length data via data_runs.
     ///
     /// Unlike [`expand_data_runs_bytes`](Self::expand_data_runs_bytes) which
@@ -3105,6 +3210,129 @@ mod tests {
         // total_rows is 2 but caller supplied only one length.
         assert!(
             pm.pad_trimmed_rows_variable(&data, &[4], TrimSide::Leading)
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn pad_random_access_rows_dedups_offset_zero_across_rows() {
+        // Variant-2 RA shape: 4 rows, two length runs (3 rows of length 2,
+        // 1 row of length 3). Rows 0-2 share offset=0; row 3 sits at
+        // offset 2. Logical width 5 — leading-trim restoration leaves
+        // `width - trimmed` zero bytes at the start of each row.
+        let pm = PageMap {
+            data_recs: 4,
+            lengths: vec![2, 3],
+            leng_runs: vec![3, 1],
+            data_runs: vec![0, 0, 0, 2], // repurposed as data_offset[]
+        };
+        // data: bytes 0..2 = the dedup'd 2-byte payload for the first
+        // run; bytes 2..5 = the unique 3-byte payload for the last row.
+        let data = vec![0x0a, 0x0b, 0xcc, 0xdd, 0xee];
+        let widths = [5u32; 4];
+        let out = pm
+            .pad_random_access_rows(&data, &widths, TrimSide::Leading)
+            .unwrap();
+        // Each output row is 5 bytes; trimmed bytes right-aligned with
+        // leading zeros padding the gap.
+        assert_eq!(
+            out,
+            vec![
+                0, 0, 0, 0x0a, 0x0b, // row 0
+                0, 0, 0, 0x0a, 0x0b, // row 1 (shares offset)
+                0, 0, 0, 0x0a, 0x0b, // row 2 (shares offset)
+                0, 0, 0xcc, 0xdd, 0xee, // row 3
+            ]
+        );
+    }
+
+    #[test]
+    fn pad_random_access_rows_zero_trim_emits_all_zeros() {
+        // A zero-trim run means "no overlay for these rows" — the output
+        // width should still be respected; bytes stay zero.
+        let pm = PageMap {
+            data_recs: 2,
+            lengths: vec![0],
+            leng_runs: vec![2],
+            data_runs: vec![0, 0],
+        };
+        let data = vec![];
+        let out = pm
+            .pad_random_access_rows(&data, &[4, 4], TrimSide::Leading)
+            .unwrap();
+        assert_eq!(out, vec![0u8; 8]);
+    }
+
+    #[test]
+    fn pad_random_access_rows_trailing_side_left_aligns() {
+        // TrimSide::Trailing: trim<0,0> with side=1 strips trailing
+        // zeros, so restoration places stored bytes at the start of
+        // each row.
+        let pm = PageMap {
+            data_recs: 2,
+            lengths: vec![2],
+            leng_runs: vec![2],
+            data_runs: vec![0, 0],
+        };
+        let data = vec![0x11, 0x22];
+        let out = pm
+            .pad_random_access_rows(&data, &[5, 5], TrimSide::Trailing)
+            .unwrap();
+        assert_eq!(
+            out,
+            vec![
+                0x11, 0x22, 0, 0, 0, // row 0
+                0x11, 0x22, 0, 0, 0, // row 1
+            ]
+        );
+    }
+
+    #[test]
+    fn pad_random_access_rows_rejects_trim_greater_than_logical() {
+        // A trimmed length wider than the row's logical width would mean
+        // trim<0,0> output more bytes than its input held — corrupt
+        // page_map. Refuse.
+        let pm = PageMap {
+            data_recs: 1,
+            lengths: vec![10],
+            leng_runs: vec![1],
+            data_runs: vec![0],
+        };
+        let data = vec![0u8; 10];
+        assert!(
+            pm.pad_random_access_rows(&data, &[5], TrimSide::Leading)
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn pad_random_access_rows_rejects_offset_past_data_end() {
+        // Offset+length out of bounds. Loud failure beats silent bad
+        // FASTQ; the caller logs the error and skips the merge.
+        let pm = PageMap {
+            data_recs: 1,
+            lengths: vec![3],
+            leng_runs: vec![1],
+            data_runs: vec![5], // 5 + 3 = 8 > data.len() = 6
+        };
+        let data = vec![0u8; 6];
+        assert!(
+            pm.pad_random_access_rows(&data, &[5], TrimSide::Leading)
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn pad_random_access_rows_rejects_wrong_logical_lens_count() {
+        let pm = PageMap {
+            data_recs: 2,
+            lengths: vec![1],
+            leng_runs: vec![2],
+            data_runs: vec![0, 0],
+        };
+        let data = vec![0x01];
+        assert!(
+            pm.pad_random_access_rows(&data, &[4], TrimSide::Leading)
                 .is_err()
         );
     }

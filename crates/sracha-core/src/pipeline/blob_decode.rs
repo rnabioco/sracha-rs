@@ -189,11 +189,14 @@ pub(crate) struct BlobDecodeCtx<'a> {
 /// Decode the ALTREAD blob (when present) and merge its per-base 4na
 /// ambiguity mask into `read_data`. Best-effort: small or malformed
 /// ALTREAD blobs log at debug and leave the 2na basecalls untouched
-/// rather than refusing the whole spot. One exception is the variant-2
-/// page_map shape (no data_runs + multiple distinct lengths), which
-/// can silently leak real N annotations — that case errors out with an
-/// [`sracha_vdb::Error::UnsupportedFormat`] (surfaced as [`Error::Vdb`])
-/// so we never emit wrong FASTQ.
+/// rather than refusing the whole spot. The variant-2 random-access
+/// shape (`data_runs.len() == total_rows`, multi-length, repurposed as
+/// `data_offset[]`) routes through [`PageMap::pad_random_access_rows`]
+/// to reconstruct rows from a deduplicated data buffer. The variant-2
+/// non-random-access shape (`data_runs.is_empty()`, multi-length) still
+/// errors with [`sracha_vdb::Error::UnsupportedFormat`] (surfaced as
+/// [`Error::Vdb`]) — silent skip would leak real N annotations and
+/// we don't yet have a validated decoder for that shape.
 ///
 /// `read_page_map` is the (post-data_runs) READ page_map for this blob;
 /// when ALTREAD and READ blobs share row boundaries, its per-logical-row
@@ -237,38 +240,26 @@ fn apply_altread_merge(
     // stored bytes because `trim<0, 0>` trims from the left) using
     // the page_map, then merge byte-per-base.
     //
-    // Fail-fast on variant 2 page maps: when there's more than one
-    // distinct length value, ALTREAD stores 4na ambiguity overlays
-    // in a layout we don't have a correct decoder for. Two on-disk
-    // shapes hit this path:
-    //   - `data_runs` empty + multi-length (the original variant 2
-    //     non-random-access case validated on DRR024182 blob 162)
-    //   - `data_runs.len() == total_rows` + multi-length (variant 2
-    //     random-access; ncbi-vdb's serialiser overlays per-row
-    //     `data_offset` on the data_run slot, but ALTREAD doesn't
-    //     pad cleanly through `expand_via_page_map`'s offset path
-    //     because trim<0,0> needs row-by-row padding, not flat
-    //     row-length × row_count slabs).
-    // Silently skipping the merge would leak real N annotations
-    // into output (0.01–1.5% sequence divergence from fasterq-dump
-    // on impacted accessions). Erroring with an actionable message
-    // is the safer choice — better to refuse than produce wrong
-    // FASTQ.
+    // Fail-fast guard for the *non*-random-access flavor of v1 variant 2:
+    // `data_runs` empty + multi-length, with nonzero bytes still in the
+    // data buffer. We don't have a validated decoder or fixture for this
+    // shape (it's distinct from the variant-2 RA shape handled below),
+    // and silently skipping the merge leaks real N annotations into FASTQ
+    // (0.01–1.5% sequence divergence vs fasterq-dump). Refuse rather than
+    // emit potentially-wrong FASTQ.
     if let Some(pm) = alt_page_map.as_ref()
         && pm.lengths.len() > 1
-        && (pm.data_runs.is_empty() || pm.data_runs.len() as u64 == pm.total_rows())
+        && pm.data_runs.is_empty()
         && altread_data.iter().any(|&b| b != 0)
     {
         return Err(sracha_vdb::Error::UnsupportedFormat {
-            format: "page_map v1 variant 2 in ALTREAD".into(),
+            format: "page_map v1 variant 2 non-random-access in ALTREAD".into(),
             hint: format!(
-                "ALTREAD blob {blob_idx} stores {} rows with {} unique length \
-                 values via a variant-2 page_map (no data_runs); sracha's \
-                 decoder for this variant doesn't produce byte-identical \
-                 output vs fasterq-dump. Refusing to emit potentially-wrong \
-                 FASTQ — use fasterq-dump for this file, or file an issue \
-                 with the accession so we can add proper variant-2 support. \
-                 See comment in pipeline::decode_blob_to_fastq.",
+                "ALTREAD blob {blob_idx} stores {} rows with {} unique length values via \
+                 a variant-2 non-random-access page_map (no data_runs); sracha doesn't \
+                 have a byte-identity-validated decoder for this shape. Refusing to emit \
+                 potentially-wrong FASTQ — use fasterq-dump for this file, or file an \
+                 issue with the accession so we can add coverage.",
                 pm.leng_runs.iter().sum::<u32>(),
                 pm.lengths.len(),
             ),
@@ -312,9 +303,48 @@ fn apply_altread_merge(
             lens
         })
     });
+    // Variant-2 random-access page maps repurpose `data_runs` as
+    // `data_offset[row_count]`: each row's trimmed bytes are sliced
+    // out of `altread_data` at `data_offsets[row]` for `lengths[run]`
+    // bytes (multiple rows can share the same offset → write-time
+    // dedup, so the data buffer can be far smaller than
+    // `sum(lengths × leng_runs)`). DRR024182 blob 162 hits this:
+    // 8192 rows / 77 unique lengths / 1981 stored bytes / only 17
+    // unique offsets (6481 rows share offset=0). Detect by the data
+    // shape (`data_runs.len() == total_rows && lengths.len() > 1`)
+    // and route to the offset-aware reconstruction; everything else
+    // continues through the run-length variable padder.
+    let is_variant2_ra = alt_page_map
+        .as_ref()
+        .is_some_and(|pm| pm.lengths.len() > 1 && pm.data_runs.len() as u64 == pm.total_rows());
     let padded_ok = alt_page_map.as_ref().and_then(|pm| {
         if altread_data.is_empty() {
             return None;
+        }
+        // Variant-2 RA needs to walk every row by `data_offset[row]`
+        // and copy `lengths[run]` bytes; neither `pad_trimmed_rows_*`
+        // can do that. When the READ blob aligns 1:1 with ALTREAD,
+        // pad each row to its READ-derived logical width; otherwise
+        // (e.g. DRR035866-style 2:1 ALTREAD blob) pad to the uniform
+        // `row_bases` width across every ALTREAD row, then the merge
+        // step slices the relevant `row_offset * row_bases` portion.
+        if is_variant2_ra && row_bases > 0 {
+            let alt_total_rows = pm.total_rows() as usize;
+            let row_logical_lens: Vec<u32> = match per_row_lens.as_ref() {
+                Some(lens) => lens.clone(),
+                None => vec![row_bases as u32; alt_total_rows],
+            };
+            match pm.pad_random_access_rows(
+                &altread_data,
+                &row_logical_lens,
+                crate::vdb::blob::TrimSide::Leading,
+            ) {
+                Ok(v) => return Some(v),
+                Err(e) => {
+                    tracing::debug!("blob {blob_idx}: ALTREAD pad_random_access_rows err: {e}");
+                    return None;
+                }
+            }
         }
         if let Some(lens) = per_row_lens.as_ref() {
             match pm.pad_trimmed_rows_variable(
