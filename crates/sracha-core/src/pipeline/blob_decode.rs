@@ -237,20 +237,26 @@ fn apply_altread_merge(
     // stored bytes because `trim<0, 0>` trims from the left) using
     // the page_map, then merge byte-per-base.
     //
-    // Fail-fast on variant 2 page maps: when `data_runs` is empty
-    // *and* we have more than one distinct length value, the
-    // stored data layout doesn't match either of the two
-    // interpretations that work elsewhere (`sum(lengths)` nor
-    // `sum(lengths × leng_runs)` equals `stored_len` on real
-    // data — validated against DRR024182 blob 162). We don't
-    // have a correct decoder for that variant yet, and silently
-    // skipping the merge leaks real N annotations into output
-    // (0.01–1.5% sequence divergence from fasterq-dump).
-    // Erroring out with an actionable message is the safer
-    // choice — better to refuse than produce wrong FASTQ.
+    // Fail-fast on variant 2 page maps: when there's more than one
+    // distinct length value, ALTREAD stores 4na ambiguity overlays
+    // in a layout we don't have a correct decoder for. Two on-disk
+    // shapes hit this path:
+    //   - `data_runs` empty + multi-length (the original variant 2
+    //     non-random-access case validated on DRR024182 blob 162)
+    //   - `data_runs.len() == total_rows` + multi-length (variant 2
+    //     random-access; ncbi-vdb's serialiser overlays per-row
+    //     `data_offset` on the data_run slot, but ALTREAD doesn't
+    //     pad cleanly through `expand_via_page_map`'s offset path
+    //     because trim<0,0> needs row-by-row padding, not flat
+    //     row-length × row_count slabs).
+    // Silently skipping the merge would leak real N annotations
+    // into output (0.01–1.5% sequence divergence from fasterq-dump
+    // on impacted accessions). Erroring with an actionable message
+    // is the safer choice — better to refuse than produce wrong
+    // FASTQ.
     if let Some(pm) = alt_page_map.as_ref()
-        && pm.data_runs.is_empty()
         && pm.lengths.len() > 1
+        && (pm.data_runs.is_empty() || pm.data_runs.len() as u64 == pm.total_rows())
         && altread_data.iter().any(|&b| b != 0)
     {
         return Err(sracha_vdb::Error::UnsupportedFormat {
@@ -811,6 +817,17 @@ pub(crate) fn decode_blob_to_fastq(
         // interleaved-tile assignments on Illumina HiSeq archives where
         // two tiles alternate at fine granularity along the spot axis
         // (DRR040793: tile 1101/1102 interleave starting at spot 7637).
+        //
+        // Two page_map shapes show up in real archives:
+        //   - data_runs holds run-length REPEAT counts (one per data
+        //     record). data_record_lengths × repeats expands directly
+        //     to per-row strings.
+        //   - data_runs holds per-row BYTE OFFSETS into the data buffer
+        //     (the random_access variant 2 case where ncbi-vdb's serial
+        //     format stores `data_offset[row_count]` after lengths /
+        //     leng_runs and overlays it on the data_run slot). Each row
+        //     pulls its own slice from a deduplicated pool of unique
+        //     templates.
         let name_fmt_per_row: Option<Vec<Vec<u8>>> = if raw.has_name_fmt
             && !raw.name_fmt_raw.is_empty()
         {
@@ -820,30 +837,59 @@ pub(crate) fn decode_blob_to_fastq(
                     let pm = nfd.page_map.clone();
                     let bytes = decode_zip_encoding(&nfd).ok()?;
                     let pm = pm?;
-                    // Build per-row strings using data_record_lengths +
-                    // data_runs. Each (record_len, repeat) emits `repeat`
-                    // copies of `record_len` bytes from the data buffer.
-                    let rec_lens = pm.data_record_lengths();
-                    let mut rows: Vec<Vec<u8>> =
-                        Vec::with_capacity(pm.total_rows() as usize);
-                    let mut cursor = 0usize;
-                    for (i, &len) in rec_lens.iter().enumerate() {
-                        let len = len as usize;
-                        let repeat = pm.data_runs.get(i).copied().unwrap_or(1) as usize;
-                        if cursor + len > bytes.len() {
-                            return None;
+                    let total_rows = pm.total_rows() as usize;
+                    let random_access =
+                        pm.data_runs.len() == total_rows && total_rows > 0;
+                    let mut rows: Vec<Vec<u8>> = Vec::with_capacity(total_rows);
+                    if random_access {
+                        // Per-row byte offsets: each row pulls its own
+                        // slice from `bytes` at offset data_runs[i] of
+                        // length determined by leng_runs expansion.
+                        let mut row_lens: Vec<u32> = Vec::with_capacity(total_rows);
+                        for (length, &run) in pm.lengths.iter().zip(pm.leng_runs.iter())
+                        {
+                            for _ in 0..run {
+                                row_lens.push(*length);
+                            }
                         }
-                        let chunk = bytes[cursor..cursor + len].to_vec();
-                        for _ in 0..repeat {
-                            rows.push(chunk.clone());
+                        for (i, &len) in row_lens.iter().enumerate() {
+                            let len = len as usize;
+                            if len == 0 {
+                                rows.push(Vec::new());
+                                continue;
+                            }
+                            let off = pm.data_runs.get(i).copied().unwrap_or(0) as usize;
+                            if off + len > bytes.len() {
+                                return None;
+                            }
+                            rows.push(bytes[off..off + len].to_vec());
                         }
-                        cursor += len;
+                    } else {
+                        // Run-length variant: one chunk per data record,
+                        // replicated `data_runs[i]` times (defaults to 1
+                        // when data_runs is empty).
+                        let rec_lens = pm.data_record_lengths();
+                        let mut cursor = 0usize;
+                        for (i, &len) in rec_lens.iter().enumerate() {
+                            let len = len as usize;
+                            let repeat =
+                                pm.data_runs.get(i).copied().unwrap_or(1) as usize;
+                            if cursor + len > bytes.len() {
+                                return None;
+                            }
+                            let chunk = bytes[cursor..cursor + len].to_vec();
+                            for _ in 0..repeat {
+                                rows.push(chunk.clone());
+                            }
+                            cursor += len;
+                        }
                     }
                     if blob_idx == 0 {
                         let nonempty = rows.iter().filter(|r| !r.is_empty()).count();
                         tracing::debug!(
-                            "NAME_FMT blob 0: {} rows, {} non-empty overrides",
+                            "NAME_FMT blob 0: {} rows ({}), {} non-empty overrides",
                             rows.len(),
+                            if random_access { "random-access" } else { "run-length" },
                             nonempty,
                         );
                     }

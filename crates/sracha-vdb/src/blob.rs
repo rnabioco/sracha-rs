@@ -622,21 +622,43 @@ fn page_map_deserialize_v0(data: &[u8], row_count: u64) -> Result<PageMap> {
         }
         2 => {
             // Variable row length, data_run = 1.
+            //
+            // When random_access is set (page_map version=2), this
+            // variant additionally stores `data_offset[row_count]`
+            // after the lengths/leng_runs pair — a per-row byte offset
+            // into the column's data buffer. ncbi-vdb repurposes the
+            // `data_run` slot to carry these offsets for the random-
+            // access variant. We follow the same convention so
+            // downstream code can detect "data_runs.len() ==
+            // total_rows" and dispatch into the offset-lookup branch
+            // already present in `expand_via_page_map`. Without this,
+            // NAME_FMT blobs on Illumina HiSeq archives (DRR040793
+            // blob 2 et al) lose their per-row template overrides and
+            // sracha falls back to the skey range mapping, which can't
+            // reproduce the fine-grained tile interleave.
             let (leng_recs, sz) = vlen_decode_u64(&data[cur..])?;
             cur += sz;
 
             // Both lengths and leng_runs are serialized sequentially.
             let total = 2 * leng_recs as usize;
-            let (combined, _) = deserialize_lengths(&data[cur..], total)?;
+            let (combined, sz) = deserialize_lengths(&data[cur..], total)?;
+            cur += sz;
 
             let lengths = combined[..leng_recs as usize].to_vec();
             let leng_runs = combined[leng_recs as usize..].to_vec();
+
+            let data_runs = if random_access {
+                let (offsets, _) = deserialize_lengths(&data[cur..], row_count as usize)?;
+                offsets
+            } else {
+                Vec::new()
+            };
 
             Ok(PageMap {
                 data_recs: row_count,
                 lengths,
                 leng_runs,
-                data_runs: vec![],
+                data_runs,
             })
         }
         3 => {
