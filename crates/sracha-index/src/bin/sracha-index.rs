@@ -22,21 +22,43 @@ struct Cli {
 enum Cmd {
     /// Extract metadata for a single accession and print as JSON.
     Extract { accession: String },
-    /// Build a catalog shard from a list of accessions.
+    /// Build a fresh catalog (initial base shard). Replaces any
+    /// existing manifest at the catalog dir.
     Build {
         /// File with one accession per line.
         #[arg(long)]
         accession_list: std::path::PathBuf,
-        /// Output shard path.
+        /// Output catalog directory.
         #[arg(short, long)]
         output: std::path::PathBuf,
+        /// Shard name within the catalog (default "base").
+        #[arg(long, default_value = "base")]
+        shard_name: String,
         /// Parallel extractor workers.
         #[arg(short = 'j', long, default_value = "32")]
         workers: usize,
     },
-    /// Query a shard by accession id.
+    /// Append a new delta shard to an existing catalog. Re-uses the
+    /// same shard format; readers union over all shards in the
+    /// manifest, newest-wins on lookup collisions.
+    Append {
+        /// File with one accession per line.
+        #[arg(long)]
+        accession_list: std::path::PathBuf,
+        /// Existing catalog directory (must contain manifest.json).
+        #[arg(short, long)]
+        catalog: std::path::PathBuf,
+        /// Shard name (default = today's date `YYYY-MM-DD`).
+        #[arg(long)]
+        shard_name: Option<String>,
+        /// Parallel extractor workers.
+        #[arg(short = 'j', long, default_value = "32")]
+        workers: usize,
+    },
+    /// Query a catalog (single shard or multi-shard manifest) by
+    /// accession id.
     Query {
-        shard: std::path::PathBuf,
+        catalog: std::path::PathBuf,
         accession: String,
     },
 }
@@ -69,19 +91,31 @@ async fn main() -> Result<()> {
         Cmd::Build {
             accession_list,
             output,
+            shard_name,
             workers,
         } => {
-            run_build(&accession_list, &output, workers).await?;
+            run_build(&accession_list, &output, &shard_name, workers, false).await?;
         }
-        Cmd::Query { shard, accession } => {
+        Cmd::Append {
+            accession_list,
+            catalog,
+            shard_name,
+            workers,
+        } => {
+            let name = shard_name.unwrap_or_else(today_yyyy_mm_dd);
+            run_build(&accession_list, &catalog, &name, workers, true).await?;
+        }
+        Cmd::Query { catalog, accession } => {
             let started = std::time::Instant::now();
-            let cat = reader::CatalogReader::open_local(&shard).await?;
+            let cat = reader::CatalogReader::open_local(&catalog).await?;
             let opened = started.elapsed();
             let lookup_start = std::time::Instant::now();
             let rec = cat.lookup(&accession).await?;
             let lookup = lookup_start.elapsed();
             tracing::info!(
-                "opened catalog ({} accessions) in {:.1}ms; point lookup in {:.3}ms",
+                "opened catalog ({} shards, {} accessions) in {:.1}ms; \
+                 point lookup in {:.3}ms",
+                cat.shard_count(),
                 cat.len(),
                 opened.as_secs_f64() * 1000.0,
                 lookup.as_secs_f64() * 1000.0,
@@ -98,10 +132,16 @@ async fn main() -> Result<()> {
     Ok(())
 }
 
+/// Build a shard inside `<catalog_dir>/shards/<shard_name>.vortex/`
+/// and add an entry to `<catalog_dir>/manifest.json`. When
+/// `is_append` is false, removes any pre-existing shard with the
+/// same name (overwrite); when true, appends/replaces in-place.
 async fn run_build(
     accession_list: &std::path::Path,
-    output: &std::path::Path,
+    catalog_dir: &std::path::Path,
+    shard_name: &str,
     workers: usize,
+    is_append: bool,
 ) -> Result<()> {
     use std::sync::Arc;
     use std::time::Instant;
@@ -131,7 +171,22 @@ async fn run_build(
         }));
     }
 
-    let mut writer_obj = writer::ShardWriter::create(output)?;
+    // Resolve paths.
+    let shard_relative = format!("shards/{shard_name}.vortex");
+    let shard_path = catalog_dir.join(&shard_relative);
+    let manifest_path = catalog_dir.join("manifest.json");
+
+    if !is_append && shard_path.exists() {
+        std::fs::remove_dir_all(&shard_path)?;
+    }
+    if !is_append && manifest_path.exists() {
+        // Fresh build: remove the old manifest. Subsequent appends
+        // will recreate it.
+        std::fs::remove_file(&manifest_path)?;
+    }
+    std::fs::create_dir_all(catalog_dir.join("shards"))?;
+
+    let mut writer_obj = writer::ShardWriter::create(&shard_path)?;
     let mut total_bytes_fetched: u64 = 0;
     let mut total_extract_secs: f32 = 0.0;
     let mut n_ok = 0usize;
@@ -178,7 +233,9 @@ async fn run_build(
     }
 
     let session = VortexSession::default().with_tokio();
-    let summary = writer_obj.finish(&session).await?;
+    let summary = writer_obj
+        .finish_with_manifest(&session, Some(&manifest_path), shard_name, &shard_relative)
+        .await?;
 
     let wall = started.elapsed().as_secs_f32();
     tracing::info!(
@@ -197,4 +254,32 @@ async fn run_build(
         total_extract_secs / wall.max(0.001),
     );
     Ok(())
+}
+
+/// `YYYY-MM-DD` for the current UTC date — default delta shard name.
+fn today_yyyy_mm_dd() -> String {
+    let secs = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    let days = secs / 86400;
+    // Days since 1970-01-01 → calendar date via the simple
+    // proleptic-Gregorian algorithm. Avoids pulling in chrono just
+    // for a filename.
+    let (y, m, d) = days_to_ymd(days as i64);
+    format!("{y:04}-{m:02}-{d:02}")
+}
+
+fn days_to_ymd(mut days: i64) -> (i32, u32, u32) {
+    days += 719468;
+    let era = days.div_euclid(146097);
+    let doe = (days - era * 146097) as u64;
+    let yoe = (doe - doe / 1460 + doe / 36524 - doe / 146096) / 365;
+    let y = (yoe as i64 + era * 400) as i32;
+    let doy = (doe - (365 * yoe + yoe / 4 - yoe / 100)) as u32;
+    let mp = (5 * doy + 2) / 153;
+    let d = doy - (153 * mp + 2) / 5 + 1;
+    let m = if mp < 10 { mp + 3 } else { mp - 9 };
+    let y = if m <= 2 { y + 1 } else { y };
+    (y, m as u32, d as u32)
 }

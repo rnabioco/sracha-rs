@@ -87,6 +87,24 @@ impl ShardWriter {
     /// EXACT blob boundaries (decode), sracha re-fetches the (tiny,
     /// few-KB) idx files from S3 directly. The catalog tells it
     /// where to find them via `data_slab_offset`.
+    /// Write the shard's three .vortex files into `self.path` and
+    /// optionally update `manifest_path`'s shard list. Pass `None`
+    /// for manifest_path on tests / one-off runs that don't need a
+    /// catalog directory.
+    pub async fn finish_with_manifest(
+        self,
+        session: &VortexSession,
+        manifest_path: Option<&std::path::Path>,
+        shard_name: &str,
+        shard_relative_path: &str,
+    ) -> Result<WriteSummary> {
+        let summary = self.finish(session).await?;
+        if let Some(mpath) = manifest_path {
+            update_manifest(mpath, shard_name, shard_relative_path, summary.n_accessions)?;
+        }
+        Ok(summary)
+    }
+
     pub async fn finish(self, session: &VortexSession) -> Result<WriteSummary> {
         std::fs::create_dir_all(&self.path)?;
         let accessions_array = build_accessions_array(&self.records, &self.schemas)?;
@@ -326,6 +344,48 @@ fn build_schemas_array(
 }
 
 // --- helpers -------------------------------------------------------------
+
+/// Append (or create) a `manifest.json` entry pointing at the new
+/// shard. Idempotent on shard_name — re-builds replace the entry.
+fn update_manifest(
+    manifest_path: &std::path::Path,
+    shard_name: &str,
+    shard_relative_path: &str,
+    n_accessions: usize,
+) -> Result<()> {
+    use crate::reader::{Manifest, ShardEntry};
+    let mut manifest = if manifest_path.exists() {
+        let bytes = std::fs::read(manifest_path)?;
+        serde_json::from_slice::<Manifest>(&bytes)?
+    } else {
+        Manifest {
+            version: 1,
+            shards: Vec::new(),
+        }
+    };
+
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    let entry = ShardEntry {
+        name: shard_name.to_string(),
+        path: shard_relative_path.to_string(),
+        n_accessions: n_accessions as u64,
+        built_at: format!("epoch:{now}"),
+    };
+
+    // Replace existing entry with the same name, else append.
+    if let Some(slot) = manifest.shards.iter_mut().find(|s| s.name == shard_name) {
+        *slot = entry;
+    } else {
+        manifest.shards.push(entry);
+    }
+
+    let body = serde_json::to_vec_pretty(&manifest)?;
+    std::fs::write(manifest_path, body)?;
+    Ok(())
+}
 
 /// SHA256 fingerprint of a list of [`ColumnMetaEntry`]s — used for
 /// schema dedup. Public so tests can assert determinism.

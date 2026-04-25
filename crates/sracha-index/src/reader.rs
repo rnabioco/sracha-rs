@@ -20,14 +20,17 @@ use crate::record::{
 };
 use crate::{Error, Result};
 
-pub struct CatalogReader {
+/// One self-contained shard: three Vortex files
+/// (accessions/col_extents/schemas) where all foreign keys
+/// (`schema_id`, `accession_idx`) resolve within the shard.
+pub struct ShardReader {
     session: VortexSession,
     accessions_file: VortexFile,
     col_extents_file: VortexFile,
     schemas_file: VortexFile,
 }
 
-impl CatalogReader {
+impl ShardReader {
     pub async fn open_local(path: &Path) -> Result<Self> {
         let session = VortexSession::default().with_tokio();
         let accessions_file = session
@@ -296,4 +299,93 @@ fn field_i64(s: &vortex::array::scalar::StructScalar, name: &str) -> Result<i64>
         .ok_or_else(|| Error::Reader(format!("field {name} not primitive")))?;
     p.as_::<i64>()
         .ok_or_else(|| Error::Reader(format!("field {name} not i64")))
+}
+
+// ---------------------------------------------------------------------------
+// Multi-shard catalog
+// ---------------------------------------------------------------------------
+
+/// Manifest format. Lives at `<catalog_dir>/manifest.json`.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct Manifest {
+    pub version: u32,
+    pub shards: Vec<ShardEntry>,
+}
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct ShardEntry {
+    /// Display name (e.g. "base", "2026-04-26").
+    pub name: String,
+    /// Path relative to the catalog dir.
+    pub path: String,
+    /// Number of accessions in this shard. Diagnostic — not load
+    /// bearing.
+    pub n_accessions: u64,
+    /// ISO 8601 timestamp of when this shard was built.
+    pub built_at: String,
+}
+
+/// Multi-shard catalog reader. Lookups query each shard in order
+/// (newest last) — last hit wins, so an `append` rebuild of an
+/// existing accession overrides the original.
+pub struct CatalogReader {
+    /// Shards in manifest order. Oldest first; newest last.
+    shards: Vec<ShardReader>,
+}
+
+impl CatalogReader {
+    /// Open a catalog directory. Reads `manifest.json` and opens
+    /// every shard listed.
+    pub async fn open_local(catalog_dir: &Path) -> Result<Self> {
+        let manifest_path = catalog_dir.join("manifest.json");
+        // Backwards compat: if there's no manifest.json but the dir
+        // contains accessions.vortex, treat the dir as a single
+        // shard catalog. Lets old single-shard outputs keep working
+        // through the multi-shard reader.
+        if !manifest_path.exists() && catalog_dir.join("accessions.vortex").exists() {
+            let shard = ShardReader::open_local(catalog_dir).await?;
+            return Ok(Self { shards: vec![shard] });
+        }
+        let manifest_bytes = std::fs::read(&manifest_path)
+            .map_err(|e| Error::Reader(format!("read manifest: {e}")))?;
+        let manifest: Manifest = serde_json::from_slice(&manifest_bytes)?;
+        if manifest.version != 1 {
+            return Err(Error::Reader(format!(
+                "unsupported manifest version {}",
+                manifest.version
+            )));
+        }
+        let mut shards = Vec::with_capacity(manifest.shards.len());
+        for entry in &manifest.shards {
+            let path = catalog_dir.join(&entry.path);
+            shards.push(ShardReader::open_local(&path).await?);
+        }
+        Ok(Self { shards })
+    }
+
+    pub fn shard_count(&self) -> usize {
+        self.shards.len()
+    }
+
+    /// Number of accessions across all shards. Note: if an
+    /// accession appears in multiple shards (e.g. base + delta
+    /// rebuild) the count is per-shard, not deduped.
+    pub fn len(&self) -> usize {
+        self.shards.iter().map(|s| s.len()).sum()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.shards.iter().all(|s| s.is_empty())
+    }
+
+    /// Point lookup. Walks shards newest-to-oldest; first hit wins.
+    /// (manifest order is oldest-first; we iterate in reverse.)
+    pub async fn lookup(&self, accession: &str) -> Result<Option<AccessionRecord>> {
+        for shard in self.shards.iter().rev() {
+            if let Some(rec) = shard.lookup(accession).await? {
+                return Ok(Some(rec));
+            }
+        }
+        Ok(None)
+    }
 }
