@@ -1420,7 +1420,12 @@ fn deserialize_izip_encoded(src: &[u8]) -> Result<IzipEncoded<'_>> {
 }
 
 /// Helper to decompress or copy a sub-array buffer.
+///
+/// `max_out` is the pre-allocated output size; bound it against the input so
+/// a misinterpreted/oversized iZip header cannot drive an arbitrary deflate
+/// destination buffer.
 fn izip_decompress_buf(data: &[u8], flag: u32, max_out: usize) -> Result<Vec<u8>> {
+    check_alloc_bytes(max_out, data.len(), "izip_decompress_buf")?;
     if flag == DATA_ZIPPED {
         zlib_raw_decompress(data, max_out)
     } else {
@@ -1685,26 +1690,63 @@ fn decode_types(n: usize, src: &[u8]) -> Result<Vec<u8>> {
     Ok(dst)
 }
 
+/// Maximum allowed output-to-input byte ratio for a single decode step.
+///
+/// iZip and deflate compress at most a few hundred to one for highly
+/// repetitive payloads; 1024 is a defense-in-depth cap that rejects
+/// header-driven allocation requests derived from misinterpreted bytes
+/// (e.g. issue #30) without ever rejecting a real blob.
+pub(crate) const MAX_DECODE_RATIO: usize = 1024;
+
+/// Reject a header-driven allocation that exceeds `src.len() * MAX_DECODE_RATIO`.
+///
+/// Used at every `vec![0u8; N]` whose `N` derives from on-wire bytes — the
+/// shared bound prevents a malformed `data_count` / size field from
+/// triggering `handle_alloc_error` before we ever look at the payload.
+pub(crate) fn check_alloc_bytes(n_bytes: usize, src_len: usize, ctx: &str) -> Result<()> {
+    let limit = src_len.saturating_mul(MAX_DECODE_RATIO);
+    if n_bytes > limit {
+        return Err(Error::Format(format!(
+            "{ctx}: requested {n_bytes}-byte allocation exceeds {limit}-byte cap \
+             for {src_len}-byte input"
+        )));
+    }
+    Ok(())
+}
+
+/// Allocate a zero-filled byte buffer with `check_alloc_bytes` already applied.
+fn bounded_zeros(n: usize, src_len: usize, ctx: &str) -> Result<Vec<u8>> {
+    check_alloc_bytes(n, src_len, ctx)?;
+    Ok(vec![0u8; n])
+}
+
 /// Decode izip-compressed integers.
 ///
 /// `data` is the raw izip-encoded byte stream (as found in the blob's column
 /// data after envelope/header stripping). `elem_bits` is the output element
-/// size in bits (8, 16, 32, or 64). `num_elements` is the expected number of
-/// output elements.
+/// size in bits (8, 16, 32, or 64). The output element count comes from the
+/// iZip header's `data_count` field; allocations are bounded against
+/// `data.len() * MAX_DECODE_RATIO` so that misinterpreted bytes (e.g. a
+/// deflate-compressed quality blob fed to the iZip probe) cannot drive an
+/// unbounded heap allocation.
 ///
 /// Returns the decoded integers as a byte vector in native (little-endian)
-/// format, with `num_elements * (elem_bits / 8)` bytes.
-pub fn izip_decode(data: &[u8], elem_bits: u32, _num_elements_hint: u32) -> Result<Vec<u8>> {
+/// format, with `data_count * (elem_bits / 8)` bytes.
+pub fn izip_decode(data: &[u8], elem_bits: u32) -> Result<Vec<u8>> {
     let encoded = deserialize_izip_encoded(data)?;
-    // Use the data_count from the izip header as the authoritative element count.
-    // The caller's hint may not match (e.g., blob id_range vs actual element count).
     let n = encoded.data_count as usize;
 
     let enc_type = encoded.flags & 0x03;
     let _size_type = ((encoded.flags >> 2) & 3) as u32;
 
     let out_bytes = (elem_bits / 8) as usize;
-    let mut output = vec![0u8; n * out_bytes];
+    let total = n.checked_mul(out_bytes).ok_or_else(|| {
+        Error::Format(format!(
+            "izip_decode: n={n} * out_bytes={out_bytes} overflows usize"
+        ))
+    })?;
+    check_alloc_bytes(total, data.len(), "izip_decode output")?;
+    let mut output = vec![0u8; total];
 
     match enc_type {
         // Type 1: zlib-compressed, no min offset.
@@ -1741,9 +1783,15 @@ pub fn izip_decode(data: &[u8], elem_bits: u32, _num_elements_hint: u32) -> Resu
                 .ok_or_else(|| Error::Format("izip type 0: missing izip fields".into()))?;
 
             // Decode diff buffer.
+            //
+            // The DATA_CONSTANT branches below allocate from header-supplied
+            // size fields directly — without `bounded_zeros`, a misinterpreted
+            // header could request gigabytes here. The non-constant branches
+            // route through `izip_decompress_buf`, which carries the same
+            // bound internally.
             let flag_diff = flag_extract(iz.data_flags, FLAG_BITS);
             let diff_raw = if flag_diff == DATA_CONSTANT {
-                vec![0u8; iz.diff_size as usize]
+                bounded_zeros(iz.diff_size as usize, data.len(), "izip type 0 diff_const")?
             } else {
                 izip_decompress_buf(iz.diff_data, flag_diff, n * 8)?
             };
@@ -1756,16 +1804,18 @@ pub fn izip_decode(data: &[u8], elem_bits: u32, _num_elements_hint: u32) -> Resu
             let diff_var = variant_from_elem_bits(diff_elem_bits)?;
 
             // Determine lines and outlier counts.
+            let segments = iz.segments as usize;
+            check_alloc_bytes(segments, data.len(), "izip type 0 segments")?;
             let segment_types = if iz.outliers > 0 {
                 let flag_type = flag_extract(iz.data_flags, 0);
                 let type_raw = if flag_type == DATA_ZIPPED {
-                    zlib_raw_decompress(iz.type_data, iz.segments as usize)?
+                    zlib_raw_decompress(iz.type_data, segments)?
                 } else {
                     iz.type_data.to_vec()
                 };
-                decode_types(iz.segments as usize, &type_raw)?
+                decode_types(segments, &type_raw)?
             } else {
-                vec![0u8; iz.segments as usize]
+                vec![0u8; segments]
             };
 
             let lines = segment_types.iter().filter(|&&t| t == 0).count();
@@ -1777,7 +1827,12 @@ pub fn izip_decode(data: &[u8], elem_bits: u32, _num_elements_hint: u32) -> Resu
             let flag_length = flag_extract(iz.data_flags, 2 * FLAG_BITS);
             let total_segs = lines + outlier_count;
             let length_raw = if flag_length == DATA_CONSTANT {
-                vec![0u8; iz.length_size as usize * total_segs]
+                let n_bytes = (iz.length_size as usize)
+                    .checked_mul(total_segs)
+                    .ok_or_else(|| Error::Format(
+                        format!("izip type 0 length_const: length_size={} * total_segs={total_segs} overflows usize",
+                                iz.length_size)))?;
+                bounded_zeros(n_bytes, data.len(), "izip type 0 length_const")?
             } else {
                 izip_decompress_buf(iz.length_data, flag_length, total_segs * 4)?
             };
@@ -1790,7 +1845,7 @@ pub fn izip_decode(data: &[u8], elem_bits: u32, _num_elements_hint: u32) -> Resu
 
             let flag_dy = flag_extract(iz.data_flags, 3 * FLAG_BITS);
             let dy_raw = if flag_dy == DATA_CONSTANT {
-                vec![0u8; lines * 8]
+                bounded_zeros(lines.saturating_mul(8), data.len(), "izip type 0 dy_const")?
             } else {
                 izip_decompress_buf(iz.dy_data, flag_dy, lines * 8)?
             };
@@ -1803,7 +1858,7 @@ pub fn izip_decode(data: &[u8], elem_bits: u32, _num_elements_hint: u32) -> Resu
 
             let flag_dx = flag_extract(iz.data_flags, 4 * FLAG_BITS);
             let dx_raw = if flag_dx == DATA_CONSTANT {
-                vec![0u8; lines * 8]
+                bounded_zeros(lines.saturating_mul(8), data.len(), "izip type 0 dx_const")?
             } else {
                 izip_decompress_buf(iz.dx_data, flag_dx, lines * 8)?
             };
@@ -1816,7 +1871,7 @@ pub fn izip_decode(data: &[u8], elem_bits: u32, _num_elements_hint: u32) -> Resu
 
             let flag_a = flag_extract(iz.data_flags, 5 * FLAG_BITS);
             let a_raw = if flag_a == DATA_CONSTANT {
-                vec![0u8; lines * 8]
+                bounded_zeros(lines.saturating_mul(8), data.len(), "izip type 0 a_const")?
             } else {
                 izip_decompress_buf(iz.a_data, flag_a, lines * 8)?
             };
@@ -1830,7 +1885,11 @@ pub fn izip_decode(data: &[u8], elem_bits: u32, _num_elements_hint: u32) -> Resu
             let (outlier_raw, outlier_var) = if outlier_count > 0 {
                 let flag_outlier = flag_extract(iz.data_flags, 6 * FLAG_BITS);
                 let raw = if flag_outlier == DATA_CONSTANT {
-                    vec![0u8; outlier_count * 8]
+                    bounded_zeros(
+                        outlier_count.saturating_mul(8),
+                        data.len(),
+                        "izip type 0 outlier_const",
+                    )?
                 } else {
                     izip_decompress_buf(iz.outlier_data, flag_outlier, outlier_count * 8)?
                 };
@@ -1987,6 +2046,20 @@ pub fn irzip_decode(
     let n = num_elements as usize;
     let out_bytes = (elem_bits / 8) as usize;
 
+    // Bound both internal buffers against the input — `num_elements` is
+    // caller-supplied and ultimately derived from blob-header bytes, so a
+    // crafted header could otherwise drive an arbitrary allocation.
+    let values_bytes = n
+        .checked_mul(8)
+        .ok_or_else(|| Error::Format(format!("irzip_decode: n={n} * 8 overflows usize")))?;
+    check_alloc_bytes(values_bytes, data.len(), "irzip_decode values")?;
+    let output_bytes = n.checked_mul(out_bytes).ok_or_else(|| {
+        Error::Format(format!(
+            "irzip_decode: n={n} * out_bytes={out_bytes} overflows usize"
+        ))
+    })?;
+    check_alloc_bytes(output_bytes, data.len(), "irzip_decode output")?;
+
     // Decompress each byte-plane from concatenated zlib streams.
     let mut values = vec![0i64; n];
     let mut offset = 0usize;
@@ -2052,7 +2125,7 @@ pub fn irzip_decode(
     const DELTA_NEG: i64 = 0x7ffffffffffffff1_u64 as i64;
     const DELTA_BOTH: i64 = 0x7ffffffffffffff2_u64 as i64;
 
-    let mut output = vec![0u8; n * out_bytes];
+    let mut output = vec![0u8; output_bytes];
 
     if let Some((min2, slope2)) = series2 {
         // Dual-series (irzip v3): low bit of each value selects series.
@@ -2542,7 +2615,7 @@ mod tests {
         data.extend_from_slice(&4u32.to_le_bytes()); // data_count
         data.extend_from_slice(&compressed);
 
-        let result = izip_decode(&data, 8, 4).unwrap();
+        let result = izip_decode(&data, 8).unwrap();
         assert_eq!(result, vec![10, 20, 30, 40]);
     }
 
@@ -2566,7 +2639,7 @@ mod tests {
         data.extend_from_slice(&100i64.to_le_bytes()); // min
         data.extend_from_slice(&compressed);
 
-        let result = izip_decode(&data, 8, 4).unwrap();
+        let result = izip_decode(&data, 8).unwrap();
         assert_eq!(result, vec![100, 101, 102, 103]);
     }
 
@@ -2580,8 +2653,54 @@ mod tests {
         data.extend_from_slice(&50i64.to_le_bytes()); // min
         data.extend_from_slice(&[0u8, 1, 2]); // packed data
 
-        let result = izip_decode(&data, 8, 3).unwrap();
+        let result = izip_decode(&data, 8).unwrap();
         assert_eq!(result, vec![50, 51, 52]);
+    }
+
+    #[test]
+    fn izip_decode_rejects_oversized_data_count() {
+        // Issue #30 reproducer: a 5-byte buffer with type=1 and
+        // data_count=u32::MAX claims a 4 GiB output. `check_alloc_bytes`
+        // must reject this rather than calling `vec![0u8; 4 GiB]`.
+        let mut data = Vec::new();
+        data.push(0x01); // flags: type=1
+        data.extend_from_slice(&u32::MAX.to_le_bytes());
+        let err = izip_decode(&data, 8).expect_err("oversized data_count must error");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("izip_decode output") || msg.contains("exceeds"),
+            "unexpected error: {msg}"
+        );
+    }
+
+    #[test]
+    fn izip_decode_rejects_overflowing_n_times_out_bytes() {
+        // data_count near usize::MAX/4 would silently wrap when multiplied
+        // by 8 (elem_bits=64). `checked_mul` must catch the overflow.
+        let huge = u32::MAX / 2;
+        let mut data = Vec::new();
+        data.push(0x01); // flags: type=1
+        data.extend_from_slice(&huge.to_le_bytes());
+        let err = izip_decode(&data, 64).expect_err("overflow must error");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("overflows") || msg.contains("exceeds"),
+            "unexpected error: {msg}"
+        );
+    }
+
+    #[test]
+    fn irzip_decode_rejects_oversized_num_elements() {
+        // Caller-supplied num_elements is unbounded; check_alloc_bytes
+        // rejects requests larger than data.len() * MAX_DECODE_RATIO.
+        let data = vec![0u8; 16];
+        let err = irzip_decode(&data, 8, u32::MAX, 0, 0, 0xFF, None)
+            .expect_err("oversized num_elements must error");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("irzip_decode") && (msg.contains("exceeds") || msg.contains("overflows")),
+            "unexpected error: {msg}"
+        );
     }
 
     // -----------------------------------------------------------------------

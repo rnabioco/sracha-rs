@@ -138,6 +138,7 @@ impl CachedColumn {
         let logical_to_rec = page_map
             .as_ref()
             .map(compute_logical_to_rec)
+            .transpose()?
             .unwrap_or_default();
 
         *self.cache.borrow_mut() = Some(DecodedColumnBlob {
@@ -374,23 +375,37 @@ fn compute_prefix(record_lens: &[u32]) -> Vec<u64> {
     prefix
 }
 
-fn compute_logical_to_rec(pm: &PageMap) -> Vec<u32> {
+/// Maximum logical rows per blob — reject crafted page maps whose
+/// `leng_runs` sum to more than this. Real SRA blobs hold well under this
+/// (a few million rows is typical, hundreds of millions is the high end).
+const MAX_LOGICAL_ROWS_PER_BLOB: u64 = 1_000_000_000;
+
+fn compute_logical_to_rec(pm: &PageMap) -> Result<Vec<u32>> {
     if pm.data_runs.is_empty() {
-        return Vec::new();
+        return Ok(Vec::new());
     }
     let total = pm.total_rows();
     // Random-access variant: data_runs[i] is the rec_idx for logical row i.
     if (pm.data_runs.len() as u64) >= total {
-        return pm.data_runs.clone();
+        return Ok(pm.data_runs.clone());
     }
     // Run-length variant: data_runs[i] is the repeat count for rec_idx i.
+    //
+    // `total` is the sum of `pm.leng_runs` (parsed from idx2/page-map bytes).
+    // A crafted page map can make this arbitrarily large; reject before
+    // allocating.
+    if total > MAX_LOGICAL_ROWS_PER_BLOB {
+        return Err(Error::Format(format!(
+            "page map: logical row count {total} exceeds {MAX_LOGICAL_ROWS_PER_BLOB} cap"
+        )));
+    }
     let mut out = Vec::with_capacity(total as usize);
     for (i, &repeat) in pm.data_runs.iter().enumerate() {
         for _ in 0..repeat {
             out.push(i as u32);
         }
     }
-    out
+    Ok(out)
 }
 
 fn decode_bytes_payload(decoded: &DecodedBlob<'_>) -> Result<Vec<u8>> {
@@ -446,8 +461,7 @@ fn decode_integer_bytes(decoded: &DecodedBlob<'_>, elem_bits: u32) -> Result<Vec
     }
 
     if hdr.is_none() && !decoded.data.is_empty() {
-        let num_elems = (osize as u32) / (elem_bits / 8);
-        return blob::izip_decode(&decoded.data, elem_bits, num_elems);
+        return blob::izip_decode(&decoded.data, elem_bits);
     }
 
     Err(Error::Format(format!(
@@ -484,7 +498,7 @@ mod tests {
 
     #[test]
     fn logical_to_rec_empty_is_identity() {
-        let map = compute_logical_to_rec(&pm(vec![], vec![1], vec![1]));
+        let map = compute_logical_to_rec(&pm(vec![], vec![1], vec![1])).unwrap();
         assert!(
             map.is_empty(),
             "no data_runs → identity mapping (empty vec)"
@@ -494,7 +508,7 @@ mod tests {
     #[test]
     fn logical_to_rec_run_length() {
         // data_runs = [3, 2, 4] → rows 0..3 → rec 0, 3..5 → rec 1, 5..9 → rec 2.
-        let map = compute_logical_to_rec(&pm(vec![3, 2, 4], vec![1], vec![9]));
+        let map = compute_logical_to_rec(&pm(vec![3, 2, 4], vec![1], vec![9])).unwrap();
         assert_eq!(map, vec![0, 0, 0, 1, 1, 2, 2, 2, 2]);
     }
 
@@ -503,7 +517,7 @@ mod tests {
         // data_runs has one entry per logical row → treat as rec_idx lookup.
         // total_rows (leng_runs sum) = 4; data_runs.len()=4 → random-access.
         let dr = vec![2, 0, 1, 3];
-        let map = compute_logical_to_rec(&pm(dr.clone(), vec![1], vec![4]));
+        let map = compute_logical_to_rec(&pm(dr.clone(), vec![1], vec![4])).unwrap();
         assert_eq!(map, dr);
     }
 

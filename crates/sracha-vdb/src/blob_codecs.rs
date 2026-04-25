@@ -54,10 +54,7 @@ pub fn decode_irzip_column(decoded: &blob::DecodedBlob<'_>) -> Result<Vec<u8>> {
             blob::irzip_decode(&decoded.data, 32, num_elems, min, slope, planes, series2)?
         }
     } else {
-        let num_elems = decoded
-            .row_length
-            .unwrap_or_else(|| (decoded.data.len() as u64 * 8) / 32) as u32;
-        blob::izip_decode(&decoded.data, 32, num_elems)?
+        blob::izip_decode(&decoded.data, 32)?
     };
     expand_via_page_map(decoded_ints, &decoded.page_map)
 }
@@ -232,14 +229,21 @@ pub fn decode_zip_encoding(decoded: &blob::DecodedBlob<'_>) -> Result<Vec<u8>> {
 /// zlib — modern Illumina) and `izip_encoding` (NCBI integer compression —
 /// older srf-load-era Illumina such as DRR001816).
 ///
-/// The encoding isn't tagged in the blob header in a way that's trivially
-/// inspectable, so we probe by attempting `izip_decode` first: its 5-byte
-/// header validation rejects non-iZip payloads cleanly, so any file whose
-/// QUALITY is standard deflate falls straight through to
-/// [`decode_zip_encoding`].
+/// The encoding isn't tagged in the blob header, so we probe. zlib streams
+/// always start with a `0x78` CMF byte for the deflate window sizes NCBI
+/// uses, so when we see one we go straight to [`decode_zip_encoding`] and
+/// skip the iZip probe entirely — that closes the path that drove issue
+/// #30, where SRA-Lite quality blobs were being interpreted as iZip with
+/// arbitrary `data_count` values. Otherwise try `izip_decode` (now bounded
+/// against the input size) and fall back to deflate on failure.
 pub fn decode_quality_encoding(decoded: &blob::DecodedBlob<'_>) -> Result<Vec<u8>> {
-    if !decoded.data.is_empty()
-        && let Ok(qdata) = blob::izip_decode(&decoded.data, 8, decoded.data.len() as u32)
+    if decoded.data.is_empty() {
+        return decode_zip_encoding(decoded);
+    }
+    if decoded.data.first() == Some(&0x78) {
+        return decode_zip_encoding(decoded);
+    }
+    if let Ok(qdata) = blob::izip_decode(&decoded.data, 8)
         && !qdata.is_empty()
     {
         return Ok(qdata);
@@ -499,6 +503,49 @@ mod tests {
         let blob = make_blob(vec![], None);
         let out = decode_quality_encoding(&blob).unwrap();
         assert!(out.is_empty());
+    }
+
+    #[test]
+    fn decode_quality_encoding_uses_zlib_fast_path_for_0x78_payloads() {
+        // Issue #30: SRA-Lite quality blobs are stock zlib streams. The
+        // probe must short-circuit on the 0x78 CMF byte and route to
+        // decode_zip_encoding, never attempting izip_decode on bytes that
+        // happen to look like an iZip header.
+        let payload: Vec<u8> = vec![b'F'; 100];
+        let mut zlib = flate2::write::ZlibEncoder::new(Vec::new(), flate2::Compression::default());
+        std::io::Write::write_all(&mut zlib, &payload).unwrap();
+        let compressed = zlib.finish().unwrap();
+        assert_eq!(compressed[0], 0x78, "zlib stream must start with 0x78");
+
+        let osize = payload.len() as u64;
+        let blob = DecodedBlob {
+            data: Cow::Owned(compressed),
+            adjust: 0,
+            big_endian: false,
+            headers: vec![crate::blob::BlobHeaderFrame {
+                version: 1,
+                osize,
+                ..Default::default()
+            }],
+            page_map: None,
+            row_length: None,
+        };
+        let out = decode_quality_encoding(&blob).expect("zlib fast path must decode");
+        assert_eq!(out, payload);
+    }
+
+    #[test]
+    fn decode_quality_encoding_rejects_oversized_izip_header() {
+        // A non-zlib payload whose first 5 bytes spell out
+        // `flags=0x01, data_count=u32::MAX` previously drove a 4 GiB
+        // allocation in `izip_decode`. After the fix, `izip_decode` errors
+        // out and we fall through to deflate, which also fails on the
+        // garbage payload — neither path may panic with handle_alloc_error.
+        let mut data = vec![0u8; 32];
+        data[0] = 0x01;
+        data[1..5].copy_from_slice(&u32::MAX.to_le_bytes());
+        let blob = make_blob(data, None);
+        let _ = decode_quality_encoding(&blob); // must not abort the process
     }
 
     // -----------------------------------------------------------------------

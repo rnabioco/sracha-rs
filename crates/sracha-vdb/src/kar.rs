@@ -150,6 +150,16 @@ pub(crate) fn parse_pbstree_slices(buf: &[u8]) -> Result<Vec<&[u8]>> {
         }
     };
 
+    // The bounds check above ensures `num_nodes <= buf.len()` (each entry
+    // occupies at least one index byte), so this is bounded — but a 1 GiB
+    // KAR can otherwise drive `num_nodes * size_of::<&[u8]>() = 16 GiB` of
+    // capacity. Reject through the same defense-in-depth ratio used by the
+    // blob decoders.
+    crate::blob::check_alloc_bytes(
+        num_nodes.saturating_mul(std::mem::size_of::<&[u8]>()),
+        buf.len(),
+        "PBSTree node table",
+    )?;
     let mut nodes = Vec::with_capacity(num_nodes);
     for i in 0..num_nodes {
         let off = read_idx(i);
