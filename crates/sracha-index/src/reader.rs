@@ -87,11 +87,27 @@ impl ShardReader {
         let file_size = field_u64(&acc_struct, "file_size")?;
         let kar_data_offset = field_u64(&acc_struct, "kar_data_offset")?;
         let schema_id = field_u32(&acc_struct, "schema_id")?;
-        // Fields not stored yet (extractor TODOs): layout, platform,
-        // spots, md5. Fill placeholders.
-        let layout = Layout::Unknown;
-        let platform = Platform::Other;
-        let spots = None;
+        let spots_present = field_u8(&acc_struct, "spots_present")? != 0;
+        let spots = if spots_present {
+            Some(field_u64(&acc_struct, "spots")?)
+        } else {
+            None
+        };
+        let layout = match field_u8(&acc_struct, "layout")? {
+            1 => Layout::Single,
+            2 => Layout::Paired,
+            _ => Layout::Unknown,
+        };
+        let platform = match field_u8(&acc_struct, "platform")? {
+            1 => Platform::Illumina,
+            2 => Platform::PacBio,
+            3 => Platform::OxfordNanopore,
+            4 => Platform::IonTorrent,
+            _ => Platform::Other,
+        };
+        let read_lengths_json = field_string(&acc_struct, "read_lengths_json")?;
+        let read_lengths: Vec<u32> = serde_json::from_str(&read_lengths_json).unwrap_or_default();
+        // md5 not yet populated by the extractor — separate task.
         let md5 = None;
 
         // 2. Look up schema by schema_id.
@@ -107,7 +123,7 @@ impl ShardReader {
             spots,
             layout,
             platform,
-            read_lengths: Vec::new(),
+            read_lengths,
             schema_fingerprint: schema.fingerprint,
             kar_data_offset,
             blobs,

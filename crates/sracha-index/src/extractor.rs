@@ -13,6 +13,7 @@ use sha2::{Digest, Sha256};
 use sracha_core::s3 as s3core;
 use sracha_vdb::kar::KarArchive;
 use sracha_vdb::kdb::ColumnReader;
+use sracha_vdb::metadata as vdb_md;
 
 use crate::record::{
     AccessionRecord, BlobLocator, ColumnMetaEntry, Layout, NameFmtEntry, Platform, SchemaEntry,
@@ -127,13 +128,58 @@ pub async fn extract(accession: &str) -> Result<AccessionRecord> {
         }
     }
 
+    // 6b. Also queue the `md/cur` files. These carry read structure
+    //     (per-spot read types + lengths) and platform — needed to
+    //     populate AccessionRecord.{platform, layout, read_lengths}.
+    //     Try the table-level path first, then fall back to the
+    //     database-level path; mirroring sracha-vdb's
+    //     detect_metadata.
+    let mut md_plan: Vec<(String, u64, u64)> = Vec::new();
+    for path in ["tbl/SEQUENCE/md/cur", "md/cur"] {
+        if let Some((off, sz)) = archive.file_location(path) {
+            if sz == 0 || sz > MAX_IDX_BYTES {
+                continue;
+            }
+            md_plan.push((path.to_string(), off, sz));
+        }
+    }
+    let combined_plan: Vec<(String, u64, u64)> = idx_fetch_plan
+        .into_iter()
+        .chain(md_plan.into_iter())
+        .collect();
+
     let mut idx_buffers: BTreeMap<String, Vec<u8>> = BTreeMap::new();
     let fetched: Vec<(String, Vec<u8>)> =
-        futures_join_all_ranges(&client, &url, idx_fetch_plan).await?;
+        futures_join_all_ranges(&client, &url, combined_plan).await?;
     for (path, buf) in fetched {
         bytes_fetched += buf.len() as u64;
         idx_buffers.insert(path, buf);
     }
+
+    // Parse md/cur (8-byte KDBHdr prefix, then PBSTree). Try
+    // table-level first.
+    let (read_descs, platform_str): (Option<Vec<vdb_md::ReadDescriptor>>, Option<String>) = {
+        let mut rps: Option<Vec<vdb_md::ReadDescriptor>> = None;
+        let mut platform: Option<String> = None;
+        for path in ["tbl/SEQUENCE/md/cur", "md/cur"] {
+            let Some(buf) = idx_buffers.get(path) else {
+                continue;
+            };
+            if buf.len() < 8 {
+                continue;
+            }
+            let tree = &buf[8..];
+            if rps.is_none()
+                && let Ok(d) = vdb_md::parse_read_structure(tree)
+            {
+                rps = Some(d);
+            }
+            if platform.is_none() {
+                platform = vdb_md::detect_platform(tree);
+            }
+        }
+        (rps, platform)
+    };
 
     // 7. For each column, build a ColumnReader from its idx buffers.
     //    Extract blob locators and column metadata. Empty data is
@@ -141,6 +187,9 @@ pub async fn extract(accession: &str) -> Result<AccessionRecord> {
     //    the data slab.
     let mut column_meta: Vec<ColumnMetaEntry> = Vec::with_capacity(columns.len());
     let mut blobs_out: Vec<BlobLocator> = Vec::new();
+    // Spots = total row count of the READ column (sum of blob
+    // id_ranges). Set the first time we successfully parse READ.
+    let mut spots_from_read: Option<u64> = None;
 
     for (column_id_u8, col) in columns.iter().enumerate() {
         let column_id =
@@ -195,6 +244,18 @@ pub async fn extract(accession: &str) -> Result<AccessionRecord> {
         // Capture per-column metadata for the schema fingerprint.
         let meta_view = reader.meta();
         let column_name = col.rsplit('/').next().unwrap_or(col.as_str()).to_string();
+
+        // First time we see the READ column: derive `spots` from
+        // its blob id_ranges. Every column has the same row count
+        // for SEQUENCE-table data, so READ is a fine canonical
+        // source.
+        if column_name == "READ" && spots_from_read.is_none() {
+            let total: u64 = reader.blobs().iter().map(|b| u64::from(b.id_range)).sum();
+            if total > 0 {
+                spots_from_read = Some(total);
+            }
+        }
+
         column_meta.push(ColumnMetaEntry {
             name: column_name,
             version: meta_view.version,
@@ -240,18 +301,40 @@ pub async fn extract(accession: &str) -> Result<AccessionRecord> {
 
     let kar_data_offset = file_offset;
 
-    // v0: platform/layout/spots/read_lengths require parsing
-    // tbl/SEQUENCE/md/cur metadata trees, which lives in the
-    // header+TOC byte range — we DO have them. Wire up later;
-    // for now mark Unknown.
+    // Map md/cur read structure to AccessionRecord fields.
+    // Biological reads (type='B') determine layout + per-mate
+    // length pattern; technical reads (e.g. barcodes) are filtered
+    // out for the user-facing read_lengths.
+    let bio_lens: Vec<u32> = read_descs
+        .as_ref()
+        .map(|descs| {
+            descs
+                .iter()
+                .filter(|d| d.read_type == b'B')
+                .map(|d| d.read_len)
+                .collect()
+        })
+        .unwrap_or_default();
+    let layout = match bio_lens.len() {
+        1 => Layout::Single,
+        2 => Layout::Paired,
+        _ => Layout::Unknown,
+    };
+    let platform = platform_str
+        .as_deref()
+        .map(str::to_uppercase)
+        .as_deref()
+        .map(classify_platform)
+        .unwrap_or(Platform::Other);
+
     let record = AccessionRecord {
         accession: accession.to_string(),
         file_size,
         md5,
-        spots: None,
-        layout: Layout::Unknown,
-        platform: Platform::Other,
-        read_lengths: Vec::new(),
+        spots: spots_from_read,
+        layout,
+        platform,
+        read_lengths: bio_lens,
         schema_fingerprint,
         kar_data_offset,
         blobs: blobs_out,
@@ -381,4 +464,20 @@ fn parse_md5_hex(s: &str) -> Option<[u8; 16]> {
         out[i] = u8::from_str_radix(&s[i * 2..i * 2 + 2], 16).ok()?;
     }
     Some(out)
+}
+
+/// Classify a VDB metadata `PLATFORM/SRA_PLATFORM_*` string into the
+/// catalog's compact `Platform` enum. Input is assumed uppercased.
+fn classify_platform(p: &str) -> Platform {
+    if p.contains("ILLUMINA") {
+        Platform::Illumina
+    } else if p.contains("PACBIO") {
+        Platform::PacBio
+    } else if p.contains("NANOPORE") || p.contains("OXFORD") {
+        Platform::OxfordNanopore
+    } else if p.contains("ION_TORRENT") || p.contains("ION TORRENT") || p.contains("IONTORRENT") {
+        Platform::IonTorrent
+    } else {
+        Platform::Other
+    }
 }

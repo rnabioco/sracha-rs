@@ -160,18 +160,23 @@ fn build_accessions_array(
     records: &[AccessionRecord],
     schemas: &HashMap<[u8; 32], (u32, SchemaEntry)>,
 ) -> Result<ArrayRef> {
-    // Optional fields are flattened to (value + present-flag) columns
-    // for v0 — simpler than threading Vortex Validity through each
-    // builder. Reader unflattens via the *_present column.
-    // Fields the extractor actually populates today. spots,
-    // platform, layout, md5, read_lengths are still extractor TODOs
-    // — left out of the schema until they carry real data.
     let n = records.len();
     let mut accession_idx: Vec<u32> = Vec::with_capacity(n);
     let mut accession_id_bytes: Vec<Vec<u8>> = Vec::with_capacity(n);
     let mut file_size: Vec<u64> = Vec::with_capacity(n);
     let mut kar_data_offset: Vec<u64> = Vec::with_capacity(n);
     let mut schema_id: Vec<u32> = Vec::with_capacity(n);
+    // Newly populated by the extractor (md/cur parse).
+    let mut spots: Vec<u64> = Vec::with_capacity(n);
+    let mut spots_present: Vec<u8> = Vec::with_capacity(n);
+    let mut layout: Vec<u8> = Vec::with_capacity(n);
+    let mut platform: Vec<u8> = Vec::with_capacity(n);
+    // read_lengths is a small list (often 1-2 u32 entries). Encode
+    // as a JSON string per row — Vortex's BtrBlocks dictionary will
+    // collapse the few common patterns ([150,150], [100,100], …)
+    // to ~zero bytes. Avoids wiring a ListArray for what's typically
+    // 4-8 bytes raw.
+    let mut read_lengths_json: Vec<Vec<u8>> = Vec::with_capacity(n);
 
     for (i, r) in records.iter().enumerate() {
         accession_idx
@@ -184,6 +189,19 @@ fn build_accessions_array(
             .map(|(id, _)| *id)
             .unwrap_or(u32::MAX);
         schema_id.push(sid);
+        match r.spots {
+            Some(v) => {
+                spots.push(v);
+                spots_present.push(1);
+            }
+            None => {
+                spots.push(0);
+                spots_present.push(0);
+            }
+        }
+        layout.push(layout_to_u8(r.layout));
+        platform.push(platform_to_u8(r.platform));
+        read_lengths_json.push(serde_json::to_vec(&r.read_lengths)?);
     }
 
     let acc_idx_arr: PrimitiveArray = accession_idx.into_iter().collect();
@@ -192,13 +210,25 @@ fn build_accessions_array(
     let fs_arr: PrimitiveArray = file_size.into_iter().collect();
     let kar_arr: PrimitiveArray = kar_data_offset.into_iter().collect();
     let sch_arr: PrimitiveArray = schema_id.into_iter().collect();
+    let spots_arr: PrimitiveArray = spots.into_iter().collect();
+    let spots_present_arr: PrimitiveArray = spots_present.into_iter().collect();
+    let layout_arr: PrimitiveArray = layout.into_iter().collect();
+    let platform_arr: PrimitiveArray = platform.into_iter().collect();
+    let read_lens_arr =
+        VarBinArray::from_vec(read_lengths_json, DType::Utf8(Nullability::NonNullable))
+            .into_array();
 
-    let fields: [(&str, ArrayRef); 5] = [
+    let fields: [(&str, ArrayRef); 10] = [
         ("accession_idx", acc_idx_arr.into_array()),
         ("accession", acc_arr),
         ("file_size", fs_arr.into_array()),
         ("kar_data_offset", kar_arr.into_array()),
         ("schema_id", sch_arr.into_array()),
+        ("spots", spots_arr.into_array()),
+        ("spots_present", spots_present_arr.into_array()),
+        ("layout", layout_arr.into_array()),
+        ("platform", platform_arr.into_array()),
+        ("read_lengths_json", read_lens_arr),
     ];
 
     Ok(StructArray::from_fields(&fields)
@@ -382,6 +412,26 @@ fn update_manifest(
     let body = serde_json::to_vec_pretty(&manifest)?;
     std::fs::write(manifest_path, body)?;
     Ok(())
+}
+
+fn layout_to_u8(layout: crate::record::Layout) -> u8 {
+    use crate::record::Layout::*;
+    match layout {
+        Single => 1,
+        Paired => 2,
+        Unknown => 0,
+    }
+}
+
+fn platform_to_u8(platform: crate::record::Platform) -> u8 {
+    use crate::record::Platform::*;
+    match platform {
+        Illumina => 1,
+        PacBio => 2,
+        OxfordNanopore => 3,
+        IonTorrent => 4,
+        Other => 0,
+    }
 }
 
 /// SHA256 fingerprint of a list of [`ColumnMetaEntry`]s — used for
