@@ -3399,6 +3399,7 @@ dependencies = [
  "tracing",
  "tracing-subscriber",
  "vortex",
+ "vortex-btrblocks",
 ]
 
 [[package]]
@@ -3960,6 +3961,7 @@ dependencies = [
  "vortex-sequence",
  "vortex-session",
  "vortex-sparse",
+ "vortex-tensor",
  "vortex-utils",
  "vortex-zigzag",
  "vortex-zstd",
@@ -4074,6 +4076,7 @@ dependencies = [
  "vortex-runend",
  "vortex-sequence",
  "vortex-sparse",
+ "vortex-tensor",
  "vortex-utils",
  "vortex-zigzag",
  "vortex-zstd",
@@ -4228,6 +4231,7 @@ dependencies = [
  "vortex-sequence",
  "vortex-session",
  "vortex-sparse",
+ "vortex-tensor",
  "vortex-utils",
  "vortex-zigzag",
  "vortex-zstd",
@@ -4473,6 +4477,26 @@ dependencies = [
  "vortex-error",
  "vortex-mask",
  "vortex-session",
+]
+
+[[package]]
+name = "vortex-tensor"
+version = "0.68.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "b929734e2c30279b4c3dd1515caebd8ae27d007ec316cf5bdd813123b6522b9c"
+dependencies = [
+ "half",
+ "itertools 0.14.0",
+ "num-traits",
+ "prost",
+ "rand 0.10.1",
+ "vortex-array",
+ "vortex-buffer",
+ "vortex-compressor",
+ "vortex-error",
+ "vortex-fastlanes",
+ "vortex-session",
+ "vortex-utils",
 ]
 
 [[package]]

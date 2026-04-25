@@ -13,8 +13,9 @@ use vortex::array::arrays::{PrimitiveArray, StructArray, VarBinArray};
 use vortex::array::{ArrayRef, IntoArray};
 use vortex::buffer::ByteBufferMut;
 use vortex::dtype::{DType, Nullability};
-use vortex::file::WriteOptionsSessionExt;
+use vortex::file::{WriteOptionsSessionExt, WriteStrategyBuilder};
 use vortex::session::VortexSession;
+use vortex_btrblocks::BtrBlocksCompressorBuilder;
 
 use crate::record::{AccessionRecord, ColumnMetaEntry, SchemaEntry};
 use crate::{Error, Result};
@@ -80,15 +81,29 @@ impl ShardWriter {
         let blobs_array = build_blobs_array(&self.records)?;
         let schemas_array = build_schemas_array(&self.schemas)?;
 
+        // Compact-mode BtrBlocks compressor: enables aggressive
+        // cascaded encodings (FoR + Delta + Dict + RLE + bit-pack).
+        // Default strategy without compact still emits near-raw
+        // primitive columns — measured 22 B/row on blobs vs an
+        // achievable ~5-8 B with these codecs available.
+        let compressor = BtrBlocksCompressorBuilder::default()
+            .with_compact()
+            .build();
         let mut total_bytes = 0;
         for (name, array) in [
             ("accessions.vortex", accessions_array),
             ("blobs.vortex", blobs_array),
             ("schemas.vortex", schemas_array),
         ] {
+            // Strategy is one-shot — `build()` consumes the builder,
+            // so re-build for each shard file.
+            let strategy = WriteStrategyBuilder::default()
+                .with_compressor(compressor.clone())
+                .build();
             let mut buf = ByteBufferMut::empty();
             session
                 .write_options()
+                .with_strategy(strategy)
                 .write(&mut buf, array.to_array_stream())
                 .await
                 .map_err(|e| Error::Writer(format!("vortex write {name}: {e}")))?;
@@ -200,45 +215,46 @@ fn build_blobs_array(records: &[AccessionRecord]) -> Result<ArrayRef> {
     let capacity = records.iter().map(|r| r.blobs.len()).sum::<usize>();
     let mut accession_idx: Vec<u32> = Vec::with_capacity(capacity);
     let mut column_id: Vec<u8> = Vec::with_capacity(capacity);
-    let mut blob_idx: Vec<u32> = Vec::with_capacity(capacity);
     let mut start_id: Vec<i64> = Vec::with_capacity(capacity);
     let mut id_range: Vec<u32> = Vec::with_capacity(capacity);
     let mut blob_offset: Vec<u64> = Vec::with_capacity(capacity);
     let mut blob_size: Vec<u32> = Vec::with_capacity(capacity);
-    let mut pg: Vec<u64> = Vec::with_capacity(capacity);
 
+    // Sort order: rows are appended in (accession_idx, column_id,
+    // blob_position) order. This makes accession_idx and column_id
+    // RLE-compress to ~zero, blob_offset delta-compress within each
+    // (acc, col) run, and id_range dictionary-compress.
     for (i, r) in records.iter().enumerate() {
         let idx = u32::try_from(i).map_err(|_| Error::Writer("accession idx overflow".into()))?;
-        for b in &r.blobs {
+        // Pre-sort blobs by (column_id, start_id) so deltas stay
+        // monotonic per column even if the extractor emitted them
+        // interleaved.
+        let mut sorted_blobs: Vec<&crate::record::BlobLocator> = r.blobs.iter().collect();
+        sorted_blobs.sort_by_key(|b| (b.column_id, b.start_id));
+        for b in sorted_blobs {
             accession_idx.push(idx);
             column_id.push(b.column_id);
-            blob_idx.push(b.blob_idx);
             start_id.push(b.start_id);
             id_range.push(b.id_range);
             blob_offset.push(b.blob_offset);
             blob_size.push(b.blob_size);
-            pg.push(b.pg);
         }
     }
 
     let acc_idx_arr: PrimitiveArray = accession_idx.into_iter().collect();
     let col_arr: PrimitiveArray = column_id.into_iter().collect();
-    let bi_arr: PrimitiveArray = blob_idx.into_iter().collect();
     let sid_arr: PrimitiveArray = start_id.into_iter().collect();
     let ir_arr: PrimitiveArray = id_range.into_iter().collect();
     let bo_arr: PrimitiveArray = blob_offset.into_iter().collect();
     let bs_arr: PrimitiveArray = blob_size.into_iter().collect();
-    let pg_arr: PrimitiveArray = pg.into_iter().collect();
 
-    let fields: [(&str, ArrayRef); 8] = [
+    let fields: [(&str, ArrayRef); 6] = [
         ("accession_idx", acc_idx_arr.into_array()),
         ("column_id", col_arr.into_array()),
-        ("blob_idx", bi_arr.into_array()),
         ("start_id", sid_arr.into_array()),
         ("id_range", ir_arr.into_array()),
         ("blob_offset", bo_arr.into_array()),
         ("blob_size", bs_arr.into_array()),
-        ("pg", pg_arr.into_array()),
     ];
 
     Ok(StructArray::from_fields(&fields)

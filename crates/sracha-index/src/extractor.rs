@@ -205,15 +205,14 @@ pub async fn extract(accession: &str) -> Result<AccessionRecord> {
             page_size: meta_view.page_size,
         });
 
-        // Walk blobs and emit BlobLocator rows.
-        for (blob_idx_usize, blob) in reader.blobs().iter().enumerate() {
-            let blob_idx =
-                u32::try_from(blob_idx_usize).map_err(|_| Error::Extractor("blob_idx overflow".into()))?;
-
-            // Reconstruct absolute file offset: data_off + blob_offset_within_slab.
-            // ColumnReader's blob_data_offset is `pg * page_size` (or just
-            // `pg` if page_size <= 1). We don't have direct access, but we
-            // can derive it from blob.pg + meta.page_size.
+        // Walk blobs and emit BlobLocator rows. blob_idx and pg
+        // are dropped — derivable at read time from row order and
+        // (blob_offset / page_size) respectively.
+        for blob in reader.blobs() {
+            // Reconstruct absolute file offset: data_off +
+            // blob_offset_within_slab. ColumnReader's
+            // blob_data_offset is `pg * page_size` (or just `pg` if
+            // page_size <= 1). Derive from blob.pg + meta.page_size.
             let off_within = if meta_view.page_size <= 1 {
                 blob.pg as u64
             } else {
@@ -223,12 +222,10 @@ pub async fn extract(accession: &str) -> Result<AccessionRecord> {
 
             blobs_out.push(BlobLocator {
                 column_id,
-                blob_idx,
                 start_id: blob.start_id,
                 id_range: blob.id_range,
                 blob_offset: blob_offset_abs,
                 blob_size: blob.size,
-                pg: blob.pg,
             });
         }
     }

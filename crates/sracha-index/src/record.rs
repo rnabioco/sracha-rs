@@ -87,24 +87,26 @@ pub enum Platform {
 
 /// One row of the `blobs` table — locates a single blob within its
 /// column's data slab.
+///
+/// Compact form: `blob_idx` and `pg` are NOT stored — both are
+/// derivable. `blob_idx` = row-position within the table for a given
+/// (accession, column) run. `pg` = `blob_offset / page_size` (page
+/// size lives in the schemas table). Reader recomputes both on
+/// load.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct BlobLocator {
     /// Index into the schema's column list (compact int, dictionary-encoded).
     pub column_id: u8,
-    /// Position of this blob within the column.
-    pub blob_idx: u32,
     /// First row id in this blob.
     pub start_id: i64,
-    /// Number of rows.
+    /// Number of rows. Typically 8192 or similar small set of values
+    /// — dictionary-encodes well.
     pub id_range: u32,
-    /// Absolute byte offset in the .sra file. Delta-encoded within
-    /// (accession, column) at write time.
+    /// Absolute byte offset in the .sra file. Monotonic per
+    /// (accession, column) so delta-encodes to small values.
     pub blob_offset: u64,
     /// Compressed size in bytes.
     pub blob_size: u32,
-    /// Page locator (page index OR raw byte offset depending on
-    /// `page_size` in the column metadata; see `sracha-vdb::kdb`).
-    pub pg: u64,
 }
 
 /// Schema fingerprint payload. Distinct schemas are deduped via
