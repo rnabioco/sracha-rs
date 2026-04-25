@@ -460,6 +460,35 @@ pub struct GetArgs {
     /// split-3 or split-files (Phase 1 scope). Skips VDB decode entirely.
     #[arg(long, help_heading = "Advanced")]
     pub prefer_ena: bool,
+
+    /// Max concurrent S3 HEAD probes during accession resolution.
+    /// Default 64; clamped to 1–256. The HTTP client's per-host
+    /// connection pool is sized to match this value at startup, so
+    /// raising it actually opens more sockets to the SRA bucket
+    /// (rather than queueing on the pool). Values above ~128 rarely
+    /// help and risk hitting bucket-side rate limits.
+    #[arg(
+        long,
+        help_heading = "Advanced",
+        value_name = "N",
+        default_value_t = sracha_core::s3::DEFAULT_PROBE_CONCURRENCY,
+        value_parser = parse_head_concurrency,
+    )]
+    pub head_concurrency: usize,
+}
+
+const HEAD_CONCURRENCY_MAX: usize = 256;
+
+fn parse_head_concurrency(s: &str) -> Result<usize, String> {
+    let n: usize = s
+        .parse()
+        .map_err(|_| format!("`{s}` is not a non-negative integer"))?;
+    if !(1..=HEAD_CONCURRENCY_MAX).contains(&n) {
+        return Err(format!(
+            "head-concurrency must be between 1 and {HEAD_CONCURRENCY_MAX} (got {n})",
+        ));
+    }
+    Ok(n)
 }
 
 #[derive(Args)]
