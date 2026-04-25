@@ -83,38 +83,14 @@ impl CatalogReader {
 
         let accession_idx = field_u32(&acc_struct, "accession_idx")?;
         let file_size = field_u64(&acc_struct, "file_size")?;
-        let spots_present = field_u8(&acc_struct, "spots_present")? != 0;
-        let spots = if spots_present {
-            Some(field_u64(&acc_struct, "spots")?)
-        } else {
-            None
-        };
         let kar_data_offset = field_u64(&acc_struct, "kar_data_offset")?;
         let schema_id = field_u32(&acc_struct, "schema_id")?;
-        let layout = match field_u8(&acc_struct, "layout")? {
-            1 => Layout::Single,
-            2 => Layout::Paired,
-            _ => Layout::Unknown,
-        };
-        let platform = match field_u8(&acc_struct, "platform")? {
-            1 => Platform::Illumina,
-            2 => Platform::PacBio,
-            3 => Platform::OxfordNanopore,
-            4 => Platform::IonTorrent,
-            _ => Platform::Other,
-        };
-        let md5 = if field_u8(&acc_struct, "md5_present")? != 0 {
-            let bytes = field_binary(&acc_struct, "md5_bytes")?;
-            if bytes.len() == 16 {
-                let mut out = [0u8; 16];
-                out.copy_from_slice(&bytes);
-                Some(out)
-            } else {
-                None
-            }
-        } else {
-            None
-        };
+        // Fields not stored yet (extractor TODOs): layout, platform,
+        // spots, md5. Fill placeholders.
+        let layout = Layout::Unknown;
+        let platform = Platform::Other;
+        let spots = None;
+        let md5 = None;
 
         // 2. Look up schema by schema_id.
         let schema = self.lookup_schema(schema_id).await?;

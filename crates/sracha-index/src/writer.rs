@@ -147,46 +147,26 @@ fn build_accessions_array(
     // Optional fields are flattened to (value + present-flag) columns
     // for v0 — simpler than threading Vortex Validity through each
     // builder. Reader unflattens via the *_present column.
+    // Fields the extractor actually populates today. spots,
+    // platform, layout, md5, read_lengths are still extractor TODOs
+    // — left out of the schema until they carry real data.
     let n = records.len();
     let mut accession_idx: Vec<u32> = Vec::with_capacity(n);
     let mut accession_id_bytes: Vec<Vec<u8>> = Vec::with_capacity(n);
     let mut file_size: Vec<u64> = Vec::with_capacity(n);
-    let mut spots: Vec<u64> = Vec::with_capacity(n);
-    let mut spots_present: Vec<u8> = Vec::with_capacity(n);
     let mut kar_data_offset: Vec<u64> = Vec::with_capacity(n);
     let mut schema_id: Vec<u32> = Vec::with_capacity(n);
-    let mut layout_byte: Vec<u8> = Vec::with_capacity(n);
-    let mut platform_byte: Vec<u8> = Vec::with_capacity(n);
-    // md5: stored as a VarBin column with one entry per row. Each
-    // entry is either exactly 16 bytes (present) or empty (missing).
-    // Reader pairs this with `md5_present` to disambiguate.
-    let mut md5_rows: Vec<Vec<u8>> = Vec::with_capacity(n);
-    let mut md5_present: Vec<u8> = Vec::with_capacity(n);
 
     for (i, r) in records.iter().enumerate() {
         accession_idx.push(u32::try_from(i).map_err(|_| Error::Writer("accession idx overflow".into()))?);
         accession_id_bytes.push(r.accession.as_bytes().to_vec());
         file_size.push(r.file_size);
-        spots.push(r.spots.unwrap_or(0));
-        spots_present.push(u8::from(r.spots.is_some()));
         kar_data_offset.push(r.kar_data_offset);
         let sid = schemas
             .get(&r.schema_fingerprint)
             .map(|(id, _)| *id)
             .unwrap_or(u32::MAX);
         schema_id.push(sid);
-        layout_byte.push(layout_to_u8(r.layout));
-        platform_byte.push(platform_to_u8(r.platform));
-        match r.md5 {
-            Some(m) => {
-                md5_rows.push(m.to_vec());
-                md5_present.push(1);
-            }
-            None => {
-                md5_rows.push(Vec::new());
-                md5_present.push(0);
-            }
-        }
     }
 
     let acc_idx_arr: PrimitiveArray = accession_idx.into_iter().collect();
@@ -196,26 +176,13 @@ fn build_accessions_array(
     let fs_arr: PrimitiveArray = file_size.into_iter().collect();
     let kar_arr: PrimitiveArray = kar_data_offset.into_iter().collect();
     let sch_arr: PrimitiveArray = schema_id.into_iter().collect();
-    let lay_arr: PrimitiveArray = layout_byte.into_iter().collect();
-    let plat_arr: PrimitiveArray = platform_byte.into_iter().collect();
-    let spots_arr: PrimitiveArray = spots.into_iter().collect();
-    let spots_present_arr: PrimitiveArray = spots_present.into_iter().collect();
-    let md5_arr =
-        VarBinArray::from_vec(md5_rows, DType::Binary(Nullability::NonNullable)).into_array();
-    let md5_present_arr: PrimitiveArray = md5_present.into_iter().collect();
 
-    let fields: [(&str, ArrayRef); 11] = [
+    let fields: [(&str, ArrayRef); 5] = [
         ("accession_idx", acc_idx_arr.into_array()),
         ("accession", acc_arr),
         ("file_size", fs_arr.into_array()),
-        ("spots", spots_arr.into_array()),
-        ("spots_present", spots_present_arr.into_array()),
         ("kar_data_offset", kar_arr.into_array()),
         ("schema_id", sch_arr.into_array()),
-        ("layout", lay_arr.into_array()),
-        ("platform", plat_arr.into_array()),
-        ("md5_bytes", md5_arr),
-        ("md5_present", md5_present_arr.into_array()),
     ];
 
     Ok(StructArray::from_fields(&fields)
@@ -359,26 +326,6 @@ fn build_schemas_array(
 }
 
 // --- helpers -------------------------------------------------------------
-
-fn layout_to_u8(layout: crate::record::Layout) -> u8 {
-    use crate::record::Layout::*;
-    match layout {
-        Single => 1,
-        Paired => 2,
-        Unknown => 0,
-    }
-}
-
-fn platform_to_u8(platform: crate::record::Platform) -> u8 {
-    use crate::record::Platform::*;
-    match platform {
-        Illumina => 1,
-        PacBio => 2,
-        OxfordNanopore => 3,
-        IonTorrent => 4,
-        Other => 0,
-    }
-}
 
 /// SHA256 fingerprint of a list of [`ColumnMetaEntry`]s — used for
 /// schema dedup. Public so tests can assert determinism.
