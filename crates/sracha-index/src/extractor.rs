@@ -143,10 +143,8 @@ pub async fn extract(accession: &str) -> Result<AccessionRecord> {
             md_plan.push((path.to_string(), off, sz));
         }
     }
-    let combined_plan: Vec<(String, u64, u64)> = idx_fetch_plan
-        .into_iter()
-        .chain(md_plan.into_iter())
-        .collect();
+    let combined_plan: Vec<(String, u64, u64)> =
+        idx_fetch_plan.into_iter().chain(md_plan).collect();
 
     let mut idx_buffers: BTreeMap<String, Vec<u8>> = BTreeMap::new();
     let fetched: Vec<(String, Vec<u8>)> =
