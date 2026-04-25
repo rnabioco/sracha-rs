@@ -19,7 +19,12 @@ use crate::sdl::{ResolvedAccession, ResolvedFile, ResolvedMirror};
 const ODP_BASE: &str = "https://sra-pub-run-odp.s3.amazonaws.com/sra";
 
 /// Maximum concurrent HEAD probes.
-const PROBE_CONCURRENCY: usize = 16;
+/// Default concurrency for batched S3 HEAD probes. The CLI exposes this
+/// as `--head-concurrency` for users who want to widen (or narrow) the
+/// resolve fan-out on large accession lists. Should track
+/// `http::DEFAULT_POOL_MAX_IDLE_PER_HOST` so the semaphore isn't
+/// re-bottlenecked by the connection pool.
+pub const DEFAULT_PROBE_CONCURRENCY: usize = 64;
 
 /// Timeout for a single HEAD probe.
 const PROBE_TIMEOUT: Duration = Duration::from_secs(5);
@@ -119,14 +124,34 @@ pub async fn resolve_direct(
     })
 }
 
-/// Resolve multiple accessions concurrently via direct S3 HEAD probes.
-///
-/// Returns a map from accession to result. Failed probes appear as `Err`.
+/// Resolve multiple accessions concurrently via direct S3 HEAD probes
+/// at the default concurrency ([`DEFAULT_PROBE_CONCURRENCY`]).
 pub async fn resolve_direct_many(
     client: &reqwest::Client,
     accessions: &[String],
 ) -> HashMap<String, Result<ResolvedAccession>> {
-    let semaphore = Arc::new(Semaphore::new(PROBE_CONCURRENCY));
+    resolve_direct_many_with_concurrency(client, accessions, DEFAULT_PROBE_CONCURRENCY).await
+}
+
+/// Resolve multiple accessions concurrently via direct S3 HEAD probes
+/// with a caller-specified concurrency. `concurrency = 0` is treated
+/// as 1.
+///
+/// Returns a map from accession to result. Failed probes appear as `Err`.
+///
+/// Note that the underlying [`reqwest::Client`] caps connections via
+/// `pool_max_idle_per_host` (default 16 in `sracha_core::http::default_client`).
+/// Setting a concurrency higher than the pool size lets requests
+/// queue inside reqwest's connection pool — useful for reducing
+/// startup latency on large lists, but won't open more sockets than
+/// the client allows.
+pub async fn resolve_direct_many_with_concurrency(
+    client: &reqwest::Client,
+    accessions: &[String],
+    concurrency: usize,
+) -> HashMap<String, Result<ResolvedAccession>> {
+    let concurrency = concurrency.max(1);
+    let semaphore = Arc::new(Semaphore::new(concurrency));
     let mut handles = Vec::with_capacity(accessions.len());
 
     for acc in accessions {
