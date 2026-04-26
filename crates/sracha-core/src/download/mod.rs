@@ -72,6 +72,17 @@ pub struct DownloadConfig {
     /// moving while decode is gated. Total = 10000; download
     /// contributes up to 5000; see Phase 4d plan.
     pub progress_combined: Option<Arc<indicatif::ProgressBar>>,
+    /// Optional `(offset, size)` byte ranges that should be fetched
+    /// ahead of normal numerical-order chunks. Translated to chunk
+    /// indices and applied via `ChunkReadyTracker::prioritize_pending`
+    /// immediately after the dispatch queue is initialized — before a
+    /// single byte is downloaded. Empty = no priority hints.
+    ///
+    /// Populated by `sracha get --catalog --stream` from the catalog's
+    /// per-blob offset table so streaming-decode doesn't have to wait
+    /// for the KAR header to land and be parsed before issuing its
+    /// own priority hint.
+    pub priority_ranges: Vec<(u64, u64)>,
 }
 
 impl Default for DownloadConfig {
@@ -87,6 +98,7 @@ impl Default for DownloadConfig {
             expected_prefix: None,
             progress_parent: None,
             progress_combined: None,
+            priority_ranges: Vec::new(),
         }
     }
 }
@@ -943,6 +955,43 @@ async fn download_file_inner(
             let chunks_by_idx: std::sync::Arc<std::collections::HashMap<usize, ChunkRange>> =
                 std::sync::Arc::new(chunks_to_download.iter().copied().collect());
             tracker.init_pending(chunks_to_download.iter().map(|(idx, _)| *idx));
+
+            // Apply caller-supplied priority byte ranges (typically from
+            // the catalog) BEFORE workers start pulling from the queue.
+            // Each (offset, size) range maps to one or more chunk
+            // indices; dedup so the priority list is in column order
+            // (catalogs emit per-column groups) without repeats from
+            // adjacent blobs sharing a chunk. Without this, decode has
+            // to wait for KAR header bytes to land and be parsed before
+            // it can issue its own priority hint — wasted bootstrap
+            // time when the catalog already encodes the same map.
+            if !config.priority_ranges.is_empty() {
+                let mut prio: Vec<usize> = Vec::with_capacity(config.priority_ranges.len());
+                let mut seen = std::collections::HashSet::new();
+                for &(off, sz) in &config.priority_ranges {
+                    if sz == 0 {
+                        continue;
+                    }
+                    let first = tracker.chunk_index_for_byte(off);
+                    let last =
+                        tracker.chunk_index_for_byte(off.saturating_add(sz).saturating_sub(1));
+                    for c in first..=last {
+                        if seen.insert(c) {
+                            prio.push(c);
+                        }
+                    }
+                }
+                if !prio.is_empty() {
+                    tracing::info!(
+                        "download: prioritizing {} chunks from {} caller-supplied byte ranges",
+                        prio.len(),
+                        config.priority_ranges.len(),
+                    );
+                    tracker.prioritize_pending(&prio);
+                    tracker.mark_caller_priorities_seeded();
+                }
+            }
+
             tracker.close_pending();
 
             // Phase 4a: streaming MD5. Spawn a hashing task NOW so it

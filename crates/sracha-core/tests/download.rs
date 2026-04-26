@@ -25,6 +25,7 @@ fn test_config() -> DownloadConfig {
         expected_prefix: None,
         progress_parent: None,
         progress_combined: None,
+        priority_ranges: Vec::new(),
     }
 }
 

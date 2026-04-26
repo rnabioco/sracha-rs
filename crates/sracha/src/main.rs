@@ -1861,8 +1861,15 @@ async fn catalog_resolve(
         }
     };
 
+    // PRIO_BLOBS_PER_COL mirrors the constant in
+    // pipeline::decode_and_write so the hint shape (first N blobs of
+    // every column) matches what the decode-side gate would have
+    // computed otherwise — keeps the two paths honestly equivalent.
+    const PRIO_BLOBS_PER_COL: usize = 1024;
+
     let mut out = Vec::with_capacity(accessions.len());
     let mut hits = 0usize;
+    let mut total_priority_ranges: usize = 0;
     for acc in accessions {
         let rec = reader.lookup(acc).await.ok().flatten();
         match rec {
@@ -1872,6 +1879,8 @@ async fn catalog_resolve(
                     "https://sra-pub-run-odp.s3.amazonaws.com/sra/{acc}/{acc}",
                     acc = acc
                 );
+                let priority_ranges = r.priority_byte_ranges(PRIO_BLOBS_PER_COL);
+                total_priority_ranges += priority_ranges.len();
                 out.push(Some(ResolvedAccession {
                     accession: acc.clone(),
                     sra_file: ResolvedFile {
@@ -1885,6 +1894,7 @@ async fn catalog_resolve(
                     },
                     vdbcache_file: None,
                     run_info: None,
+                    priority_ranges,
                 }));
             }
             None => out.push(None),
@@ -1892,7 +1902,8 @@ async fn catalog_resolve(
     }
     if hits > 0 {
         tracing::info!(
-            "catalog hit on {hits}/{} accession(s) (skipped S3 HEAD probe)",
+            "catalog hit on {hits}/{} accession(s) (skipped S3 HEAD probe; \
+             {total_priority_ranges} priority byte-ranges seeded for download)",
             accessions.len()
         );
     }
@@ -2151,6 +2162,7 @@ mod tests {
             },
             vdbcache_file: None,
             run_info: None,
+            priority_ranges: Vec::new(),
         }
     }
 

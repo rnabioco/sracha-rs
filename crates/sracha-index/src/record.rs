@@ -134,3 +134,91 @@ pub struct NameFmtEntry {
     pub templates: Vec<Vec<u8>>,
     pub spot_starts: Vec<i64>,
 }
+
+impl AccessionRecord {
+    /// Per-column first-`blobs_per_col` `(blob_offset, blob_size)` pairs
+    /// for download priority hinting. Groups `blobs` by `column_id`
+    /// first, since the on-disk catalog is sorted by `(column_id,
+    /// blob_idx)` but a defensive group-by makes the helper robust to
+    /// future reorderings.
+    ///
+    /// Used by `sracha get --catalog --stream` to seed the chunk
+    /// dispatch queue before download starts, instead of waiting for
+    /// the KAR header to land and be parsed.
+    pub fn priority_byte_ranges(&self, blobs_per_col: usize) -> Vec<(u64, u64)> {
+        use std::collections::BTreeMap;
+        let mut by_col: BTreeMap<u8, Vec<&BlobLocator>> = BTreeMap::new();
+        for b in &self.blobs {
+            by_col.entry(b.column_id).or_default().push(b);
+        }
+        let mut out = Vec::with_capacity(by_col.len() * blobs_per_col);
+        for blobs in by_col.values() {
+            let take = blobs_per_col.min(blobs.len());
+            for b in &blobs[..take] {
+                if b.blob_size == 0 {
+                    continue;
+                }
+                out.push((b.blob_offset, u64::from(b.blob_size)));
+            }
+        }
+        out
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn rec(blobs: Vec<BlobLocator>) -> AccessionRecord {
+        AccessionRecord {
+            accession: "X".into(),
+            file_size: 0,
+            md5: None,
+            spots: None,
+            layout: Layout::Unknown,
+            platform: Platform::Other,
+            read_lengths: vec![],
+            schema_fingerprint: [0; 32],
+            kar_data_offset: 0,
+            blobs,
+            schema: SchemaEntry {
+                fingerprint: [0; 32],
+                columns: vec![],
+                is_csra: false,
+            },
+            name_fmt: None,
+            extract_secs: 0.0,
+            bytes_fetched: 0,
+        }
+    }
+
+    fn b(column_id: u8, offset: u64, size: u32) -> BlobLocator {
+        BlobLocator {
+            column_id,
+            start_id: 0,
+            id_range: 0,
+            blob_offset: offset,
+            blob_size: size,
+        }
+    }
+
+    #[test]
+    fn priority_byte_ranges_groups_by_column_and_caps() {
+        let r = rec(vec![
+            b(0, 100, 10),
+            b(0, 200, 10),
+            b(0, 300, 10),
+            b(1, 1000, 20),
+            b(1, 2000, 20),
+        ]);
+        let mut got = r.priority_byte_ranges(2);
+        got.sort();
+        assert_eq!(got, vec![(100, 10), (200, 10), (1000, 20), (2000, 20)]);
+    }
+
+    #[test]
+    fn priority_byte_ranges_skips_zero_size_blobs() {
+        let r = rec(vec![b(0, 100, 0), b(0, 200, 10)]);
+        assert_eq!(r.priority_byte_ranges(2), vec![(200, 10)]);
+    }
+}

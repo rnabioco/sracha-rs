@@ -132,6 +132,12 @@ pub struct ResolvedAccession {
     pub vdbcache_file: Option<ResolvedFile>,
     /// Read structure from NCBI EUtils (may be `None` if the API call failed).
     pub run_info: Option<RunInfo>,
+    /// Optional download priority hints: byte ranges that should be
+    /// fetched ahead of normal numerical-order chunks. Populated by
+    /// the catalog resolver from per-blob offsets so streaming-decode
+    /// can start without waiting for the KAR header parse to issue
+    /// its own priority hint. Empty = no hints (legacy behavior).
+    pub priority_ranges: Vec<(u64, u64)>,
 }
 
 /// Client for the NCBI SDL (Service Discovery Layer) API.
@@ -241,6 +247,7 @@ impl SdlClient {
             sra_file,
             vdbcache_file,
             run_info,
+            priority_ranges: Vec::new(),
         })
     }
 
@@ -298,6 +305,7 @@ impl SdlClient {
                     sra_file,
                     vdbcache_file,
                     run_info,
+                    priority_ranges: Vec::new(),
                 })
             })
             .collect();

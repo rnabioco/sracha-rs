@@ -120,6 +120,7 @@ pub async fn resolve_direct(
         },
         vdbcache_file,
         run_info: None,
+        priority_ranges: Vec::new(),
     })
 }
 

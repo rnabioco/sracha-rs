@@ -450,7 +450,15 @@ fn decode_and_write(
     // contiguous `wait_range(min, max)` would still have blocked on the
     // sequentially-downloaded bytes between columns even after these
     // chunks landed, defeating the priority hint.
-    if let Some(tracker) = chunk_ready {
+    //
+    // Skipped when the dispatch queue was already seeded with priority
+    // hints by the caller (typically `--catalog --stream`, which seeds
+    // from the catalog's per-blob offset table at download init). The
+    // catalog hints cover the same byte ranges, so re-walking the
+    // cursor to compute them again is pure busy-work.
+    if let Some(tracker) = chunk_ready
+        && !tracker.priorities_seeded()
+    {
         const PRIO_BLOBS_PER_COL: usize = 1024;
         let mut col_prio: Vec<usize> = Vec::new();
         let mut seen: std::collections::HashSet<usize> = std::collections::HashSet::new();
@@ -1902,6 +1910,7 @@ async fn download_sra_inner(
         },
         progress_parent: config.progress_parent.clone(),
         progress_combined: config.progress_combined.clone(),
+        priority_ranges: resolved.priority_ranges.clone(),
     };
 
     tracing::info!(
@@ -1983,6 +1992,9 @@ pub async fn download_ena_fastq(
         expected_prefix: None,
         progress_parent: config.progress_parent.clone(),
         progress_combined: config.progress_combined.clone(),
+        // Catalog hints don't apply to ENA FASTQ files (the catalog
+        // describes SRA blob layout, ENA serves pre-decoded FASTQ).
+        priority_ranges: Vec::new(),
     };
 
     let mut output_files: Vec<PathBuf> = Vec::with_capacity(ena.fastq_files.len());
@@ -2499,6 +2511,7 @@ mod tests {
             },
             vdbcache_file: None,
             run_info: None,
+            priority_ranges: Vec::new(),
         }
     }
 

@@ -70,6 +70,15 @@ pub struct ChunkReadyTracker {
     /// Workers exit their loop once they observe pending empty AND
     /// pending_closed = true.
     pending_closed: AtomicBool,
+    /// Set the first time `prioritize_pending` is called with a
+    /// non-empty index list. Lets a streaming consumer (decode)
+    /// detect that the dispatch queue has already been seeded with
+    /// priority hints (typically from a catalog) and skip its own
+    /// redundant priority computation. Idempotent reorderings would
+    /// be cheap, but the *work* the consumer would do to compute
+    /// them (walking column metadata, mapping blobs → chunks) is not
+    /// — that's what we save.
+    priorities_seeded: AtomicBool,
 }
 
 impl ChunkReadyTracker {
@@ -97,6 +106,7 @@ impl ChunkReadyTracker {
             pending: Mutex::new(None),
             pending_notify: Notify::new(),
             pending_closed: AtomicBool::new(false),
+            priorities_seeded: AtomicBool::new(false),
         }
     }
 
@@ -143,6 +153,25 @@ impl ChunkReadyTracker {
     /// Has the pending queue been closed (no more chunks to come)?
     pub fn pending_closed(&self) -> bool {
         self.pending_closed.load(Ordering::Acquire)
+    }
+
+    /// Mark that an *external* source (typically the catalog) has
+    /// supplied priority hints to the dispatch queue. Distinct from
+    /// `prioritize_pending` itself: the decode side also calls
+    /// `prioritize_pending` for idx files later, but that's a
+    /// different concern and should NOT cause the caller-seeded
+    /// flag to flip. Call this only from the download init path
+    /// when applying `DownloadConfig::priority_ranges`.
+    pub fn mark_caller_priorities_seeded(&self) {
+        self.priorities_seeded.store(true, Ordering::Release);
+    }
+
+    /// Returns `true` once `mark_caller_priorities_seeded` has been
+    /// called. Lets the decode side skip its own column-priority
+    /// computation when the catalog already supplied equivalent
+    /// hints at download init.
+    pub fn priorities_seeded(&self) -> bool {
+        self.priorities_seeded.load(Ordering::Acquire)
     }
 
     /// Async: wait until a `prioritize_pending` / `init_pending` /
