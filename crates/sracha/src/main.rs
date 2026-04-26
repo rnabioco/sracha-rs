@@ -350,8 +350,20 @@ async fn main() -> Result<()> {
             Ok(())
         }
         Command::Get(args) => {
-            let split_mode =
-                cli::resolve_split_mode(args.split, args.stdout).map_err(|e| anyhow::anyhow!(e))?;
+            // `--stream` forces stdout output (see make_config below). Its
+            // help text promises "interleaved FASTQ output", so override
+            // the user-supplied `--split` (which defaults to split-3) to
+            // Interleaved here — same single-stream constraint as `-Z`.
+            // Without this, the FASTQ writer keeps split-3 naming and
+            // drops the `/1`/`/2` mate suffix that interleaved mode emits,
+            // diverging from the `-Z --split interleaved` path.
+            let effective_split = if args.stream {
+                cli::SplitMode::Interleaved
+            } else {
+                args.split
+            };
+            let split_mode = cli::resolve_split_mode(effective_split, args.stdout)
+                .map_err(|e| anyhow::anyhow!(e))?;
 
             let raw = collect_accessions(&args.accessions, args.accession_list.as_deref())?;
             // Size the per-host pool to whichever is larger: the user's
