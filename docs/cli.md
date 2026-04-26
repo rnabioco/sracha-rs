@@ -80,7 +80,7 @@ sracha get [OPTIONS] [ACCESSION]...
 | Option | Default | Description |
 |--------|---------|-------------|
 | `--no-gzip` | | Disable gzip compression (compressed by default) |
-| `--gzip-level <N>` | `6` | Gzip compression level (1-9) |
+| `--gzip-level <N>` | `1` | Gzip compression level (1-9) |
 | `--zstd` | | Use zstd compression instead of gzip |
 | `--zstd-level <N>` | `3` | Zstd compression level (1-22) |
 
@@ -170,7 +170,7 @@ sracha fastq [OPTIONS] <INPUT>...
 | Option | Default | Description |
 |--------|---------|-------------|
 | `--no-gzip` | | Disable gzip compression (compressed by default) |
-| `--gzip-level <N>` | `6` | Gzip compression level (1-9) |
+| `--gzip-level <N>` | `1` | Gzip compression level (1-9) |
 | `--zstd` | | Use zstd compression instead of gzip |
 | `--zstd-level <N>` | `3` | Zstd compression level (1-22) |
 
