@@ -277,7 +277,7 @@ pub struct FastqArgs {
     )]
     pub no_gzip: bool,
 
-    /// Gzip compression level [default: 6]
+    /// Gzip compression level [default: 1]
     #[arg(
         long,
         value_parser = clap::value_parser!(u32).range(1..=9),
@@ -366,7 +366,7 @@ pub struct GetArgs {
     )]
     pub no_gzip: bool,
 
-    /// Gzip compression level [default: 6]
+    /// Gzip compression level [default: 1]
     #[arg(
         long,
         value_parser = clap::value_parser!(u32).range(1..=9),
@@ -620,7 +620,7 @@ pub fn resolve_compression(
         }
     } else {
         CompressionMode::Gzip {
-            level: gzip_level.unwrap_or(6),
+            level: gzip_level.unwrap_or(1),
         }
     }
 }
