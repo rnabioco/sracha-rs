@@ -258,9 +258,15 @@ impl VdbCursor {
         self.name_fmt_col.as_ref()
     }
 
-    /// Whether Illumina name reconstruction is possible (ALTREAD + X + Y columns present).
+    /// Whether Illumina name reconstruction is possible — requires X + Y
+    /// per-spot coordinates plus skey templates (loaded separately).
+    /// ALTREAD is **not** part of the gate: name templates live in the
+    /// skey index, not in ALTREAD's bytes (ALTREAD carries the 4na
+    /// ambiguity mask and is consulted independently). Some Illumina
+    /// archives ship X + Y + skey but no ALTREAD (e.g. DRR041584,
+    /// DRR041585) — fasterq-dump still reconstructs deflines for those.
     pub fn has_illumina_name_parts(&self) -> bool {
-        self.altread_col.is_some() && self.x_col.is_some() && self.y_col.is_some()
+        self.x_col.is_some() && self.y_col.is_some()
     }
 
     /// Reads-per-spot inferred from table metadata, if available.
