@@ -774,14 +774,14 @@ pub(crate) fn decode_blob_to_fastq(
     };
 
     // ------------------------------------------------------------------
-    // Illumina name reconstruction from ALTREAD + X + Y columns.
-    // If the NAME column is absent but ALTREAD/X/Y are present, reconstruct
-    // the original Illumina read name by substituting $X and $Y placeholders
-    // in the ALTREAD template string with per-spot X/Y coordinates.
+    // Illumina name reconstruction from skey templates + X + Y columns.
+    // When NAME is absent but X/Y are present, fill in $X/$Y placeholders
+    // in the skey-derived template for each spot. ALTREAD is NOT required:
+    // its bytes carry the 4na ambiguity mask (handled separately above);
+    // the templates themselves live in the skey index.
     // ------------------------------------------------------------------
     let spot_names: Option<Vec<Vec<u8>>> = if spot_names.is_none()
         && raw.has_illumina_name_parts
-        && !raw.altread_raw.is_empty()
         && !raw.x_raw.is_empty()
         && !raw.y_raw.is_empty()
     {

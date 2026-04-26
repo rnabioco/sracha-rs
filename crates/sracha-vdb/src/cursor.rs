@@ -258,9 +258,15 @@ impl VdbCursor {
         self.name_fmt_col.as_ref()
     }
 
-    /// Whether Illumina name reconstruction is possible (ALTREAD + X + Y columns present).
+    /// Whether Illumina name reconstruction is possible — requires X + Y
+    /// per-spot coordinates plus skey templates (loaded separately).
+    /// ALTREAD is **not** part of the gate: name templates live in the
+    /// skey index, not in ALTREAD's bytes (ALTREAD carries the 4na
+    /// ambiguity mask and is consulted independently). Some Illumina
+    /// archives ship X + Y + skey but no ALTREAD (e.g. DRR041584,
+    /// DRR041585) — fasterq-dump still reconstructs deflines for those.
     pub fn has_illumina_name_parts(&self) -> bool {
-        self.altread_col.is_some() && self.x_col.is_some() && self.y_col.is_some()
+        self.x_col.is_some() && self.y_col.is_some()
     }
 
     /// Reads-per-spot inferred from table metadata, if available.
@@ -360,8 +366,9 @@ impl VdbCursor {
         // id2ord) maps directly into it without any sort or rename.
         // Falls back to the older byte-scan-for-`$X` heuristic if the
         // offset-table doesn't validate (foreign archive layouts).
-        let templates: Vec<Vec<u8>> =
-            parse_skey_offset_table(&skey_data).unwrap_or_else(|| parse_skey_byte_scan(&skey_data));
+        let templates: Vec<Vec<u8>> = parse_skey_offset_table(&skey_data)
+            .or_else(|| crate::ptrie::parse_ptrie_templates(&skey_data))
+            .unwrap_or_else(|| parse_skey_byte_scan(&skey_data));
 
         // Parse the skey header to get first spot_id and count.
         // The header is at the start of skey_data. Try v4 (40 bytes) then v2 (32 bytes).
@@ -424,14 +431,13 @@ impl VdbCursor {
         'skey_search: for scan_pos in 0..skey_data.len().saturating_sub(4) {
             let candidate =
                 u32::from_le_bytes(skey_data[scan_pos..scan_pos + 4].try_into().unwrap());
-            // Heuristic: candidate must be >= templates.len() (at least one
-            // ord2node entry per template) and cover at most ~10x — the
-            // continuation entries we've observed never approach that
-            // multiple. Bound keeps the scan from latching onto random
-            // u32 noise in the template payload.
-            if candidate < templates.len() as u32
-                || candidate as usize > templates.len().saturating_mul(10).max(16)
-            {
+            // Heuristic: candidate must be at least 1 and within a sane
+            // absolute upper bound. The packed_size match below is the
+            // real anchor that prevents latching onto random u32 noise.
+            // We can't bound by templates.len() because the PTrie walker
+            // returns a sparse Vec sized to max_node_id (id_coding-shifted),
+            // not to the populated count.
+            if candidate == 0 || candidate as usize > 10_000_000 {
                 continue;
             }
             let proj_count = candidate as usize;
@@ -528,7 +534,11 @@ impl VdbCursor {
             let mut pairs: Vec<(i64, usize)> = id2ord
                 .iter()
                 .zip(effective.iter())
-                .filter(|&(_, &n)| n > 0 && (n as usize) <= templates.len())
+                .filter(|&(_, &n)| {
+                    n > 0
+                        && (n as usize) <= templates.len()
+                        && !templates[n as usize - 1].is_empty()
+                })
                 .map(|(&s, &n)| (s, n as usize - 1))
                 .collect();
             pairs.sort_by_key(|&(s, _)| s);
