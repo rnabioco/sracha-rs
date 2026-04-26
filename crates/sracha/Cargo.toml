@@ -27,16 +27,18 @@ tabled.workspace = true
 
 [features]
 default = []
-# Off by default until the hosted catalog is published. Adds the
-# `--catalog DIR` flag to `sracha get` (consumer-side: lookup +
-# download priority seeding) and pulls in `sracha-index` with vortex
-# (~50 transitive deps). Build with `--features catalog` to enable.
-catalog = ["dep:sracha-index"]
-# Off by default. Exposes the `sracha index` subcommand
-# (update / status / path / clear / build / extract / append /
-# query) — producer-side tools, not yet ready for general release.
-# Enabling pulls catalog in too.
-index = ["catalog"]
+# Off by default until the hosted catalog is published. Pulls in
+# `sracha-index` with the Vortex stack (~50 transitive deps) and
+# enables the full catalog surface:
+#   - `sracha get --catalog DIR` flag (consumer: lookup + download
+#     priority seeding)
+#   - `sracha index <sub>` subcommand (update / status / path /
+#     clear for cache management; build / extract / append / query
+#     for catalog producers)
+# Consumer flag and the `sracha index update` cache fetcher are
+# naturally paired — there's no useful state where one ships
+# without the other — so they share a single feature gate.
+index = ["dep:sracha-index"]
 
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"

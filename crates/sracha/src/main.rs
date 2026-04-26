@@ -422,7 +422,7 @@ async fn main() -> Result<()> {
             // S3+SDL for misses. Saves the HEAD round-trip on
             // catalog hits — visible mostly on small or first-
             // byte-latency-sensitive `--stream` invocations.
-            #[cfg(feature = "catalog")]
+            #[cfg(feature = "index")]
             let catalog_hits: Vec<Option<ResolvedAccession>> = {
                 let resolved = resolve_catalog_dir(args.catalog.as_deref());
                 if let Some(catalog_dir) = resolved {
@@ -431,7 +431,7 @@ async fn main() -> Result<()> {
                     vec![None; run_accessions.len()]
                 }
             };
-            #[cfg(not(feature = "catalog"))]
+            #[cfg(not(feature = "index"))]
             let catalog_hits: Vec<Option<ResolvedAccession>> = vec![None; run_accessions.len()];
 
             let miss_indices: Vec<usize> = catalog_hits
@@ -1821,7 +1821,7 @@ const LARGE_DOWNLOAD_THRESHOLD: u64 = 100 * 1024 * 1024 * 1024; // 100 GiB
 /// `~/.cache/sracha/catalog/`) if a `manifest.json` is present —
 /// i.e. the user has run `sracha index update`. Returns `None` if
 /// nothing is usable; callers go straight to S3/SDL.
-#[cfg(feature = "catalog")]
+#[cfg(feature = "index")]
 fn resolve_catalog_dir(explicit: Option<&Path>) -> Option<std::path::PathBuf> {
     if let Some(p) = explicit {
         return Some(p.to_path_buf());
@@ -1843,7 +1843,7 @@ fn resolve_catalog_dir(explicit: Option<&Path>) -> Option<std::path::PathBuf> {
 /// verification) and `run_info: None` (decoder derives layout
 /// from VDB metadata). Both are recoverable; the catalog only
 /// shortcuts the S3 HEAD probe.
-#[cfg(feature = "catalog")]
+#[cfg(feature = "index")]
 async fn catalog_resolve(
     catalog_dir: &Path,
     accessions: &[String],

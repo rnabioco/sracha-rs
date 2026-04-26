@@ -504,11 +504,11 @@ pub struct GetArgs {
     /// seeds the download dispatch queue with per-blob priority
     /// hints so decode can start without waiting for KAR header
     /// bytes to land. Falls back to the usual resolve path on a
-    /// miss. Requires the `catalog` build feature (off by default
+    /// miss. Requires the `index` build feature (off by default
     /// until the hosted catalog is published; build with
-    /// `--features catalog` to enable).
+    /// `--features index` to enable).
     #[arg(long, help_heading = "Advanced", value_name = "DIR")]
-    #[cfg(feature = "catalog")]
+    #[cfg(feature = "index")]
     pub catalog: Option<PathBuf>,
 
     /// Try ENA FASTQ mirrors first; fall back to NCBI if ENA has no FASTQ
