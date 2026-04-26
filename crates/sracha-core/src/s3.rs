@@ -18,7 +18,6 @@ use crate::sdl::{ResolvedAccession, ResolvedFile, ResolvedMirror};
 
 const ODP_BASE: &str = "https://sra-pub-run-odp.s3.amazonaws.com/sra";
 
-/// Maximum concurrent HEAD probes.
 /// Default concurrency for batched S3 HEAD probes. The CLI exposes this
 /// as `--head-concurrency` for users who want to widen (or narrow) the
 /// resolve fan-out on large accession lists. Should track
@@ -140,11 +139,11 @@ pub async fn resolve_direct_many(
 /// Returns a map from accession to result. Failed probes appear as `Err`.
 ///
 /// Note that the underlying [`reqwest::Client`] caps connections via
-/// `pool_max_idle_per_host` (default 16 in `sracha_core::http::default_client`).
-/// Setting a concurrency higher than the pool size lets requests
-/// queue inside reqwest's connection pool — useful for reducing
-/// startup latency on large lists, but won't open more sockets than
-/// the client allows.
+/// `pool_max_idle_per_host` (default [`crate::http::DEFAULT_POOL_MAX_IDLE_PER_HOST`]
+/// in `sracha_core::http::default_client`). Setting a concurrency
+/// higher than the pool size lets requests queue inside reqwest's
+/// connection pool — useful for reducing startup latency on large
+/// lists, but won't open more sockets than the client allows.
 pub async fn resolve_direct_many_with_concurrency(
     client: &reqwest::Client,
     accessions: &[String],
