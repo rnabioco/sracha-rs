@@ -2153,7 +2153,7 @@ dependencies = [
 
 [[package]]
 name = "sracha"
-version = "0.3.4"
+version = "0.3.5"
 dependencies = [
  "anyhow",
  "assert_cmd",
@@ -2174,7 +2174,7 @@ dependencies = [
 
 [[package]]
 name = "sracha-core"
-version = "0.3.4"
+version = "0.3.5"
 dependencies = [
  "anyhow",
  "byteorder",
@@ -2204,7 +2204,7 @@ dependencies = [
 
 [[package]]
 name = "sracha-vdb"
-version = "0.3.4"
+version = "0.3.5"
 dependencies = [
  "byteorder",
  "flate2",

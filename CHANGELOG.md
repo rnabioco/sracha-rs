@@ -2,6 +2,27 @@
 
 ## Unreleased
 
+## 0.3.5 (2026-04-26)
+
+### Fixes
+
+- Honor `idx0_count` from the v3+ column header so columns whose idx0
+  carries trailing bytes past the last valid BlobLoc parse cleanly
+  (#32). Unblocks SRR15000000 and similar newer-writer archives.
+- Decode variant-2 random-access ALTREAD page maps via
+  `data_offset[row_count]` + per-run lengths, with write-time row
+  dedup (#33). DRR024182 reaches byte-identical R1/R2 vs fasterq-dump.
+- Walk persisted PTrie nodes to reconstruct full skey templates (the
+  offset-table fast path only saw leaf suffixes), and drop the ALTREAD
+  gate from Illumina X/Y detection (#35). DRR016241, DRR032228,
+  DRR032250, DRR041584, DRR041585, DRR048907 reach PASS_MD5.
+
+### Features
+
+- `sracha get --head-concurrency <N>` (default 64) tunes the S3
+  HEAD-probe fan-out used during accession resolution (#34). Bumps
+  the built-in pool/probe defaults from 16 → 64.
+
 ## 0.3.4 (2026-04-25)
 
 ### Fixes
