@@ -8,15 +8,26 @@
   into anonymous memory (Linux `memfd_create`, NamedTempFile fallback
   elsewhere). Output is byte-identical to the disk-backed `-Z` path.
   Enables `sracha get --stream ACC | bwa mem ref - | samtools sort > out.bam`.
-- `sracha get --catalog DIR`: skip the S3 HEAD probe + SDL round-trip
-  on accessions present in a hosted Vortex catalog.
-- New `sracha-index` crate + `sracha index` CLI: extract per-accession
-  metadata (file_size, kar_data_offset, schema, n_blobs, platform,
-  layout, spots, read_lengths, md5) from the KAR header and
-  `tbl/SEQUENCE/md/cur` only — never the full SRA. 5500 accessions
-  → ~140 KB total (~48 B/accession). Multi-shard manifest +
-  base/delta append; predicate-pushdown reader (~40 ms open,
-  ~50 ms lookup, constant in catalog size).
+- `sracha get --catalog DIR` (behind off-by-default `index` feature):
+  skip the S3 HEAD probe + SDL round-trip on catalog hits AND seed the
+  download dispatch queue with per-blob priority hints from the
+  catalog so streaming-decode doesn't have to wait for the KAR header
+  bytes to land + parse before issuing its own column-priority hint.
+  Decode-side column-priority block is gated on a tracker
+  `priorities_seeded()` flag and skipped on catalog hits.
+- New `sracha-index` crate + `sracha index <sub>` CLI bundled into the
+  main binary (replaces the previous standalone `sracha-index`
+  binary). Extracts per-accession metadata (file_size, kar_data_offset,
+  schema, n_blobs, platform, layout, spots, read_lengths, md5) from the
+  KAR header + `tbl/SEQUENCE/md/cur` only — never the full SRA.
+  5500 accessions → ~140 KB total (~48 B/accession). Multi-shard
+  manifest + base/delta append; predicate-pushdown reader (~40 ms
+  open, ~50 ms lookup, constant in catalog size).
+- `index` Cargo feature (default off until the hosted catalog is
+  published) gates the entire catalog surface: `--catalog DIR`,
+  `sracha index update/status/path/clear/build/extract/append/query`.
+  Build with `--features index` to opt in; default release strips
+  the Vortex stack (~50 transitive deps).
 - Streaming-decode plumbing: `ChunkReadyTracker` for per-chunk
   readiness, column-priority chunk hint, multi-chunk per-batch
   wait, streaming MD5 (~20% faster on 16 GiB downloads), single
