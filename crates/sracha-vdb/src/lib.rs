@@ -17,6 +17,7 @@ pub mod inspect;
 pub mod kar;
 pub mod kdb;
 pub mod metadata;
+pub(crate) mod ptrie;
 pub mod reference;
 pub mod restore;
 pub mod row_range;
