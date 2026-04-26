@@ -2,6 +2,26 @@
 
 ## Unreleased
 
+### Features
+
+- `sracha get --stream`: pipe FASTQ to stdout with the `.sra` materialized
+  into anonymous memory (Linux `memfd_create`, NamedTempFile fallback
+  elsewhere). Output is byte-identical to the disk-backed `-Z` path.
+  Enables `sracha get --stream ACC | bwa mem ref - | samtools sort > out.bam`.
+- `sracha get --catalog DIR`: skip the S3 HEAD probe + SDL round-trip
+  on accessions present in a hosted Vortex catalog.
+- New `sracha-index` crate + `sracha index` CLI: extract per-accession
+  metadata (file_size, kar_data_offset, schema, n_blobs, platform,
+  layout, spots, read_lengths, md5) from the KAR header and
+  `tbl/SEQUENCE/md/cur` only — never the full SRA. 5500 accessions
+  → ~140 KB total (~48 B/accession). Multi-shard manifest +
+  base/delta append; predicate-pushdown reader (~40 ms open,
+  ~50 ms lookup, constant in catalog size).
+- Streaming-decode plumbing: `ChunkReadyTracker` for per-chunk
+  readiness, column-priority chunk hint, multi-chunk per-batch
+  wait, streaming MD5 (~20% faster on 16 GiB downloads), single
+  combined work bar.
+
 ## 0.3.4 (2026-04-25)
 
 ### Fixes

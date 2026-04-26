@@ -74,3 +74,50 @@ fn open_inner() -> std::io::Result<BackingStore> {
         _tempfile: Some(nt),
     })
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::io::{Read, Seek, SeekFrom};
+
+    #[cfg(unix)]
+    fn pwrite(file: &File, offset: u64, buf: &[u8]) -> std::io::Result<()> {
+        use std::os::unix::fs::FileExt;
+        file.write_all_at(buf, offset)
+    }
+
+    /// Cross-platform exercise of the BackingStore: open at `size`,
+    /// pwrite two non-contiguous byte runs, mmap-read via the alias
+    /// path, and verify both runs round-trip. Validates the Linux
+    /// memfd path and the non-Linux NamedTempFile path together.
+    #[cfg(unix)]
+    #[test]
+    fn backing_store_roundtrip() {
+        let size: u64 = 4096;
+        let store = BackingStore::open(size).expect("open");
+
+        assert_eq!(store.file.metadata().unwrap().len(), size);
+        assert!(
+            store.path.exists() || cfg!(target_os = "linux"),
+            "alias path {} must exist on non-Linux",
+            store.path.display()
+        );
+
+        let head = b"sracha-head";
+        let tail = b"sracha-tail";
+        pwrite(&store.file, 0, head).unwrap();
+        pwrite(&store.file, size - tail.len() as u64, tail).unwrap();
+
+        let mut reader = std::fs::File::open(&store.path).expect("reopen via alias path");
+        let mut got_head = vec![0u8; head.len()];
+        reader.read_exact(&mut got_head).unwrap();
+        assert_eq!(&got_head, head);
+
+        reader
+            .seek(SeekFrom::Start(size - tail.len() as u64))
+            .unwrap();
+        let mut got_tail = vec![0u8; tail.len()];
+        reader.read_exact(&mut got_tail).unwrap();
+        assert_eq!(&got_tail, tail);
+    }
+}
