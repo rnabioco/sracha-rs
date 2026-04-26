@@ -136,22 +136,38 @@ pub struct NameFmtEntry {
 }
 
 impl AccessionRecord {
-    /// Per-column first-`blobs_per_col` `(blob_offset, blob_size)` pairs
-    /// for download priority hinting. Groups `blobs` by `column_id`
-    /// first, since the on-disk catalog is sorted by `(column_id,
-    /// blob_idx)` but a defensive group-by makes the helper robust to
-    /// future reorderings.
+    /// Priority byte ranges for download priority hinting. Order
+    /// matters: the download module pushes them onto the dispatch
+    /// queue in the returned order, so the FIRST entries get fetched
+    /// first.
     ///
-    /// Used by `sracha get --catalog --stream` to seed the chunk
-    /// dispatch queue before download starts, instead of waiting for
-    /// the KAR header to land and be parsed.
+    /// Output:
+    /// 1. `[0, kar_data_offset)` — the KAR header + TOC + any
+    ///    pre-data idx files. Decode opens the cursor by reading
+    ///    these bytes; without seeding them up front, catalog
+    ///    priorities at high offsets get fetched first and
+    ///    decode-startup waits on the low-offset metadata that
+    ///    nominally has FIFO priority.
+    /// 2. Per-column first-`blobs_per_col` `(blob_offset, blob_size)`
+    ///    pairs. Grouped by `column_id` — the on-disk catalog is
+    ///    sorted by `(column_id, blob_idx)`, but a defensive
+    ///    group-by makes the helper robust to future reorderings.
+    ///
+    /// Used by `sracha get --catalog [--stream]` to seed the chunk
+    /// dispatch queue before download starts. Without (1), our
+    /// streaming bench saw a ~2-3 s/accession regression vs
+    /// no-catalog because column-data priorities pushed metadata
+    /// chunks back; (1) restores the natural metadata-first ordering.
     pub fn priority_byte_ranges(&self, blobs_per_col: usize) -> Vec<(u64, u64)> {
         use std::collections::BTreeMap;
         let mut by_col: BTreeMap<u8, Vec<&BlobLocator>> = BTreeMap::new();
         for b in &self.blobs {
             by_col.entry(b.column_id).or_default().push(b);
         }
-        let mut out = Vec::with_capacity(by_col.len() * blobs_per_col);
+        let mut out = Vec::with_capacity(by_col.len() * blobs_per_col + 1);
+        if self.kar_data_offset > 0 {
+            out.push((0, self.kar_data_offset));
+        }
         for blobs in by_col.values() {
             let take = blobs_per_col.min(blobs.len());
             for b in &blobs[..take] {
@@ -204,16 +220,28 @@ mod tests {
 
     #[test]
     fn priority_byte_ranges_groups_by_column_and_caps() {
-        let r = rec(vec![
+        let mut r = rec(vec![
             b(0, 100, 10),
             b(0, 200, 10),
             b(0, 300, 10),
             b(1, 1000, 20),
             b(1, 2000, 20),
         ]);
-        let mut got = r.priority_byte_ranges(2);
-        got.sort();
-        assert_eq!(got, vec![(100, 10), (200, 10), (1000, 20), (2000, 20)]);
+        r.kar_data_offset = 50;
+        let got = r.priority_byte_ranges(2);
+        // First entry must be the [0, kar_data_offset) header range,
+        // then the per-column first-N blobs (sorted by column_id +
+        // input order).
+        assert_eq!(
+            got,
+            vec![(0, 50), (100, 10), (200, 10), (1000, 20), (2000, 20),],
+        );
+    }
+
+    #[test]
+    fn priority_byte_ranges_omits_header_when_kar_data_offset_zero() {
+        let r = rec(vec![b(0, 100, 10)]);
+        assert_eq!(r.priority_byte_ranges(2), vec![(100, 10)]);
     }
 
     #[test]
