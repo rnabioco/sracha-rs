@@ -11,6 +11,7 @@ use indicatif::{ProgressBar, ProgressStyle};
 use sracha_core::util::format_size;
 use sracha_index::cache;
 use sracha_index::fetch::{self, FetchProgress};
+use sracha_index::{build, extractor, reader};
 
 use crate::cli::IndexCmd;
 use crate::progress::Spinner;
@@ -27,6 +28,100 @@ pub async fn run(cmd: IndexCmd) -> Result<()> {
         IndexCmd::Status { cache_dir } => run_status(cache_dir),
         IndexCmd::Path { cache_dir } => run_path(cache_dir),
         IndexCmd::Clear { cache_dir, dry_run } => run_clear(cache_dir, dry_run),
+        IndexCmd::Extract { accession } => run_extract(&accession).await,
+        IndexCmd::Build {
+            accession_list,
+            output,
+            shard_name,
+            workers,
+            include_unsupported_platforms,
+        } => {
+            run_build(
+                &accession_list,
+                &output,
+                &shard_name,
+                workers,
+                false,
+                !include_unsupported_platforms,
+            )
+            .await
+        }
+        IndexCmd::Append {
+            accession_list,
+            catalog,
+            shard_name,
+            workers,
+            include_unsupported_platforms,
+        } => {
+            let name = shard_name.unwrap_or_else(build::today_yyyy_mm_dd);
+            run_build(
+                &accession_list,
+                &catalog,
+                &name,
+                workers,
+                true,
+                !include_unsupported_platforms,
+            )
+            .await
+        }
+        IndexCmd::Query { catalog, accession } => run_query(&catalog, &accession).await,
+    }
+}
+
+async fn run_extract(accession: &str) -> Result<()> {
+    let rec = extractor::extract(accession)
+        .await
+        .map_err(|e| anyhow!(e))?;
+    println!("{}", serde_json::to_string_pretty(&rec)?);
+    Ok(())
+}
+
+async fn run_build(
+    accession_list: &Path,
+    catalog_dir: &Path,
+    shard_name: &str,
+    workers: usize,
+    is_append: bool,
+    skip_unsupported_platforms: bool,
+) -> Result<()> {
+    build::build_shard(
+        accession_list,
+        catalog_dir,
+        shard_name,
+        workers,
+        is_append,
+        skip_unsupported_platforms,
+    )
+    .await
+    .map_err(|e| anyhow!(e))
+}
+
+async fn run_query(catalog: &Path, accession: &str) -> Result<()> {
+    let started = Instant::now();
+    let cat = reader::CatalogReader::open_local(catalog)
+        .await
+        .map_err(|e| anyhow!(e))?;
+    let opened = started.elapsed();
+    let lookup_start = Instant::now();
+    let rec = cat.lookup(accession).await.map_err(|e| anyhow!(e))?;
+    let lookup = lookup_start.elapsed();
+    tracing::info!(
+        "opened catalog ({} shards, {} accessions) in {:.1}ms; \
+         point lookup in {:.3}ms",
+        cat.shard_count(),
+        cat.len(),
+        opened.as_secs_f64() * 1000.0,
+        lookup.as_secs_f64() * 1000.0,
+    );
+    match rec {
+        Some(r) => {
+            println!("{}", serde_json::to_string_pretty(&r)?);
+            Ok(())
+        }
+        None => {
+            eprintln!("not found: {accession}");
+            std::process::exit(1);
+        }
     }
 }
 

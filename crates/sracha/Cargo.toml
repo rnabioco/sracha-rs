@@ -26,11 +26,17 @@ owo-colors.workspace = true
 tabled.workspace = true
 
 [features]
-default = ["catalog"]
-# Pull in the sracha-index crate (vortex, ~50 transitive deps) for
-# `--catalog` fast-resolve. Build with --no-default-features to
-# strip it for slimmer release binaries.
+default = []
+# Off by default until the hosted catalog is published. Adds the
+# `--catalog DIR` flag to `sracha get` (consumer-side: lookup +
+# download priority seeding) and pulls in `sracha-index` with vortex
+# (~50 transitive deps). Build with `--features catalog` to enable.
 catalog = ["dep:sracha-index"]
+# Off by default. Exposes the `sracha index` subcommand
+# (update / status / path / clear / build / extract / append /
+# query) — producer-side tools, not yet ready for general release.
+# Enabling pulls catalog in too.
+index = ["catalog"]
 
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"

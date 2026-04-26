@@ -75,8 +75,11 @@ pub enum Command {
     /// Inspect VDB structure of a local .sra file (replacement for vdb-dump)
     Vdb(VdbArgs),
 
-    /// Manage the local catalog cache (download, status, clear)
-    #[cfg(feature = "catalog")]
+    /// Manage the local catalog cache and (with `index` feature
+    /// enabled) build/query catalog shards. Hidden from default
+    /// release help; run a build with `--features index` to surface
+    /// it.
+    #[cfg(feature = "index")]
     Index(IndexArgs),
 
     /// Delete leftover temp/partial-download files from a directory
@@ -495,11 +498,15 @@ pub struct GetArgs {
     pub stream: bool,
 
     /// Path to a sracha-index catalog directory (built via
-    /// `sracha-index build`). When set, sracha looks up the
+    /// `sracha index build`). When set, sracha looks up the
     /// accession in the catalog before probing S3/SDL — saves the
-    /// HEAD round-trip on first-byte latency. Falls back to the
-    /// usual resolve path on a miss. Requires the `catalog`
-    /// build feature (default-on).
+    /// HEAD round-trip on first-byte latency, and (with `--stream`)
+    /// seeds the download dispatch queue with per-blob priority
+    /// hints so decode can start without waiting for KAR header
+    /// bytes to land. Falls back to the usual resolve path on a
+    /// miss. Requires the `catalog` build feature (off by default
+    /// until the hosted catalog is published; build with
+    /// `--features catalog` to enable).
     #[arg(long, help_heading = "Advanced", value_name = "DIR")]
     #[cfg(feature = "catalog")]
     pub catalog: Option<PathBuf>,
@@ -674,14 +681,14 @@ pub fn resolve_compression(
     }
 }
 
-#[cfg(feature = "catalog")]
+#[cfg(feature = "index")]
 #[derive(Args)]
 pub struct IndexArgs {
     #[command(subcommand)]
     pub cmd: IndexCmd,
 }
 
-#[cfg(feature = "catalog")]
+#[cfg(feature = "index")]
 #[derive(Subcommand)]
 pub enum IndexCmd {
     /// Download the hosted catalog into the local cache
@@ -732,4 +739,54 @@ pub enum IndexCmd {
         #[arg(long)]
         dry_run: bool,
     },
+
+    /// Extract metadata for a single accession and print as JSON
+    /// (catalog producer tool).
+    Extract { accession: String },
+
+    /// Build a fresh catalog (initial base shard). Replaces any
+    /// existing manifest at the catalog dir.
+    Build {
+        /// File with one accession per line.
+        #[arg(long)]
+        accession_list: PathBuf,
+        /// Output catalog directory.
+        #[arg(short, long)]
+        output: PathBuf,
+        /// Shard name within the catalog (default "base").
+        #[arg(long, default_value = "base")]
+        shard_name: String,
+        /// Parallel extractor workers.
+        #[arg(short = 'j', long, default_value = "32")]
+        workers: usize,
+        /// Keep records for platforms sracha can't decode (default
+        /// drops them).
+        #[arg(long)]
+        include_unsupported_platforms: bool,
+    },
+
+    /// Append a new delta shard to an existing catalog.
+    Append {
+        /// File with one accession per line.
+        #[arg(long)]
+        accession_list: PathBuf,
+        /// Existing catalog directory (must contain manifest.json).
+        #[arg(short, long)]
+        catalog: PathBuf,
+        /// Shard name (default = today's date `YYYY-MM-DD`).
+        #[arg(long)]
+        shard_name: Option<String>,
+        /// Parallel extractor workers.
+        #[arg(short = 'j', long, default_value = "32")]
+        workers: usize,
+        /// Keep records for platforms sracha can't decode (default
+        /// drops them).
+        #[arg(long)]
+        include_unsupported_platforms: bool,
+    },
+
+    /// Query a catalog (single shard or multi-shard manifest) by
+    /// accession id. Prints the matching record as JSON or exits 1
+    /// on a miss.
+    Query { catalog: PathBuf, accession: String },
 }

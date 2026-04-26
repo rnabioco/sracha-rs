@@ -1,5 +1,5 @@
 mod cli;
-#[cfg(feature = "catalog")]
+#[cfg(feature = "index")]
 mod index_cmd;
 mod progress;
 mod style;
@@ -1143,7 +1143,7 @@ async fn main() -> Result<()> {
         }
         Command::Vdb(args) => vdb_cmd::run(args.cmd),
 
-        #[cfg(feature = "catalog")]
+        #[cfg(feature = "index")]
         Command::Index(args) => index_cmd::run(args.cmd).await,
 
         Command::Clean(args) => run_clean(&args),
