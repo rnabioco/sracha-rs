@@ -10,7 +10,9 @@ crates/sracha-vdb/tests/fixtures/*.sra
 sracha-big-*.out
 test-big*.sh
 validation/
+
 .claude/worktrees
+.claude/worktree-backups
 
 # development artifacts
 .sracha-done-*
