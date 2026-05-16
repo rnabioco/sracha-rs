@@ -131,6 +131,8 @@ pub struct FastqConfig {
     pub min_read_len: Option<u32>,
     /// Output FASTA instead of FASTQ (drops quality line).
     pub fasta: bool,
+    /// Suffix style for paired/split output filenames.
+    pub paired_suffix: PairedSuffix,
 }
 
 impl Default for FastqConfig {
@@ -140,6 +142,7 @@ impl Default for FastqConfig {
             skip_technical: true,
             min_read_len: None,
             fasta: false,
+            paired_suffix: PairedSuffix::Numeric,
         }
     }
 }
@@ -165,6 +168,16 @@ pub enum OutputSlot {
     Unpaired,
     /// `_N.fastq[.gz]` (Nth read in SplitFiles mode, 0-indexed).
     ReadN(u32),
+}
+
+/// Filename suffix style for paired / split FASTQ outputs.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum PairedSuffix {
+    /// `_1.fastq` / `_2.fastq` (default; matches fasterq-dump and ENA filenames).
+    #[default]
+    Numeric,
+    /// `_R1.fastq` / `_R2.fastq` (matches Illumina BCL output convention).
+    R,
 }
 
 // ---------------------------------------------------------------------------
@@ -571,6 +584,7 @@ pub fn output_filename(
     slot: OutputSlot,
     fasta: bool,
     compression: &CompressionMode,
+    suffix: PairedSuffix,
 ) -> String {
     let base = if fasta { ".fasta" } else { ".fastq" };
     let ext = match compression {
@@ -578,16 +592,20 @@ pub fn output_filename(
         CompressionMode::Gzip { .. } => format!("{base}.gz"),
         CompressionMode::Zstd { .. } => format!("{base}.zst"),
     };
+    let sep = match suffix {
+        PairedSuffix::Numeric => "_",
+        PairedSuffix::R => "_R",
+    };
     match slot {
         OutputSlot::Single => format!("{accession}{ext}"),
-        OutputSlot::Read1 => format!("{accession}_1{ext}"),
-        OutputSlot::Read2 => format!("{accession}_2{ext}"),
+        OutputSlot::Read1 => format!("{accession}{sep}1{ext}"),
+        OutputSlot::Read2 => format!("{accession}{sep}2{ext}"),
         // Matches fasterq-dump: split-3 orphans and single-end runs both
         // land in `{accession}.fastq` (no `_0` suffix).
         OutputSlot::Unpaired => format!("{accession}{ext}"),
         // ReadN is 0-indexed internally but 1-indexed in the filename to match
         // the convention used by SRA tools (read number, not array index).
-        OutputSlot::ReadN(n) => format!("{accession}_{}{ext}", n + 1),
+        OutputSlot::ReadN(n) => format!("{accession}{sep}{}{ext}", n + 1),
     }
 }
 
@@ -1167,7 +1185,13 @@ mod tests {
     fn output_filename_single_gzip() {
         let gz = CompressionMode::Gzip { level: 6 };
         assert_eq!(
-            output_filename("SRR123456", OutputSlot::Single, false, &gz),
+            output_filename(
+                "SRR123456",
+                OutputSlot::Single,
+                false,
+                &gz,
+                PairedSuffix::Numeric
+            ),
             "SRR123456.fastq.gz"
         );
     }
@@ -1179,7 +1203,8 @@ mod tests {
                 "SRR123456",
                 OutputSlot::Single,
                 false,
-                &CompressionMode::None
+                &CompressionMode::None,
+                PairedSuffix::Numeric,
             ),
             "SRR123456.fastq"
         );
@@ -1189,7 +1214,13 @@ mod tests {
     fn output_filename_read1() {
         let gz = CompressionMode::Gzip { level: 6 };
         assert_eq!(
-            output_filename("SRR123456", OutputSlot::Read1, false, &gz),
+            output_filename(
+                "SRR123456",
+                OutputSlot::Read1,
+                false,
+                &gz,
+                PairedSuffix::Numeric
+            ),
             "SRR123456_1.fastq.gz"
         );
     }
@@ -1198,7 +1229,13 @@ mod tests {
     fn output_filename_read2() {
         let gz = CompressionMode::Gzip { level: 6 };
         assert_eq!(
-            output_filename("SRR123456", OutputSlot::Read2, false, &gz),
+            output_filename(
+                "SRR123456",
+                OutputSlot::Read2,
+                false,
+                &gz,
+                PairedSuffix::Numeric
+            ),
             "SRR123456_2.fastq.gz"
         );
     }
@@ -1210,7 +1247,13 @@ mod tests {
         // causes FAIL_MISSING in validation comparisons.
         let gz = CompressionMode::Gzip { level: 6 };
         assert_eq!(
-            output_filename("SRR123456", OutputSlot::Unpaired, false, &gz),
+            output_filename(
+                "SRR123456",
+                OutputSlot::Unpaired,
+                false,
+                &gz,
+                PairedSuffix::Numeric
+            ),
             "SRR123456.fastq.gz"
         );
     }
@@ -1220,7 +1263,13 @@ mod tests {
         let gz = CompressionMode::Gzip { level: 6 };
         // ReadN(0) -> _1 in the filename (1-indexed).
         assert_eq!(
-            output_filename("SRR123456", OutputSlot::ReadN(0), false, &gz),
+            output_filename(
+                "SRR123456",
+                OutputSlot::ReadN(0),
+                false,
+                &gz,
+                PairedSuffix::Numeric
+            ),
             "SRR123456_1.fastq.gz"
         );
     }
@@ -1232,7 +1281,8 @@ mod tests {
                 "SRR123456",
                 OutputSlot::ReadN(2),
                 false,
-                &CompressionMode::None
+                &CompressionMode::None,
+                PairedSuffix::Numeric,
             ),
             "SRR123456_3.fastq"
         );
@@ -1245,7 +1295,8 @@ mod tests {
                 "SRR999",
                 OutputSlot::Unpaired,
                 false,
-                &CompressionMode::None
+                &CompressionMode::None,
+                PairedSuffix::Numeric,
             ),
             "SRR999.fastq"
         );
@@ -1254,7 +1305,13 @@ mod tests {
     #[test]
     fn output_filename_read1_no_gzip() {
         assert_eq!(
-            output_filename("SRR999", OutputSlot::Read1, false, &CompressionMode::None),
+            output_filename(
+                "SRR999",
+                OutputSlot::Read1,
+                false,
+                &CompressionMode::None,
+                PairedSuffix::Numeric
+            ),
             "SRR999_1.fastq"
         );
     }
@@ -1262,7 +1319,13 @@ mod tests {
     #[test]
     fn output_filename_read2_no_gzip() {
         assert_eq!(
-            output_filename("SRR999", OutputSlot::Read2, false, &CompressionMode::None),
+            output_filename(
+                "SRR999",
+                OutputSlot::Read2,
+                false,
+                &CompressionMode::None,
+                PairedSuffix::Numeric
+            ),
             "SRR999_2.fastq"
         );
     }
@@ -1271,7 +1334,13 @@ mod tests {
     fn output_filename_fasta_gzip() {
         let gz = CompressionMode::Gzip { level: 6 };
         assert_eq!(
-            output_filename("SRR123456", OutputSlot::Single, true, &gz),
+            output_filename(
+                "SRR123456",
+                OutputSlot::Single,
+                true,
+                &gz,
+                PairedSuffix::Numeric
+            ),
             "SRR123456.fasta.gz"
         );
     }
@@ -1279,7 +1348,13 @@ mod tests {
     #[test]
     fn output_filename_fasta_no_compression() {
         assert_eq!(
-            output_filename("SRR123456", OutputSlot::Read1, true, &CompressionMode::None),
+            output_filename(
+                "SRR123456",
+                OutputSlot::Read1,
+                true,
+                &CompressionMode::None,
+                PairedSuffix::Numeric
+            ),
             "SRR123456_1.fasta"
         );
     }
@@ -1291,7 +1366,13 @@ mod tests {
             threads: 4,
         };
         assert_eq!(
-            output_filename("SRR123456", OutputSlot::Single, false, &zst),
+            output_filename(
+                "SRR123456",
+                OutputSlot::Single,
+                false,
+                &zst,
+                PairedSuffix::Numeric
+            ),
             "SRR123456.fastq.zst"
         );
     }
@@ -1303,8 +1384,106 @@ mod tests {
             threads: 4,
         };
         assert_eq!(
-            output_filename("SRR123456", OutputSlot::Read2, true, &zst),
+            output_filename(
+                "SRR123456",
+                OutputSlot::Read2,
+                true,
+                &zst,
+                PairedSuffix::Numeric
+            ),
             "SRR123456_2.fasta.zst"
+        );
+    }
+
+    // PairedSuffix::R variants ------------------------------------------------
+
+    #[test]
+    fn output_filename_read1_r_suffix() {
+        let gz = CompressionMode::Gzip { level: 6 };
+        assert_eq!(
+            output_filename("SRR123456", OutputSlot::Read1, false, &gz, PairedSuffix::R),
+            "SRR123456_R1.fastq.gz"
+        );
+    }
+
+    #[test]
+    fn output_filename_read2_r_suffix() {
+        let gz = CompressionMode::Gzip { level: 6 };
+        assert_eq!(
+            output_filename("SRR123456", OutputSlot::Read2, false, &gz, PairedSuffix::R),
+            "SRR123456_R2.fastq.gz"
+        );
+    }
+
+    #[test]
+    fn output_filename_read_n_zero_indexed_r_suffix() {
+        let gz = CompressionMode::Gzip { level: 6 };
+        // ReadN(0) -> _R1 with PairedSuffix::R.
+        assert_eq!(
+            output_filename(
+                "SRR123456",
+                OutputSlot::ReadN(0),
+                false,
+                &gz,
+                PairedSuffix::R
+            ),
+            "SRR123456_R1.fastq.gz"
+        );
+    }
+
+    #[test]
+    fn output_filename_read_n_higher_r_suffix() {
+        let gz = CompressionMode::Gzip { level: 6 };
+        // ReadN(2) -> _R3 with PairedSuffix::R.
+        assert_eq!(
+            output_filename(
+                "SRR123456",
+                OutputSlot::ReadN(2),
+                false,
+                &gz,
+                PairedSuffix::R
+            ),
+            "SRR123456_R3.fastq.gz"
+        );
+    }
+
+    #[test]
+    fn output_filename_single_unaffected_by_r_suffix() {
+        // Single-file outputs never get a paired suffix; --paired-suffix r
+        // must leave them alone.
+        let gz = CompressionMode::Gzip { level: 6 };
+        assert_eq!(
+            output_filename("SRR123456", OutputSlot::Single, false, &gz, PairedSuffix::R),
+            "SRR123456.fastq.gz"
+        );
+    }
+
+    #[test]
+    fn output_filename_unpaired_unaffected_by_r_suffix() {
+        // Split-3 orphan files (Unpaired slot) follow fasterq-dump naming and
+        // are not renamed by --paired-suffix r.
+        let gz = CompressionMode::Gzip { level: 6 };
+        assert_eq!(
+            output_filename(
+                "SRR123456",
+                OutputSlot::Unpaired,
+                false,
+                &gz,
+                PairedSuffix::R
+            ),
+            "SRR123456.fastq.gz"
+        );
+    }
+
+    #[test]
+    fn output_filename_fasta_zstd_r_suffix() {
+        let zst = CompressionMode::Zstd {
+            level: 3,
+            threads: 4,
+        };
+        assert_eq!(
+            output_filename("SRR123456", OutputSlot::Read1, true, &zst, PairedSuffix::R),
+            "SRR123456_R1.fasta.zst"
         );
     }
 

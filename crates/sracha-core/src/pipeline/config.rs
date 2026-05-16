@@ -9,7 +9,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
 
-use crate::fastq::{CompressionMode, IntegrityDiag, SplitMode};
+use crate::fastq::{CompressionMode, IntegrityDiag, PairedSuffix, SplitMode};
 
 /// Configuration for the get pipeline.
 #[derive(Clone)]
@@ -54,6 +54,8 @@ pub struct PipelineConfig {
     /// decode instead of deleting it. Useful for validation runs that
     /// want to compare against another tool on the same input file.
     pub keep_sra: bool,
+    /// Suffix style for paired/split FASTQ outputs (`_1`/`_2` vs `_R1`/`_R2`).
+    pub paired_suffix: PairedSuffix,
     /// Place each accession's outputs (FASTQ + sidecars + temp SRA) inside
     /// its own subdirectory of `output_dir`, named after the accession.
     /// When `false`, all files land flat in `output_dir`.
@@ -132,6 +134,7 @@ mod tests {
             strict: false,
             http_client: None,
             keep_sra: false,
+            paired_suffix: crate::fastq::PairedSuffix::Numeric,
             folder_per_accession,
             metadata: None,
             metadata_url: None,
