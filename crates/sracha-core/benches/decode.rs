@@ -53,6 +53,7 @@ fn config(out: &std::path::Path, threads: usize, compression: CompressionMode) -
         strict: false,
         http_client: None,
         keep_sra: false,
+        folder_per_accession: false,
     }
 }
 

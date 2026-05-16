@@ -177,8 +177,9 @@ fn create_output_writer_for_slot(
     compress_pool: &Option<Arc<rayon::ThreadPool>>,
 ) -> (OutputWriter, PathBuf, PathBuf) {
     let filename = output_filename(accession, slot, config.fasta, &config.compression);
-    let final_path = config.output_dir.join(&filename);
-    let tmp_path = config.output_dir.join(format!("{filename}.partial"));
+    let out_dir = config.accession_output_dir(accession);
+    let final_path = out_dir.join(&filename);
+    let tmp_path = out_dir.join(format!("{filename}.partial"));
 
     let file = std::fs::File::create(&tmp_path).expect("failed to create output file");
     let buf = std::io::BufWriter::with_capacity(256 * 1024, file);
@@ -430,7 +431,7 @@ fn decode_and_write(
 
     // Create output directory (not needed for stdout mode).
     if !config.stdout {
-        std::fs::create_dir_all(&config.output_dir)?;
+        std::fs::create_dir_all(config.accession_output_dir(accession))?;
     }
 
     // Lazily create output writers as we encounter different output slots.
@@ -1172,7 +1173,7 @@ fn run_fastq_csra(
     };
 
     if !config.stdout {
-        std::fs::create_dir_all(&config.output_dir)?;
+        std::fs::create_dir_all(config.accession_output_dir(acc))?;
     }
 
     let mut writers: HashMap<OutputSlot, OutputWriter> = HashMap::new();
@@ -1306,8 +1307,9 @@ fn run_fastq_csra(
             return Ok(());
         }
         let filename = output_filename(acc, slot, config.fasta, &config.compression);
-        let final_path = config.output_dir.join(&filename);
-        let tmp_path = config.output_dir.join(format!("{filename}.partial"));
+        let out_dir = config.accession_output_dir(acc);
+        let final_path = out_dir.join(&filename);
+        let tmp_path = out_dir.join(format!("{filename}.partial"));
         output_paths.push((final_path, tmp_path.clone()));
         let file = std::fs::File::create(&tmp_path)?;
         let buf = std::io::BufWriter::with_capacity(256 * 1024, file);
@@ -1432,20 +1434,21 @@ pub async fn download_sra(
 ) -> Result<DownloadedSra> {
     let accession = &resolved.accession;
     let total_sra_size = resolved.sra_file.size;
+    let acc_dir = config.accession_output_dir(accession);
 
     // Delete completion marker when --force is used.
     if config.force {
-        let _ = std::fs::remove_file(marker_path(&config.output_dir, accession));
+        let _ = std::fs::remove_file(marker_path(&acc_dir, accession));
     }
 
     // If outputs already exist (validated via completion marker), skip entirely.
     if !config.force
         && !config.stdout
-        && check_completion_marker(&config.output_dir, accession, config, total_sra_size).is_some()
+        && check_completion_marker(&acc_dir, accession, config, total_sra_size).is_some()
     {
         tracing::info!("{accession}: outputs already exist, skipping download");
         let temp_filename = format!(".sracha-tmp-{accession}.sra");
-        let temp_path = config.output_dir.join(&temp_filename);
+        let temp_path = acc_dir.join(&temp_filename);
         return Ok(DownloadedSra {
             temp_path,
             bytes_transferred: 0,
@@ -1462,9 +1465,9 @@ pub async fn download_sra(
     tracing::debug!("{accession}: starting full download from {url}");
 
     let temp_filename = format!(".sracha-tmp-{accession}.sra");
-    let temp_path = config.output_dir.join(&temp_filename);
+    let temp_path = acc_dir.join(&temp_filename);
 
-    tokio::fs::create_dir_all(&config.output_dir).await?;
+    tokio::fs::create_dir_all(&acc_dir).await?;
 
     let dl_config = DownloadConfig {
         connections: config.connections,
@@ -1540,7 +1543,8 @@ pub async fn download_ena_fastq(
     config: &PipelineConfig,
 ) -> Result<PipelineStats> {
     let accession = &ena.accession;
-    tokio::fs::create_dir_all(&config.output_dir).await?;
+    let acc_dir = config.accession_output_dir(accession);
+    tokio::fs::create_dir_all(&acc_dir).await?;
 
     let dl_config = DownloadConfig {
         connections: config.connections,
@@ -1570,7 +1574,7 @@ pub async fn download_ena_fastq(
         }
 
         let name = output_filename(accession, file.slot, config.fasta, &config.compression);
-        let target = config.output_dir.join(&name);
+        let target = acc_dir.join(&name);
 
         tracing::info!(
             "{accession}: downloading ENA FASTQ {} ({}) → {}",
@@ -1628,11 +1632,12 @@ async fn poll_cancelled(flag: Arc<AtomicBool>) {
 /// This is the decode phase of `run_get`. Call from within
 /// `tokio::task::block_in_place` or a blocking thread.
 pub fn decode_sra(downloaded: &DownloadedSra, config: &PipelineConfig) -> Result<PipelineStats> {
+    let acc_dir = config.accession_output_dir(&downloaded.accession);
     // Check if decode can be skipped (unless --force or stdout mode).
     if let Some(output_files) = (!config.force && !config.stdout)
         .then(|| {
             check_completion_marker(
-                &config.output_dir,
+                &acc_dir,
                 &downloaded.accession,
                 config,
                 downloaded.total_sra_size,
@@ -1671,7 +1676,7 @@ pub fn decode_sra(downloaded: &DownloadedSra, config: &PipelineConfig) -> Result
         Ok(result) => result,
         Err(Error::Cancelled { output_files }) => {
             // Delete completion marker (may not exist yet).
-            let _ = std::fs::remove_file(marker_path(&config.output_dir, &downloaded.accession));
+            let _ = std::fs::remove_file(marker_path(&acc_dir, &downloaded.accession));
             // Delete partial FASTQ output files.
             for path in &output_files {
                 if let Err(e) = std::fs::remove_file(path) {
@@ -1709,9 +1714,7 @@ pub fn decode_sra(downloaded: &DownloadedSra, config: &PipelineConfig) -> Result
 
     // Clean up temp file (or preserve it in the output dir if requested).
     if config.keep_sra && !config.stdout {
-        let kept = config
-            .output_dir
-            .join(format!("{}.sra", downloaded.accession));
+        let kept = acc_dir.join(format!("{}.sra", downloaded.accession));
         if let Err(e) = std::fs::rename(&downloaded.temp_path, &kept) {
             tracing::warn!(
                 "{}: failed to move temp SRA {} -> {}: {e}",
@@ -1734,7 +1737,7 @@ pub fn decode_sra(downloaded: &DownloadedSra, config: &PipelineConfig) -> Result
     // Write completion marker so future runs can skip this accession.
     if !config.stdout
         && let Err(e) = write_completion_marker(
-            &config.output_dir,
+            &acc_dir,
             &downloaded.accession,
             downloaded.sra_md5.as_deref(),
             downloaded.total_sra_size,

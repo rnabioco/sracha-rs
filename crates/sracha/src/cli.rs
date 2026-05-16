@@ -269,6 +269,12 @@ pub struct FastqArgs {
     #[arg(short, long, help_heading = "Output")]
     pub force: bool,
 
+    /// Place each accession's outputs (FASTQ + sidecars) inside its own
+    /// subdirectory of the output directory, named after the accession.
+    /// Default: all files flat in the output directory.
+    #[arg(long, help_heading = "Output")]
+    pub folder_per_accession: bool,
+
     /// Disable gzip compression (compressed by default)
     #[arg(
         long,
@@ -357,6 +363,12 @@ pub struct GetArgs {
     /// Overwrite existing files
     #[arg(short, long, help_heading = "Output")]
     pub force: bool,
+
+    /// Place each accession's outputs (FASTQ + sidecars) inside its own
+    /// subdirectory of the output directory, named after the accession.
+    /// Default: all files flat in the output directory.
+    #[arg(long, help_heading = "Output")]
+    pub folder_per_accession: bool,
 
     /// Disable gzip compression (compressed by default)
     #[arg(
