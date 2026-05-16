@@ -475,6 +475,22 @@ pub struct GetArgs {
         value_parser = parse_head_concurrency,
     )]
     pub head_concurrency: usize,
+
+    /// Resolve accessions and print what would be downloaded as TSV (default)
+    /// or JSON. Does not download or decode anything.
+    #[arg(long, help_heading = "Advanced")]
+    pub dry_run: bool,
+
+    /// Format for `--dry-run` output.
+    #[arg(long, value_enum, default_value = "tsv", help_heading = "Advanced")]
+    pub dry_run_format: DryRunFormat,
+}
+
+#[derive(Clone, Copy, ValueEnum, Default)]
+pub enum DryRunFormat {
+    #[default]
+    Tsv,
+    Json,
 }
 
 const HEAD_CONCURRENCY_MAX: usize = 256;
