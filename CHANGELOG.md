@@ -2,6 +2,31 @@
 
 ## Unreleased
 
+### Features
+
+- `sracha get --metadata {tsv,json,both}` writes a
+  `{accession}.metadata.{tsv,json}` sidecar alongside the FASTQ outputs
+  after a successful decode (#37). Captures BioSample/SAMN, Sample/SRS,
+  BioProject, library strategy/source/selection/layout, instrument
+  model, experiment, study, scientific name, tax id, base count, and
+  release/load dates from the EUtils RunInfo CSV. `RunInfo` gains 17
+  optional fields and now derives `Default`.
+- `sracha get --dry-run` resolves accessions and prints what would be
+  downloaded as TSV (default) or JSON via `--dry-run-format`, then
+  exits without downloading or decoding (#38). Honors `--prefer-sdl`,
+  `--no-runinfo`, `--prefer-ena`, and project/study expansion.
+- `sracha {get,fastq} --paired-suffix {numeric,r}` selects between
+  `_1`/`_2` (default, matches fasterq-dump and ENA filenames) and
+  `_R1`/`_R2` FASTQ filenames for paired/split outputs (#39). Matches
+  the Illumina BCL convention many pipelines expect; applies uniformly
+  to VDB decode, cSRA decode, split-files, and the ENA fast path.
+- `sracha {get,fastq} --folder-per-accession` places each accession's
+  outputs — FASTQ files, metadata sidecar, completion marker, temp
+  SRA, `.sracha-progress` sidecar, and any `--keep-sra` artifact —
+  inside its own `<output_dir>/<accession>/` subdirectory (#40). The
+  shared `sracha-stats.jsonl` audit log stays at the top level so it
+  aggregates across runs.
+
 ## 0.3.5 (2026-04-26)
 
 ### Fixes
