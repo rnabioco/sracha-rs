@@ -325,6 +325,11 @@ async fn main() -> Result<()> {
                     http_client: None,
                     strict: !args.no_strict,
                     keep_sra: false,
+                    metadata: None,
+                    metadata_url: None,
+                    metadata_md5: None,
+                    metadata_size: None,
+                    metadata_service: None,
                 };
 
                 let stats = sracha_core::pipeline::run_fastq(sra_path, None, &pipeline_config)?;
@@ -503,24 +508,32 @@ async fn main() -> Result<()> {
             let make_config = {
                 let http_client = http_client.clone();
                 let cancelled = cancelled.clone();
-                move |resolved: &ResolvedAccession| sracha_core::pipeline::PipelineConfig {
-                    output_dir: args.output_dir.clone(),
-                    split_mode,
-                    compression,
-                    threads: args.threads,
-                    connections: args.connections,
-                    skip_technical: !args.include_technical,
-                    min_read_len: args.min_read_len,
-                    force: args.force,
-                    progress,
-                    run_info: resolved.run_info.clone(),
-                    fasta: args.fasta,
-                    resume: !args.no_resume,
-                    stdout: args.stdout,
-                    cancelled: Some(cancelled.clone()),
-                    strict: !args.no_strict,
-                    http_client: Some(http_client.clone()),
-                    keep_sra: args.keep_sra,
+                move |resolved: &ResolvedAccession| {
+                    let primary = resolved.sra_file.mirrors.first();
+                    sracha_core::pipeline::PipelineConfig {
+                        output_dir: args.output_dir.clone(),
+                        split_mode,
+                        compression,
+                        threads: args.threads,
+                        connections: args.connections,
+                        skip_technical: !args.include_technical,
+                        min_read_len: args.min_read_len,
+                        force: args.force,
+                        progress,
+                        run_info: resolved.run_info.clone(),
+                        fasta: args.fasta,
+                        resume: !args.no_resume,
+                        stdout: args.stdout,
+                        cancelled: Some(cancelled.clone()),
+                        strict: !args.no_strict,
+                        http_client: Some(http_client.clone()),
+                        keep_sra: args.keep_sra,
+                        metadata: args.metadata.map(Into::into),
+                        metadata_url: primary.map(|m| m.url.clone()),
+                        metadata_md5: resolved.sra_file.md5.clone(),
+                        metadata_size: Some(resolved.sra_file.size),
+                        metadata_service: primary.map(|m| m.service.clone()),
+                    }
                 }
             };
 

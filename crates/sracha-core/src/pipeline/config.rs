@@ -54,6 +54,22 @@ pub struct PipelineConfig {
     /// decode instead of deleting it. Useful for validation runs that
     /// want to compare against another tool on the same input file.
     pub keep_sra: bool,
+    /// Optional run-metadata sidecar format. When `Some`, [`decode_sra`]
+    /// writes a `<accession>.metadata.{tsv,json}` file next to the FASTQ
+    /// outputs after a successful decode.
+    ///
+    /// [`decode_sra`]: crate::pipeline::decode_sra
+    pub metadata: Option<crate::metadata::MetadataFormat>,
+    /// Primary download URL recorded into the metadata sidecar. Optional
+    /// because the `fastq` subcommand (local file decode) has no URL.
+    pub metadata_url: Option<String>,
+    /// MD5 of the SRA payload recorded into the metadata sidecar.
+    pub metadata_md5: Option<String>,
+    /// SDL-reported SRA size in bytes recorded into the metadata sidecar.
+    pub metadata_size: Option<u64>,
+    /// Mirror service label (e.g. `s3`, `gs`, `ncbi`) recorded into the
+    /// metadata sidecar.
+    pub metadata_service: Option<String>,
 }
 
 /// Statistics from a completed pipeline run.

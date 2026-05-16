@@ -6,6 +6,7 @@ pub mod error;
 pub mod fastq;
 pub mod http;
 pub mod info;
+pub mod metadata;
 pub mod pipeline;
 pub mod s3;
 pub mod sdl;
