@@ -62,6 +62,7 @@ sracha get [OPTIONS] [ACCESSION]...
 |--------|---------|-------------|
 | `--accession-list <FILE>` | | Read accessions from a file (one per line) |
 | `-O, --output-dir <DIR>` | `.` | Output directory |
+| `--folder-per-accession` | | Place each accession's outputs (FASTQ + metadata sidecar + temp SRA + completion marker + `.sracha-progress` + any `--keep-sra` artifact) inside its own `<output-dir>/<accession>/` subdirectory. The shared `sracha-stats.jsonl` audit log stays at the top level |
 | `--format <FORMAT>` | `sra` | Download format: `sra` (full quality) or `sralite` (simplified quality, smaller) |
 | `-f, --force` | | Overwrite existing files |
 
@@ -70,9 +71,11 @@ sracha get [OPTIONS] [ACCESSION]...
 | Option | Default | Description |
 |--------|---------|-------------|
 | `--split <MODE>` | `split-3` | Split mode: `split-3`, `split-files`, `split-spot`, `interleaved` |
+| `--paired-suffix <STYLE>` | `numeric` | Suffix style for paired/split FASTQ outputs: `numeric` (`_1`/`_2`, matches fasterq-dump and ENA) or `r` (`_R1`/`_R2`, matches Illumina BCL output) |
 | `--fasta` | | Output FASTA instead of FASTQ (drops quality scores) |
 | `--min-read-len <N>` | | Minimum read length filter |
 | `--include-technical` | | Include technical reads (skipped by default) |
+| `--metadata <FORMAT>` | | Write a `<accession>.metadata.{tsv,json}` sidecar alongside each FASTQ output, capturing BioSample/SAMN, Sample/SRS, BioProject, library strategy/source/selection/layout, instrument, experiment, study, scientific name, tax id, bases, and release dates from the EUtils RunInfo CSV. Values: `tsv`, `json`, `both` |
 | `-Z, --stdout` | | Write to stdout (stream interleaved FASTQ, auto-delete temp SRA) |
 
 **Compression**
@@ -96,6 +99,8 @@ sracha get [OPTIONS] [ACCESSION]...
 | Option | Default | Description |
 |--------|---------|-------------|
 | `--no-resume` | | Disable download resume (re-download from scratch) |
+| `--dry-run` | | Resolve accessions and print what would be downloaded, then exit without downloading or decoding |
+| `--dry-run-format <FORMAT>` | `tsv` | Output format for `--dry-run`: `tsv` or `json` |
 | `-y, --yes` | | Confirm project downloads and large downloads (>100 GiB) |
 | `--prefer-sdl` | | Skip direct S3 and resolve via the SDL API |
 | `--prefer-ena` | | Try ENA FASTQ mirrors first; fall back to the NCBI SRA path if ENA has no FASTQ for the accession or its output config is incompatible with the requested split/compression |
@@ -160,6 +165,7 @@ sracha fastq [OPTIONS] <INPUT>...
 | Option | Default | Description |
 |--------|---------|-------------|
 | `--split <MODE>` | `split-3` | Split mode: `split-3`, `split-files`, `split-spot`, `interleaved` |
+| `--paired-suffix <STYLE>` | `numeric` | Suffix style for paired/split FASTQ outputs: `numeric` (`_1`/`_2`, matches fasterq-dump and ENA) or `r` (`_R1`/`_R2`, matches Illumina BCL output) |
 | `--fasta` | | Output FASTA instead of FASTQ (drops quality scores) |
 | `--min-read-len <N>` | | Minimum read length filter |
 | `--include-technical` | | Include technical reads (skipped by default) |
@@ -180,6 +186,7 @@ sracha fastq [OPTIONS] <INPUT>...
 |--------|---------|-------------|
 | `-t, --threads <N>` | `8` | Thread count for decode and compression |
 | `-O, --output-dir <DIR>` | `.` | Output directory |
+| `--folder-per-accession` | | Place each accession's outputs inside its own `<output-dir>/<accession>/` subdirectory |
 | `-f, --force` | | Overwrite existing files |
 | `--no-progress` | | Disable progress bar |
 | `--no-strict` | | Downgrade strict-fatal data-integrity anomalies (quality length mismatch, invalid quality bytes, quality overruns, paired-spot violations) from hard failures to warnings. Strict is the default. Benign-fallback counters (SRA-lite all-zero quality blobs, truncated-spot recovery) stay informational either way |
