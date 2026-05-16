@@ -325,6 +325,7 @@ async fn main() -> Result<()> {
                     http_client: None,
                     strict: !args.no_strict,
                     keep_sra: false,
+                    paired_suffix: args.paired_suffix.into(),
                 };
 
                 let stats = sracha_core::pipeline::run_fastq(sra_path, None, &pipeline_config)?;
@@ -521,6 +522,7 @@ async fn main() -> Result<()> {
                     strict: !args.no_strict,
                     http_client: Some(http_client.clone()),
                     keep_sra: args.keep_sra,
+                    paired_suffix: args.paired_suffix.into(),
                 }
             };
 

@@ -176,7 +176,13 @@ fn create_output_writer_for_slot(
     config: &PipelineConfig,
     compress_pool: &Option<Arc<rayon::ThreadPool>>,
 ) -> (OutputWriter, PathBuf, PathBuf) {
-    let filename = output_filename(accession, slot, config.fasta, &config.compression);
+    let filename = output_filename(
+        accession,
+        slot,
+        config.fasta,
+        &config.compression,
+        config.paired_suffix,
+    );
     let final_path = config.output_dir.join(&filename);
     let tmp_path = config.output_dir.join(format!("{filename}.partial"));
 
@@ -426,6 +432,7 @@ fn decode_and_write(
         skip_technical: config.skip_technical,
         min_read_len: config.min_read_len,
         fasta: config.fasta,
+        paired_suffix: config.paired_suffix,
     };
 
     // Create output directory (not needed for stdout mode).
@@ -1169,6 +1176,7 @@ fn run_fastq_csra(
         skip_technical: config.skip_technical,
         min_read_len: config.min_read_len,
         fasta: config.fasta,
+        paired_suffix: config.paired_suffix,
     };
 
     if !config.stdout {
@@ -1305,7 +1313,13 @@ fn run_fastq_csra(
         if writers.contains_key(&slot) {
             return Ok(());
         }
-        let filename = output_filename(acc, slot, config.fasta, &config.compression);
+        let filename = output_filename(
+            acc,
+            slot,
+            config.fasta,
+            &config.compression,
+            config.paired_suffix,
+        );
         let final_path = config.output_dir.join(&filename);
         let tmp_path = config.output_dir.join(format!("{filename}.partial"));
         output_paths.push((final_path, tmp_path.clone()));
@@ -1569,7 +1583,13 @@ pub async fn download_ena_fastq(
             });
         }
 
-        let name = output_filename(accession, file.slot, config.fasta, &config.compression);
+        let name = output_filename(
+            accession,
+            file.slot,
+            config.fasta,
+            &config.compression,
+            config.paired_suffix,
+        );
         let target = config.output_dir.join(&name);
 
         tracing::info!(

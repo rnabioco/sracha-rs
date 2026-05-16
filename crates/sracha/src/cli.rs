@@ -261,6 +261,12 @@ pub struct FastqArgs {
     #[arg(long, default_value = "split-3", help_heading = "Output")]
     pub split: SplitMode,
 
+    /// Suffix style for paired/split FASTQ outputs.
+    /// `numeric` -> `_1.fastq`/`_2.fastq` (default, matches fasterq-dump and ENA).
+    /// `r` -> `_R1.fastq`/`_R2.fastq` (matches Illumina BCL output convention).
+    #[arg(long, value_enum, default_value = "numeric", help_heading = "Output")]
+    pub paired_suffix: PairedSuffix,
+
     /// Output FASTA instead of FASTQ (drops quality scores)
     #[arg(long, help_heading = "Output")]
     pub fasta: bool,
@@ -349,6 +355,12 @@ pub struct GetArgs {
     /// Split mode
     #[arg(long, default_value = "split-3", help_heading = "Output")]
     pub split: SplitMode,
+
+    /// Suffix style for paired/split FASTQ outputs.
+    /// `numeric` -> `_1.fastq`/`_2.fastq` (default, matches fasterq-dump and ENA).
+    /// `r` -> `_R1.fastq`/`_R2.fastq` (matches Illumina BCL output convention).
+    #[arg(long, value_enum, default_value = "numeric", help_heading = "Output")]
+    pub paired_suffix: PairedSuffix,
 
     /// Output FASTA instead of FASTQ (drops quality scores)
     #[arg(long, help_heading = "Output")]
@@ -584,6 +596,24 @@ impl From<SplitMode> for fastq::SplitMode {
             SplitMode::SplitFiles => fastq::SplitMode::SplitFiles,
             SplitMode::SplitSpot => fastq::SplitMode::SplitSpot,
             SplitMode::Interleaved => fastq::SplitMode::Interleaved,
+        }
+    }
+}
+
+#[derive(Clone, Copy, ValueEnum, Default)]
+pub enum PairedSuffix {
+    /// `_1.fastq` / `_2.fastq` (default, matches fasterq-dump and ENA)
+    #[default]
+    Numeric,
+    /// `_R1.fastq` / `_R2.fastq` (matches Illumina BCL output convention)
+    R,
+}
+
+impl From<PairedSuffix> for fastq::PairedSuffix {
+    fn from(s: PairedSuffix) -> Self {
+        match s {
+            PairedSuffix::Numeric => fastq::PairedSuffix::Numeric,
+            PairedSuffix::R => fastq::PairedSuffix::R,
         }
     }
 }
