@@ -413,6 +413,23 @@ async fn main() -> Result<()> {
                 "Resolved {} accession(s)",
                 style::count(resolved_all.len()),
             ));
+
+            if args.dry_run {
+                use std::io::Write;
+                let stdout = std::io::stdout();
+                let mut handle = stdout.lock();
+                match args.dry_run_format {
+                    cli::DryRunFormat::Tsv => {
+                        sracha_core::dry_run::write_tsv(&mut handle, &resolved_all)?
+                    }
+                    cli::DryRunFormat::Json => {
+                        sracha_core::dry_run::write_json(&mut handle, &resolved_all)?;
+                        writeln!(handle).ok();
+                    }
+                }
+                return Ok(());
+            }
+
             check_download_confirmation(&resolved_all, args.yes, has_projects)?;
             check_disk_space(&resolved_all, &args.output_dir)?;
 

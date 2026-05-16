@@ -1,6 +1,7 @@
 pub mod accession;
 pub mod compress;
 pub mod download;
+pub mod dry_run;
 pub mod ena;
 pub mod error;
 pub mod fastq;
