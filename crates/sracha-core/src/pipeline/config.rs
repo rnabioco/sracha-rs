@@ -58,6 +58,22 @@ pub struct PipelineConfig {
     /// its own subdirectory of `output_dir`, named after the accession.
     /// When `false`, all files land flat in `output_dir`.
     pub folder_per_accession: bool,
+    /// Optional run-metadata sidecar format. When `Some`, [`decode_sra`]
+    /// writes a `<accession>.metadata.{tsv,json}` file next to the FASTQ
+    /// outputs after a successful decode.
+    ///
+    /// [`decode_sra`]: crate::pipeline::decode_sra
+    pub metadata: Option<crate::metadata::MetadataFormat>,
+    /// Primary download URL recorded into the metadata sidecar. Optional
+    /// because the `fastq` subcommand (local file decode) has no URL.
+    pub metadata_url: Option<String>,
+    /// MD5 of the SRA payload recorded into the metadata sidecar.
+    pub metadata_md5: Option<String>,
+    /// SDL-reported SRA size in bytes recorded into the metadata sidecar.
+    pub metadata_size: Option<u64>,
+    /// Mirror service label (e.g. `s3`, `gs`, `ncbi`) recorded into the
+    /// metadata sidecar.
+    pub metadata_service: Option<String>,
 }
 
 impl PipelineConfig {
@@ -117,6 +133,11 @@ mod tests {
             http_client: None,
             keep_sra: false,
             folder_per_accession,
+            metadata: None,
+            metadata_url: None,
+            metadata_md5: None,
+            metadata_size: None,
+            metadata_service: None,
         }
     }
 

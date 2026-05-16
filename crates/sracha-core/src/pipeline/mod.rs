@@ -1666,7 +1666,7 @@ pub fn decode_sra(downloaded: &DownloadedSra, config: &PipelineConfig) -> Result
     }
 
     let diag = Arc::new(IntegrityDiag::default());
-    let (spots_read, reads_written, output_files) = match decode_and_write(
+    let (spots_read, reads_written, mut output_files) = match decode_and_write(
         &downloaded.temp_path,
         &downloaded.accession,
         config,
@@ -1732,6 +1732,121 @@ pub fn decode_sra(downloaded: &DownloadedSra, config: &PipelineConfig) -> Result
             downloaded.accession,
             downloaded.temp_path.display(),
         );
+    }
+
+    // Write run-metadata sidecar(s), if requested. Done before the
+    // completion marker so the marker records the metadata file sizes too
+    // (and rerun-skips will keep the sidecar around).
+    if !config.stdout
+        && let Some(format) = config.metadata
+    {
+        let row = crate::metadata::RunMetadata {
+            accession: downloaded.accession.clone(),
+            url: config.metadata_url.clone(),
+            size_bytes: config.metadata_size,
+            md5: config.metadata_md5.clone(),
+            source_service: config.metadata_service.clone(),
+            spots: config.run_info.as_ref().and_then(|r| r.spots),
+            spot_len: config.run_info.as_ref().map(|r| r.spot_len),
+            nreads: config.run_info.as_ref().map(|r| r.nreads),
+            avg_read_len: config
+                .run_info
+                .as_ref()
+                .map(|r| r.avg_read_len.clone())
+                .unwrap_or_default(),
+            platform: config.run_info.as_ref().and_then(|r| r.platform.clone()),
+            instrument_model: config
+                .run_info
+                .as_ref()
+                .and_then(|r| r.instrument_model.clone()),
+            library_strategy: config
+                .run_info
+                .as_ref()
+                .and_then(|r| r.library_strategy.clone()),
+            library_source: config
+                .run_info
+                .as_ref()
+                .and_then(|r| r.library_source.clone()),
+            library_selection: config
+                .run_info
+                .as_ref()
+                .and_then(|r| r.library_selection.clone()),
+            library_layout: config
+                .run_info
+                .as_ref()
+                .and_then(|r| r.library_layout.clone()),
+            library_name: config
+                .run_info
+                .as_ref()
+                .and_then(|r| r.library_name.clone()),
+            experiment: config.run_info.as_ref().and_then(|r| r.experiment.clone()),
+            study: config.run_info.as_ref().and_then(|r| r.study.clone()),
+            bioproject: config.run_info.as_ref().and_then(|r| r.bioproject.clone()),
+            sample: config.run_info.as_ref().and_then(|r| r.sample.clone()),
+            biosample: config.run_info.as_ref().and_then(|r| r.biosample.clone()),
+            scientific_name: config
+                .run_info
+                .as_ref()
+                .and_then(|r| r.scientific_name.clone()),
+            tax_id: config.run_info.as_ref().and_then(|r| r.tax_id),
+            bases: config.run_info.as_ref().and_then(|r| r.bases),
+            size_mb: config.run_info.as_ref().and_then(|r| r.size_mb),
+            release_date: config
+                .run_info
+                .as_ref()
+                .and_then(|r| r.release_date.clone()),
+            load_date: config.run_info.as_ref().and_then(|r| r.load_date.clone()),
+        };
+        let stem = config
+            .accession_output_dir(&downloaded.accession)
+            .join(&downloaded.accession);
+        let rows = [row];
+        let tsv_path = stem.with_extension("metadata.tsv");
+        let json_path = stem.with_extension("metadata.json");
+        match format {
+            crate::metadata::MetadataFormat::Tsv => {
+                if let Err(e) = crate::metadata::write_tsv(&tsv_path, &rows) {
+                    tracing::warn!(
+                        "{}: failed to write metadata TSV {}: {e}",
+                        downloaded.accession,
+                        tsv_path.display(),
+                    );
+                } else {
+                    output_files.push(tsv_path);
+                }
+            }
+            crate::metadata::MetadataFormat::Json => {
+                if let Err(e) = crate::metadata::write_json(&json_path, &rows) {
+                    tracing::warn!(
+                        "{}: failed to write metadata JSON {}: {e}",
+                        downloaded.accession,
+                        json_path.display(),
+                    );
+                } else {
+                    output_files.push(json_path);
+                }
+            }
+            crate::metadata::MetadataFormat::Both => {
+                if let Err(e) = crate::metadata::write_tsv(&tsv_path, &rows) {
+                    tracing::warn!(
+                        "{}: failed to write metadata TSV {}: {e}",
+                        downloaded.accession,
+                        tsv_path.display(),
+                    );
+                } else {
+                    output_files.push(tsv_path);
+                }
+                if let Err(e) = crate::metadata::write_json(&json_path, &rows) {
+                    tracing::warn!(
+                        "{}: failed to write metadata JSON {}: {e}",
+                        downloaded.accession,
+                        json_path.display(),
+                    );
+                } else {
+                    output_files.push(json_path);
+                }
+            }
+        }
     }
 
     // Write completion marker so future runs can skip this accession.

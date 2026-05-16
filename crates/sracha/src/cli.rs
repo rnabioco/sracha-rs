@@ -420,6 +420,11 @@ pub struct GetArgs {
     #[arg(long, default_value_t = 8)]
     pub connections: usize,
 
+    /// Write run metadata (BioSample, library, instrument, etc.) sidecar
+    /// file(s) alongside each FASTQ output.
+    #[arg(long, value_enum, help_heading = "Output")]
+    pub metadata: Option<MetadataFormat>,
+
     /// Number of accessions to download ahead of the decoder. A larger
     /// value hides slow networks behind decode, at the cost of one extra
     /// temp SRA file per depth step. Only applies to multi-accession
@@ -487,6 +492,22 @@ pub struct GetArgs {
         value_parser = parse_head_concurrency,
     )]
     pub head_concurrency: usize,
+
+    /// Resolve accessions and print what would be downloaded as TSV (default)
+    /// or JSON. Does not download or decode anything.
+    #[arg(long, help_heading = "Advanced")]
+    pub dry_run: bool,
+
+    /// Format for `--dry-run` output.
+    #[arg(long, value_enum, default_value = "tsv", help_heading = "Advanced")]
+    pub dry_run_format: DryRunFormat,
+}
+
+#[derive(Clone, Copy, ValueEnum, Default)]
+pub enum DryRunFormat {
+    #[default]
+    Tsv,
+    Json,
 }
 
 const HEAD_CONCURRENCY_MAX: usize = 256;
@@ -570,6 +591,26 @@ impl From<SraFormat> for FormatPreference {
         match f {
             SraFormat::Sra => FormatPreference::Sra,
             SraFormat::Sralite => FormatPreference::Sralite,
+        }
+    }
+}
+
+#[derive(Clone, Copy, ValueEnum)]
+pub enum MetadataFormat {
+    /// Write a single TSV sidecar (`<acc>.metadata.tsv`).
+    Tsv,
+    /// Write a single JSON sidecar (`<acc>.metadata.json`).
+    Json,
+    /// Write both TSV and JSON sidecars.
+    Both,
+}
+
+impl From<MetadataFormat> for sracha_core::metadata::MetadataFormat {
+    fn from(f: MetadataFormat) -> Self {
+        match f {
+            MetadataFormat::Tsv => sracha_core::metadata::MetadataFormat::Tsv,
+            MetadataFormat::Json => sracha_core::metadata::MetadataFormat::Json,
+            MetadataFormat::Both => sracha_core::metadata::MetadataFormat::Both,
         }
     }
 }

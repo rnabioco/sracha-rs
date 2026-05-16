@@ -326,6 +326,11 @@ async fn main() -> Result<()> {
                     strict: !args.no_strict,
                     keep_sra: false,
                     folder_per_accession: args.folder_per_accession,
+                    metadata: None,
+                    metadata_url: None,
+                    metadata_md5: None,
+                    metadata_size: None,
+                    metadata_service: None,
                 };
 
                 let stats = sracha_core::pipeline::run_fastq(sra_path, None, &pipeline_config)?;
@@ -414,6 +419,23 @@ async fn main() -> Result<()> {
                 "Resolved {} accession(s)",
                 style::count(resolved_all.len()),
             ));
+
+            if args.dry_run {
+                use std::io::Write;
+                let stdout = std::io::stdout();
+                let mut handle = stdout.lock();
+                match args.dry_run_format {
+                    cli::DryRunFormat::Tsv => {
+                        sracha_core::dry_run::write_tsv(&mut handle, &resolved_all)?
+                    }
+                    cli::DryRunFormat::Json => {
+                        sracha_core::dry_run::write_json(&mut handle, &resolved_all)?;
+                        writeln!(handle).ok();
+                    }
+                }
+                return Ok(());
+            }
+
             check_download_confirmation(&resolved_all, args.yes, has_projects)?;
             check_disk_space(&resolved_all, &args.output_dir)?;
 
@@ -504,25 +526,33 @@ async fn main() -> Result<()> {
             let make_config = {
                 let http_client = http_client.clone();
                 let cancelled = cancelled.clone();
-                move |resolved: &ResolvedAccession| sracha_core::pipeline::PipelineConfig {
-                    output_dir: args.output_dir.clone(),
-                    split_mode,
-                    compression,
-                    threads: args.threads,
-                    connections: args.connections,
-                    skip_technical: !args.include_technical,
-                    min_read_len: args.min_read_len,
-                    force: args.force,
-                    progress,
-                    run_info: resolved.run_info.clone(),
-                    fasta: args.fasta,
-                    resume: !args.no_resume,
-                    stdout: args.stdout,
-                    cancelled: Some(cancelled.clone()),
-                    strict: !args.no_strict,
-                    http_client: Some(http_client.clone()),
-                    keep_sra: args.keep_sra,
-                    folder_per_accession: args.folder_per_accession,
+                move |resolved: &ResolvedAccession| {
+                    let primary = resolved.sra_file.mirrors.first();
+                    sracha_core::pipeline::PipelineConfig {
+                        output_dir: args.output_dir.clone(),
+                        split_mode,
+                        compression,
+                        threads: args.threads,
+                        connections: args.connections,
+                        skip_technical: !args.include_technical,
+                        min_read_len: args.min_read_len,
+                        force: args.force,
+                        progress,
+                        run_info: resolved.run_info.clone(),
+                        fasta: args.fasta,
+                        resume: !args.no_resume,
+                        stdout: args.stdout,
+                        cancelled: Some(cancelled.clone()),
+                        strict: !args.no_strict,
+                        http_client: Some(http_client.clone()),
+                        keep_sra: args.keep_sra,
+                        folder_per_accession: args.folder_per_accession,
+                        metadata: args.metadata.map(Into::into),
+                        metadata_url: primary.map(|m| m.url.clone()),
+                        metadata_md5: resolved.sra_file.md5.clone(),
+                        metadata_size: Some(resolved.sra_file.size),
+                        metadata_service: primary.map(|m| m.service.clone()),
+                    }
                 }
             };
 
