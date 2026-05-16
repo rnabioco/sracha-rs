@@ -256,6 +256,7 @@ fn test_config(
         strict: false,
         http_client: None,
         keep_sra: false,
+        folder_per_accession: false,
         metadata: None,
         metadata_url: None,
         metadata_md5: None,
