@@ -97,6 +97,7 @@ mod tests {
                 spot_len: 200,
                 platform: Some("ILLUMINA".into()),
                 spots: Some(42),
+                ..Default::default()
             }),
         }
     }
