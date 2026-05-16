@@ -183,8 +183,9 @@ fn create_output_writer_for_slot(
         &config.compression,
         config.paired_suffix,
     );
-    let final_path = config.output_dir.join(&filename);
-    let tmp_path = config.output_dir.join(format!("{filename}.partial"));
+    let out_dir = config.accession_output_dir(accession);
+    let final_path = out_dir.join(&filename);
+    let tmp_path = out_dir.join(format!("{filename}.partial"));
 
     let file = std::fs::File::create(&tmp_path).expect("failed to create output file");
     let buf = std::io::BufWriter::with_capacity(256 * 1024, file);
@@ -437,7 +438,7 @@ fn decode_and_write(
 
     // Create output directory (not needed for stdout mode).
     if !config.stdout {
-        std::fs::create_dir_all(&config.output_dir)?;
+        std::fs::create_dir_all(config.accession_output_dir(accession))?;
     }
 
     // Lazily create output writers as we encounter different output slots.
@@ -1180,7 +1181,7 @@ fn run_fastq_csra(
     };
 
     if !config.stdout {
-        std::fs::create_dir_all(&config.output_dir)?;
+        std::fs::create_dir_all(config.accession_output_dir(acc))?;
     }
 
     let mut writers: HashMap<OutputSlot, OutputWriter> = HashMap::new();
@@ -1320,8 +1321,9 @@ fn run_fastq_csra(
             &config.compression,
             config.paired_suffix,
         );
-        let final_path = config.output_dir.join(&filename);
-        let tmp_path = config.output_dir.join(format!("{filename}.partial"));
+        let out_dir = config.accession_output_dir(acc);
+        let final_path = out_dir.join(&filename);
+        let tmp_path = out_dir.join(format!("{filename}.partial"));
         output_paths.push((final_path, tmp_path.clone()));
         let file = std::fs::File::create(&tmp_path)?;
         let buf = std::io::BufWriter::with_capacity(256 * 1024, file);
@@ -1446,20 +1448,21 @@ pub async fn download_sra(
 ) -> Result<DownloadedSra> {
     let accession = &resolved.accession;
     let total_sra_size = resolved.sra_file.size;
+    let acc_dir = config.accession_output_dir(accession);
 
     // Delete completion marker when --force is used.
     if config.force {
-        let _ = std::fs::remove_file(marker_path(&config.output_dir, accession));
+        let _ = std::fs::remove_file(marker_path(&acc_dir, accession));
     }
 
     // If outputs already exist (validated via completion marker), skip entirely.
     if !config.force
         && !config.stdout
-        && check_completion_marker(&config.output_dir, accession, config, total_sra_size).is_some()
+        && check_completion_marker(&acc_dir, accession, config, total_sra_size).is_some()
     {
         tracing::info!("{accession}: outputs already exist, skipping download");
         let temp_filename = format!(".sracha-tmp-{accession}.sra");
-        let temp_path = config.output_dir.join(&temp_filename);
+        let temp_path = acc_dir.join(&temp_filename);
         return Ok(DownloadedSra {
             temp_path,
             bytes_transferred: 0,
@@ -1476,9 +1479,9 @@ pub async fn download_sra(
     tracing::debug!("{accession}: starting full download from {url}");
 
     let temp_filename = format!(".sracha-tmp-{accession}.sra");
-    let temp_path = config.output_dir.join(&temp_filename);
+    let temp_path = acc_dir.join(&temp_filename);
 
-    tokio::fs::create_dir_all(&config.output_dir).await?;
+    tokio::fs::create_dir_all(&acc_dir).await?;
 
     let dl_config = DownloadConfig {
         connections: config.connections,
@@ -1554,7 +1557,8 @@ pub async fn download_ena_fastq(
     config: &PipelineConfig,
 ) -> Result<PipelineStats> {
     let accession = &ena.accession;
-    tokio::fs::create_dir_all(&config.output_dir).await?;
+    let acc_dir = config.accession_output_dir(accession);
+    tokio::fs::create_dir_all(&acc_dir).await?;
 
     let dl_config = DownloadConfig {
         connections: config.connections,
@@ -1590,7 +1594,7 @@ pub async fn download_ena_fastq(
             &config.compression,
             config.paired_suffix,
         );
-        let target = config.output_dir.join(&name);
+        let target = acc_dir.join(&name);
 
         tracing::info!(
             "{accession}: downloading ENA FASTQ {} ({}) → {}",
@@ -1648,11 +1652,12 @@ async fn poll_cancelled(flag: Arc<AtomicBool>) {
 /// This is the decode phase of `run_get`. Call from within
 /// `tokio::task::block_in_place` or a blocking thread.
 pub fn decode_sra(downloaded: &DownloadedSra, config: &PipelineConfig) -> Result<PipelineStats> {
+    let acc_dir = config.accession_output_dir(&downloaded.accession);
     // Check if decode can be skipped (unless --force or stdout mode).
     if let Some(output_files) = (!config.force && !config.stdout)
         .then(|| {
             check_completion_marker(
-                &config.output_dir,
+                &acc_dir,
                 &downloaded.accession,
                 config,
                 downloaded.total_sra_size,
@@ -1681,7 +1686,7 @@ pub fn decode_sra(downloaded: &DownloadedSra, config: &PipelineConfig) -> Result
     }
 
     let diag = Arc::new(IntegrityDiag::default());
-    let (spots_read, reads_written, output_files) = match decode_and_write(
+    let (spots_read, reads_written, mut output_files) = match decode_and_write(
         &downloaded.temp_path,
         &downloaded.accession,
         config,
@@ -1691,7 +1696,7 @@ pub fn decode_sra(downloaded: &DownloadedSra, config: &PipelineConfig) -> Result
         Ok(result) => result,
         Err(Error::Cancelled { output_files }) => {
             // Delete completion marker (may not exist yet).
-            let _ = std::fs::remove_file(marker_path(&config.output_dir, &downloaded.accession));
+            let _ = std::fs::remove_file(marker_path(&acc_dir, &downloaded.accession));
             // Delete partial FASTQ output files.
             for path in &output_files {
                 if let Err(e) = std::fs::remove_file(path) {
@@ -1729,9 +1734,7 @@ pub fn decode_sra(downloaded: &DownloadedSra, config: &PipelineConfig) -> Result
 
     // Clean up temp file (or preserve it in the output dir if requested).
     if config.keep_sra && !config.stdout {
-        let kept = config
-            .output_dir
-            .join(format!("{}.sra", downloaded.accession));
+        let kept = acc_dir.join(format!("{}.sra", downloaded.accession));
         if let Err(e) = std::fs::rename(&downloaded.temp_path, &kept) {
             tracing::warn!(
                 "{}: failed to move temp SRA {} -> {}: {e}",
@@ -1751,10 +1754,125 @@ pub fn decode_sra(downloaded: &DownloadedSra, config: &PipelineConfig) -> Result
         );
     }
 
+    // Write run-metadata sidecar(s), if requested. Done before the
+    // completion marker so the marker records the metadata file sizes too
+    // (and rerun-skips will keep the sidecar around).
+    if !config.stdout
+        && let Some(format) = config.metadata
+    {
+        let row = crate::metadata::RunMetadata {
+            accession: downloaded.accession.clone(),
+            url: config.metadata_url.clone(),
+            size_bytes: config.metadata_size,
+            md5: config.metadata_md5.clone(),
+            source_service: config.metadata_service.clone(),
+            spots: config.run_info.as_ref().and_then(|r| r.spots),
+            spot_len: config.run_info.as_ref().map(|r| r.spot_len),
+            nreads: config.run_info.as_ref().map(|r| r.nreads),
+            avg_read_len: config
+                .run_info
+                .as_ref()
+                .map(|r| r.avg_read_len.clone())
+                .unwrap_or_default(),
+            platform: config.run_info.as_ref().and_then(|r| r.platform.clone()),
+            instrument_model: config
+                .run_info
+                .as_ref()
+                .and_then(|r| r.instrument_model.clone()),
+            library_strategy: config
+                .run_info
+                .as_ref()
+                .and_then(|r| r.library_strategy.clone()),
+            library_source: config
+                .run_info
+                .as_ref()
+                .and_then(|r| r.library_source.clone()),
+            library_selection: config
+                .run_info
+                .as_ref()
+                .and_then(|r| r.library_selection.clone()),
+            library_layout: config
+                .run_info
+                .as_ref()
+                .and_then(|r| r.library_layout.clone()),
+            library_name: config
+                .run_info
+                .as_ref()
+                .and_then(|r| r.library_name.clone()),
+            experiment: config.run_info.as_ref().and_then(|r| r.experiment.clone()),
+            study: config.run_info.as_ref().and_then(|r| r.study.clone()),
+            bioproject: config.run_info.as_ref().and_then(|r| r.bioproject.clone()),
+            sample: config.run_info.as_ref().and_then(|r| r.sample.clone()),
+            biosample: config.run_info.as_ref().and_then(|r| r.biosample.clone()),
+            scientific_name: config
+                .run_info
+                .as_ref()
+                .and_then(|r| r.scientific_name.clone()),
+            tax_id: config.run_info.as_ref().and_then(|r| r.tax_id),
+            bases: config.run_info.as_ref().and_then(|r| r.bases),
+            size_mb: config.run_info.as_ref().and_then(|r| r.size_mb),
+            release_date: config
+                .run_info
+                .as_ref()
+                .and_then(|r| r.release_date.clone()),
+            load_date: config.run_info.as_ref().and_then(|r| r.load_date.clone()),
+        };
+        let stem = config
+            .accession_output_dir(&downloaded.accession)
+            .join(&downloaded.accession);
+        let rows = [row];
+        let tsv_path = stem.with_extension("metadata.tsv");
+        let json_path = stem.with_extension("metadata.json");
+        match format {
+            crate::metadata::MetadataFormat::Tsv => {
+                if let Err(e) = crate::metadata::write_tsv(&tsv_path, &rows) {
+                    tracing::warn!(
+                        "{}: failed to write metadata TSV {}: {e}",
+                        downloaded.accession,
+                        tsv_path.display(),
+                    );
+                } else {
+                    output_files.push(tsv_path);
+                }
+            }
+            crate::metadata::MetadataFormat::Json => {
+                if let Err(e) = crate::metadata::write_json(&json_path, &rows) {
+                    tracing::warn!(
+                        "{}: failed to write metadata JSON {}: {e}",
+                        downloaded.accession,
+                        json_path.display(),
+                    );
+                } else {
+                    output_files.push(json_path);
+                }
+            }
+            crate::metadata::MetadataFormat::Both => {
+                if let Err(e) = crate::metadata::write_tsv(&tsv_path, &rows) {
+                    tracing::warn!(
+                        "{}: failed to write metadata TSV {}: {e}",
+                        downloaded.accession,
+                        tsv_path.display(),
+                    );
+                } else {
+                    output_files.push(tsv_path);
+                }
+                if let Err(e) = crate::metadata::write_json(&json_path, &rows) {
+                    tracing::warn!(
+                        "{}: failed to write metadata JSON {}: {e}",
+                        downloaded.accession,
+                        json_path.display(),
+                    );
+                } else {
+                    output_files.push(json_path);
+                }
+            }
+        }
+    }
+
     // Write completion marker so future runs can skip this accession.
     if !config.stdout
         && let Err(e) = write_completion_marker(
-            &config.output_dir,
+            &acc_dir,
             &downloaded.accession,
             downloaded.sra_md5.as_deref(),
             downloaded.total_sra_size,

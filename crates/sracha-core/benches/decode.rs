@@ -54,6 +54,12 @@ fn config(out: &std::path::Path, threads: usize, compression: CompressionMode) -
         http_client: None,
         keep_sra: false,
         paired_suffix: sracha_core::fastq::PairedSuffix::Numeric,
+        folder_per_accession: false,
+        metadata: None,
+        metadata_url: None,
+        metadata_md5: None,
+        metadata_size: None,
+        metadata_service: None,
     }
 }
 

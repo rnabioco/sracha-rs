@@ -107,7 +107,7 @@ pub struct ResolvedFile {
 ///
 /// Queried from the EFetch RunInfo CSV endpoint, this provides authoritative
 /// read structure information that is more reliable than parsing VDB metadata.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
 pub struct RunInfo {
     /// Number of reads per spot (1 for SINGLE, 2 for PAIRED).
     pub nreads: usize,
@@ -119,6 +119,40 @@ pub struct RunInfo {
     pub platform: Option<String>,
     /// Total spot count reported by EUtils RunInfo (None if missing/unparseable).
     pub spots: Option<u64>,
+    /// Library strategy (e.g. "WGS", "RNA-Seq", "ChIP-Seq").
+    pub library_strategy: Option<String>,
+    /// Library source (e.g. "GENOMIC", "TRANSCRIPTOMIC").
+    pub library_source: Option<String>,
+    /// Library selection (e.g. "RANDOM", "PCR").
+    pub library_selection: Option<String>,
+    /// Library layout (e.g. "SINGLE", "PAIRED").
+    pub library_layout: Option<String>,
+    /// Library name.
+    pub library_name: Option<String>,
+    /// Instrument model (e.g. "Illumina NovaSeq 6000").
+    pub instrument_model: Option<String>,
+    /// SRA Experiment accession (SRX).
+    pub experiment: Option<String>,
+    /// SRA Study accession (SRP).
+    pub study: Option<String>,
+    /// NCBI BioProject accession (PRJNA / PRJEB / PRJDB).
+    pub bioproject: Option<String>,
+    /// SRA Sample accession (SRS).
+    pub sample: Option<String>,
+    /// NCBI BioSample accession (SAMN / SAMEA / SAMD).
+    pub biosample: Option<String>,
+    /// Scientific name of organism.
+    pub scientific_name: Option<String>,
+    /// NCBI Taxonomy ID.
+    pub tax_id: Option<u32>,
+    /// Total bases in the run.
+    pub bases: Option<u64>,
+    /// File size in megabytes (reported by EUtils).
+    pub size_mb: Option<u64>,
+    /// Release date.
+    pub release_date: Option<String>,
+    /// Load date.
+    pub load_date: Option<String>,
 }
 
 /// Resolved download information for a single accession.
@@ -485,6 +519,22 @@ fn parse_run_info_csv_multi(body: &str) -> HashMap<String, RunInfo> {
     let run_idx = col("Run");
     let platform_idx = col("Platform");
     let spots_idx = col("spots");
+    let library_strategy_idx = col("LibraryStrategy");
+    let library_source_idx = col("LibrarySource");
+    let library_selection_idx = col("LibrarySelection");
+    let library_name_idx = col("LibraryName");
+    let model_idx = col("Model");
+    let experiment_idx = col("Experiment");
+    let study_idx = col("SRAStudy");
+    let bioproject_idx = col("BioProject");
+    let sample_idx = col("Sample");
+    let biosample_idx = col("BioSample");
+    let scientific_name_idx = col("ScientificName");
+    let tax_id_idx = col("TaxID");
+    let bases_idx = col("bases");
+    let size_mb_idx = col("size_MB");
+    let release_date_idx = col("ReleaseDate");
+    let load_date_idx = col("LoadDate");
 
     for data in lines {
         let values: Vec<&str> = data.split(',').collect();
@@ -537,6 +587,41 @@ fn parse_run_info_csv_multi(body: &str) -> HashMap<String, RunInfo> {
 
         let spots = spots_idx.and_then(|i| values.get(i).and_then(|v| v.parse::<u64>().ok()));
 
+        // Helper closure: copy column value as Option<String>, treating empty as None.
+        let opt_str = |idx: Option<usize>| -> Option<String> {
+            idx.and_then(|i| values.get(i).copied())
+                .filter(|s| !s.is_empty())
+                .map(String::from)
+        };
+        let opt_u64 = |idx: Option<usize>| -> Option<u64> {
+            idx.and_then(|i| values.get(i).and_then(|v| v.parse::<u64>().ok()))
+        };
+        let opt_u32 = |idx: Option<usize>| -> Option<u32> {
+            idx.and_then(|i| values.get(i).and_then(|v| v.parse::<u32>().ok()))
+        };
+
+        let library_strategy = opt_str(library_strategy_idx);
+        let library_source = opt_str(library_source_idx);
+        let library_selection = opt_str(library_selection_idx);
+        let library_layout = if layout.is_empty() {
+            None
+        } else {
+            Some(layout.to_string())
+        };
+        let library_name = opt_str(library_name_idx);
+        let instrument_model = opt_str(model_idx);
+        let experiment = opt_str(experiment_idx);
+        let study = opt_str(study_idx);
+        let bioproject = opt_str(bioproject_idx);
+        let sample = opt_str(sample_idx);
+        let biosample = opt_str(biosample_idx);
+        let scientific_name = opt_str(scientific_name_idx);
+        let tax_id = opt_u32(tax_id_idx);
+        let bases = opt_u64(bases_idx);
+        let size_mb = opt_u64(size_mb_idx);
+        let release_date = opt_str(release_date_idx);
+        let load_date = opt_str(load_date_idx);
+
         tracing::debug!(
             "{accession}: EUtils RunInfo: layout={layout}, avgLength={avg_length}, \
              nreads={nreads}, per_read_len={avg_read_len:?}, platform={platform:?}, spots={spots:?}",
@@ -550,6 +635,23 @@ fn parse_run_info_csv_multi(body: &str) -> HashMap<String, RunInfo> {
                 spot_len: avg_length,
                 platform,
                 spots,
+                library_strategy,
+                library_source,
+                library_selection,
+                library_layout,
+                library_name,
+                instrument_model,
+                experiment,
+                study,
+                bioproject,
+                sample,
+                biosample,
+                scientific_name,
+                tax_id,
+                bases,
+                size_mb,
+                release_date,
+                load_date,
             },
         );
     }
@@ -805,5 +907,68 @@ mod tests {
     fn parse_run_accessions_no_run_column() {
         let csv = "spots,bases\n100,200\n";
         assert!(parse_run_accessions_from_csv(csv).is_empty());
+    }
+
+    #[test]
+    fn parse_run_info_full_columns() {
+        // Header order chosen to mirror NCBI's EUtils RunInfo CSV. All 17 new
+        // optional columns are present so we can assert every field round-trips.
+        let csv = "Run,ReleaseDate,LoadDate,spots,bases,spots_with_mates,avgLength,\
+                   size_MB,AssemblyName,download_path,Experiment,LibraryName,\
+                   LibraryStrategy,LibrarySelection,LibrarySource,LibraryLayout,\
+                   InsertSize,InsertDev,Platform,Model,SRAStudy,BioProject,Study_Pubmed_Id,\
+                   ProjectID,Sample,BioSample,SampleType,TaxID,ScientificName,\
+                   SampleName,g1k_pop_code,source,g1k_analysis_group,Subject_ID,\
+                   Sex,Disease,Tumor,Affection_Status,Analyte_Type,Histological_Type,\
+                   Body_Site,CenterName,Submission,dbgap_study_accession,Consent,\
+                   RunHash,ReadHash\n\
+                   SRR9999999,2024-01-15,2024-01-20,123456,37000000,123456,300,\
+                   42,,https://example.com/SRR9999999.sra,SRX111222,my_library,\
+                   RNA-Seq,cDNA,TRANSCRIPTOMIC,PAIRED,0,0,ILLUMINA,Illumina NovaSeq 6000,\
+                   SRP000111,PRJNA000222,0,222,SRS000333,SAMN00000444,simple,9606,\
+                   Homo sapiens,sample-name,,size,RANDOM,subj1,female,,no,affected,\
+                   RNA,normal,blood,GEO,SRA000555,,public,abc,def\n";
+        let ri = parse_run_info_csv(csv, "SRR9999999").expect("row parses");
+
+        // Pre-existing fields still work.
+        assert_eq!(ri.nreads, 2);
+        assert_eq!(ri.spot_len, 300);
+        assert_eq!(ri.avg_read_len, vec![150, 150]);
+        assert_eq!(ri.spots, Some(123_456));
+        assert_eq!(ri.platform.as_deref(), Some("ILLUMINA"));
+
+        // All 17 new fields populated as expected.
+        assert_eq!(ri.library_strategy.as_deref(), Some("RNA-Seq"));
+        assert_eq!(ri.library_source.as_deref(), Some("TRANSCRIPTOMIC"));
+        assert_eq!(ri.library_selection.as_deref(), Some("cDNA"));
+        assert_eq!(ri.library_layout.as_deref(), Some("PAIRED"));
+        assert_eq!(ri.library_name.as_deref(), Some("my_library"));
+        assert_eq!(
+            ri.instrument_model.as_deref(),
+            Some("Illumina NovaSeq 6000")
+        );
+        assert_eq!(ri.experiment.as_deref(), Some("SRX111222"));
+        assert_eq!(ri.study.as_deref(), Some("SRP000111"));
+        assert_eq!(ri.bioproject.as_deref(), Some("PRJNA000222"));
+        assert_eq!(ri.sample.as_deref(), Some("SRS000333"));
+        assert_eq!(ri.biosample.as_deref(), Some("SAMN00000444"));
+        assert_eq!(ri.scientific_name.as_deref(), Some("Homo sapiens"));
+        assert_eq!(ri.tax_id, Some(9606));
+        assert_eq!(ri.bases, Some(37_000_000));
+        assert_eq!(ri.size_mb, Some(42));
+        assert_eq!(ri.release_date.as_deref(), Some("2024-01-15"));
+        assert_eq!(ri.load_date.as_deref(), Some("2024-01-20"));
+    }
+
+    #[test]
+    fn run_info_default_is_all_none() {
+        let ri = RunInfo::default();
+        assert_eq!(ri.nreads, 0);
+        assert!(ri.avg_read_len.is_empty());
+        assert_eq!(ri.spot_len, 0);
+        assert!(ri.platform.is_none());
+        assert!(ri.library_strategy.is_none());
+        assert!(ri.biosample.is_none());
+        assert!(ri.tax_id.is_none());
     }
 }
