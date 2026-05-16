@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+## 0.3.6 (2026-05-16)
+
 ### Features
 
 - `sracha get --metadata {tsv,json,both}` writes a
