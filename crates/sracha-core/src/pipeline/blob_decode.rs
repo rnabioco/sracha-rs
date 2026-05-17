@@ -842,16 +842,13 @@ pub(crate) fn decode_blob_to_fastq(
             Some(names)
         } else if let Some(row_len) = ndecoded.row_length {
             let rl = row_len as usize;
-            if rl > 0 {
-                let row_count = name_bytes.len() / rl;
+            name_bytes.len().checked_div(rl).map(|row_count| {
                 let mut names = FlatBytes::with_capacity(row_count, name_bytes.len());
                 for c in name_bytes.chunks(rl) {
                     names.push(c);
                 }
-                Some(names)
-            } else {
-                None
-            }
+                names
+            })
         } else {
             let delimiter = if name_bytes.contains(&0) { 0u8 } else { b'\n' };
             let mut names = FlatBytes::with_capacity(num_spots, name_bytes.len());
