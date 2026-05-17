@@ -88,6 +88,7 @@ pub(crate) fn ncbi_crc32(data: &[u8]) -> u32 {
 /// flag: if bit 7 is set, more bytes follow.
 ///
 /// Returns `(value, bytes_consumed)`.
+#[inline]
 pub fn vlen_decode_u64(data: &[u8]) -> Result<(u64, usize)> {
     if data.is_empty() {
         return Err(Error::Format("vlen_decode_u64: empty input".into()));
@@ -118,6 +119,7 @@ pub fn vlen_decode_u64(data: &[u8]) -> Result<(u64, usize)> {
 /// Subsequent bytes use 7 data bits with bit 7 as continuation.
 ///
 /// Returns `(value, bytes_consumed)`.
+#[inline]
 pub fn vlen_decode_i64(data: &[u8]) -> Result<(i64, usize)> {
     if data.is_empty() {
         return Err(Error::Format("vlen_decode_i64: empty input".into()));

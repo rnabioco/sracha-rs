@@ -95,6 +95,7 @@ const LUT_2NA: [[u8; 4]; 256] = {
 ///
 /// `num_bases` may be less than `packed.len() * 4` when the last byte contains
 /// padding bits.
+#[inline]
 pub fn unpack_2na(packed: &[u8], num_bases: usize) -> Vec<u8> {
     let full_bytes = num_bases / 4;
     let trailing = num_bases % 4;
@@ -126,6 +127,7 @@ pub fn unpack_2na(packed: &[u8], num_bases: usize) -> Vec<u8> {
 ///
 /// `num_bases` may be less than `packed.len() * 2` when the last byte contains
 /// only one meaningful nibble.
+#[inline]
 pub fn unpack_4na(packed: &[u8], num_bases: usize) -> Vec<u8> {
     // Output truncates when `packed` is shorter than `num_bases` implies; this
     // matches the prior `push`-per-nibble loop.

@@ -24,6 +24,90 @@ use crate::fastq::{
 
 use super::BlobSlotOutput;
 
+// ---------------------------------------------------------------------------
+// Slot LUT layout — keep in sync with `SLOT_LUT_SIZE` in `decode_blob_to_fastq`.
+//
+// Returns `Some(idx)` when `slot` fits in the inline LUT; `None` punts to the
+// overflow Vec scan. ReadN occupies indices 4..SLOT_LUT_SIZE, so any rps that
+// could realistically be observed (≤ 12) goes through the fast path.
+// ---------------------------------------------------------------------------
+#[inline]
+fn slot_lut_index(slot: OutputSlot) -> Option<usize> {
+    const SLOT_LUT_SIZE: usize = 16;
+    let idx = match slot {
+        OutputSlot::Single => 0,
+        OutputSlot::Read1 => 1,
+        OutputSlot::Read2 => 2,
+        OutputSlot::Unpaired => 3,
+        OutputSlot::ReadN(n) => 4usize.checked_add(n as usize)?,
+    };
+    (idx < SLOT_LUT_SIZE).then_some(idx)
+}
+
+// ---------------------------------------------------------------------------
+// FlatBytes — single-allocation alternative to `Vec<Vec<u8>>` for the NAME /
+// NAME_FMT per-row strings. The decode hot path needs random access by row
+// index but never mutates individual rows, so a flat byte buffer + u32
+// offset array gives the same access pattern with one allocation per blob
+// instead of one per row (NAME blobs commonly hold 100K+ rows).
+// ---------------------------------------------------------------------------
+
+/// Row-indexed byte storage backed by a single contiguous buffer.
+///
+/// `offsets` has `rows + 1` entries; row `i` is `bytes[offsets[i]..offsets[i+1]]`.
+/// Rows are append-only.
+pub(crate) struct FlatBytes {
+    bytes: Vec<u8>,
+    offsets: Vec<u32>,
+}
+
+impl FlatBytes {
+    fn with_capacity(rows: usize, bytes_cap: usize) -> Self {
+        let mut offsets = Vec::with_capacity(rows + 1);
+        offsets.push(0);
+        Self {
+            bytes: Vec::with_capacity(bytes_cap),
+            offsets,
+        }
+    }
+
+    #[inline]
+    fn len(&self) -> usize {
+        self.offsets.len() - 1
+    }
+
+    #[inline]
+    fn is_empty(&self) -> bool {
+        self.offsets.len() <= 1
+    }
+
+    #[inline]
+    fn push(&mut self, row: &[u8]) {
+        self.bytes.extend_from_slice(row);
+        self.offsets.push(self.bytes.len() as u32);
+    }
+
+    /// Append the same chunk `repeat` times — used by NAME_FMT's run-length
+    /// variant where identical templates back many consecutive rows.
+    fn push_repeated(&mut self, row: &[u8], repeat: usize) {
+        for _ in 0..repeat {
+            self.bytes.extend_from_slice(row);
+            self.offsets.push(self.bytes.len() as u32);
+        }
+    }
+
+    #[inline]
+    fn get(&self, i: usize) -> Option<&[u8]> {
+        if i + 1 < self.offsets.len() {
+            let s = self.offsets[i] as usize;
+            let e = self.offsets[i + 1] as usize;
+            Some(&self.bytes[s..e])
+        } else {
+            None
+        }
+    }
+}
+
 // Shared blob decoders live in `sracha-vdb::blob_codecs` so the fastq
 // pipeline and the `sracha vdb dump` command can reach them. Re-exported
 // here so the rest of this module and `pipeline::mod` / `pipeline::validate`
@@ -576,7 +660,13 @@ pub(crate) fn decode_blob_to_fastq(
         if row_offset > 0 || lengths.len() > row_offset + row_take {
             let end = (row_offset + row_take).min(lengths.len());
             let start = row_offset.min(end);
-            lengths = lengths[start..end].to_vec();
+            // In-place trim: shift the kept window to the front, then
+            // truncate. Avoids reallocating a fresh Vec<u32> on every
+            // blob whose READ_LEN spans more rows than READ does.
+            if start > 0 {
+                lengths.copy_within(start..end, 0);
+            }
+            lengths.truncate(end - start);
         }
 
         if blob_idx == 0 {
@@ -721,7 +811,7 @@ pub(crate) fn decode_blob_to_fastq(
     // ------------------------------------------------------------------
     // Decode NAME blob.
     // ------------------------------------------------------------------
-    let spot_names: Option<Vec<Vec<u8>>> = if raw.has_name && !raw.name_raw.is_empty() {
+    let spot_names: Option<FlatBytes> = if raw.has_name && !raw.name_raw.is_empty() {
         let ndecoded = decode_raw(raw.name_raw, raw.name_cs, raw.name_id_range)?;
         let name_bytes = decode_zip_encoding(&ndecoded)?;
 
@@ -731,13 +821,13 @@ pub(crate) fn decode_blob_to_fastq(
             .unwrap_or(read_lengths.len());
 
         if let Some(ref pm) = ndecoded.page_map {
-            let mut names = Vec::with_capacity(num_spots);
+            let mut names = FlatBytes::with_capacity(num_spots, name_bytes.len());
             let mut offset = 0usize;
             for (len, run) in pm.lengths.iter().zip(pm.leng_runs.iter()) {
                 let name_len = *len as usize;
                 for _ in 0..*run {
                     if offset + name_len <= name_bytes.len() {
-                        names.push(name_bytes[offset..offset + name_len].to_vec());
+                        names.push(&name_bytes[offset..offset + name_len]);
                         offset += name_len;
                     }
                 }
@@ -746,27 +836,28 @@ pub(crate) fn decode_blob_to_fastq(
                 tracing::debug!(
                     "NAME: {} names decoded, first={:?}",
                     names.len(),
-                    names
-                        .first()
-                        .map(|n| String::from_utf8_lossy(n).to_string()),
+                    names.get(0).map(String::from_utf8_lossy),
                 );
             }
             Some(names)
         } else if let Some(row_len) = ndecoded.row_length {
             let rl = row_len as usize;
-            if rl > 0 {
-                let names: Vec<Vec<u8>> = name_bytes.chunks(rl).map(|c| c.to_vec()).collect();
-                Some(names)
-            } else {
-                None
-            }
+            name_bytes.len().checked_div(rl).map(|row_count| {
+                let mut names = FlatBytes::with_capacity(row_count, name_bytes.len());
+                for c in name_bytes.chunks(rl) {
+                    names.push(c);
+                }
+                names
+            })
         } else {
             let delimiter = if name_bytes.contains(&0) { 0u8 } else { b'\n' };
-            let names: Vec<Vec<u8>> = name_bytes
+            let mut names = FlatBytes::with_capacity(num_spots, name_bytes.len());
+            for s in name_bytes
                 .split(|&b| b == delimiter)
                 .filter(|s| !s.is_empty())
-                .map(|s| s.to_vec())
-                .collect();
+            {
+                names.push(s);
+            }
             if !names.is_empty() { Some(names) } else { None }
         }
     } else {
@@ -780,7 +871,7 @@ pub(crate) fn decode_blob_to_fastq(
     // its bytes carry the 4na ambiguity mask (handled separately above);
     // the templates themselves live in the skey index.
     // ------------------------------------------------------------------
-    let spot_names: Option<Vec<Vec<u8>>> = if spot_names.is_none()
+    let spot_names: Option<FlatBytes> = if spot_names.is_none()
         && raw.has_illumina_name_parts
         && !raw.x_raw.is_empty()
         && !raw.y_raw.is_empty()
@@ -857,81 +948,82 @@ pub(crate) fn decode_blob_to_fastq(
         //     leng_runs and overlays it on the data_run slot). Each row
         //     pulls its own slice from a deduplicated pool of unique
         //     templates.
-        let name_fmt_per_row: Option<Vec<Vec<u8>>> =
-            if raw.has_name_fmt && !raw.name_fmt_raw.is_empty() {
-                decode_raw(raw.name_fmt_raw, raw.name_fmt_cs, raw.name_fmt_id_range)
-                    .ok()
-                    .and_then(|nfd| {
-                        let pm = nfd.page_map.clone();
-                        let bytes = decode_zip_encoding(&nfd).ok()?;
-                        let pm = pm?;
-                        let total_rows = pm.total_rows() as usize;
-                        let random_access = pm.data_runs.len() == total_rows && total_rows > 0;
-                        let mut rows: Vec<Vec<u8>> = Vec::with_capacity(total_rows);
-                        if random_access {
-                            // Per-row byte offsets: each row pulls its own
-                            // slice from `bytes` at offset data_runs[i] of
-                            // length determined by leng_runs expansion.
-                            let mut row_lens: Vec<u32> = Vec::with_capacity(total_rows);
-                            for (length, &run) in pm.lengths.iter().zip(pm.leng_runs.iter()) {
-                                for _ in 0..run {
-                                    row_lens.push(*length);
-                                }
-                            }
-                            for (i, &len) in row_lens.iter().enumerate() {
-                                let len = len as usize;
+        let name_fmt_per_row: Option<FlatBytes> = if raw.has_name_fmt
+            && !raw.name_fmt_raw.is_empty()
+        {
+            decode_raw(raw.name_fmt_raw, raw.name_fmt_cs, raw.name_fmt_id_range)
+                .ok()
+                .and_then(|nfd| {
+                    let pm = nfd.page_map.as_ref()?;
+                    let total_rows = pm.total_rows() as usize;
+                    let random_access = pm.data_runs.len() == total_rows && total_rows > 0;
+                    let bytes = decode_zip_encoding(&nfd).ok()?;
+                    let mut rows = FlatBytes::with_capacity(total_rows, bytes.len());
+                    if random_access {
+                        // Per-row byte offsets: each row pulls its own
+                        // slice from `bytes` at offset data_runs[i] of
+                        // length determined by leng_runs expansion.
+                        let mut row_idx = 0usize;
+                        for (length, &run) in pm.lengths.iter().zip(pm.leng_runs.iter()) {
+                            let len = *length as usize;
+                            for _ in 0..run {
                                 if len == 0 {
-                                    rows.push(Vec::new());
+                                    rows.push(&[]);
+                                    row_idx += 1;
                                     continue;
                                 }
-                                let off = pm.data_runs.get(i).copied().unwrap_or(0) as usize;
+                                let off = pm.data_runs.get(row_idx).copied().unwrap_or(0) as usize;
                                 if off + len > bytes.len() {
                                     return None;
                                 }
-                                rows.push(bytes[off..off + len].to_vec());
-                            }
-                        } else {
-                            // Run-length variant: one chunk per data record,
-                            // replicated `data_runs[i]` times (defaults to 1
-                            // when data_runs is empty).
-                            let rec_lens = pm.data_record_lengths();
-                            let mut cursor = 0usize;
-                            for (i, &len) in rec_lens.iter().enumerate() {
-                                let len = len as usize;
-                                let repeat = pm.data_runs.get(i).copied().unwrap_or(1) as usize;
-                                if cursor + len > bytes.len() {
-                                    return None;
-                                }
-                                let chunk = bytes[cursor..cursor + len].to_vec();
-                                for _ in 0..repeat {
-                                    rows.push(chunk.clone());
-                                }
-                                cursor += len;
+                                rows.push(&bytes[off..off + len]);
+                                row_idx += 1;
                             }
                         }
-                        if blob_idx == 0 {
-                            let nonempty = rows.iter().filter(|r| !r.is_empty()).count();
-                            tracing::debug!(
-                                "NAME_FMT blob 0: {} rows ({}), {} non-empty overrides",
-                                rows.len(),
-                                if random_access {
-                                    "random-access"
-                                } else {
-                                    "run-length"
-                                },
-                                nonempty,
-                            );
+                    } else {
+                        // Run-length variant: one chunk per data record,
+                        // replicated `data_runs[i]` times (defaults to 1
+                        // when data_runs is empty).
+                        let rec_lens = pm.data_record_lengths();
+                        let mut cursor = 0usize;
+                        for (i, &len) in rec_lens.iter().enumerate() {
+                            let len = len as usize;
+                            let repeat = pm.data_runs.get(i).copied().unwrap_or(1) as usize;
+                            if cursor + len > bytes.len() {
+                                return None;
+                            }
+                            rows.push_repeated(&bytes[cursor..cursor + len], repeat);
+                            cursor += len;
                         }
-                        Some(rows)
-                    })
-            } else {
-                None
-            };
+                    }
+                    if blob_idx == 0 {
+                        let nonempty = (0..rows.len())
+                            .filter(|&i| rows.get(i).is_some_and(|r| !r.is_empty()))
+                            .count();
+                        tracing::debug!(
+                            "NAME_FMT blob 0: {} rows ({}), {} non-empty overrides",
+                            rows.len(),
+                            if random_access {
+                                "random-access"
+                            } else {
+                                "run-length"
+                            },
+                            nonempty,
+                        );
+                    }
+                    Some(rows)
+                })
+        } else {
+            None
+        };
 
         if has_templates && !x_vals.is_empty() && !y_vals.is_empty() {
-            let mut names = Vec::with_capacity(num_spots);
+            // Average template length ~30 chars + ~20 chars of expanded
+            // X/Y digits; pre-sizing avoids repeated buffer realloc.
+            let mut names = FlatBytes::with_capacity(num_spots, num_spots * 50);
             let mut itoa_x = itoa::Buffer::new();
             let mut itoa_y = itoa::Buffer::new();
+            let mut scratch: Vec<u8> = Vec::with_capacity(64);
             for spot_i in 0..num_spots {
                 let spot_id = spots_before as i64 + spot_i as i64 + 1;
                 // NAME_FMT override (when present and non-empty) wins
@@ -939,8 +1031,7 @@ pub(crate) fn decode_blob_to_fastq(
                 let nf_override: Option<&[u8]> = name_fmt_per_row
                     .as_ref()
                     .and_then(|rows| rows.get(spot_i))
-                    .filter(|r| !r.is_empty())
-                    .map(|r| r.as_slice());
+                    .filter(|r| !r.is_empty());
                 let tmpl: &[u8] = if let Some(t) = nf_override {
                     t
                 } else {
@@ -956,30 +1047,30 @@ pub(crate) fn decode_blob_to_fastq(
                 // Substitute $X and $Y in the template.
                 let x_str = itoa_x.format(x);
                 let y_str = itoa_y.format(y);
-                let mut name = Vec::with_capacity(tmpl.len() + 10);
+                scratch.clear();
                 let mut ti = 0;
                 while ti < tmpl.len() {
                     if tmpl[ti] == b'$' && ti + 1 < tmpl.len() {
                         if tmpl[ti + 1] == b'X' {
-                            name.extend_from_slice(x_str.as_bytes());
+                            scratch.extend_from_slice(x_str.as_bytes());
                             ti += 2;
                             continue;
                         } else if tmpl[ti + 1] == b'Y' {
-                            name.extend_from_slice(y_str.as_bytes());
+                            scratch.extend_from_slice(y_str.as_bytes());
                             ti += 2;
                             continue;
                         }
                     }
-                    name.push(tmpl[ti]);
+                    scratch.push(tmpl[ti]);
                     ti += 1;
                 }
-                names.push(name);
+                names.push(&scratch);
             }
 
             if blob_idx == 0 && !names.is_empty() {
                 tracing::debug!(
                     "Illumina name reconstructed: first={:?}",
-                    String::from_utf8_lossy(&names[0]),
+                    names.get(0).map(String::from_utf8_lossy),
                 );
             }
             Some(names)
@@ -1015,9 +1106,15 @@ pub(crate) fn decode_blob_to_fastq(
     let rps = reads_per_spot.max(1);
     // Per-slot output accumulators. At most 2-4 slots in realistic configs
     // (Split3 -> Read1/Read2/Unpaired, SplitSpot/Interleaved -> Single,
-    // SplitFiles -> ReadN(0..rps)). A linear scan over this small Vec beats
-    // a HashMap lookup in the hot path.
-    let mut records: Vec<BlobSlotOutput> = Vec::with_capacity(4);
+    // SplitFiles -> ReadN(0..rps)). Use a fixed-size LUT indexed by slot
+    // discriminant for O(1) lookup; the previous Vec + iter().find() was
+    // O(rps) per emit and showed up as a hotspot on millions-of-spots runs.
+    // SLOT_LUT_SIZE = 4 fixed variants + up to 12 ReadN values (SRA's
+    // reads-per-spot is bounded by metadata to ~4 in practice). The
+    // overflow path preserves correctness for any larger rps.
+    const SLOT_LUT_SIZE: usize = 16;
+    let mut slot_lut: [Option<BlobSlotOutput>; SLOT_LUT_SIZE] = std::array::from_fn(|_| None);
+    let mut slot_overflow: Vec<BlobSlotOutput> = Vec::new();
     let mut seq_offset: usize = 0;
     let mut qual_offset: usize = 0;
     let mut rt_offset: usize = 0;
@@ -1099,15 +1196,9 @@ pub(crate) fn decode_blob_to_fastq(
         let spot_number = spot_number_str.as_bytes();
 
         // Original read name from the NAME column (if present).
-        let original_name: Option<&[u8]> = if let Some(ref names) = spot_names {
-            if spot_idx_in_blob < names.len() {
-                Some(&names[spot_idx_in_blob])
-            } else {
-                None
-            }
-        } else {
-            None
-        };
+        let original_name: Option<&[u8]> = spot_names
+            .as_ref()
+            .and_then(|names| names.get(spot_idx_in_blob));
 
         // Read types for this spot: borrow from decoded data or default to biological.
         let spot_read_types: &[u8] =
@@ -1181,15 +1272,28 @@ pub(crate) fn decode_blob_to_fastq(
             // `append_fastq_record` derive it from `spot_label`).
             let mut emit =
                 |slot: OutputSlot, seg: &ReadSeg, spot_label: &[u8], desc: Option<&[u8]>| {
-                    let buf = match records.iter_mut().find(|s| s.slot == slot) {
-                        Some(s) => s,
-                        None => {
-                            records.push(BlobSlotOutput {
-                                slot,
-                                bytes: Vec::new(),
-                                records: 0,
-                            });
-                            records.last_mut().unwrap()
+                    let lut_idx = slot_lut_index(slot);
+                    let buf = if let Some(i) = lut_idx {
+                        slot_lut[i].get_or_insert_with(|| BlobSlotOutput {
+                            slot,
+                            bytes: Vec::new(),
+                            records: 0,
+                        })
+                    } else {
+                        // Overflow path for ReadN(n) where n exceeds the
+                        // LUT capacity — virtually impossible in practice
+                        // (SRA's max reads-per-spot is bounded by metadata),
+                        // but kept correct for forward compatibility.
+                        match slot_overflow.iter().position(|s| s.slot == slot) {
+                            Some(i) => &mut slot_overflow[i],
+                            None => {
+                                slot_overflow.push(BlobSlotOutput {
+                                    slot,
+                                    bytes: Vec::new(),
+                                    records: 0,
+                                });
+                                slot_overflow.last_mut().unwrap()
+                            }
                         }
                     };
                     let seq = &sequence[seg.start..seg.start + seg.len];
@@ -1260,6 +1364,13 @@ pub(crate) fn decode_blob_to_fastq(
         rl_cursor += rps;
         spot_idx_in_blob += 1;
     }
+
+    // Collect populated LUT entries in slot-index order, then overflow.
+    let mut records: Vec<BlobSlotOutput> = Vec::with_capacity(4);
+    for entry in slot_lut.into_iter().flatten() {
+        records.push(entry);
+    }
+    records.extend(slot_overflow);
 
     Ok((records, spot_idx_in_blob as u64))
 }
