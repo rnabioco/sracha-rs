@@ -56,15 +56,16 @@ jobs:
       - name: Package
         shell: bash
         run: |
+          version="${GITHUB_REF_NAME#v}"
           cd target/${{ matrix.target }}/release
-          tar czf ../../../sracha-${{ matrix.target }}.tar.gz sracha
+          tar czf ../../../sracha-${version}-${{ matrix.target }}.tar.gz sracha
           cd ../../..
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:
-          name: sracha-${{ matrix.target }}
-          path: sracha-${{ matrix.target }}.tar.gz
+          name: sracha-${{ github.ref_name }}-${{ matrix.target }}
+          path: sracha-*-${{ matrix.target }}.tar.gz
 
   release:
     name: Create Release
