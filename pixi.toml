@@ -13,6 +13,7 @@ vhs = ">=0.11.0,<0.12"
 bwa = ">=0.7.18"
 samtools = ">=1.21"
 sracha = ">=0.3.0,<0.4"
+cargo-nextest = ">=0.9"
 
 [pypi-dependencies]
 zensical = "*"
@@ -21,7 +22,8 @@ zensical = "*"
 build = "cargo build"
 release = "cargo build --profile release"
 release-debug = "cargo build --profile release-with-debug"
-test = "cargo test"
+test = "cargo nextest run"
+test-integration = "cargo nextest run -p sracha-core --run-ignored=ignored-only"
 check = "cargo check"
 clippy = "cargo clippy --all-targets --all-features -- -D warnings"
 fmt = "cargo fmt --all"
@@ -41,12 +43,13 @@ install-sratools = { cmd = "bash validation/install-sratools.sh", description = 
 mold = ">=2.4"
 
 [feature.dev.tasks]
-build         = "mold -run cargo build"
-release       = "mold -run cargo build --profile release"
-release-debug = "mold -run cargo build --profile release-with-debug"
-test          = "mold -run cargo test"
-check         = "mold -run cargo check"
-clippy        = "mold -run cargo clippy --all-targets --all-features -- -D warnings"
+build            = "mold -run cargo build"
+release          = "mold -run cargo build --profile release"
+release-debug    = "mold -run cargo build --profile release-with-debug"
+test             = "mold -run cargo nextest run"
+test-integration = "mold -run cargo nextest run -p sracha-core --run-ignored=ignored-only"
+check            = "mold -run cargo check"
+clippy           = "mold -run cargo clippy --all-targets --all-features -- -D warnings"
 
 [environments]
 dev = { features = ["dev"], solve-group = "default" }
