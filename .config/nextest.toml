@@ -1,0 +1,33 @@
+# cargo-nextest configuration
+# https://nexte.st/docs/configuration/
+
+[profile.default]
+# Show output for failing tests after the run completes
+failure-output = "immediate-final"
+# Hide stdout/stderr for passing tests
+success-output = "never"
+# Retry flaky tests once (most tests are deterministic; network tests benefit)
+retries = 0
+# Fail fast on first test failure during local development
+fail-fast = true
+
+[profile.ci]
+# CI: never fail-fast — surface every failure in one run
+fail-fast = false
+# Retry transient network failures in integration tests
+retries = { backoff = "exponential", count = 2, delay = "5s", jitter = true, max-delay = "30s" }
+# Verbose failure output for CI logs
+failure-output = "immediate-final"
+final-status-level = "slow"
+
+[profile.ci.junit]
+path = "junit.xml"
+
+# Integration tests download SRA files from NCBI — give them more time
+[[profile.default.overrides]]
+filter = "test(integration_) or test(test_download_) or test(test_pipeline_)"
+slow-timeout = { period = "60s", terminate-after = 4 }
+
+[[profile.ci.overrides]]
+filter = "test(integration_) or test(test_download_) or test(test_pipeline_)"
+slow-timeout = { period = "60s", terminate-after = 4 }

@@ -11,12 +11,14 @@ sracha-rs is a pure Rust SRA downloader and FASTQ converter — a fast replaceme
 ```bash
 cargo build                                          # dev build
 cargo build --profile release                        # optimized release build (LTO)
-cargo test                                           # unit tests only
-cargo test -p sracha-core -- --ignored               # integration tests (downloads SRA fixtures from NCBI)
-cargo test -p sracha-core -- test_name               # run a single test
+cargo nextest run                                    # unit tests only (cargo-nextest required)
+cargo nextest run -p sracha-core --run-ignored=ignored-only  # integration tests (downloads SRA fixtures from NCBI)
+cargo nextest run -p sracha-core -E 'test(test_name)'        # run a single test
 cargo clippy --all-targets --all-features -- -D warnings
 cargo fmt --all -- --check
 ```
+
+Tests run via [cargo-nextest](https://nexte.st). Install with `cargo install cargo-nextest --locked` or use the bundled `pixi` env (`cargo-nextest` is a pixi dep). Config lives at `.config/nextest.toml`; the `ci` profile retries flaky network tests and writes JUnit XML.
 
 Fast local dev builds via mold (pixi env: `dev`). `mold -run` intercepts the
 linker exec via `LD_PRELOAD` and works with the compute nodes' system gcc
