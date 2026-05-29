@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+## 0.3.7 (2026-05-29)
+
 ### Features
 
 - `sracha {get,fastq} --seq-defline <TEMPLATE>` sets a custom FASTQ/FASTA
