@@ -271,6 +271,18 @@ pub struct FastqArgs {
     #[arg(long, help_heading = "Output")]
     pub fasta: bool,
 
+    /// Custom defline template (fasterq-dump `--seq-defline` syntax).
+    /// Variables: $ac (accession) $si (spot id) $ri (read id) $sn (spot name)
+    /// $rl (read length); $$ is a literal '$'. Example: '@$ac.$si.$ri'.
+    /// The '+' line mirrors this. ($sg/spot-group is not supported.)
+    #[arg(
+        long,
+        value_name = "TEMPLATE",
+        help_heading = "Output",
+        value_parser = fastq::DeflineTemplate::parse,
+    )]
+    pub seq_defline: Option<fastq::DeflineTemplate>,
+
     /// Overwrite existing files
     #[arg(short, long, help_heading = "Output")]
     pub force: bool,
@@ -371,6 +383,18 @@ pub struct GetArgs {
     /// Output FASTA instead of FASTQ (drops quality scores)
     #[arg(long, help_heading = "Output")]
     pub fasta: bool,
+
+    /// Custom defline template (fasterq-dump `--seq-defline` syntax).
+    /// Variables: $ac (accession) $si (spot id) $ri (read id) $sn (spot name)
+    /// $rl (read length); $$ is a literal '$'. Example: '@$ac.$si.$ri'.
+    /// The '+' line mirrors this. ($sg/spot-group is not supported.)
+    #[arg(
+        long,
+        value_name = "TEMPLATE",
+        help_heading = "Output",
+        value_parser = fastq::DeflineTemplate::parse,
+    )]
+    pub seq_defline: Option<fastq::DeflineTemplate>,
 
     /// Overwrite existing files
     #[arg(short, long, help_heading = "Output")]

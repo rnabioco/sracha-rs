@@ -257,6 +257,7 @@ fn test_config(
         http_client: None,
         keep_sra: false,
         paired_suffix: sracha_core::fastq::PairedSuffix::Numeric,
+        seq_defline: None,
         folder_per_accession: false,
         metadata: None,
         metadata_url: None,

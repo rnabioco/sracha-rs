@@ -56,6 +56,9 @@ pub struct PipelineConfig {
     pub keep_sra: bool,
     /// Suffix style for paired/split FASTQ outputs (`_1`/`_2` vs `_R1`/`_R2`).
     pub paired_suffix: PairedSuffix,
+    /// Optional custom defline template (`--seq-defline`). `None` uses the
+    /// built-in `{run}.{spot} {desc} length={len}` format.
+    pub seq_defline: Option<crate::fastq::DeflineTemplate>,
     /// Place each accession's outputs (FASTQ + sidecars + temp SRA) inside
     /// its own subdirectory of `output_dir`, named after the accession.
     /// When `false`, all files land flat in `output_dir`.
@@ -135,6 +138,7 @@ mod tests {
             http_client: None,
             keep_sra: false,
             paired_suffix: crate::fastq::PairedSuffix::Numeric,
+            seq_defline: None,
             folder_per_accession,
             metadata: None,
             metadata_url: None,
