@@ -1297,7 +1297,26 @@ pub(crate) fn decode_blob_to_fastq(
                         }
                     };
                     let seq = &sequence[seg.start..seg.start + seg.len];
-                    if config.fasta {
+                    if let Some(tmpl) = config.seq_defline.as_ref() {
+                        // Custom defline: feed the raw fields ($si = bare spot
+                        // number, $ri = read index) and let the template decide
+                        // layout — bypass the `<spot>/<mate>` label and forced
+                        // `desc` that the default split-spot/interleaved path
+                        // bakes into `spot_label`/`desc`.
+                        let qual = &quality[seg.start..seg.start + seg.len];
+                        crate::fastq::append_record_templated(
+                            &mut buf.bytes,
+                            tmpl,
+                            config.fasta,
+                            run_name,
+                            spot_number,
+                            seg.mate_idx,
+                            original_name,
+                            seq,
+                            qual,
+                            Some(diag),
+                        );
+                    } else if config.fasta {
                         append_fasta_record(&mut buf.bytes, run_name, spot_label, desc, seq);
                     } else {
                         let qual = &quality[seg.start..seg.start + seg.len];

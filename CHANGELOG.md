@@ -2,6 +2,16 @@
 
 ## Unreleased
 
+### Features
+
+- `sracha {get,fastq} --seq-defline <TEMPLATE>` sets a custom FASTQ/FASTA
+  defline using fasterq-dump's `--seq-defline` syntax (#50). Supports
+  `$ac` (accession), `$si` (spot id), `$ri` (read id), `$sn` (spot name),
+  `$rl` (read length), and `$$` for a literal `$`; the `+` line mirrors
+  the template. Templates are validated at startup. `$sg` (spot-group) is
+  not supported. Without the flag, output is unchanged. Adds a "Coming
+  from sra-tools" option-mapping table to the CLI docs.
+
 ## 0.3.6 (2026-05-16)
 
 ### Features

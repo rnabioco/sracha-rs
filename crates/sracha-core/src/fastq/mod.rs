@@ -7,6 +7,10 @@
 use std::fmt;
 use std::sync::atomic::{AtomicU64, Ordering};
 
+mod defline;
+pub use defline::DeflineTemplate;
+pub(crate) use defline::append_record_templated;
+
 /// Aggregated data-integrity counters captured during FASTQ formatting.
 ///
 /// Populated by [`format_read`] / [`format_spot`] and aggregated upstream by
@@ -133,6 +137,11 @@ pub struct FastqConfig {
     pub fasta: bool,
     /// Suffix style for paired/split output filenames.
     pub paired_suffix: PairedSuffix,
+    /// Optional custom defline template (`--seq-defline`). When `Some`, it
+    /// replaces the built-in `{run}.{spot} {desc} length={len}` defline and
+    /// the split-spot/interleaved `<spot>/<mate>` labeling is bypassed (the
+    /// template's `$ri` distinguishes mates instead).
+    pub seq_defline: Option<DeflineTemplate>,
 }
 
 impl Default for FastqConfig {
@@ -143,6 +152,7 @@ impl Default for FastqConfig {
             min_read_len: None,
             fasta: false,
             paired_suffix: PairedSuffix::Numeric,
+            seq_defline: None,
         }
     }
 }
@@ -430,6 +440,9 @@ pub fn append_fasta_record(
 struct ReadSegment<'a> {
     sequence: &'a [u8],
     quality: &'a [u8],
+    /// 1-based read index within the spot, before filtering (the `$ri`
+    /// value for custom deflines).
+    mate_idx: u32,
 }
 
 /// Format a spot into FASTQ records, routing each to the appropriate output slot.
@@ -455,7 +468,7 @@ pub fn format_spot(
     if segments.is_empty() {
         return Vec::new();
     }
-    route_segments_to_slots(&segments, &spot.name, run_name, config.split_mode)
+    route_segments_to_slots(&segments, &spot.name, run_name, config)
 }
 
 /// Split a spot's concatenated sequence/quality into per-read segments,
@@ -505,6 +518,7 @@ fn filter_spot_segments<'a>(spot: &'a SpotRecord, config: &FastqConfig) -> Vec<R
         segments.push(ReadSegment {
             sequence: seq,
             quality: qual,
+            mate_idx: (i + 1) as u32,
         });
     }
 
@@ -520,13 +534,32 @@ fn route_segments_to_slots(
     segments: &[ReadSegment<'_>],
     spot_name: &[u8],
     run_name: &str,
-    split_mode: SplitMode,
+    config: &FastqConfig,
 ) -> Vec<(OutputSlot, FastqRecord)> {
     let mut results = Vec::with_capacity(segments.len());
-    let format =
-        |seg: &ReadSegment<'_>| format_read(run_name, spot_name, None, seg.sequence, seg.quality);
+    let format = |seg: &ReadSegment<'_>| {
+        if let Some(tmpl) = config.seq_defline.as_ref() {
+            // cSRA has no NAME column, so `$sn` resolves to empty here.
+            let mut data = Vec::new();
+            append_record_templated(
+                &mut data,
+                tmpl,
+                config.fasta,
+                run_name,
+                spot_name,
+                seg.mate_idx,
+                None,
+                seg.sequence,
+                seg.quality,
+                None,
+            );
+            FastqRecord { data }
+        } else {
+            format_read(run_name, spot_name, None, seg.sequence, seg.quality)
+        }
+    };
 
-    match split_mode {
+    match config.split_mode {
         SplitMode::Split3 => {
             if segments.len() == 2 {
                 results.push((OutputSlot::Read1, format(&segments[0])));

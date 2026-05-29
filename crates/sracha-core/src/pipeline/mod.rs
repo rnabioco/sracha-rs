@@ -434,6 +434,7 @@ fn decode_and_write(
         min_read_len: config.min_read_len,
         fasta: config.fasta,
         paired_suffix: config.paired_suffix,
+        seq_defline: config.seq_defline.clone(),
     };
 
     // Create output directory (not needed for stdout mode).
@@ -1178,6 +1179,7 @@ fn run_fastq_csra(
         min_read_len: config.min_read_len,
         fasta: config.fasta,
         paired_suffix: config.paired_suffix,
+        seq_defline: config.seq_defline.clone(),
     };
 
     if !config.stdout {

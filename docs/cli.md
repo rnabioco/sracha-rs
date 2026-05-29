@@ -73,6 +73,7 @@ sracha get [OPTIONS] [ACCESSION]...
 | `--split <MODE>` | `split-3` | Split mode: `split-3`, `split-files`, `split-spot`, `interleaved` |
 | `--paired-suffix <STYLE>` | `numeric` | Suffix style for paired/split FASTQ outputs: `numeric` (`_1`/`_2`, matches fasterq-dump and ENA) or `r` (`_R1`/`_R2`, matches Illumina BCL output) |
 | `--fasta` | | Output FASTA instead of FASTQ (drops quality scores) |
+| `--seq-defline <TEMPLATE>` | | Custom defline template, fasterq-dump `--seq-defline` syntax (see [Custom deflines](#custom-deflines)) |
 | `--min-read-len <N>` | | Minimum read length filter |
 | `--include-technical` | | Include technical reads (skipped by default) |
 | `--metadata <FORMAT>` | | Write a `<accession>.metadata.{tsv,json}` sidecar alongside each FASTQ output, capturing BioSample/SAMN, Sample/SRS, BioProject, library strategy/source/selection/layout, instrument, experiment, study, scientific name, tax id, bases, and release dates from the EUtils RunInfo CSV. Values: `tsv`, `json`, `both` |
@@ -167,6 +168,7 @@ sracha fastq [OPTIONS] <INPUT>...
 | `--split <MODE>` | `split-3` | Split mode: `split-3`, `split-files`, `split-spot`, `interleaved` |
 | `--paired-suffix <STYLE>` | `numeric` | Suffix style for paired/split FASTQ outputs: `numeric` (`_1`/`_2`, matches fasterq-dump and ENA) or `r` (`_R1`/`_R2`, matches Illumina BCL output) |
 | `--fasta` | | Output FASTA instead of FASTQ (drops quality scores) |
+| `--seq-defline <TEMPLATE>` | | Custom defline template, fasterq-dump `--seq-defline` syntax (see [Custom deflines](#custom-deflines)) |
 | `--min-read-len <N>` | | Minimum read length filter |
 | `--include-technical` | | Include technical reads (skipped by default) |
 | `-Z, --stdout` | | Write to stdout (implies `--no-progress`) |
@@ -343,3 +345,67 @@ sracha vdb id-range <FILE> [-T TABLE] [-C COLUMN]
 |--------|---------|-------------|
 | `-T, --table <NAME>` | `SEQUENCE` (or first) | Table to inspect |
 | `-C, --column <NAME>` | first alphabetically | Column to read |
+
+---
+
+## Custom deflines
+
+`--seq-defline <TEMPLATE>` (available on both `sracha get` and `sracha fastq`)
+replaces the built-in FASTQ/FASTA header with a template, using the same
+`$`-variable syntax as fasterq-dump's `--seq-defline`:
+
+| Variable | Expands to |
+|----------|------------|
+| `$ac` | Run accession (e.g. `SRR12345678`) |
+| `$si` | Spot id — 1-based row number |
+| `$ri` | Read id — 1-based read number within the spot |
+| `$sn` | Spot name from the NAME column (empty when the archive has none) |
+| `$rl` | Read length in bases |
+| `$$` | A literal `$` |
+
+```bash
+# Match a fasterq-dump pipeline that used --seq-defline '@$ac.$si.$ri'
+sracha get --seq-defline '@$ac.$si.$ri' --split split-files SRR12345678
+#  -> @SRR12345678.1.1
+#     @SRR12345678.1.2   (mate 2 of spot 1)
+```
+
+Notes:
+
+- A leading `@` (or `>` for FASTA) is optional — it is stripped, and sracha adds
+  the correct record prefix automatically.
+- The `+` (quality) line always mirrors the sequence defline. There is no
+  separate `--qual-defline`.
+- When a template is given, the `split-spot`/`interleaved` modes do **not** add
+  their implicit `<spot>/<mate>` suffix — use `$ri` in the template to
+  distinguish mates instead.
+- `$sg` (spot-group) is **not supported**; a template using it is rejected at
+  startup. Reference-compressed (cSRA) archives have no NAME column, so `$sn`
+  expands to empty there.
+
+## Coming from sra-tools
+
+How common `fasterq-dump` / `fastq-dump` options map to sracha:
+
+| sra-tools option | sracha equivalent | Notes |
+|------------------|-------------------|-------|
+| `-O, --outdir <DIR>` | `-O, --output-dir <DIR>` | Same |
+| `-e, --threads <N>` | `-t, --threads <N>` | Decode + compression threads |
+| `--split-3` | `--split split-3` | Default in both |
+| `--split-files` | `--split split-files` | One file per read |
+| `--split-spot` | `--split split-spot` | All reads of a spot in one file |
+| `--concatenate-reads` / no split | `--split interleaved` | Single interleaved stream |
+| `-Z, --stdout` | `-Z, --stdout` | Interleaved FASTQ to stdout |
+| `--fasta` | `--fasta` | Drops quality |
+| `--seq-defline <FMT>` | `--seq-defline <FMT>` | Common variables; see [above](#custom-deflines) |
+| `--include-technical` | `--include-technical` | Technical reads skipped by default in both |
+| `-M, --min-read-len <N>` | `--min-read-len <N>` | Same |
+| `-p, --progress` | (on by default) | Disable with `--no-progress` |
+| `-t, --temp <DIR>` | (automatic) | Temp files are managed internally |
+| `--qual-defline <FMT>` | *(unsupported)* | The `+` line mirrors `--seq-defline` |
+| `--rowid-as-name` | *(unsupported)* | Use `--seq-defline` with `$si` |
+| gzip via external pipe | `--gzip-level` / `--zstd` | Compression is built in (gzip on by default) |
+
+sracha-only conveniences with no fasterq-dump equivalent: parallel chunked
+download, `--prefer-ena`, `--metadata` sidecars, `--folder-per-accession`,
+`--zstd`, and direct accession resolution from a study/BioProject.
