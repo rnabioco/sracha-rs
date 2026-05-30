@@ -519,6 +519,11 @@ async fn main() -> Result<()> {
             // Depth 1 matches the old behavior; depth 2+ costs one extra
             // temp file on disk per step but hides network latency.
             let prefetch_depth = args.prefetch_depth.max(1);
+            // Prototype: decode up to `decode_parallelism` accessions at once.
+            // Split the CPU thread budget across concurrent decodes so K
+            // decoders don't oversubscribe to K×--threads rayon threads.
+            let decode_parallelism = args.decode_parallelism.max(1);
+            let threads_per_decode = (args.threads / decode_parallelism).max(1);
             let mut pending_downloads: std::collections::VecDeque<
                 tokio::task::JoinHandle<
                     sracha_core::error::Result<sracha_core::pipeline::DownloadedSra>,
@@ -534,7 +539,7 @@ async fn main() -> Result<()> {
                         output_dir: args.output_dir.clone(),
                         split_mode,
                         compression,
-                        threads: args.threads,
+                        threads: threads_per_decode,
                         connections: args.connections,
                         skip_technical: !args.include_technical,
                         min_read_len: args.min_read_len,
@@ -598,6 +603,18 @@ async fn main() -> Result<()> {
                 }
                 n
             };
+
+            // Prototype: bounded concurrent decode. A semaphore caps in-flight
+            // decodes (also pacing downloads via backpressure on the loop); a
+            // JoinSet holds the spawned decode tasks, each running on the
+            // blocking pool so runtime workers stay free for downloads.
+            let report_stdout = args.stdout;
+            let decode_sem = Arc::new(tokio::sync::Semaphore::new(decode_parallelism));
+            let mut decode_tasks: tokio::task::JoinSet<(
+                String,
+                String,
+                sracha_core::error::Result<sracha_core::pipeline::PipelineStats>,
+            )> = tokio::task::JoinSet::new();
 
             for (i, resolved) in resolved_all.iter().enumerate() {
                 if cancelled.load(Ordering::Relaxed) {
@@ -683,59 +700,50 @@ async fn main() -> Result<()> {
                 // Skip trailing ENA indices after the one we just spawned.
                 let _ = i;
 
-                // Decode (CPU-bound) while the next download runs in the background.
+                // Decode on the blocking pool (not block_in_place) so all
+                // runtime workers stay free for downloads. The semaphore caps
+                // concurrent decodes to --decode-parallelism; acquiring a permit
+                // here also paces downloads (backpressure) so finished .sra
+                // files don't pile up unbounded on disk.
                 let source = resolved
                     .sra_file
                     .mirrors
                     .first()
                     .map(|m| m.service.clone())
                     .unwrap_or_else(|| "unknown".into());
-                match tokio::task::block_in_place(|| {
-                    sracha_core::pipeline::decode_sra(&downloaded, &pipeline_config)
-                }) {
+                let permit = decode_sem
+                    .clone()
+                    .acquire_owned()
+                    .await
+                    .expect("decode semaphore never closed");
+                let cfg = pipeline_config.clone();
+                let acc = resolved.accession.clone();
+                decode_tasks.spawn_blocking(move || {
+                    let _permit = permit;
+                    let r = sracha_core::pipeline::decode_sra(&downloaded, &cfg);
+                    (acc, source, r)
+                });
+            }
+
+            // Drain remaining decodes. With --decode-parallelism > 1 these
+            // finish out of order, so per-accession output interleaves.
+            while let Some(joined) = decode_tasks.join_next().await {
+                let (acc, source, result) = match joined {
+                    Ok(t) => t,
+                    Err(join_err) => {
+                        if cancelled.load(Ordering::Relaxed) {
+                            continue;
+                        }
+                        return Err(anyhow::anyhow!("decode task panicked: {join_err}"));
+                    }
+                };
+                match result {
                     Ok(stats) => {
-                        if stats.spots_read == 0 && stats.bytes_transferred == 0 {
-                            eprintln!(
-                                "{}: outputs already exist, skipped (use --force to re-process)",
-                                style::header(&stats.accession),
-                            );
-                        } else if stats.bytes_transferred == 0 {
-                            eprintln!(
-                                "{}: {} spots, {} reads written (cached, no download needed)",
-                                style::header(&stats.accession),
-                                style::count(stats.spots_read),
-                                style::count(stats.reads_written),
-                            );
-                        } else if stats.bytes_transferred < stats.total_sra_size {
-                            eprintln!(
-                                "{}: {} spots, {} reads written, {} of {} transferred from [{}] (resumed)",
-                                style::header(&stats.accession),
-                                style::count(stats.spots_read),
-                                style::count(stats.reads_written),
-                                style::value(format_size(stats.bytes_transferred)),
-                                style::value(format_size(stats.total_sra_size)),
-                                style::value(&source),
-                            );
-                        } else {
-                            eprintln!(
-                                "{}: {} spots, {} reads written, {} downloaded from [{}]",
-                                style::header(&stats.accession),
-                                style::count(stats.spots_read),
-                                style::count(stats.reads_written),
-                                style::value(format_size(stats.total_sra_size)),
-                                style::value(&source),
-                            );
-                        }
-                        if !args.stdout {
-                            for path in &stats.output_files {
-                                eprintln!("  wrote {}", style::path(path.display()));
-                            }
-                        }
-                        completed_accessions.push(resolved.accession.clone());
+                        report_decode(&stats, &source, report_stdout);
+                        completed_accessions.push(acc);
                     }
                     Err(sracha_core::error::Error::Cancelled { .. }) => {
-                        interrupted_accession = Some(resolved.accession.clone());
-                        break;
+                        interrupted_accession = Some(acc);
                     }
                     Err(e) => return Err(e.into()),
                 }
@@ -1788,6 +1796,48 @@ fn check_download_confirmation(
     }
 
     Ok(())
+}
+
+/// Print the per-accession decode result line(s) — shared by the inline and
+/// final decode drains in `Command::Get`.
+fn report_decode(stats: &sracha_core::pipeline::PipelineStats, source: &str, stdout: bool) {
+    if stats.spots_read == 0 && stats.bytes_transferred == 0 {
+        eprintln!(
+            "{}: outputs already exist, skipped (use --force to re-process)",
+            style::header(&stats.accession),
+        );
+    } else if stats.bytes_transferred == 0 {
+        eprintln!(
+            "{}: {} spots, {} reads written (cached, no download needed)",
+            style::header(&stats.accession),
+            style::count(stats.spots_read),
+            style::count(stats.reads_written),
+        );
+    } else if stats.bytes_transferred < stats.total_sra_size {
+        eprintln!(
+            "{}: {} spots, {} reads written, {} of {} transferred from [{}] (resumed)",
+            style::header(&stats.accession),
+            style::count(stats.spots_read),
+            style::count(stats.reads_written),
+            style::value(format_size(stats.bytes_transferred)),
+            style::value(format_size(stats.total_sra_size)),
+            style::value(source),
+        );
+    } else {
+        eprintln!(
+            "{}: {} spots, {} reads written, {} downloaded from [{}]",
+            style::header(&stats.accession),
+            style::count(stats.spots_read),
+            style::count(stats.reads_written),
+            style::value(format_size(stats.total_sra_size)),
+            style::value(source),
+        );
+    }
+    if !stdout {
+        for path in &stats.output_files {
+            eprintln!("  wrote {}", style::path(path.display()));
+        }
+    }
 }
 
 /// Check that the target directory has enough free disk space for the download.

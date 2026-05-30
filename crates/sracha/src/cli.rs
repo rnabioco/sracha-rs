@@ -468,6 +468,13 @@ pub struct GetArgs {
     #[arg(long, default_value_t = 2, help_heading = "Advanced")]
     pub prefetch_depth: usize,
 
+    /// Number of accessions to decode concurrently. Default 1 (decode one run
+    /// at a time). Values >1 overlap the serial parts of decode across runs —
+    /// helps when fetching many small runs from a fast mirror. The --threads
+    /// CPU budget is divided across concurrent decoders to avoid oversubscription.
+    #[arg(long, default_value_t = 1, help_heading = "Advanced")]
+    pub decode_parallelism: usize,
+
     /// Confirm project downloads and large downloads (>100 GiB)
     #[arg(short, long)]
     pub yes: bool,
