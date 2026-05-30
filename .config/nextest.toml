@@ -10,6 +10,14 @@ success-output = "never"
 retries = 0
 # Fail fast on first test failure during local development
 fail-fast = true
+# Grace period for a test process's stdio to reach EOF after the test returns
+# before nextest flags it as "leaky". The default (100ms) produces false
+# positives on fast, pure tests (e.g. statvfs/tempdir unit tests in the
+# `sracha` binary) when the full suite saturates the CPU and process teardown
+# is descheduled past 100ms. None of these tests spawn subprocesses/threads,
+# so a wider window suppresses the spurious LEAK verdict without masking a
+# genuine leak. Inherited by [profile.ci].
+leak-timeout = "500ms"
 
 [profile.ci]
 # CI: never fail-fast — surface every failure in one run
