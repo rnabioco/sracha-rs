@@ -510,8 +510,20 @@ async fn main() -> Result<()> {
                 });
             }
 
+            // Which phase a Ctrl-C landed in determines what was left on disk,
+            // and therefore what we tell the user the next run will do.
+            enum InterruptPhase {
+                // Partial .sra + sidecar preserved; next run resumes download.
+                Download,
+                // Full .sra preserved; next run skips download, re-decodes.
+                Decode,
+                // ENA fast path: partial FASTQ removed, no .sra involved.
+                Ena,
+            }
+
             let mut completed_accessions: Vec<String> = Vec::new();
             let mut interrupted_accession: Option<String> = None;
+            let mut interrupt_phase: Option<InterruptPhase> = None;
 
             // Process accessions with an N-deep download prefetch queue:
             // while decoding accession i, keep the next `prefetch_depth`
@@ -614,6 +626,7 @@ async fn main() -> Result<()> {
                         Ok(s) => s,
                         Err(sracha_core::error::Error::Cancelled { .. }) => {
                             interrupted_accession = Some(resolved.accession.clone());
+                            interrupt_phase = Some(InterruptPhase::Ena);
                             break;
                         }
                         Err(e) => return Err(e.into()),
@@ -658,12 +671,14 @@ async fn main() -> Result<()> {
                     Ok(Ok(d)) => d,
                     Ok(Err(sracha_core::error::Error::Cancelled { .. })) => {
                         interrupted_accession = Some(resolved.accession.clone());
+                        interrupt_phase = Some(InterruptPhase::Download);
                         break;
                     }
                     Ok(Err(e)) => return Err(e.into()),
                     Err(join_err) => {
                         if cancelled.load(Ordering::Relaxed) {
                             interrupted_accession = Some(resolved.accession.clone());
+                            interrupt_phase = Some(InterruptPhase::Download);
                             break;
                         }
                         return Err(anyhow::anyhow!("download task panicked: {join_err}"));
@@ -735,6 +750,7 @@ async fn main() -> Result<()> {
                     }
                     Err(sracha_core::error::Error::Cancelled { .. }) => {
                         interrupted_accession = Some(resolved.accession.clone());
+                        interrupt_phase = Some(InterruptPhase::Decode);
                         break;
                     }
                     Err(e) => return Err(e.into()),
@@ -761,9 +777,19 @@ async fn main() -> Result<()> {
                         style::header(interrupted),
                     );
                 } else {
+                    let detail = match interrupt_phase {
+                        Some(InterruptPhase::Download) => {
+                            "partial download kept, next run will resume"
+                        }
+                        Some(InterruptPhase::Decode) => {
+                            "temp SRA kept, next run will skip download"
+                        }
+                        // ENA fast path leaves no .sra; only the partial FASTQ
+                        // was removed.
+                        Some(InterruptPhase::Ena) | None => "cleaned up partial output",
+                    };
                     eprintln!(
-                        "Interrupted -- cleaned up partial output for {} \
-                         (temp SRA kept, next run will skip download).{suffix}",
+                        "Interrupted {} -- {detail}.{suffix}",
                         style::header(interrupted),
                     );
                 }

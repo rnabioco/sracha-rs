@@ -1528,10 +1528,19 @@ pub async fn download_sra(
         tokio::select! {
             result = dl_future => result?,
             _ = poll_cancelled(flag) => {
-                tracing::info!("{accession}: download cancelled");
-                let _ = tokio::fs::remove_file(&temp_path).await;
-                let sidecar = crate::download::progress_path(&temp_path);
-                let _ = tokio::fs::remove_file(&sidecar).await;
+                // Non-stdout: preserve the partial file + `.sracha-progress`
+                // sidecar so the next run resumes the download instead of
+                // starting over (see the resume contract in `download_file`).
+                // stdout streams should leave no artifacts, matching the
+                // decode-phase cleanup below, so wipe both there.
+                if config.stdout {
+                    let _ = tokio::fs::remove_file(&temp_path).await;
+                    let sidecar = crate::download::progress_path(&temp_path);
+                    let _ = tokio::fs::remove_file(&sidecar).await;
+                    tracing::info!("{accession}: download cancelled (partial discarded)");
+                } else {
+                    tracing::info!("{accession}: download cancelled (partial kept for resume)");
+                }
                 return Err(Error::Cancelled { output_files: vec![] });
             }
         }
