@@ -1457,7 +1457,10 @@ fn download_cancel_stdout_discards_partial_and_sidecar() {
         matches!(result, Err(sracha_core::error::Error::Cancelled { .. })),
         "pre-cancelled stdout download must return Error::Cancelled",
     );
-    assert!(!temp_path.exists(), "stdout cancel must discard the partial .sra");
+    assert!(
+        !temp_path.exists(),
+        "stdout cancel must discard the partial .sra"
+    );
     assert!(!sidecar.exists(), "stdout cancel must discard the sidecar");
 }
 
