@@ -272,9 +272,11 @@ pub struct FastqArgs {
     pub fasta: bool,
 
     /// Custom defline template (fasterq-dump `--seq-defline` syntax).
-    /// Variables: $ac (accession) $si (spot id) $ri (read id) $sn (spot name)
-    /// $rl (read length); $$ is a literal '$'. Example: '@$ac.$si.$ri'.
-    /// The '+' line mirrors this. ($sg/spot-group is not supported.)
+    /// Variables: $ac (accession) $si (spot id) $ri (read id) $sn (spot/read
+    /// name) $rl (read length); $$ is a literal '$'. Example: '@$ac.$si.$ri'.
+    /// For PacBio/ONT, $sn is the native read name (e.g. PacBio
+    /// 'm64012_.../ccs', ONT '<uuid> ch=.. start_time=..'); it is also the
+    /// default header. The '+' line mirrors this. ($sg/spot-group unsupported.)
     #[arg(
         long,
         value_name = "TEMPLATE",
@@ -385,9 +387,11 @@ pub struct GetArgs {
     pub fasta: bool,
 
     /// Custom defline template (fasterq-dump `--seq-defline` syntax).
-    /// Variables: $ac (accession) $si (spot id) $ri (read id) $sn (spot name)
-    /// $rl (read length); $$ is a literal '$'. Example: '@$ac.$si.$ri'.
-    /// The '+' line mirrors this. ($sg/spot-group is not supported.)
+    /// Variables: $ac (accession) $si (spot id) $ri (read id) $sn (spot/read
+    /// name) $rl (read length); $$ is a literal '$'. Example: '@$ac.$si.$ri'.
+    /// For PacBio/ONT, $sn is the native read name (e.g. PacBio
+    /// 'm64012_.../ccs', ONT '<uuid> ch=.. start_time=..'); it is also the
+    /// default header. The '+' line mirrors this. ($sg/spot-group unsupported.)
     #[arg(
         long,
         value_name = "TEMPLATE",

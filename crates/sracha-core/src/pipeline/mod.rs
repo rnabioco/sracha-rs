@@ -1021,18 +1021,28 @@ pub fn run_fastq(
         decode_and_write(sra_path, &acc, config, is_lite, &diag)
             .map_err(|e| wrap_blob_integrity(&acc, e))?;
 
-    // Warn (but don't fail) when split-3 was requested on an effectively
-    // single-end run: every spot produced exactly one read, so output
-    // lands in `{accession}.fastq` with no `_1`/`_2` files. Users asking
-    // for --split split-3 on single-end data usually didn't realize the
-    // layout; surfacing this beats a silently-different filename.
-    if matches!(config.split_mode, SplitMode::Split3)
-        && spots_read > 0
+    // Warn (but don't fail) when a paired layout was requested on an
+    // effectively single-end run: every spot produced exactly one read, so
+    // split-3 collapses to `{accession}.fastq` (no `_1`/`_2`) and interleaved
+    // has nothing to interleave. This is the common shape for long-read
+    // platforms (PacBio/ONT, one biological read per spot) and single-end
+    // Illumina; users usually didn't realize the layout. `--split split-spot`
+    // expresses the single-file result explicitly, so point them at it.
+    if spots_read > 0
         && reads_written == spots_read
+        && matches!(
+            config.split_mode,
+            SplitMode::Split3 | SplitMode::Interleaved
+        )
     {
+        let requested = match config.split_mode {
+            SplitMode::Interleaved => "interleaved",
+            _ => "split-3",
+        };
         eprintln!(
-            "warning: {acc}: --split split-3 requested but run is single-end \
-             ({spots_read} spots, 1 read each); output is {acc}.fastq"
+            "warning: {acc}: --split {requested} requested but run is single-end \
+             ({spots_read} spots, 1 read each); output is a single file — \
+             use --split split-spot to make this explicit"
         );
     }
 

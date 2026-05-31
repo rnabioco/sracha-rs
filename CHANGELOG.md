@@ -2,6 +2,28 @@
 
 ## Unreleased
 
+### Improvements
+
+- Better long-read (PacBio / Oxford Nanopore) support. Platform detection
+  now reads the authoritative `col/PLATFORM/row` numeric id
+  (`INSDC:SRA:platform_id`) before sniffing the schema table name, so runs
+  submitted as plain FASTQ and loaded under the generic
+  `NCBI:SRA:GenericFastq` schema — common for PacBio/ONT — report their real
+  platform (e.g. `PACBIO_SMRT`) instead of `unknown`. The same id feeds the
+  read-structure fallback, so generic-loaded long-read runs resolve to one
+  biological read per spot even without read columns. Schema-based
+  read-structure inference also resolves PacBio and Nanopore *schema-tagged*
+  runs to one biological read per spot instead of erroring out to an untyped
+  fallback, so single-end long-read spots decode with a known read type. The
+  single-end advisory printed for `--split split-3` now also fires for
+  `--split interleaved` and points at `--split split-spot` as the explicit
+  single-file layout. `--seq-defline`'s `$sn` is documented as the
+  platform-native read identifier for PacBio/ONT (e.g. `m64012_.../ccs`,
+  ONT `<uuid> ch=.. start_time=..`); the channel/start-time/ZMW values
+  long-read platforms embed there are substrings of that name rather than
+  separate columns. Adds network-gated integration fixtures for a PacBio
+  SMRT run (SRR38889541) and an Oxford Nanopore run (SRR38892122).
+
 ## 0.3.7 (2026-05-29)
 
 ### Features

@@ -232,6 +232,84 @@ fn ensure_vdb_3418() -> PathBuf {
     path
 }
 
+/// Ensure the SRR38889541 fixture (PacBio SMRT amplicon, ~11 MiB).
+///
+/// A genuine long-read run: 25,000 spots, one biological read per spot,
+/// variable read length (~1.5 kb). Exercises the long-read decode path —
+/// single-read spots through the variable-length READ_LEN column — and the
+/// `--split split-3` single-end advisory (every spot yields exactly one read).
+fn ensure_srr38889541() -> PathBuf {
+    static DOWNLOAD: Once = Once::new();
+    let path = fixtures_dir().join("SRR38889541.sra");
+
+    DOWNLOAD.call_once(|| {
+        if path.exists() {
+            return;
+        }
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+
+        let url = "https://sra-pub-run-odp.s3.amazonaws.com/sra/SRR38889541/SRR38889541";
+        eprintln!("downloading SRR38889541 fixture from {url} ...");
+
+        let resp = reqwest::blocking::get(url)
+            .unwrap_or_else(|e| panic!("failed to download SRR38889541: {e}"));
+        assert!(
+            resp.status().is_success(),
+            "HTTP {} downloading fixture",
+            resp.status()
+        );
+        let bytes = resp.bytes().unwrap();
+        std::fs::write(&path, &bytes).unwrap();
+        eprintln!(
+            "fixture saved to {} ({} bytes)",
+            path.display(),
+            bytes.len()
+        );
+    });
+
+    assert!(path.exists(), "fixture not found at {}", path.display());
+    path
+}
+
+/// Ensure the SRR38892122 fixture (Oxford Nanopore WGS, ~7 MiB).
+///
+/// A genuine long-read run: 1,828 spots, one biological read per spot, with
+/// multi-kilobase reads (the first read is ~9.2 kb). The VDB schema is tagged
+/// `NCBI:SRA:Nanopore`, so `cursor.platform()` reports `OXFORD_NANOPORE` —
+/// covers long-read platform detection plus the single-end decode shape.
+fn ensure_srr38892122() -> PathBuf {
+    static DOWNLOAD: Once = Once::new();
+    let path = fixtures_dir().join("SRR38892122.sra");
+
+    DOWNLOAD.call_once(|| {
+        if path.exists() {
+            return;
+        }
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+
+        let url = "https://sra-pub-run-odp.s3.amazonaws.com/sra/SRR38892122/SRR38892122";
+        eprintln!("downloading SRR38892122 fixture from {url} ...");
+
+        let resp = reqwest::blocking::get(url)
+            .unwrap_or_else(|e| panic!("failed to download SRR38892122: {e}"));
+        assert!(
+            resp.status().is_success(),
+            "HTTP {} downloading fixture",
+            resp.status()
+        );
+        let bytes = resp.bytes().unwrap();
+        std::fs::write(&path, &bytes).unwrap();
+        eprintln!(
+            "fixture saved to {} ({} bytes)",
+            path.display(),
+            bytes.len()
+        );
+    });
+
+    assert!(path.exists(), "fixture not found at {}", path.display());
+    path
+}
+
 /// Build a `PipelineConfig` suitable for testing.
 fn test_config(
     output_dir: &std::path::Path,
@@ -1322,6 +1400,101 @@ fn ls454_platform_is_rejected_end_to_end() {
         files.is_empty(),
         "no FASTQ output should be written for rejected platform, found: {:?}",
         files.iter().map(|e| e.file_name()).collect::<Vec<_>>(),
+    );
+}
+
+#[ignore]
+#[test]
+fn pacbio_long_read_decodes_single_end() {
+    // PacBio SMRT amplicon run: every spot is one biological read, so the
+    // long-read decode path (single read per spot, variable READ_LEN) must
+    // produce exactly `spots_read` reads with split-spot's single output file.
+    use sracha_core::vdb::{KarArchive, VdbCursor};
+
+    let sra_path = ensure_srr38889541();
+
+    // This run was loaded under the generic `NCBI:SRA:GenericFastq` schema
+    // (no platform tag in the schema name), so platform detection must come
+    // from the authoritative `col/PLATFORM/row` numeric id, not schema sniffing.
+    let file = std::fs::File::open(&sra_path).unwrap();
+    let mut archive = KarArchive::open(std::io::BufReader::new(file)).unwrap();
+    let cursor = VdbCursor::open(&mut archive, &sra_path).unwrap();
+    assert_eq!(
+        cursor.platform(),
+        Some("PACBIO_SMRT"),
+        "PacBio PLATFORM column should resolve even under a generic schema",
+    );
+    drop(cursor);
+    drop(archive);
+
+    let tmp = tempfile::tempdir().unwrap();
+    let config = test_config(tmp.path(), SplitMode::SplitSpot, CompressionMode::None);
+
+    let stats = sracha_core::pipeline::run_fastq(&sra_path, Some("SRR38889541"), &config).unwrap();
+
+    assert!(stats.spots_read > 0, "should read at least one spot");
+    assert_eq!(
+        stats.reads_written, stats.spots_read,
+        "long-read run is single-end: one read per spot",
+    );
+    assert_eq!(
+        stats.output_files.len(),
+        1,
+        "split-spot should produce exactly one file",
+    );
+
+    let data = std::fs::read(&stats.output_files[0]).unwrap();
+    assert_valid_fastq(&data);
+}
+
+#[ignore]
+#[test]
+fn nanopore_platform_detected_and_decodes_single_end() {
+    // Oxford Nanopore WGS run. Two things to lock in: (1) the VDB schema is
+    // tagged `NCBI:SRA:Nanopore`, so the cursor must report OXFORD_NANOPORE;
+    // (2) the run is single-end with multi-kilobase reads.
+    use sracha_core::vdb::{KarArchive, VdbCursor};
+
+    let sra_path = ensure_srr38892122();
+
+    // (1) Platform detection straight from the archive metadata.
+    let file = std::fs::File::open(&sra_path).unwrap();
+    let mut archive = KarArchive::open(std::io::BufReader::new(file)).unwrap();
+    let cursor = VdbCursor::open(&mut archive, &sra_path).unwrap();
+    assert_eq!(
+        cursor.platform(),
+        Some("OXFORD_NANOPORE"),
+        "Nanopore schema should be detected as OXFORD_NANOPORE",
+    );
+    drop(cursor);
+    drop(archive);
+
+    // (2) Decode: single-end, valid FASTQ, long reads present.
+    let tmp = tempfile::tempdir().unwrap();
+    let config = test_config(tmp.path(), SplitMode::SplitSpot, CompressionMode::None);
+    let stats = sracha_core::pipeline::run_fastq(&sra_path, Some("SRR38892122"), &config).unwrap();
+
+    assert!(stats.spots_read > 0);
+    assert_eq!(
+        stats.reads_written, stats.spots_read,
+        "long-read run is single-end: one read per spot",
+    );
+    assert_eq!(stats.output_files.len(), 1, "split-spot is one file");
+
+    let data = std::fs::read(&stats.output_files[0]).unwrap();
+    assert_valid_fastq(&data);
+    // Long reads: at least one sequence well past short-read length.
+    let max_seq_len = std::str::from_utf8(&data)
+        .unwrap()
+        .lines()
+        .skip(1)
+        .step_by(4)
+        .map(str::len)
+        .max()
+        .unwrap_or(0);
+    assert!(
+        max_seq_len > 1000,
+        "Nanopore reads should be long (>1 kb), got max {max_seq_len}",
     );
 }
 

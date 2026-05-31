@@ -54,9 +54,22 @@ pub fn parse_read_structure(tree_data: &[u8]) -> Result<Vec<ReadDescriptor>, Str
         return Ok(descs);
     }
 
-    // Strategy 3: detect platform from embedded schema text.
-    // The "schema" node contains the full VDB schema which starts with
-    // the table type name (e.g. "NCBI:SRA:Illumina:tbl:phred:v2#1.0.4").
+    // Strategy 3: infer reads-per-spot from the run's platform, as a last
+    // resort when no physical/static read columns exist (e.g. SRA-lite).
+    //
+    // 3a: the authoritative `col/PLATFORM/row` numeric id. This is set even
+    // when the schema table name carries no platform tag — the common case
+    // for PacBio/ONT runs loaded under the generic `NCBI:SRA:GenericFastq`
+    // schema, where 3b below would find nothing.
+    if let Some(nreads) = read_platform_id_column(&nodes)
+        .and_then(platform_id_to_name)
+        .and_then(infer_nreads_from_platform)
+    {
+        return Ok(biological_descs(nreads));
+    }
+
+    // 3b: platform tag embedded in the schema table name (e.g.
+    // "NCBI:SRA:Illumina:tbl:phred:v2#1.0.4").
     for node in &nodes {
         if node.name == "schema" {
             // The table type name is typically stored as an attribute of
@@ -64,25 +77,13 @@ pub fn parse_read_structure(tree_data: &[u8]) -> Result<Vec<ReadDescriptor>, Str
             for (_, attr_val) in &node.attrs {
                 let attr_text = String::from_utf8_lossy(attr_val);
                 if let Some(nreads) = infer_nreads_from_schema(&attr_text) {
-                    let descs = (0..nreads)
-                        .map(|_| ReadDescriptor {
-                            read_type: b'B',
-                            read_len: 0,
-                        })
-                        .collect();
-                    return Ok(descs);
+                    return Ok(biological_descs(nreads));
                 }
             }
             // Also check the value text.
             let schema_text = String::from_utf8_lossy(&node.value);
             if let Some(nreads) = infer_nreads_from_schema(&schema_text) {
-                let descs = (0..nreads)
-                    .map(|_| ReadDescriptor {
-                        read_type: b'B',
-                        read_len: 0,
-                    })
-                    .collect();
-                return Ok(descs);
+                return Ok(biological_descs(nreads));
             }
         }
     }
@@ -231,13 +232,52 @@ pub fn detect_platform_from_schema(schema_text: &str) -> Option<String> {
     None
 }
 
-/// Infer reads-per-spot from the schema table name.
-fn infer_nreads_from_schema(schema_text: &str) -> Option<usize> {
-    if schema_text.contains("Illumina") {
-        tracing::debug!("metadata: schema indicates Illumina platform, assuming nreads=2");
-        return Some(2);
+/// Build `n` biological read descriptors of unknown length. Used by the
+/// Strategy-3 platform fallbacks, where only the read *count* is known and
+/// per-read lengths come from `spot_len / nreads` downstream.
+fn biological_descs(n: usize) -> Vec<ReadDescriptor> {
+    (0..n)
+        .map(|_| ReadDescriptor {
+            read_type: b'B',
+            read_len: 0,
+        })
+        .collect()
+}
+
+/// Default reads-per-spot implied by a known platform.
+///
+/// Used only as a last-resort fallback (Strategy 3) when neither physical
+/// `READ_LEN` nor static `col/READ_TYPE` columns are present. The mapping is
+/// deliberately conservative — it asserts a read count only for platforms
+/// whose spot structure is fixed by the technology:
+///
+/// - **Illumina** → 2. Paired-end is the overwhelming default and SRA-lite
+///   Illumina runs routinely drop the physical columns this would otherwise
+///   read; assuming 2 matches fasterq-dump's behaviour on those runs.
+/// - **PacBio / Oxford Nanopore** → 1. Long-read platforms emit a single
+///   biological read per spot (one ZMW/CCS read, one nanopore strand). Without
+///   this, such runs hit the "no read structure found" error and fall through
+///   to `meta_rps = 1` anyway — but only after losing the read *type*, so the
+///   spot would be treated as untyped rather than a known single biological
+///   read. Asserting it here keeps `metadata_read_types()` meaningful and lets
+///   the split-mode advisor (see `pipeline`) recognise the run as single-read.
+fn infer_nreads_from_platform(name: &str) -> Option<usize> {
+    match name {
+        "ILLUMINA" => Some(2),
+        "PACBIO_SMRT" | "OXFORD_NANOPORE" => Some(1),
+        _ => None,
     }
-    None
+}
+
+/// Infer reads-per-spot from the schema table name, by mapping it to a
+/// platform first. Thin wrapper over [`infer_nreads_from_platform`] so the
+/// schema-string and `PLATFORM`-column fallbacks stay in lock-step.
+fn infer_nreads_from_schema(schema_text: &str) -> Option<usize> {
+    let nreads = detect_platform_from_schema(schema_text)
+        .as_deref()
+        .and_then(infer_nreads_from_platform)?;
+    tracing::debug!("metadata: schema implies platform nreads={nreads}");
+    Some(nreads)
 }
 
 /// Detect whether a run is an SRA-Lite (quality-stripped, synthesized-on-read)
@@ -266,12 +306,58 @@ pub fn detect_sra_lite(tree_data: &[u8]) -> bool {
     false
 }
 
+/// Map an `INSDC:SRA:platform_id` enum value to sracha's canonical platform
+/// name. The enum is defined by NCBI in `interfaces/insdc/sra.vschema` and has
+/// been stable for years; we mirror the well-established values and reuse the
+/// exact strings sracha matches on elsewhere (e.g. `UNSUPPORTED_PLATFORMS`).
+///
+/// `0` (UNDEFINED) and any unmapped/newer id return `None` so the caller falls
+/// back to schema-name sniffing rather than asserting a wrong platform.
+fn platform_id_to_name(id: u8) -> Option<&'static str> {
+    Some(match id {
+        1 => "LS454",
+        2 => "ILLUMINA",
+        3 => "ABI_SOLID",
+        4 => "COMPLETE_GENOMICS",
+        5 => "HELICOS",
+        6 => "PACBIO_SMRT",
+        7 => "ION_TORRENT",
+        8 => "CAPILLARY",
+        9 => "OXFORD_NANOPORE",
+        10 => "DNBSEQ",
+        11 => "ELEMENT",
+        _ => return None,
+    })
+}
+
+/// Read the run's platform id from the static `col/PLATFORM/row` column.
+///
+/// VDB stores the sequencing platform as a single `INSDC:SRA:platform_id` (U8)
+/// in this static column — the authoritative source `vdb`/`fasterq-dump` read.
+/// It is present even when the table's *schema name* carries no platform tag,
+/// which is the common case for PacBio/ONT runs submitted as plain FASTQ and
+/// loaded under the generic `NCBI:SRA:GenericFastq` schema. Returns the first
+/// byte (platform is constant per run); `None` when the column is absent/empty.
+fn read_platform_id_column(nodes: &[MetaNode]) -> Option<u8> {
+    let col = nodes.iter().find(|n| n.name == "col")?;
+    let platform = find_meta_node(&col.children, "PLATFORM/row")?;
+    platform.value.first().copied()
+}
+
 /// Detect the sequencing platform from VDB metadata.
 ///
-/// Examines the schema node for platform-identifying strings.
-/// Returns `None` if the platform cannot be determined.
+/// Prefers the authoritative `col/PLATFORM/row` numeric id (set even on
+/// generic-FASTQ-loaded runs), then falls back to sniffing the schema table
+/// name for a platform tag. Returns `None` if neither yields a known platform.
 pub fn detect_platform(tree_data: &[u8]) -> Option<String> {
     let nodes = parse_meta_nodes(tree_data).ok()?;
+
+    // Authoritative: the numeric platform id column.
+    if let Some(name) = read_platform_id_column(&nodes).and_then(platform_id_to_name) {
+        return Some(name.to_string());
+    }
+
+    // Fallback: platform tag embedded in the schema table name.
     for node in &nodes {
         if node.name == "schema" {
             for (_, attr_val) in &node.attrs {
@@ -716,6 +802,68 @@ pub(crate) mod tests {
     }
 
     // -----------------------------------------------------------------------
+    // PLATFORM column detection (INSDC:SRA:platform_id)
+    // -----------------------------------------------------------------------
+
+    /// Build a metadata tree with a `col/PLATFORM/row` byte, optionally
+    /// alongside a `schema` node carrying `schema_name`.
+    fn platform_col_tree(platform_id: u8, schema_name: Option<&[u8]>) -> Vec<u8> {
+        let row = build_meta_node("row", &[platform_id], None);
+        let platform = build_meta_node_with_children("PLATFORM", b"", &[&row], None);
+        let col = build_meta_node_with_children("col", b"", &[&platform], None);
+        match schema_name {
+            Some(name) => {
+                let attrs = build_attrs_pbstree(&[("name", name)]);
+                let schema = build_meta_node("schema", b"", Some(&attrs));
+                build_pbstree(&[&col, &schema])
+            }
+            None => build_pbstree(&[&col]),
+        }
+    }
+
+    #[test]
+    fn platform_id_to_name_mapping() {
+        assert_eq!(platform_id_to_name(2), Some("ILLUMINA"));
+        assert_eq!(platform_id_to_name(6), Some("PACBIO_SMRT"));
+        assert_eq!(platform_id_to_name(9), Some("OXFORD_NANOPORE"));
+        // UNDEFINED and unmapped/newer ids fall through to schema sniffing.
+        assert_eq!(platform_id_to_name(0), None);
+        assert_eq!(platform_id_to_name(200), None);
+    }
+
+    #[test]
+    fn detect_platform_from_platform_column() {
+        // PacBio run loaded under a generic schema: the schema name has no
+        // platform tag, but the PLATFORM column (id 6) is authoritative.
+        let tree = platform_col_tree(6, Some(b"NCBI:SRA:GenericFastq:sequence#2"));
+        assert_eq!(detect_platform(&tree), Some("PACBIO_SMRT".into()));
+    }
+
+    #[test]
+    fn detect_platform_column_beats_schema() {
+        // If they ever disagree, the numeric column wins.
+        let tree = platform_col_tree(9, Some(b"NCBI:SRA:Illumina:tbl:phred:v2"));
+        assert_eq!(detect_platform(&tree), Some("OXFORD_NANOPORE".into()));
+    }
+
+    #[test]
+    fn detect_platform_falls_back_to_schema_when_id_unmapped() {
+        // PLATFORM id 0 (UNDEFINED) → ignore column, use schema tag.
+        let tree = platform_col_tree(0, Some(b"NCBI:SRA:Illumina:tbl:phred:v2"));
+        assert_eq!(detect_platform(&tree), Some("ILLUMINA".into()));
+    }
+
+    #[test]
+    fn read_structure_from_platform_column() {
+        // Generic-loaded PacBio with no read columns: Strategy 3a reads the
+        // PLATFORM column and infers one biological read per spot.
+        let tree = platform_col_tree(6, Some(b"NCBI:SRA:GenericFastq:sequence#2"));
+        let descs = parse_read_structure(&tree).unwrap();
+        assert_eq!(descs.len(), 1);
+        assert_eq!(descs[0].read_type, b'B');
+    }
+
+    // -----------------------------------------------------------------------
     // is_aligned_database_schema
     // -----------------------------------------------------------------------
 
@@ -761,8 +909,19 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn infer_nreads_non_illumina() {
-        assert_eq!(infer_nreads_from_schema("NCBI:SRA:PacBio:tbl:v2"), None);
+    fn infer_nreads_long_read() {
+        // Long-read platforms emit one biological read per spot.
+        assert_eq!(infer_nreads_from_schema("NCBI:SRA:PacBio:tbl:v2"), Some(1));
+        assert_eq!(
+            infer_nreads_from_schema("NCBI:SRA:Nanopore:tbl:v2"),
+            Some(1)
+        );
+    }
+
+    #[test]
+    fn infer_nreads_unknown_platform() {
+        // Platforms with no fixed spot structure stay unasserted.
+        assert_eq!(infer_nreads_from_schema("NCBI:SRA:IonTorrent:tbl:v2"), None);
     }
 
     #[test]

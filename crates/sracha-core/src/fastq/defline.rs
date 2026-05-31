@@ -16,6 +16,16 @@
 //! | `$sn` | spot name    |
 //! | `$rl` | read length  |
 //!
+//! `$sn` resolves to the run's `NAME`/`SPOT_NAME` column. For Illumina that is
+//! the reconstructed instrument name (`M05881:542:...`); for long-read
+//! platforms (PacBio, Oxford Nanopore) it is the platform-native read
+//! identifier as submitted — e.g. PacBio `m64012_.../ccs` or an ONT
+//! `<uuid> runid=.. read=.. ch=.. start_time=..` string. The channel /
+//! start-time / ZMW fields ONT and PacBio embed there are substrings of that
+//! one name, not separate VDB columns, so they are exposed only as part of
+//! `$sn` (which is also the default header's description field) rather than as
+//! standalone variables.
+//!
 //! `$$` emits a literal `$`. A leading `@`/`>` is accepted (so `fasterq-dump`
 //! templates like `@$ac.$si.$ri` paste in unchanged) but stripped — the record
 //! prefix is added by the formatter (`@` for FASTQ, `>` for FASTA). `$sg`
@@ -215,6 +225,22 @@ mod tests {
     fn substitutes_all_variables() {
         let t = DeflineTemplate::parse("$ac/$si/$ri/$sn/$rl").unwrap();
         assert_eq!(body(&t, Some(b"NAME")), "SRR000001/42/1/NAME/4");
+    }
+
+    #[test]
+    fn spot_name_carries_long_read_native_id() {
+        // For PacBio/ONT the NAME column holds the platform-native read id;
+        // $sn must pass it through verbatim (spaces, slashes, key=value all).
+        let t = DeflineTemplate::parse("@$ac.$si $sn").unwrap();
+        assert_eq!(
+            body(&t, Some(b"m64012_200723_165033/ccs")),
+            "SRR000001.42 m64012_200723_165033/ccs"
+        );
+        let ont = DeflineTemplate::parse("$sn").unwrap();
+        assert_eq!(
+            body(&ont, Some(b"abc-uuid runid=r1 read=123 ch=42")),
+            "abc-uuid runid=r1 read=123 ch=42"
+        );
     }
 
     #[test]
