@@ -1358,6 +1358,112 @@ fn ctrl_c_before_decode_aborts_with_cancelled_error() {
     assert!(cancelled.load(Ordering::Relaxed));
 }
 
+/// Build a `ResolvedAccession` pointing at an unreachable mirror. Used by the
+/// download-cancel tests below, where a pre-flipped cancel flag wins the
+/// `tokio::select!` before any network I/O is attempted, so the URL is never
+/// actually fetched.
+fn resolved_for_cancel(acc: &str) -> sracha_core::sdl::ResolvedAccession {
+    use sracha_core::sdl::{ResolvedAccession, ResolvedFile, ResolvedMirror};
+    ResolvedAccession {
+        accession: acc.to_string(),
+        sra_file: ResolvedFile {
+            mirrors: vec![ResolvedMirror {
+                url: "http://127.0.0.1:1/file".to_string(),
+                service: "ncbi".to_string(),
+            }],
+            size: 1024,
+            md5: None,
+            is_lite: false,
+        },
+        vdbcache_file: None,
+        run_info: None,
+    }
+}
+
+/// Regression guard for the resume contract: a graceful Ctrl-C *during the
+/// download phase* (non-stdout) must NOT delete the partial `.sra` or its
+/// `.sracha-progress` sidecar — the next run resumes from them. Commit
+/// 83de2c9 once added a `remove_file` pair here that silently defeated resume
+/// and made the "next run will skip download" message a lie. This test fails
+/// if those deletions ever come back.
+#[test]
+fn download_cancel_keeps_partial_and_sidecar_for_resume() {
+    use std::sync::Arc;
+    use std::sync::atomic::AtomicBool;
+
+    let out = tempfile::tempdir().unwrap();
+    let acc = "SRR000001";
+
+    // Stand in for a prior interrupted download: a partial .sra plus the
+    // sidecar that `download_file` writes alongside it. The sidecar name
+    // mirrors `download::progress_path` (`.{filename}.sracha-progress`), which
+    // is crate-private, so it's spelled out here.
+    let temp_path = out.path().join(format!(".sracha-tmp-{acc}.sra"));
+    let sidecar = out
+        .path()
+        .join(format!("..sracha-tmp-{acc}.sra.sracha-progress"));
+    std::fs::write(&temp_path, b"partial bytes").unwrap();
+    std::fs::write(&sidecar, b"{}").unwrap();
+
+    let resolved = resolved_for_cancel(acc);
+    let mut config = test_config(out.path(), SplitMode::Split3, CompressionMode::None);
+    config.force = false; // don't wipe the (nonexistent) completion marker
+    config.cancelled = Some(Arc::new(AtomicBool::new(true)));
+
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    let result = rt.block_on(sracha_core::pipeline::download_sra(&resolved, &config));
+
+    assert!(
+        matches!(result, Err(sracha_core::error::Error::Cancelled { .. })),
+        "pre-cancelled download must return Error::Cancelled",
+    );
+    assert!(temp_path.exists(), "partial .sra must be kept for resume");
+    assert!(sidecar.exists(), "progress sidecar must be kept for resume");
+}
+
+/// Counterpart to the resume test: `--stdout` streams with no on-disk artifact,
+/// so a download-phase cancel there *must* wipe the partial + sidecar, matching
+/// the stdout decode-phase cleanup.
+#[test]
+fn download_cancel_stdout_discards_partial_and_sidecar() {
+    use std::sync::Arc;
+    use std::sync::atomic::AtomicBool;
+
+    let out = tempfile::tempdir().unwrap();
+    let acc = "SRR000001";
+    let temp_path = out.path().join(format!(".sracha-tmp-{acc}.sra"));
+    let sidecar = out
+        .path()
+        .join(format!("..sracha-tmp-{acc}.sra.sracha-progress"));
+    std::fs::write(&temp_path, b"partial bytes").unwrap();
+    std::fs::write(&sidecar, b"{}").unwrap();
+
+    let resolved = resolved_for_cancel(acc);
+    let mut config = test_config(out.path(), SplitMode::Split3, CompressionMode::None);
+    config.force = false;
+    config.stdout = true;
+    config.cancelled = Some(Arc::new(AtomicBool::new(true)));
+
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    let result = rt.block_on(sracha_core::pipeline::download_sra(&resolved, &config));
+
+    assert!(
+        matches!(result, Err(sracha_core::error::Error::Cancelled { .. })),
+        "pre-cancelled stdout download must return Error::Cancelled",
+    );
+    assert!(
+        !temp_path.exists(),
+        "stdout cancel must discard the partial .sra"
+    );
+    assert!(!sidecar.exists(), "stdout cancel must discard the sidecar");
+}
+
 #[ignore]
 #[test]
 fn ls454_platform_is_rejected_end_to_end() {
