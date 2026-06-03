@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+## 0.3.8 (2026-06-03)
+
 ### Performance
 
 - Sharply lower peak memory during FASTQ decode of runs with many blobs
