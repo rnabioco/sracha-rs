@@ -564,8 +564,25 @@ fn decode_and_write(
         None
     };
 
-    /// Number of blobs per batch for parallel decode.
-    const BATCH_SIZE: usize = 1024;
+    // Number of blobs per parallel-decode batch.
+    //
+    // Each decoded blob holds its formatted FASTQ output in memory until the
+    // writer drains it, so `batch_size` — together with `QUEUED_BATCHES` —
+    // bounds peak RSS *independent of run size*. A fixed 1024-blob batch let
+    // large full-quality runs (multi-MiB blob outputs) buffer tens of GiB
+    // before the writer saw the first byte (issue #54: SRR36401016 used
+    // 19.4 GiB at `-t 1`).
+    //
+    // Scale modestly with thread count so the decode pool stays busy between
+    // per-batch barriers on many-core machines, but cap it so memory stays in
+    // the low-GiB range. Peak formatted-output RSS is roughly
+    // `(QUEUED_BATCHES + 2) * batch_size * avg_blob_output_bytes`.
+    let batch_size = (num_threads * 8).clamp(64, 256);
+
+    /// Decode batches the producer may queue ahead of the writer. One batch of
+    /// slack lets the decode pool work on batch N+1 while the writer drains
+    /// batch N; more than that mostly inflates RSS on large runs (issue #54).
+    const QUEUED_BATCHES: usize = 1;
 
     // ------------------------------------------------------------------
     // Pipelined decode → write.
@@ -575,11 +592,12 @@ fn decode_and_write(
     // decode pool is already working on batch N+1.
     // ------------------------------------------------------------------
     type FormattedBlob = (Vec<BlobSlotOutput>, u64);
-    // Bounded channel gives the decode pool slack when writer batch time
-    // varies. Capacity 4 costs at most 4×BATCH_SIZE formatted blobs of
-    // memory — bounded, and measurably better than 2 on variable-sized
-    // writer work (e.g. gzip vs plain).
-    let (batch_tx, batch_rx) = crossbeam_channel::bounded::<Vec<Result<FormattedBlob>>>(4);
+    // Bounded channel gives the decode pool one batch of slack while the writer
+    // drains the previous batch. Capacity is the dominant lever on formatted
+    // FASTQ queued ahead of the writer — the main RSS source on large
+    // full-quality runs (issue #54) — so keep it tight.
+    let (batch_tx, batch_rx) =
+        crossbeam_channel::bounded::<Vec<Result<FormattedBlob>>>(QUEUED_BATCHES);
 
     // Rebind the shared state the writer thread touches as explicit
     // `&mut` / `&` references BEFORE the scope, then the writer's `move`
@@ -662,9 +680,9 @@ fn decode_and_write(
         // `cumulative_spots` tracks the total number of spots in blobs 0..blob_idx
         // so each batch can compute `spots_before_per_blob` deterministically
         // from blob metadata alone. Reading `spots_read` here would race with
-        // the writer thread on archives with more than `BATCH_SIZE` (1024)
-        // blobs — the bounded channel of capacity 4 lets the decoder queue
-        // four batches ahead of the writer, and the writer's fetch_add on
+        // the writer thread on archives with more than `batch_size`
+        // blobs — the bounded channel lets the decoder queue batches ahead
+        // of the writer, and the writer's fetch_add on
         // `spots_read` doesn't happen until it has processed a batch.
         // DRR045255 (3658 blobs) used to emit `spots_before=0` for batch 2
         // onwards, resetting the FASTQ defline spot number to 1.
@@ -677,7 +695,7 @@ fn decode_and_write(
                 break;
             }
 
-            let batch_end = (blob_idx + BATCH_SIZE).min(num_blobs);
+            let batch_end = (blob_idx + batch_size).min(num_blobs);
 
             let blob_id_ranges: Vec<u32> = (blob_idx..batch_end)
                 .map(|bi| cursor.read_col().blobs()[bi].id_range)
@@ -1114,7 +1132,7 @@ mod batch_spots_tests {
 
     #[test]
     fn second_batch_continues_from_cumulative() {
-        // Regression for the BATCH_SIZE=1024 race: batch 2's per-blob
+        // Regression for the multi-batch decode race: batch 2's per-blob
         // offsets must pick up from the running total at the end of
         // batch 1, not from a stale `spots_read` atomic that the writer
         // thread hadn't yet updated via `fetch_add`.
