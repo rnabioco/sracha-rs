@@ -43,12 +43,30 @@ impl Stride {
     }
 }
 
-/// Stride rule shared by `trans_off`, PBSTree `data_idx`, and the
-/// dad/child arrays — all keyed off the size of the addressed region.
+/// Stride rule for `trans_off`, keyed off the size of the addressed region.
+/// `trans_off` entries are stored in units of 4 bytes (the persisted offsets
+/// are `byte_offset / 4`), so a u8 entry addresses up to `256 * 4` bytes.
 fn stride_for_data_size(data_size: u64) -> Stride {
     if data_size <= 256 * 4 {
         Stride::U8
     } else if data_size <= 65536 * 4 {
+        Stride::U16
+    } else {
+        Stride::U32
+    }
+}
+
+/// Stride rule for a PBSTree's `data_idx` array. Unlike `trans_off`, these
+/// entries are RAW byte offsets into the node-data region (no `/4` scaling),
+/// so a u8 entry only addresses up to 256 bytes. Matches ncbi-vdb's
+/// `PBSTreeImplGetVTable` (`data_size <= 256 → 8-bit, <= 65536 → 16-bit,
+/// else 32-bit`). Using the `trans_off` thresholds here silently mis-strides
+/// any node-data region in `(256, 1024]` bytes (e.g. a PacBio Revio skey
+/// transition with a 1013-byte payload), corrupting every offset.
+fn stride_for_pbstree_data(data_size: u64) -> Stride {
+    if data_size <= 256 {
+        Stride::U8
+    } else if data_size <= 65536 {
         Stride::U16
     } else {
         Stride::U32
@@ -448,7 +466,7 @@ fn parse_pbstree(buf: &[u8]) -> Option<Vec<Vec<u8>>> {
     if num_nodes == 0 {
         return Some(Vec::new());
     }
-    let stride = stride_for_data_size(data_size);
+    let stride = stride_for_pbstree_data(data_size);
     let idx_start = 8;
     let idx_bytes = (num_nodes as usize) * stride.bytes();
     if idx_start + idx_bytes + data_size as usize > buf.len() {
@@ -544,6 +562,13 @@ fn dfs(
 /// Walk the P_Trie at offset 0x28 of `skey_data` and reconstruct a
 /// dense `Vec<Vec<u8>>` indexed by `node_id - 1`. Returns `None` when
 /// the layout doesn't validate (caller falls back to byte-scan).
+/// Byte offset just past the P_Trie image (where the id→node projection
+/// arrays begin). `None` when the skey wrapper / header can't be parsed.
+pub(crate) fn ptrie_image_end(skey_data: &[u8]) -> Option<usize> {
+    let header = parse_header(skey_data)?;
+    Some(header.data_base + header.data_size as usize)
+}
+
 pub(crate) fn parse_ptrie_templates(skey_data: &[u8]) -> Option<Vec<Vec<u8>>> {
     let header = parse_header(skey_data)?;
     if header.num_trans <= 1 {
@@ -633,18 +658,13 @@ pub(crate) fn parse_ptrie_templates(skey_data: &[u8]) -> Option<Vec<Vec<u8>>> {
         templates[i] = t;
     }
 
-    // Validation: at least 50% of populated entries must contain `$X`.
-    // Mirrors the offset-table parser's guard so we fall through to
-    // byte-scan rather than emit garbage on a misparse.
-    let populated: Vec<&Vec<u8>> = templates.iter().filter(|t| !t.is_empty()).collect();
-    if populated.is_empty() {
-        return None;
-    }
-    let with_placeholder = populated
-        .iter()
-        .filter(|t| t.windows(2).any(|w| w == b"$X"))
-        .count();
-    if with_placeholder * 2 < populated.len() {
+    // Reject an all-empty walk (misparse) so the caller can fall back to the
+    // byte-scan heuristic. Unlike the older guard here, we do NOT require a
+    // `$X` placeholder: Illumina name templates carry one, but PacBio/ONT
+    // GenericFastq runs store full per-read names (no placeholder) in the same
+    // PTrie, and the walker — once the PBSTree stride is correct — reconstructs
+    // both faithfully.
+    if templates.iter().all(|t| t.is_empty()) {
         return None;
     }
 
@@ -668,6 +688,24 @@ mod tests {
         assert_eq!(stride_for_num_trans(257), Stride::U16);
         assert_eq!(stride_for_num_trans(65536), Stride::U16);
         assert_eq!(stride_for_num_trans(65537), Stride::U32);
+    }
+
+    #[test]
+    fn pbstree_stride_uses_raw_byte_thresholds() {
+        // PBSTree data_idx entries are RAW byte offsets, so the u8/u16/u32
+        // boundary is 256 / 65536 — NOT the `* 4`-scaled boundary that
+        // `trans_off` (offset-in-4-byte-units) uses. The (256, 1024] window is
+        // exactly where the two disagree: a 1013-byte node-data region (real
+        // PacBio Revio skey) needs u16 offsets, and using u8 there silently
+        // corrupts every offset.
+        assert_eq!(stride_for_pbstree_data(256), Stride::U8);
+        assert_eq!(stride_for_pbstree_data(257), Stride::U16);
+        assert_eq!(stride_for_pbstree_data(1013), Stride::U16);
+        assert_eq!(stride_for_pbstree_data(1024), Stride::U16);
+        assert_eq!(stride_for_pbstree_data(65536), Stride::U16);
+        assert_eq!(stride_for_pbstree_data(65537), Stride::U32);
+        // Contrast with the trans_off rule, which stays u8 through 1024.
+        assert_eq!(stride_for_data_size(1013), Stride::U8);
     }
 
     #[test]

@@ -1551,6 +1551,17 @@ fn pacbio_long_read_decodes_single_end() {
 
     let data = std::fs::read(&stats.output_files[0]).unwrap();
     assert_valid_fastq(&data);
+
+    // The native PacBio CCS read name (`<movie>/<zmw>/ccs`) is stored only in
+    // the skey text index (no physical NAME column on sharq-loaded
+    // GenericFastq runs). It must be reconstructed so the defline matches
+    // fasterq-dump instead of falling back to the bare spot number.
+    let first_line = std::str::from_utf8(&data).unwrap().lines().next().unwrap();
+    assert!(
+        first_line.contains("m84161_260513_202306_s2/208934487/ccs"),
+        "PacBio defline should carry the native CCS read name from the skey \
+         index, got: {first_line}",
+    );
 }
 
 #[ignore]
@@ -1601,6 +1612,16 @@ fn nanopore_platform_detected_and_decodes_single_end() {
     assert!(
         max_seq_len > 1000,
         "Nanopore reads should be long (>1 kb), got max {max_seq_len}",
+    );
+
+    // The native ONT read UUID lives only in the skey text index; it must be
+    // reconstructed into the defline (matching fasterq-dump) rather than
+    // falling back to the spot number.
+    let first_line = std::str::from_utf8(&data).unwrap().lines().next().unwrap();
+    assert!(
+        first_line.contains("ec840866-cfb3-4b95-9efb-f59d64d96de1"),
+        "Nanopore defline should carry the native read UUID from the skey \
+         index, got: {first_line}",
     );
 }
 

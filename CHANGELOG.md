@@ -58,6 +58,18 @@
   blob whose bytes happen to parse as a tiny deflate stream (PacBio CONSENSUS
   READ) is now recognised as raw when its size matches the expected packed base
   count, rather than being collapsed to a few bytes.
+- Reconstruct native long-read names for PacBio Revio and Oxford Nanopore
+  `GenericFastq` (sharq-loaded) runs, which store the read id
+  (`<movie>/<zmw>/ccs`, or an ONT UUID) entirely in the `skey` text index with
+  no physical NAME column. Two parts: (1) the PBSTree `data_idx` stride now uses
+  raw-byte width thresholds (`≤256→u8, ≤65536→u16`) instead of `trans_off`'s
+  `×4`-scaled thresholds, which silently corrupted any node-data region in the
+  `(256, 1024]`-byte window (e.g. a Revio skey transition with a 1013-byte
+  payload); (2) the dense (one-key-per-row) text-index projection
+  (`KPTrieIndex_v2` variant 0: `[count][ord2node]`) is now decoded to map each
+  spot to its trie node, so deflines carry the native name and match
+  fasterq-dump byte-for-byte (SRR38889541, SRR38892122) instead of falling back
+  to the spot number.
 
 ## 0.3.7 (2026-05-29)
 
