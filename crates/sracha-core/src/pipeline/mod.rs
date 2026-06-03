@@ -403,6 +403,24 @@ fn decode_and_write(
             (Vec::new(), Vec::new())
         };
 
+    // Native long-read names (PacBio/ONT GenericFastq runs): when there is no
+    // physical NAME column and no Illumina X/Y reconstruction, the read id
+    // (e.g. `m84161_.../208934487/ccs`, or an ONT UUID) lives in the skey text
+    // index. Recover one name per spot so default deflines carry the native id
+    // (matching fasterq-dump) instead of falling back to the spot number.
+    let skey_spot_names: Option<Vec<Vec<u8>>> =
+        if cursor.name_col().is_none() && !cursor.has_illumina_name_parts() {
+            VdbCursor::load_skey_spot_names(&mut archive)
+        } else {
+            None
+        };
+    if let Some(ref names) = skey_spot_names {
+        tracing::info!(
+            "{accession}: reconstructed {} native read names from skey index",
+            names.len()
+        );
+    }
+
     // ------------------------------------------------------------------
     // Batch-parallel blob decode and FASTQ output.
     //
@@ -688,6 +706,7 @@ fn decode_and_write(
             is_lite,
             read_cs,
             has_name_column: table != "CONSENSUS",
+            skey_spot_names: skey_spot_names.as_deref(),
         };
 
         // ---- Decode loop (main thread) ----

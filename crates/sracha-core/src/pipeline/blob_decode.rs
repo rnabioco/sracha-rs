@@ -275,6 +275,11 @@ pub(crate) struct BlobDecodeCtx<'a> {
     /// (PacBio/ONT CONSENSUS, which has no NAME column) it is omitted, matching
     /// fasterq-dump's `DSD_FASTQ_NO_NAME` template.
     pub(crate) has_name_column: bool,
+    /// Native per-spot read names recovered from the skey text index, in
+    /// global row order, for PacBio/ONT `GenericFastq` runs that have no
+    /// physical NAME column and no X/Y coordinates. `None` for every other
+    /// run. Each blob slices its own spot range out of this.
+    pub(crate) skey_spot_names: Option<&'a [Vec<u8>]>,
 }
 
 /// Decode the ALTREAD blob (when present) and merge its per-base 4na
@@ -525,6 +530,7 @@ pub(crate) fn decode_blob_to_fastq(
         is_lite,
         read_cs,
         has_name_column,
+        skey_spot_names,
     } = *ctx;
     // ------------------------------------------------------------------
     // Decode READ blob -> 2na -> ASCII bases.
@@ -1087,6 +1093,30 @@ pub(crate) fn decode_blob_to_fastq(
         }
     } else {
         spot_names
+    };
+
+    // ------------------------------------------------------------------
+    // Native long-read names from the skey text index (PacBio/ONT
+    // GenericFastq runs with no physical NAME column and no X/Y). The names
+    // are global and row-ordered; slice out this blob's spot range.
+    // ------------------------------------------------------------------
+    let spot_names: Option<FlatBytes> = match (spot_names, skey_spot_names) {
+        (None, Some(global)) => {
+            let num_spots = read_lengths
+                .len()
+                .checked_div(reads_per_spot)
+                .unwrap_or(read_lengths.len());
+            let start = (spots_before as usize).min(global.len());
+            let end = (start + num_spots).min(global.len());
+            let slice = &global[start..end];
+            let total: usize = slice.iter().map(|n| n.len()).sum();
+            let mut names = FlatBytes::with_capacity(slice.len(), total);
+            for n in slice {
+                names.push(n);
+            }
+            Some(names)
+        }
+        (other, _) => other,
     };
 
     // ------------------------------------------------------------------

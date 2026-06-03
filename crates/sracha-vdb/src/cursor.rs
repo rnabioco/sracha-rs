@@ -334,6 +334,79 @@ impl VdbCursor {
     // (helpers `parse_skey_offset_table` / `parse_skey_byte_scan` defined
     // at module scope below.)
 
+    /// Reconstruct the native per-spot read name from the skey text index for
+    /// runs that have **no physical NAME column** — PacBio/ONT `GenericFastq`
+    /// runs (sharq-loaded) store the read id (e.g. `m84161_.../208934487/ccs`,
+    /// or an ONT UUID) entirely in the `skey` index rather than in
+    /// `NAME`/`SPOT_NAME`.
+    ///
+    /// Returns one name per spot in row order (`names[spot_id - first]`), or
+    /// `None` when the index isn't a decodable dense text projection.
+    ///
+    /// On-disk layout (NCBI `KPTrieIndex_v2`, dense / "variant 0"):
+    ///   `[ P_Trie image ][ count: u32 ][ ord2node: u32 × count ]`
+    /// The trie maps `node_id → name` (recovered by
+    /// [`crate::ptrie::parse_ptrie_templates`]); the dense projection stores,
+    /// for each id in `[first, last]`, the trie node holding that row's name
+    /// (`ord = id - first + 1`, `node = ord2node[ord - 1]`). The id→ord step is
+    /// the identity here because every row has its own key, so no packed
+    /// `id2ord` table follows. See ncbi-vdb `libs/kdb/rtrieidx-v2.c`.
+    pub fn load_skey_spot_names<R: Read + Seek>(
+        archive: &mut KarArchive<R>,
+    ) -> Option<Vec<Vec<u8>>> {
+        let skey = archive
+            .read_file("tbl/SEQUENCE/idx/skey")
+            .or_else(|_| archive.read_file("idx/skey"))
+            .ok()?;
+        if skey.len() < 40 {
+            return None;
+        }
+        // v3/v4 header: first @16, last @24 (i64 LE).
+        let version = u32::from_le_bytes(skey[4..8].try_into().ok()?);
+        if !(version == 3 || version == 4) {
+            return None;
+        }
+        let first = i64::from_le_bytes(skey[16..24].try_into().ok()?);
+        let last = i64::from_le_bytes(skey[24..32].try_into().ok()?);
+        if last < first {
+            return None;
+        }
+        let count = (last - first + 1) as usize;
+
+        // node_id → name (the PTrie walker places each at `templates[node-1]`).
+        let templates = crate::ptrie::parse_ptrie_templates(&skey)?;
+        let proj_start = crate::ptrie::ptrie_image_end(&skey)?;
+
+        // Dense projection: a leading `count` u32 then `count` u32 ord2node
+        // entries, with no trailing packed id2ord table.
+        if proj_start + 4 + count * 4 > skey.len() {
+            return None;
+        }
+        let lead = u32::from_le_bytes(skey[proj_start..proj_start + 4].try_into().ok()?) as usize;
+        if lead != count {
+            // Not the dense one-key-per-row layout (a sparse projection with
+            // shared templates is the Illumina X/Y path in load_name_templates).
+            return None;
+        }
+        let array_start = proj_start + 4;
+
+        let mut names = Vec::with_capacity(count);
+        let mut any = false;
+        for i in 0..count {
+            let off = array_start + i * 4;
+            let node = u32::from_le_bytes(skey[off..off + 4].try_into().ok()?) as usize;
+            let name = match node.checked_sub(1).and_then(|n| templates.get(n)) {
+                Some(t) if !t.is_empty() => {
+                    any = true;
+                    t.clone()
+                }
+                _ => Vec::new(),
+            };
+            names.push(name);
+        }
+        if any { Some(names) } else { None }
+    }
+
     /// Load NAME_FMT templates from the skey index.
     ///
     /// The skey file at `tbl/SEQUENCE/idx/skey` (database layout) or
