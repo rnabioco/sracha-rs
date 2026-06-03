@@ -44,11 +44,13 @@ pub use config::{PipelineConfig, PipelineStats};
 // ---------------------------------------------------------------------------
 
 mod blob_decode;
+mod byte_budget;
 mod marker;
 mod validate;
 use blob_decode::{
     BlobDecodeCtx, RawBlobData, decode_blob_to_fastq, decode_raw, decode_zip_encoding,
 };
+use byte_budget::ByteBudget;
 use marker::{
     StatsEntry, check_completion_marker, marker_path, write_completion_marker, write_stats_file,
 };
@@ -564,22 +566,45 @@ fn decode_and_write(
         None
     };
 
-    /// Number of blobs per batch for parallel decode.
-    const BATCH_SIZE: usize = 1024;
+    // Number of blobs decoded in parallel per wave. This is the *materialized*
+    // working set the `par_iter().collect()` below holds at once, so it is kept
+    // small — a few blobs per thread for work-stealing slack, capped so the
+    // pre-handoff wave stays modest. Memory queued *ahead of the writer* is
+    // bounded separately, by bytes, via `ByteBudget` (see below).
+    let batch_size = (num_threads * 4).clamp(16, 64);
 
     // ------------------------------------------------------------------
-    // Pipelined decode → write.
+    // Pipelined decode → write, with byte-bounded backpressure.
     //
-    // A crossbeam channel decouples the decode loop (producer) from the
-    // write loop (consumer).  While the writer drains batch N, the
-    // decode pool is already working on batch N+1.
-    // ------------------------------------------------------------------
+    // A channel decouples the decode loop (producer) from the writer
+    // (consumer): while the writer drains batch N, the decode pool works on
+    // batch N+1. The channel is *unbounded* — backpressure is applied by
+    // bytes instead of by message count via `ByteBudget`, so the producer can
+    // never get more than ~one batch ahead of the budget regardless of how
+    // many (or how few) messages that represents.
+    //
+    // Why bytes, not blob count: formatted FASTQ per blob varies ~1000× across
+    // runs (short Illumina vs. long-read, full vs. SRA-lite). A fixed
+    // count-based bound buffered ~19 GiB on SRR36401016 (issue #54). A byte
+    // budget self-tunes pipeline depth — deep for small blobs (throughput),
+    // shallow for huge blobs (memory) — under one predictable cap.
     type FormattedBlob = (Vec<BlobSlotOutput>, u64);
-    // Bounded channel gives the decode pool slack when writer batch time
-    // varies. Capacity 4 costs at most 4×BATCH_SIZE formatted blobs of
-    // memory — bounded, and measurably better than 2 on variable-sized
-    // writer work (e.g. gzip vs plain).
-    let (batch_tx, batch_rx) = crossbeam_channel::bounded::<Vec<Result<FormattedBlob>>>(4);
+    // Each message is `(queued_bytes, batch)` so the writer can refund the
+    // exact amount the producer reserved. The producer blocks in
+    // `budget.acquire` before sending, so at most one batch beyond the cap is
+    // ever resident; the unbounded channel therefore never actually piles up.
+    let (batch_tx, batch_rx) = crossbeam_channel::unbounded::<(u64, Vec<Result<FormattedBlob>>)>();
+
+    /// Default cap on formatted FASTQ queued ahead of the writer (256 MiB).
+    /// Peak decode RSS is roughly this plus the in-flight wave
+    /// (`batch_size × per-blob output`), independent of total run size.
+    const DECODE_BUFFER_BYTES: u64 = 256 * 1024 * 1024;
+    let budget = ByteBudget::new(DECODE_BUFFER_BYTES);
+    let budget = &budget;
+    tracing::debug!(
+        "{accession}: decode batch_size={batch_size}, queue budget={} MiB",
+        DECODE_BUFFER_BYTES / (1024 * 1024),
+    );
 
     // Rebind the shared state the writer thread touches as explicit
     // `&mut` / `&` references BEFORE the scope, then the writer's `move`
@@ -600,52 +625,70 @@ fn decode_and_write(
     let write_result: Result<()> = std::thread::scope(|scope| {
         // ---- Writer thread ----
         let writer_handle = scope.spawn(move || -> Result<()> {
-            let mut blob_counter: usize = 0;
-            while let Ok(formatted_batches) = batch_rx.recv() {
-                for result in formatted_batches {
-                    let (slot_outputs, num_spots) = result?;
+            // Wrap the drain loop so the budget is closed on *every* exit path
+            // (normal end, decode error, write error) — otherwise a producer
+            // parked in `budget.acquire` would never wake. `close()` makes that
+            // `acquire` return `false`, unwinding the decode loop cleanly.
+            let mut drain = || -> Result<()> {
+                let mut blob_counter: usize = 0;
+                while let Ok((queued_bytes, formatted_batches)) = batch_rx.recv() {
+                    for result in formatted_batches {
+                        let (slot_outputs, num_spots) = result?;
 
-                    // One write_all per (slot, blob) instead of per record —
-                    // orders of magnitude fewer write calls, and the Vec<u8>
-                    // allocation happens at most 4× per blob, not per record.
-                    for slot_out in &slot_outputs {
-                        let writer = if let Some(sw) = stdout_writer_ref {
-                            sw
-                        } else {
-                            writers_ref.entry(slot_out.slot).or_insert_with(|| {
-                                let (writer, final_path, tmp_path) = create_output_writer_for_slot(
-                                    accession,
-                                    slot_out.slot,
-                                    config,
-                                    &compress_pool,
-                                );
-                                output_paths_ref.push((final_path, tmp_path));
-                                writer
-                            })
-                        };
+                        // One write_all per (slot, blob) instead of per record —
+                        // orders of magnitude fewer write calls, and the Vec<u8>
+                        // allocation happens at most 4× per blob, not per record.
+                        for slot_out in &slot_outputs {
+                            let writer = if let Some(sw) = stdout_writer_ref {
+                                sw
+                            } else {
+                                writers_ref.entry(slot_out.slot).or_insert_with(|| {
+                                    let (writer, final_path, tmp_path) =
+                                        create_output_writer_for_slot(
+                                            accession,
+                                            slot_out.slot,
+                                            config,
+                                            &compress_pool,
+                                        );
+                                    output_paths_ref.push((final_path, tmp_path));
+                                    writer
+                                })
+                            };
 
-                        writer.write_all(&slot_out.bytes).map_err(Error::Io)?;
-                        *reads_written_ref += slot_out.records;
-                        *per_slot_counts_ref.entry(slot_out.slot).or_insert(0) += slot_out.records;
+                            writer.write_all(&slot_out.bytes).map_err(Error::Io)?;
+                            *reads_written_ref += slot_out.records;
+                            *per_slot_counts_ref.entry(slot_out.slot).or_insert(0) +=
+                                slot_out.records;
+                        }
+
+                        spots_read_ref.fetch_add(num_spots, std::sync::atomic::Ordering::Relaxed);
+                        blob_counter += 1;
+
+                        if let Some(pb) = decode_pb_ref.as_ref() {
+                            pb.inc(1);
+                        }
+
+                        if blob_counter.is_multiple_of(50) || blob_counter == num_blobs {
+                            tracing::debug!(
+                                "{accession}: decoded {blob_counter}/{num_blobs} blobs, \
+                                 {} spots so far",
+                                spots_read_ref.load(std::sync::atomic::Ordering::Relaxed),
+                            );
+                        }
                     }
 
-                    spots_read_ref.fetch_add(num_spots, std::sync::atomic::Ordering::Relaxed);
-                    blob_counter += 1;
-
-                    if let Some(pb) = decode_pb_ref.as_ref() {
-                        pb.inc(1);
-                    }
-
-                    if blob_counter.is_multiple_of(50) || blob_counter == num_blobs {
-                        tracing::debug!(
-                            "{accession}: decoded {blob_counter}/{num_blobs} blobs, \
-                             {} spots so far",
-                            spots_read_ref.load(std::sync::atomic::Ordering::Relaxed),
-                        );
-                    }
+                    // Whole batch drained — refund exactly what the producer
+                    // reserved so it can queue more (or unblock if parked).
+                    budget.release(queued_bytes);
                 }
-            }
-            Ok(())
+                Ok(())
+            };
+
+            let result = drain();
+            // Always wake any producer parked in `budget.acquire`, even on the
+            // error path where `release` for the failed batch never ran.
+            budget.close();
+            result
         });
 
         // Per-call immutable context reused across every blob decode.
@@ -662,9 +705,9 @@ fn decode_and_write(
         // `cumulative_spots` tracks the total number of spots in blobs 0..blob_idx
         // so each batch can compute `spots_before_per_blob` deterministically
         // from blob metadata alone. Reading `spots_read` here would race with
-        // the writer thread on archives with more than `BATCH_SIZE` (1024)
-        // blobs — the bounded channel of capacity 4 lets the decoder queue
-        // four batches ahead of the writer, and the writer's fetch_add on
+        // the writer thread on archives with more than `batch_size` blobs —
+        // the byte budget lets the decoder queue batches ahead of the writer,
+        // and the writer's fetch_add on
         // `spots_read` doesn't happen until it has processed a batch.
         // DRR045255 (3658 blobs) used to emit `spots_before=0` for batch 2
         // onwards, resetting the FASTQ defline spot number to 1.
@@ -677,7 +720,7 @@ fn decode_and_write(
                 break;
             }
 
-            let batch_end = (blob_idx + BATCH_SIZE).min(num_blobs);
+            let batch_end = (blob_idx + batch_size).min(num_blobs);
 
             let blob_id_ranges: Vec<u32> = (blob_idx..batch_end)
                 .map(|bi| cursor.read_col().blobs()[bi].id_range)
@@ -865,10 +908,27 @@ fn decode_and_write(
                     .collect()
             });
 
-            // Send to writer thread (blocks if writer is behind by 2 batches).
-            if batch_tx.send(formatted_batches).is_err() {
-                break; // Writer thread exited (error) — rx is dropped
-                // because the writer closure captured it by value (move).
+            // Sum the formatted bytes this batch will queue (errored blobs
+            // contribute nothing — the writer surfaces the error and exits).
+            let queued_bytes: u64 = formatted_batches
+                .iter()
+                .filter_map(|r| r.as_ref().ok())
+                .flat_map(|(slots, _)| slots.iter())
+                .map(|s| s.bytes.len() as u64)
+                .sum();
+
+            // Backpressure by bytes: block until this batch fits under the
+            // budget (an oversized lone batch passes when the queue is empty).
+            // `false` means the writer is gone (error/cancel) — stop sending.
+            if !budget.acquire(queued_bytes, config.cancelled.as_deref()) {
+                break;
+            }
+
+            // Unbounded channel, so this never blocks; the budget above is the
+            // sole backpressure. An error means the writer thread exited (it
+            // dropped `batch_rx` on the way out).
+            if batch_tx.send((queued_bytes, formatted_batches)).is_err() {
+                break;
             }
 
             blob_idx = batch_end;
@@ -1114,7 +1174,7 @@ mod batch_spots_tests {
 
     #[test]
     fn second_batch_continues_from_cumulative() {
-        // Regression for the BATCH_SIZE=1024 race: batch 2's per-blob
+        // Regression for the multi-batch decode race: batch 2's per-blob
         // offsets must pick up from the running total at the end of
         // batch 1, not from a stale `spots_read` atomic that the writer
         // thread hadn't yet updated via `fetch_add`.
