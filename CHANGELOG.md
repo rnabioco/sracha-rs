@@ -2,6 +2,19 @@
 
 ## Unreleased
 
+### Performance
+
+- Sharply lower peak memory during FASTQ decode of runs with many blobs
+  (#54, #55). The decode→write pipeline buffered formatted FASTQ in
+  fixed 1024-blob batches with a 4-deep hand-off queue, so a large
+  full-quality run could hold tens of GiB of decoded output before the
+  writer drained any of it — `SRR36401016` used 19.4 GiB even at
+  `-t 1 --connections 1`. The buffer is now bounded by a thread-scaled
+  batch size (`(threads × 8).clamp(64, 256)`) with a single queued batch,
+  making peak decode RSS roughly independent of run size. The reporter
+  measured 19.4 GiB → 1.1 GiB at `-t 1`, with a small wall-clock
+  improvement; output is byte-identical.
+
 ### Improvements
 
 - Better long-read (PacBio / Oxford Nanopore) support. Platform detection
