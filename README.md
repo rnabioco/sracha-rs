@@ -119,6 +119,36 @@ or install from source:
 cargo install --git https://github.com/rnabioco/sracha-rs sracha
 ```
 
+### Containers
+
+Because sracha is on Bioconda, [BioContainers](https://biocontainers.pro/)
+automatically publishes a Docker/Singularity image for every release — no
+local build required.
+
+```bash
+# Docker / Podman
+docker run --rm quay.io/biocontainers/sracha:0.3.7--h54198d6_0 sracha --help
+
+# Singularity / Apptainer
+singularity run \
+  https://depot.galaxyproject.org/singularity/sracha:0.3.7--h54198d6_0 sracha --help
+```
+
+The tags above are examples — check
+[quay.io](https://quay.io/repository/biocontainers/sracha?tab=tags) for the
+latest `<version>--<build>` tag and substitute it in.
+
+In [Nextflow](https://www.nextflow.io/), point a process at the image directly
+or let the `conda` directive resolve it:
+
+```groovy
+process SRACHA_GET {
+    container 'quay.io/biocontainers/sracha:0.3.7--h54198d6_0'
+    // or: conda 'bioconda::sracha=0.3.7'
+    // ...
+}
+```
+
 ## Documentation
 
 Full CLI reference and usage guide: <https://rnabioco.github.io/sracha-rs/>
