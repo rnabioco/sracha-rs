@@ -121,10 +121,12 @@ pub fn expand_via_page_map(
         }
         Ok(expanded)
     } else if !pm.data_runs.is_empty() {
-        // data_runs is per-row; each row is `entry_bytes` (row_length × elem_bytes).
-        // Passing elem_bytes here would trip the length check on any column with
-        // row_length > 1, crashing with a 2:1 (or N:1) "expected at least" ratio.
-        Ok(pm.expand_data_runs_bytes(&decoded_ints, entry_bytes)?)
+        // data_runs replicates physical records across rows. Records may be
+        // variable-length (array columns like READ_START on PacBio SMRT pack
+        // one NREADS-sized array per spot), so widths come from the page map's
+        // lengths/leng_runs rather than a single row_length. For uniform-length
+        // columns this reduces to the old fixed-width walk.
+        Ok(pm.expand_records_to_rows(&decoded_ints, elem_bytes)?)
     } else {
         Ok(decoded_ints)
     }

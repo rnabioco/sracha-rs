@@ -354,7 +354,18 @@ fn decode_and_write(
 ) -> Result<(u64, u64, Vec<PathBuf>)> {
     let file = std::fs::File::open(sra_path)?;
     let mut archive = KarArchive::open(std::io::BufReader::new(file))?;
-    let cursor = VdbCursor::open(&mut archive, sra_path)?;
+    // PacBio/Nanopore databases expose their CCS / consensus reads in a
+    // CONSENSUS table; fasterq-dump reads it by default in preference to
+    // SEQUENCE (`insp_db_type()`). Mirror that so our FASTQ matches.
+    let table = if crate::vdb::cursor::archive_has_consensus_table(&archive) {
+        "CONSENSUS"
+    } else {
+        "SEQUENCE"
+    };
+    if table != "SEQUENCE" {
+        tracing::info!("{accession}: reading reads from {table} table");
+    }
+    let cursor = VdbCursor::open_table(&mut archive, sra_path, table)?;
 
     // Check platform — reject legacy platforms with complex read structures.
     if let Some(platform) = cursor.platform()
@@ -667,12 +678,16 @@ fn decode_and_write(
         });
 
         // Per-call immutable context reused across every blob decode.
+        // The SEQUENCE schema always exposes a (possibly virtual) NAME column,
+        // so its default deflines carry a name field; the CONSENSUS table has
+        // none, so fasterq-dump omits it there.
         let decode_ctx = BlobDecodeCtx {
             run_name: accession,
             config: &fastq_config,
             diag,
             is_lite,
             read_cs,
+            has_name_column: table != "CONSENSUS",
         };
 
         // ---- Decode loop (main thread) ----

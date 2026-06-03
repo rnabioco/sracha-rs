@@ -36,6 +36,28 @@
   long-read platforms embed there are substrings of that name rather than
   separate columns. Adds network-gated integration fixtures for a PacBio
   SMRT run (SRR38889541) and an Oxford Nanopore run (SRR38892122).
+- PacBio/Oxford Nanopore **CONSENSUS** (CCS) support. When a database carries
+  a `CONSENSUS` table, sracha now reads its reads from there by default —
+  mirroring fasterq-dump's `insp_db_type()` table selection — so FASTQ output
+  matches fasterq-dump byte-for-byte (verified on DRR032988: 4,004 reads,
+  identical bases/quality/deflines, with empty consensus rows dropped). The
+  default defline now follows fasterq-dump's `dflt_seq_defline` rule: the name
+  field is emitted for tables that carry spot names (the reconstructed name, or
+  the spot number as the synthesized fallback) and **omitted entirely** for
+  tables with no NAME column (CONSENSUS), instead of repeating the spot number.
+
+### Fixes
+
+- Decode older PacBio SMRT archives (e.g. DRR032988) that previously failed
+  with `page_map: data_runs has N entries, expected at least M`. Variable-length
+  array columns (READ_START, READ_TYPE, LABEL_LEN/START, RD_FILTER) pack
+  per-record arrays of differing lengths; the page-map expansion now derives
+  each physical record's width from `lengths`/`leng_runs` instead of assuming a
+  single fixed row length, so records are replicated to rows correctly.
+- Stop mis-decoding raw, uncompressed 2na READ payloads. A header-less READ
+  blob whose bytes happen to parse as a tiny deflate stream (PacBio CONSENSUS
+  READ) is now recognised as raw when its size matches the expected packed base
+  count, rather than being collapsed to a few bytes.
 
 ## 0.3.7 (2026-05-29)
 
