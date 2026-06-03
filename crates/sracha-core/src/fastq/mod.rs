@@ -204,9 +204,10 @@ const FALLBACK_QUAL_BYTE: u8 = b'?';
 
 /// Format a single read segment into a [`FastqRecord`].
 ///
-/// Defline format matches fasterq-dump: `@{run}.{spot_num} {description} length={len}`
-/// where `description` is the original read name if available, or the spot number again.
-/// The `+` line repeats the defline content.
+/// Defline format matches fasterq-dump: `@{run}.{spot_num} {name} length={len}`
+/// when an original read name is present, or `@{run}.{spot_num} length={len}`
+/// when it is absent (fasterq-dump omits the name field rather than repeating
+/// the spot number). The `+` line repeats the defline content.
 ///
 /// Bases with Phred quality 0 (ASCII `!`) are replaced with `N` to match
 /// the NCBI convention for no-call bases stored in 2na encoding.
@@ -273,7 +274,7 @@ pub fn append_fastq_record(
     diag: Option<&IntegrityDiag>,
 ) {
     let len = sequence.len();
-    let description = original_name.unwrap_or(spot_number);
+    let description = original_name;
     let quality = repair_quality(quality, len, diag);
 
     let mut itoa_buf = itoa::Buffer::new();
@@ -363,20 +364,27 @@ fn repair_quality<'a>(
     Cow::Borrowed(quality)
 }
 
-/// Shared defline body: `{run}.{spot} {description} length={len}`.
-/// Used by both the `@` line and the `>` line (FASTA).
+/// Shared defline body, used by both the `@` line and the `>` line (FASTA).
+///
+/// Matches fasterq-dump's default templates (`dflt_seq_defline`): when a
+/// spot name is present it emits `{run}.{spot} {name} length={len}`
+/// (`DSD_FASTQ_USE_NAME`); when there is no NAME column it omits the name
+/// field entirely — `{run}.{spot} length={len}` (`DSD_FASTQ_NO_NAME`) — rather
+/// than substituting the spot id.
 fn append_defline_body(
     out: &mut Vec<u8>,
     run_name: &str,
     spot_number: &[u8],
-    description: &[u8],
+    description: Option<&[u8]>,
     len_str: &str,
 ) {
     out.extend_from_slice(run_name.as_bytes());
     out.push(b'.');
     out.extend_from_slice(spot_number);
-    out.push(b' ');
-    out.extend_from_slice(description);
+    if let Some(desc) = description {
+        out.push(b' ');
+        out.extend_from_slice(desc);
+    }
     out.extend_from_slice(b" length=");
     out.extend_from_slice(len_str.as_bytes());
 }
@@ -385,10 +393,11 @@ fn append_defline_body(
 fn defline_body_len(
     run_name: &str,
     spot_number: &[u8],
-    description: &[u8],
+    description: Option<&[u8]>,
     len_str: &str,
 ) -> usize {
-    run_name.len() + 1 + spot_number.len() + 1 + description.len() + 8 + len_str.len()
+    let desc_len = description.map_or(0, |d| 1 + d.len());
+    run_name.len() + 1 + spot_number.len() + desc_len + 8 + len_str.len()
 }
 
 /// Format a single read segment into a FASTA record (no quality line).
@@ -419,7 +428,7 @@ pub fn append_fasta_record(
     sequence: &[u8],
 ) {
     let len = sequence.len();
-    let description = original_name.unwrap_or(spot_number);
+    let description = original_name;
 
     let mut itoa_buf = itoa::Buffer::new();
     let len_str = itoa_buf.format(len);
@@ -739,7 +748,8 @@ mod tests {
         assert_eq!(results.len(), 1);
         let data = &results[0].1.data;
         let text = std::str::from_utf8(data).unwrap();
-        assert!(text.starts_with("@SRR123456.42 42 length=4\n"));
+        // No NAME column → fasterq-dump omits the name field (no spot-id repeat).
+        assert!(text.starts_with("@SRR123456.42 length=4\n"));
     }
 
     #[test]
@@ -751,8 +761,8 @@ mod tests {
         assert_eq!(results.len(), 2);
         let r1 = std::str::from_utf8(&results[0].1.data).unwrap();
         let r2 = std::str::from_utf8(&results[1].1.data).unwrap();
-        assert!(r1.starts_with("@SRR999.99 99 length=4\n"));
-        assert!(r2.starts_with("@SRR999.99 99 length=4\n"));
+        assert!(r1.starts_with("@SRR999.99 length=4\n"));
+        assert!(r2.starts_with("@SRR999.99 length=4\n"));
     }
 
     #[test]
@@ -766,7 +776,7 @@ mod tests {
 
         assert_eq!(results.len(), 1);
         let text = std::str::from_utf8(&results[0].1.data).unwrap();
-        assert_eq!(text, "@SRR1.1 1 length=4\nACGT\n+SRR1.1 1 length=4\nIIII\n");
+        assert_eq!(text, "@SRR1.1 length=4\nACGT\n+SRR1.1 length=4\nIIII\n");
     }
 
     // -----------------------------------------------------------------------
@@ -898,16 +908,10 @@ mod tests {
         let r1 = std::str::from_utf8(&results[0].1.data).unwrap();
         let r2 = std::str::from_utf8(&results[1].1.data).unwrap();
 
-        assert_eq!(
-            r1,
-            "@SRR1.10 10 length=4\nAACC\n+SRR1.10 10 length=4\nIIII\n"
-        );
+        assert_eq!(r1, "@SRR1.10 length=4\nAACC\n+SRR1.10 length=4\nIIII\n");
         // N-masking is now handled in the pipeline layer, not format_read.
         // Bases pass through unchanged regardless of quality.
-        assert_eq!(
-            r2,
-            "@SRR1.10 10 length=4\nGGTT\n+SRR1.10 10 length=4\n!!!!\n"
-        );
+        assert_eq!(r2, "@SRR1.10 length=4\nGGTT\n+SRR1.10 length=4\n!!!!\n");
     }
 
     // -----------------------------------------------------------------------
@@ -1207,7 +1211,7 @@ mod tests {
         let results = format_spot(&spot, "SRR1", &config);
 
         let text = std::str::from_utf8(&results[0].1.data).unwrap();
-        assert!(text.starts_with("@SRR1.spot.123_abc spot.123_abc length=4\n"));
+        assert!(text.starts_with("@SRR1.spot.123_abc length=4\n"));
     }
 
     // -----------------------------------------------------------------------
@@ -1584,9 +1588,9 @@ mod tests {
         let rec = format_read("RUN", b"1", None, b"ACGT", b"IIII");
         let text = std::str::from_utf8(&rec.data).unwrap();
         let lines: Vec<&str> = text.lines().collect();
-        assert_eq!(lines[0], "@RUN.1 1 length=4");
+        assert_eq!(lines[0], "@RUN.1 length=4");
         assert_eq!(lines[1], "ACGT");
-        assert_eq!(lines[2], "+RUN.1 1 length=4");
+        assert_eq!(lines[2], "+RUN.1 length=4");
         assert_eq!(lines[3], "IIII");
     }
 

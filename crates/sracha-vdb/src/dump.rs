@@ -348,10 +348,31 @@ fn materialize_blob(
 }
 
 fn materialize_dna2na(decoded: &DecodedBlob<'_>, row_count: u64) -> Result<(Vec<u8>, Vec<usize>)> {
-    let packed = decode_zip_encoding(decoded)?;
+    let offsets = split_offsets(decoded, row_count, 1)?;
+    let expected_bases = offsets.last().copied().unwrap_or(0);
+    let packed = decode_2na_payload(decoded, expected_bases)?;
     let actual_bases = elem_count(decoded, &packed, 2);
     let bases = unpack_2na(&packed, actual_bases);
     split_by_rows(decoded, bases, row_count, 1)
+}
+
+/// Obtain the packed 2na bytes for a READ blob.
+///
+/// READ blobs with no compression header carry raw, uncompressed 2na. The
+/// generic [`decode_zip_encoding`] probe tries deflate/zlib first and can
+/// *spuriously* succeed on raw 2na — high-entropy base-packed bytes
+/// occasionally parse as a tiny valid deflate stream (e.g. the PacBio
+/// CONSENSUS READ column, which decoded to 4 bytes instead of 435 KB). When
+/// the raw payload already matches the expected packed size for `expected_bases`
+/// (2na = 4 bases/byte), trust it and skip decompression. Compressed blobs
+/// (smaller-than-expected payload, or a real compression header) still route
+/// through `decode_zip_encoding`.
+fn decode_2na_payload(decoded: &DecodedBlob<'_>, expected_bases: usize) -> Result<Vec<u8>> {
+    let expected_packed = expected_bases.div_ceil(4);
+    if decoded.headers.is_empty() && expected_packed > 0 && decoded.data.len() == expected_packed {
+        return Ok(decoded.data.to_vec());
+    }
+    decode_zip_encoding(decoded)
 }
 
 fn materialize_dna4na_bin(
@@ -527,8 +548,9 @@ fn expand_leng_runs(pm: &PageMap) -> Vec<u32> {
     out
 }
 
-/// For fixed-size element columns (u32, u8), run `expand_data_runs_bytes` if
-/// the page_map carries data_runs — otherwise return as-is.
+/// For fixed-size element columns (u32, u8), replicate physical records to
+/// per-row data via the page map's data_runs (honouring variable per-record
+/// lengths) — otherwise return as-is.
 fn expand_runs_if_any(
     decoded: &DecodedBlob<'_>,
     data: Vec<u8>,
@@ -537,7 +559,7 @@ fn expand_runs_if_any(
     if let Some(pm) = decoded.page_map.as_ref()
         && !pm.data_runs.is_empty()
     {
-        return pm.expand_data_runs_bytes(&data, elem_bytes);
+        return pm.expand_records_to_rows(&data, elem_bytes);
     }
     Ok(data)
 }
@@ -856,6 +878,57 @@ pub fn dump_to_vec<R: Read + Seek>(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn decode_2na_payload_trusts_raw_when_size_matches() {
+        // Raw, uncompressed 2na: 4 bytes = 16 bases. With no compression header
+        // and a payload that already equals the expected packed size, the bytes
+        // must be returned verbatim — never run through the deflate/zlib probe,
+        // which can spuriously "succeed" on raw 2na and collapse a whole blob to
+        // a few bytes (the PacBio CONSENSUS READ bug: 435 KB → 4 bytes).
+        let data = vec![0x1b, 0xe4, 0x4b, 0x80];
+        let blob = DecodedBlob {
+            data: std::borrow::Cow::Borrowed(&data),
+            adjust: 0,
+            big_endian: false,
+            headers: vec![],
+            page_map: None,
+            row_length: None,
+        };
+        let out = decode_2na_payload(&blob, 16).unwrap();
+        assert_eq!(out, data);
+    }
+
+    #[test]
+    fn materialize_dna2na_consensus_like_mostly_empty() {
+        // CONSENSUS READ shape: many zero-length rows plus one real read,
+        // stored as raw 2na sized to the per-row length sum. This previously
+        // errored ("decoded N bytes but split plan needs M") because the raw
+        // 2na was wrongly deflate-decoded down to a stub.
+        //
+        // lengths/leng_runs expand to per-row [0, 0, 8, 0, 0]; 8 bases total
+        // = 2 packed 2na bytes.
+        let pm = PageMap {
+            data_recs: 5,
+            lengths: vec![0, 8, 0],
+            leng_runs: vec![2, 1, 2],
+            data_runs: vec![],
+        };
+        let data = vec![0x1b, 0xe4];
+        let blob = DecodedBlob {
+            data: std::borrow::Cow::Borrowed(&data),
+            adjust: 0,
+            big_endian: false,
+            headers: vec![],
+            page_map: Some(pm),
+            row_length: None,
+        };
+        let (bases, offsets) = materialize_dna2na(&blob, 5).unwrap();
+        // Only the third row carries the 8 bases; the rest are empty.
+        assert_eq!(offsets, vec![0, 0, 0, 8, 8, 8]);
+        // Bases come straight from the raw 2na payload (no deflate misfire).
+        assert_eq!(bases, unpack_2na(&data, 8));
+    }
 
     #[test]
     fn infer_kind_table_matches_spec() {

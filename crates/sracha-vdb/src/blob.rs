@@ -637,6 +637,102 @@ impl PageMap {
 
         Ok(expanded)
     }
+
+    /// Expand variable-length physical records into per-logical-row data,
+    /// honouring both `data_runs` (record → row replication) and the per-row
+    /// element counts carried by `lengths` / `leng_runs`.
+    ///
+    /// Each physical record occupies a contiguous run of elements in `data`
+    /// whose length is the element count of the first logical row the record
+    /// covers (all rows sharing a physical record have the same length). The
+    /// record is emitted `data_runs[i]` times.
+    ///
+    /// This generalises [`expand_data_runs_bytes`](Self::expand_data_runs_bytes),
+    /// which assumes every record is the same width. Variable-length array
+    /// columns — e.g. READ_START / READ_TYPE / LABEL_LEN / RD_FILTER on PacBio
+    /// SMRT runs, where each spot stores an NREADS-sized array — pack records
+    /// of differing lengths, so the fixed-width walk reads the wrong record
+    /// boundaries (and trips the length check when the record count and the
+    /// data-run count disagree).
+    ///
+    /// `elem_bytes` is the true element size (1 for byte columns, 4 for u32),
+    /// NOT a per-row stride — record widths come from the page map. Falls back
+    /// to passthrough when there are no `data_runs`.
+    pub fn expand_records_to_rows(&self, data: &[u8], elem_bytes: usize) -> Result<Vec<u8>> {
+        if self.data_runs.is_empty() || elem_bytes == 0 {
+            return Ok(data.to_vec());
+        }
+        // Without a length structure we can't recover per-record widths; defer
+        // to the fixed-width walk (each record is one element wide).
+        if self.lengths.is_empty() || self.leng_runs.is_empty() {
+            return self.expand_data_runs_bytes(data, elem_bytes);
+        }
+
+        let mut expanded = Vec::with_capacity(data.len());
+        let mut byte_off = 0usize; // consumed bytes of `data`
+        let mut li = 0usize; // index into lengths/leng_runs
+        let mut rem = self.leng_runs[0] as u64; // rows left in the current leng run
+
+        // Advance the leng-run cursor to the next run that still has rows.
+        let advance = |li: &mut usize, rem: &mut u64| -> Result<()> {
+            while *rem == 0 {
+                *li += 1;
+                match self.leng_runs.get(*li) {
+                    Some(&r) => *rem = r as u64,
+                    None => {
+                        return Err(Error::Format(
+                            "page_map: leng_runs exhausted before data_runs (inconsistent map)"
+                                .into(),
+                        ));
+                    }
+                }
+            }
+            Ok(())
+        };
+
+        for &run in &self.data_runs {
+            advance(&mut li, &mut rem)?;
+            let rec_len =
+                *self.lengths.get(li).ok_or_else(|| {
+                    Error::Format("page_map: lengths shorter than leng_runs".into())
+                })? as usize;
+            let rec_bytes = rec_len.checked_mul(elem_bytes).ok_or_else(|| {
+                Error::Format("page_map: record length × elem_bytes overflows".into())
+            })?;
+            let end = byte_off
+                .checked_add(rec_bytes)
+                .ok_or_else(|| Error::Format("page_map: record offset overflows".into()))?;
+            if end > data.len() {
+                return Err(Error::Format(format!(
+                    "page_map: variable record wants bytes {byte_off}..{end} but data has {}",
+                    data.len(),
+                )));
+            }
+            let chunk = &data[byte_off..end];
+            for _ in 0..run {
+                expanded.extend_from_slice(chunk);
+            }
+            byte_off = end;
+
+            // Consume `run` logical rows from the leng-run stream.
+            let mut to_consume = run as u64;
+            while to_consume > 0 {
+                advance(&mut li, &mut rem)?;
+                let step = to_consume.min(rem);
+                rem -= step;
+                to_consume -= step;
+            }
+        }
+
+        if byte_off != data.len() {
+            return Err(Error::Format(format!(
+                "page_map: variable records consumed {byte_off} of {} data bytes",
+                data.len(),
+            )));
+        }
+
+        Ok(expanded)
+    }
 }
 
 /// Deserialize a page map from its serialized form.
@@ -2988,6 +3084,96 @@ mod tests {
         let data = vec![1, 2, 3, 4, 5, 6, 7, 8];
         let expanded = pm.expand_data_runs_bytes(&data, 4).unwrap();
         assert_eq!(expanded, data);
+    }
+
+    #[test]
+    fn page_map_expand_records_to_rows_uniform_matches_fixed() {
+        // For uniform-length records, expand_records_to_rows must reproduce the
+        // fixed-width expand_data_runs_bytes result exactly.
+        let pm = PageMap {
+            data_recs: 2,
+            lengths: vec![1], // one u32 per row, constant
+            leng_runs: vec![5],
+            data_runs: vec![3, 2],
+        };
+        let mut data = Vec::new();
+        data.extend_from_slice(&42u32.to_le_bytes());
+        data.extend_from_slice(&99u32.to_le_bytes());
+
+        let variable = pm.expand_records_to_rows(&data, 4).unwrap();
+        let fixed = pm.expand_data_runs_bytes(&data, 4).unwrap();
+        assert_eq!(variable, fixed);
+
+        let vals: Vec<u32> = variable
+            .chunks_exact(4)
+            .map(|c| u32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+            .collect();
+        assert_eq!(vals, vec![42, 42, 42, 99, 99]);
+    }
+
+    #[test]
+    fn page_map_expand_records_to_rows_variable_lengths() {
+        // Variable-length array column (e.g. READ_START on PacBio SMRT): records
+        // have differing element counts, given by the lengths/leng_runs runs,
+        // and each record is replicated data_runs[i] times. The fixed-width walk
+        // mis-reads record boundaries and rejects this shape — the variable walk
+        // must reconstruct it. Mirrors the real DRR032988 first-blob layout where
+        // data runs align with leng runs.
+        //
+        //   3 records: lengths 1, 3, 1 (sum = 5 u32s of source data)
+        //   record 0 (len 1) -> repeated 2 rows
+        //   record 1 (len 3) -> repeated 1 row
+        //   record 2 (len 1) -> repeated 2 rows                (total 5 rows)
+        let pm = PageMap {
+            data_recs: 3,
+            lengths: vec![1, 3, 1],
+            leng_runs: vec![2, 1, 2],
+            data_runs: vec![2, 1, 2],
+        };
+        // Source u32 stream: rec0=[10], rec1=[20,21,22], rec2=[30]  (5 u32s)
+        let src: Vec<u32> = vec![10, 20, 21, 22, 30];
+        let mut data = Vec::new();
+        for v in &src {
+            data.extend_from_slice(&v.to_le_bytes());
+        }
+
+        // The fixed-width walk can't handle this (would want >= 5 data_runs).
+        assert!(pm.expand_data_runs_bytes(&data, 4).is_err());
+
+        let expanded = pm.expand_records_to_rows(&data, 4).unwrap();
+        let vals: Vec<u32> = expanded
+            .chunks_exact(4)
+            .map(|c| u32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+            .collect();
+        // row0=[10] row1=[10] row2=[20,21,22] row3=[30] row4=[30]
+        assert_eq!(vals, vec![10, 10, 20, 21, 22, 30, 30]);
+    }
+
+    #[test]
+    fn page_map_expand_records_to_rows_byte_column() {
+        // Same shape, 1-byte elements (e.g. READ_TYPE).
+        let pm = PageMap {
+            data_recs: 3,
+            lengths: vec![1, 3, 1],
+            leng_runs: vec![2, 1, 2],
+            data_runs: vec![2, 1, 2],
+        };
+        let data = vec![1u8, 0, 1, 0, 1]; // rec0=[1] rec1=[0,1,0] rec2=[1]
+        let expanded = pm.expand_records_to_rows(&data, 1).unwrap();
+        assert_eq!(expanded, vec![1, 1, 0, 1, 0, 1, 1]);
+    }
+
+    #[test]
+    fn page_map_expand_records_to_rows_rejects_truncated() {
+        // Source shorter than the records demand -> error, not silent garbage.
+        let pm = PageMap {
+            data_recs: 2,
+            lengths: vec![1, 3],
+            leng_runs: vec![1, 1],
+            data_runs: vec![1, 1],
+        };
+        let data = vec![0u8; 4]; // only 1 u32, needs 1 + 3 = 4 u32s
+        assert!(pm.expand_records_to_rows(&data, 4).is_err());
     }
 
     #[test]

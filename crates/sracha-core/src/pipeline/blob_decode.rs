@@ -268,6 +268,13 @@ pub(crate) struct BlobDecodeCtx<'a> {
     pub(crate) diag: &'a IntegrityDiag,
     pub(crate) is_lite: bool,
     pub(crate) read_cs: u8,
+    /// Whether the source table exposes spot names (the SEQUENCE schema's
+    /// NAME/SPOT_NAME column, physical or virtual). Controls the default
+    /// defline: when `true` the name field is emitted (reconstructed name, or
+    /// the spot number as fasterq-dump's synthesized fallback); when `false`
+    /// (PacBio/ONT CONSENSUS, which has no NAME column) it is omitted, matching
+    /// fasterq-dump's `DSD_FASTQ_NO_NAME` template.
+    pub(crate) has_name_column: bool,
 }
 
 /// Decode the ALTREAD blob (when present) and merge its per-base 4na
@@ -517,6 +524,7 @@ pub(crate) fn decode_blob_to_fastq(
         diag,
         is_lite,
         read_cs,
+        has_name_column,
     } = *ctx;
     // ------------------------------------------------------------------
     // Decode READ blob -> 2na -> ASCII bases.
@@ -1200,6 +1208,21 @@ pub(crate) fn decode_blob_to_fastq(
             .as_ref()
             .and_then(|names| names.get(spot_idx_in_blob));
 
+        // Default-defline description, matching fasterq-dump's `dflt_seq_defline`:
+        // when the table exposes spot names the `$sn` field is emitted — the
+        // reconstructed name when available, otherwise the spot number as
+        // fasterq-dump's synthesized fallback (`DSD_FASTQ_SYN_NAME`); when the
+        // table has no NAME column (PacBio/ONT CONSENSUS reads) the field is
+        // omitted entirely (`DSD_FASTQ_NO_NAME`) rather than substituting the
+        // spot id. `has_name_column` is the table-level flag (true for SEQUENCE,
+        // false for CONSENSUS); note a physical NAME column may be absent even
+        // when names exist (Illumina names are reconstructed from ALTREAD+X+Y).
+        let description: Option<&[u8]> = if has_name_column {
+            Some(original_name.unwrap_or(spot_number))
+        } else {
+            None
+        };
+
         // Read types for this spot: borrow from decoded data or default to biological.
         let spot_read_types: &[u8] =
             if !read_type_data.is_empty() && rt_offset + rps <= read_type_data.len() {
@@ -1336,11 +1359,11 @@ pub(crate) fn decode_blob_to_fastq(
             match config.split_mode {
                 SplitMode::Split3 => {
                     if segments.len() == 2 {
-                        emit(OutputSlot::Read1, &segments[0], spot_number, original_name);
-                        emit(OutputSlot::Read2, &segments[1], spot_number, original_name);
+                        emit(OutputSlot::Read1, &segments[0], spot_number, description);
+                        emit(OutputSlot::Read2, &segments[1], spot_number, description);
                     } else {
                         for seg in &segments {
-                            emit(OutputSlot::Unpaired, seg, spot_number, original_name);
+                            emit(OutputSlot::Unpaired, seg, spot_number, description);
                         }
                     }
                 }
@@ -1363,7 +1386,7 @@ pub(crate) fn decode_blob_to_fastq(
                         name_buf.extend_from_slice(spot_number);
                         name_buf.push(b'/');
                         name_buf.extend_from_slice(mate_buf.format(seg.mate_idx).as_bytes());
-                        let desc = original_name.or(Some(spot_number));
+                        let desc = description.or(Some(spot_number));
                         emit(OutputSlot::Single, seg, &name_buf, desc);
                     }
                 }
@@ -1373,7 +1396,7 @@ pub(crate) fn decode_blob_to_fastq(
                             OutputSlot::ReadN(file_idx as u32),
                             seg,
                             spot_number,
-                            original_name,
+                            description,
                         );
                     }
                 }

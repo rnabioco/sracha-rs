@@ -84,12 +84,24 @@ impl VdbCursor {
         archive: &mut KarArchive<R>,
         sra_path: &std::path::Path,
     ) -> Result<Self> {
-        let seq_col_base = find_sequence_col_base(archive)?;
+        Self::open_table(archive, sra_path, "SEQUENCE")
+    }
+
+    /// Open a specific table (e.g. `SEQUENCE`, or `CONSENSUS` for PacBio/ONT
+    /// CCS runs). Mirrors fasterq-dump's `insp_db_type()`: PacBio/Nanopore
+    /// databases that carry a CONSENSUS table expose their CCS reads there
+    /// rather than in SEQUENCE.
+    pub fn open_table<R: Read + Seek>(
+        archive: &mut KarArchive<R>,
+        sra_path: &std::path::Path,
+        table: &str,
+    ) -> Result<Self> {
+        let seq_col_base = find_table_col_base(archive, table)?;
         reject_if_csra(archive, &seq_col_base)?;
 
         // Parse table metadata (md/cur) to extract reads_per_spot and
         // platform for SRA-lite files that lack physical READ_LEN/NREADS columns.
-        let (metadata_read_descs, platform) = Self::detect_metadata(archive);
+        let (metadata_read_descs, platform) = Self::detect_metadata(archive, table);
         let is_sra_lite = Self::detect_sra_lite(archive);
 
         // READ is required.
@@ -582,6 +594,7 @@ impl VdbCursor {
     /// whichever tree produced a schema attribute.
     fn detect_metadata<R: Read + Seek>(
         archive: &mut KarArchive<R>,
+        table: &str,
     ) -> (Option<Vec<ReadDescriptor>>, Option<String>) {
         fn try_tree<R: Read + Seek>(
             archive: &mut KarArchive<R>,
@@ -603,7 +616,8 @@ impl VdbCursor {
             Some((rps, platform))
         }
 
-        let (rps_tbl, plat_tbl) = try_tree(archive, "tbl/SEQUENCE/md/cur").unwrap_or((None, None));
+        let (rps_tbl, plat_tbl) =
+            try_tree(archive, &format!("tbl/{table}/md/cur")).unwrap_or((None, None));
         let (rps_db, plat_db) = try_tree(archive, "md/cur").unwrap_or((None, None));
 
         let rps = rps_tbl.or(rps_db);
@@ -786,19 +800,24 @@ fn parse_skey_byte_scan(skey_data: &[u8]) -> Vec<Vec<u8>> {
 ///
 /// This function detects which layout is present and returns the path to the
 /// `col/` directory containing the column subdirectories.
-fn find_sequence_col_base<R: Read + Seek>(archive: &KarArchive<R>) -> Result<String> {
+fn find_table_col_base<R: Read + Seek>(archive: &KarArchive<R>, table: &str) -> Result<String> {
     tracing::debug!(
-        "KAR archive has {} entries; looking for SEQUENCE column base",
+        "KAR archive has {} entries; looking for {table} column base",
         archive.entries().len()
     );
     for (path, entry) in archive.entries().iter() {
         tracing::trace!("  KAR entry: {path} ({entry:?})");
     }
 
-    // Strategy 1: look for database-style `tbl/SEQUENCE/col` directory.
-    // May be at root (`tbl/SEQUENCE/col`) or under a prefix (`SRR.../tbl/SEQUENCE/col`).
+    let tbl_col = format!("tbl/{table}/col");
+    let tbl_col_slash = format!("/tbl/{table}/col");
+    let tbl_col_prefix = format!("tbl/{table}/col/");
+    let tbl_col_mid = format!("/tbl/{table}/col/");
+
+    // Strategy 1: look for database-style `tbl/{table}/col` directory.
+    // May be at root (`tbl/{table}/col`) or under a prefix (`SRR.../tbl/{table}/col`).
     for path in archive.entries().keys() {
-        if (path == "tbl/SEQUENCE/col" || path.ends_with("/tbl/SEQUENCE/col"))
+        if (path == &tbl_col || path.ends_with(&tbl_col_slash))
             && matches!(
                 archive.entries().get(path.as_str()),
                 Some(crate::kar::KarEntry::Directory)
@@ -808,32 +827,45 @@ fn find_sequence_col_base<R: Read + Seek>(archive: &KarArchive<R>) -> Result<Str
         }
     }
 
-    // Strategy 2: look for `tbl/SEQUENCE/col/` prefix in any entry.
+    // Strategy 2: look for `tbl/{table}/col/` prefix in any entry.
     for path in archive.entries().keys() {
-        if path.starts_with("tbl/SEQUENCE/col/") {
-            return Ok("tbl/SEQUENCE/col".to_string());
+        if path.starts_with(&tbl_col_prefix) {
+            return Ok(tbl_col.clone());
         }
-        if let Some(idx) = path.find("/tbl/SEQUENCE/col/") {
-            let base = &path[..idx + "/tbl/SEQUENCE/col".len()];
+        if let Some(idx) = path.find(&tbl_col_mid) {
+            let base = &path[..idx + tbl_col_slash.len()];
             return Ok(base.to_string());
         }
     }
 
     // Strategy 3: flat-table layout — columns directly under `col/`.
-    // Look for `col/READ` (the required column) as a directory.
-    if archive.entries().contains_key("col/READ") {
-        return Ok("col".to_string());
-    }
-    // Or with the common col/READ/data pattern.
-    for path in archive.entries().keys() {
-        if path.starts_with("col/READ/") {
+    // Only valid for the primary SEQUENCE table (a flat archive has no
+    // `tbl/` wrapper and thus a single, unnamed table).
+    if table == "SEQUENCE" {
+        // Look for `col/READ` (the required column) as a directory.
+        if archive.entries().contains_key("col/READ") {
             return Ok("col".to_string());
+        }
+        // Or with the common col/READ/data pattern.
+        for path in archive.entries().keys() {
+            if path.starts_with("col/READ/") {
+                return Ok("col".to_string());
+            }
         }
     }
 
-    Err(Error::Format(
-        "SEQUENCE table not found in KAR archive (tried database and flat-table layouts)".into(),
-    ))
+    Err(Error::Format(format!(
+        "{table} table not found in KAR archive (tried database and flat-table layouts)"
+    )))
+}
+
+/// Whether the archive contains a `tbl/CONSENSUS/col` table.
+///
+/// PacBio/Nanopore databases expose their CCS / consensus reads in a
+/// `CONSENSUS` table; fasterq-dump reads it by default in preference to
+/// SEQUENCE (`insp_db_type()`). Used by the pipeline to pick the table.
+pub fn archive_has_consensus_table<R: Read + Seek>(archive: &KarArchive<R>) -> bool {
+    find_table_col_base(archive, "CONSENSUS").is_ok()
 }
 
 /// Reject archives that need ncbi-vdb's schema-aware virtual cursor.
@@ -1014,6 +1046,76 @@ mod tests {
         let root_dir = build_dir_node("SRR000001", &[&tbl_dir]);
 
         build_kar_archive(&[&root_dir], &data_section)
+    }
+
+    /// Like [`build_minimal_sra_archive`] but places the single READ column in
+    /// a database table named `table` (e.g. `SEQUENCE` or `CONSENSUS`).
+    fn build_minimal_db_archive(table: &str) -> Vec<u8> {
+        let col_data = b"ACGTN";
+        let idx1 = build_idx1_v1(col_data.len() as u64, 1, 0);
+        let idx0 = build_kdb_blob_loc(0, 5, 1, 1);
+
+        let mut data_section = Vec::new();
+        let idx1_off = 0u64;
+        data_section.extend_from_slice(&idx1);
+        let idx0_off = data_section.len() as u64;
+        data_section.extend_from_slice(&idx0);
+        let data_off = data_section.len() as u64;
+        data_section.extend_from_slice(col_data);
+
+        let idx1_node = build_file_node("idx1", idx1_off, idx1.len() as u64);
+        let idx0_node = build_file_node("idx0", idx0_off, idx0.len() as u64);
+        let data_node = build_file_node("data", data_off, col_data.len() as u64);
+
+        let read_dir = build_dir_node("READ", &[&data_node, &idx0_node, &idx1_node]);
+        let col_dir = build_dir_node("col", &[&read_dir]);
+        let tbl_inner = build_dir_node(table, &[&col_dir]);
+        let tbl_dir = build_dir_node("tbl", &[&tbl_inner]);
+        let root_dir = build_dir_node("DRR000000", &[&tbl_dir]);
+
+        build_kar_archive(&[&root_dir], &data_section)
+    }
+
+    #[test]
+    fn detects_consensus_table_presence() {
+        let cons = build_minimal_db_archive("CONSENSUS");
+        let archive = KarArchive::open(Cursor::new(cons)).unwrap();
+        assert!(archive_has_consensus_table(&archive));
+
+        let seq = build_minimal_db_archive("SEQUENCE");
+        let archive = KarArchive::open(Cursor::new(seq)).unwrap();
+        assert!(!archive_has_consensus_table(&archive));
+    }
+
+    #[test]
+    fn open_table_reads_named_table() {
+        let archive_bytes = build_minimal_db_archive("CONSENSUS");
+        let sra_path = write_temp_sra(&archive_bytes);
+        let mut archive = KarArchive::open(Cursor::new(archive_bytes)).unwrap();
+
+        // The default open() looks for SEQUENCE and must fail here.
+        {
+            let mut a2 =
+                KarArchive::open(Cursor::new(build_minimal_db_archive("CONSENSUS"))).unwrap();
+            assert!(VdbCursor::open(&mut a2, &sra_path).is_err());
+        }
+
+        // open_table("CONSENSUS") locates the CONSENSUS column base.
+        let cursor = VdbCursor::open_table(&mut archive, &sra_path, "CONSENSUS").unwrap();
+        assert_eq!(cursor.spot_count(), 1);
+        assert_eq!(cursor.read_col().read_blob_for_row(1).unwrap(), b"ACGTN");
+        let _ = std::fs::remove_file(&sra_path);
+    }
+
+    #[test]
+    fn flat_layout_only_resolves_sequence() {
+        // A flat (non-database) archive's columns live directly under `col/`
+        // with no `tbl/<name>` wrapper, so it represents the single SEQUENCE
+        // table — never CONSENSUS.
+        let flat = build_minimal_sra_archive(); // database SEQUENCE layout
+        let archive = KarArchive::open(Cursor::new(flat)).unwrap();
+        assert!(find_table_col_base(&archive, "CONSENSUS").is_err());
+        assert!(find_table_col_base(&archive, "SEQUENCE").is_ok());
     }
 
     /// Write archive bytes to a temporary file and return the path.
