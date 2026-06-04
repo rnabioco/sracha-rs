@@ -8,7 +8,7 @@ Fast SRA downloader and FASTQ converter, written in pure Rust.
 
 ## Features
 
-- **Fast** -- 4-11x faster than `fasterq-dump` on typical SRA files
+- **Fast** -- 5-12x faster than `fasterq-dump` on typical SRA files
 - **One command** -- download, convert to FASTQ, and compress
 - **Batch input** -- accessions, BioProjects (PRJNA), studies (SRP), or a file via `--accession-list`
 - **gzip or zstd output** -- parallel compression, or plain FASTQ
@@ -55,9 +55,9 @@ Uncompressed output, measured with
 
 | File | Size | sracha | fasterq-dump | fastq-dump | Speedup vs fasterq-dump |
 |:---|---:|---:|---:|---:|---:|
-| SRR28588231 | 23 MiB | 0.17 s | 1.86 s | 2.09 s | **10.9x** |
-| SRR2584863 | 288 MiB | 1.51 s | 5.80 s | 13.30 s | **3.8x** |
-| ERR1018173 | 1.94 GiB | 9.40 s | 34.35 s | -- | **3.7x** |
+| SRR28588231 | 23 MiB | 0.15 s | 1.78 s | 1.94 s | **12.3x** |
+| SRR2584863 | 288 MiB | 1.07 s | 5.53 s | 12.99 s | **5.2x** |
+| ERR1018173 | 1.94 GiB | 6.45 s | 33.41 s | -- | **5.2x** |
 
 `sracha` produces gzipped FASTQ by default (level 1, ~1.4× the
 uncompressed time on small files thanks to parallel block compression),
@@ -71,35 +71,35 @@ without a separate gzip step.
 
 | Command | Mean [ms] | Min [ms] | Max [ms] | Relative |
 |:---|---:|---:|---:|---:|
-| `sracha` | 170.9 ± 1.8 | 168.2 | 175.4 | 1.00 |
-| `fasterq-dump` | 1856.4 ± 14.2 | 1838.3 | 1871.6 | 10.86 ± 0.14 |
-| `fastq-dump` | 2090.5 ± 33.3 | 2052.5 | 2125.0 | 12.23 ± 0.23 |
+| `sracha` | 145.1 ± 2.3 | 141.7 | 149.8 | 1.00 |
+| `fasterq-dump` | 1782.6 ± 11.7 | 1769.3 | 1794.4 | 12.28 ± 0.21 |
+| `fastq-dump` | 1942.0 ± 3.6 | 1938.0 | 1945.6 | 13.38 ± 0.22 |
 
 **SRR2584863 (288 MiB, Illumina paired)**
 
 | Command | Mean [s] | Min [s] | Max [s] | Relative |
 |:---|---:|---:|---:|---:|
-| `sracha` | 1.512 ± 0.018 | 1.496 | 1.532 | 1.00 |
-| `fasterq-dump` | 5.799 ± 0.130 | 5.667 | 5.927 | 3.83 ± 0.10 |
-| `fastq-dump` | 13.297 ± 0.157 | 13.192 | 13.478 | 8.79 ± 0.15 |
+| `sracha` | 1.070 ± 0.006 | 1.064 | 1.076 | 1.00 |
+| `fasterq-dump` | 5.526 ± 0.081 | 5.441 | 5.602 | 5.16 ± 0.08 |
+| `fastq-dump` | 12.989 ± 0.031 | 12.967 | 13.025 | 12.14 ± 0.07 |
 
 **ERR1018173 (1.94 GiB, 15.6M spots, Illumina paired, single run)**
 
 | Command | Time [s] |
 |:---|---:|
-| `sracha` | 9.40 |
-| `fasterq-dump` | 34.35 |
+| `sracha` | 6.45 |
+| `fasterq-dump` | 33.41 |
 
 **sracha gzip overhead (SRR28588231, default `--gzip-level 1`)**
 
 | Command | Mean [ms] | Min [ms] | Max [ms] | Relative |
 |:---|---:|---:|---:|---:|
-| `sracha (no compression)` | 172.1 ± 5.6 | 165.1 | 185.6 | 1.00 |
-| `sracha (gzip)` | 239.5 ± 5.9 | 230.9 | 249.4 | 1.39 ± 0.06 |
+| `sracha (no compression)` | 150.4 ± 2.5 | 145.7 | 154.4 | 1.00 |
+| `sracha (gzip)` | 213.7 ± 2.8 | 208.9 | 218.3 | 1.42 ± 0.03 |
 
 </details>
 
-Benchmarks run with `sracha` v0.3.5, `sra-tools` v3.4.1, on Linux
+Benchmarks run with `sracha` v0.3.8, `sra-tools` v3.4.1, on Linux
 (8 CPUs). Install the reference toolkit with `pixi run install-sratools`
 and reproduce with `validation/benchmark.sh`.
 

@@ -5,7 +5,7 @@
 #SBATCH --cpus-per-task=8
 #SBATCH --mem=48G
 #SBATCH --time=2:00:00
-#SBATCH --array=0-4
+#SBATCH --array=0-5
 #
 # Benchmark sracha vs fastq-dump vs fasterq-dump.
 #
@@ -21,7 +21,11 @@
 #   # each array task picks its stage from SLURM_ARRAY_TASK_ID and writes
 #   # to validation/bench-results/<stage>.md
 #
-# Stages: small | medium | large | gzip | e2e
+# Stages: small | medium | large | gzip | e2e | mem
+#
+# The `mem` stage measures peak resident set size (RSS) with /usr/bin/time -v
+# rather than hyperfine (which only times wall-clock), comparing sracha against
+# fasterq-dump across the small/medium/large fixtures.
 #
 # Requires:
 #   - hyperfine
@@ -70,15 +74,15 @@ done
 # Array-job dispatch: SLURM_ARRAY_TASK_ID picks a stage and persistent
 # output dir so all tasks deposit into the same aggregation folder.
 if [[ -n "${SLURM_ARRAY_TASK_ID:-}" ]]; then
-    STAGES=(small medium large gzip e2e)
+    STAGES=(small medium large gzip e2e mem)
     ONLY="${STAGES[$SLURM_ARRAY_TASK_ID]:?array index out of range}"
     : "${RESULTS_DIR:=$ROOT_DIR/validation/bench-results}"
     echo "=== array task $SLURM_ARRAY_TASK_ID → stage=$ONLY on $(hostname) ==="
 fi
 
 case "$ONLY" in
-    ""|small|medium|large|gzip|e2e) ;;
-    *) echo "--only must be one of: small medium large gzip e2e (got $ONLY)" >&2; exit 2 ;;
+    ""|small|medium|large|gzip|e2e|mem) ;;
+    *) echo "--only must be one of: small medium large gzip e2e mem (got $ONLY)" >&2; exit 2 ;;
 esac
 
 # Returns 0 if the given stage should run in this invocation.
@@ -173,6 +177,25 @@ timed_run() {
     elapsed=$(echo "$end - $start" | bc)
     printf "  %-20s %s s\n" "$label:" "$elapsed"
     echo "$label $elapsed" >> "$TIMING_FILE"
+}
+
+# ---------- helper: peak RSS measurement ----------
+#
+# hyperfine times wall-clock but cannot report memory, so peak RSS is measured
+# separately with GNU /usr/bin/time -v ("Maximum resident set size", in KiB).
+# The command runs $MEM_RUNS times; the largest observed RSS is printed (MiB)
+# to stdout so callers can capture it. Command output is discarded.
+MEM_RUNS=3
+measure_rss() {
+    local tmpf best=0 rss_kb i
+    tmpf=$(mktemp "${TMPDIR:-/tmp}/sracha-rss.XXXXXX")
+    for ((i = 0; i < MEM_RUNS; i++)); do
+        /usr/bin/time -v -o "$tmpf" "$@" >/dev/null 2>&1 || true
+        rss_kb=$(awk '/Maximum resident set size/ {print $NF}' "$tmpf")
+        [[ -n "$rss_kb" ]] && (( rss_kb > best )) && best=$rss_kb
+    done
+    rm -f "$tmpf"
+    echo "scale=1; $best / 1024" | bc
 }
 
 # =====================================================================
@@ -348,6 +371,55 @@ if should_run e2e; then
         echo
         cat "$OUTDIR/e2e-$ACC.md"
     done
+fi
+
+# =====================================================================
+# Benchmark: Peak memory (RSS) — sracha vs fasterq-dump
+# =====================================================================
+# Reports peak resident set size for each tool across the three fixtures.
+# Decode-side memory was cut substantially in a recent release, so this
+# captures the improvement that wall-clock timing cannot show.
+if should_run mem; then
+    log "Benchmark: peak memory (RSS) — sracha vs fasterq-dump"
+
+    {
+        echo "| File | Size | sracha | fasterq-dump | sracha ÷ fasterq |"
+        echo "|:---|---:|---:|---:|---:|"
+    } > "$OUTDIR/mem.md"
+
+    for MEM_SPEC in \
+        "SRR28588231|$SMALL_SRA|23 MiB" \
+        "SRR2584863|$MEDIUM_SRA|288 MiB" \
+        "ERR1018173|$LARGE_SRA|1.94 GiB"; do
+        IFS='|' read -r ACC SRA SIZE <<< "$MEM_SPEC"
+
+        if [[ ! -f "$SRA" ]]; then
+            echo "  SKIP $ACC: $SRA not found"
+            continue
+        fi
+
+        log "  $ACC ($SIZE)"
+        MEM_OUT="$SCRATCH/mem-$ACC"
+        mkdir -p "$MEM_OUT/sracha" "$MEM_OUT/fasterq"
+
+        S_RSS=$(measure_rss "$SRACHA" fastq "$SRA" --no-gzip --no-progress -O "$MEM_OUT/sracha" -f -q)
+        rm -f "$MEM_OUT/sracha"/*
+        printf "  %-20s %s MiB\n" "sracha:" "$S_RSS"
+
+        F_RSS=$(measure_rss "$FASTERQ_DUMP" "$SRA" --split-3 -O "$MEM_OUT/fasterq" -f)
+        rm -f "$MEM_OUT/fasterq"/*
+        printf "  %-20s %s MiB\n" "fasterq-dump:" "$F_RSS"
+
+        # Ratio of sracha to fasterq-dump RSS: <1 means sracha is leaner,
+        # >1 means it uses more. awk keeps the leading zero (bc prints ".31").
+        RATIO=$(awk "BEGIN{printf \"%.2f\", $S_RSS / $F_RSS}")
+        printf "| %s | %s | %s MiB | %s MiB | %sx |\n" \
+            "$ACC" "$SIZE" "$S_RSS" "$F_RSS" "$RATIO" >> "$OUTDIR/mem.md"
+    done
+
+    echo
+    echo "  Results saved to $OUTDIR/mem.md"
+    cat "$OUTDIR/mem.md"
 fi
 
 log "Benchmarking complete!"
