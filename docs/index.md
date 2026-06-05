@@ -81,7 +81,7 @@ cargo install --git https://github.com/rnabioco/sracha-rs sracha
 ### With Bioconda
 
 ```bash
-pixi add --channel bioconda sracha
+pixi add bioconda::sracha
 ```
 
 ### With containers

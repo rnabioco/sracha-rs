@@ -108,7 +108,7 @@ and reproduce with `validation/benchmark.sh`.
 Install via [Bioconda](https://bioconda.github.io/):
 
 ```bash
-pixi add --channel bioconda sracha
+pixi add bioconda::sracha
 ```
 
 Or download pre-built binaries from the
