@@ -3,31 +3,31 @@ name = "sracha"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
-license.workspace = true
-repository.workspace = true
 description = "Fast SRA downloader and FASTQ converter"
+repository.workspace = true
+license.workspace = true
 
 [[bin]]
 name = "sracha"
 path = "src/main.rs"
 
 [dependencies]
-sracha-core.workspace = true
+anyhow.workspace = true
 chrono.workspace = true
 clap.workspace = true
-serde_json.workspace = true
-tokio.workspace = true
-anyhow.workspace = true
-tracing.workspace = true
-tracing-subscriber.workspace = true
 indicatif.workspace = true
 owo-colors.workspace = true
+serde_json.workspace = true
+sracha-core.workspace = true
 tabled.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+
+[dev-dependencies]
+assert_cmd = "2"
+predicates = "3"
+tempfile.workspace = true
 
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"
-
-[dev-dependencies]
-tempfile.workspace = true
-assert_cmd = "2"
-predicates = "3"

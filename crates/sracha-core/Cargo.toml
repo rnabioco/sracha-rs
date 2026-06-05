@@ -3,42 +3,42 @@ name = "sracha-core"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
-license.workspace = true
-repository.workspace = true
 description = "Core library for sracha SRA tools"
+repository.workspace = true
+license.workspace = true
+
+[[bench]]
+harness = false
+name = "decode"
 
 [dependencies]
-tokio.workspace = true
+anyhow.workspace = true
+byteorder.workspace = true
+bytes.workspace = true
+crossbeam-channel.workspace = true
+flate2.workspace = true
+indicatif.workspace = true
+itoa.workspace = true
+libdeflate-sys.workspace = true
+libdeflater.workspace = true
+md-5.workspace = true
+memmap2.workspace = true
+rayon.workspace = true
 reqwest.workspace = true
 serde.workspace = true
 serde_json.workspace = true
-rayon.workspace = true
-flate2.workspace = true
-libdeflater.workspace = true
-libdeflate-sys.workspace = true
-crossbeam-channel.workspace = true
-zstd.workspace = true
-indicatif.workspace = true
-thiserror.workspace = true
-anyhow.workspace = true
-md-5.workspace = true
-byteorder.workspace = true
-itoa.workspace = true
-memmap2.workspace = true
-url.workspace = true
-tempfile.workspace = true
-bytes.workspace = true
-tracing.workspace = true
 sracha-vdb.workspace = true
+tempfile.workspace = true
+thiserror.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+url.workspace = true
+zstd.workspace = true
 
 [dev-dependencies]
-reqwest = { workspace = true, features = ["blocking"] }
-flate2.workspace = true
-tempfile.workspace = true
-md-5.workspace = true
 criterion = { version = "0.8", features = ["html_reports"] }
+flate2.workspace = true
+md-5.workspace = true
+reqwest = { workspace = true, features = ["blocking"] }
+tempfile.workspace = true
 wiremock.workspace = true
-
-[[bench]]
-name = "decode"
-harness = false

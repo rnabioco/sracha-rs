@@ -12,15 +12,15 @@ site_dir = "site"
 [project.theme]
 name = "material"
 features = [
-    "content.code.copy",
-    "content.code.annotate",
-    "navigation.instant",
-    "navigation.instant.prefetch",
-    "navigation.sections",
-    "navigation.footer",
-    "navigation.top",
-    "search.highlight",
-    "search.suggest",
+  "content.code.copy",
+  "content.code.annotate",
+  "navigation.instant",
+  "navigation.instant.prefetch",
+  "navigation.sections",
+  "navigation.footer",
+  "navigation.top",
+  "search.highlight",
+  "search.suggest",
 ]
 
 [[project.theme.palette]]
@@ -53,9 +53,7 @@ pygments_lang_class = true
 [project.markdown_extensions.pymdownx.inlinehilite]
 
 [project.markdown_extensions.pymdownx.superfences]
-custom_fences = [
-  { name = "mermaid", class = "mermaid" }
-]
+custom_fences = [{ name = "mermaid", class = "mermaid" }]
 
 [project.markdown_extensions.pymdownx.tabbed]
 

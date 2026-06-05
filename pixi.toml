@@ -43,13 +43,13 @@ install-sratools = { cmd = "bash validation/install-sratools.sh", description = 
 mold = ">=2.4"
 
 [feature.dev.tasks]
-build            = "mold -run cargo build"
-release          = "mold -run cargo build --profile release"
-release-debug    = "mold -run cargo build --profile release-with-debug"
-test             = "mold -run cargo nextest run"
+build = "mold -run cargo build"
+release = "mold -run cargo build --profile release"
+release-debug = "mold -run cargo build --profile release-with-debug"
+test = "mold -run cargo nextest run"
 test-integration = "mold -run cargo nextest run -p sracha-core --run-ignored=ignored-only"
-check            = "mold -run cargo check"
-clippy           = "mold -run cargo clippy --all-targets --all-features -- -D warnings"
+check = "mold -run cargo check"
+clippy = "mold -run cargo clippy --all-targets --all-features -- -D warnings"
 
 [environments]
 dev = { features = ["dev"], solve-group = "default" }
