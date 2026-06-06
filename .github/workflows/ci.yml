@@ -59,6 +59,36 @@ jobs:
       - name: Run integration tests
         run: cargo nextest run -p sracha-core --all-features --profile ci --run-ignored=ignored-only
 
+  coverage:
+    name: Coverage
+    needs: check
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: llvm-tools-preview
+      - uses: Swatinem/rust-cache@v2
+      - uses: taiki-e/install-action@nextest
+      - uses: taiki-e/install-action@cargo-llvm-cov
+      # Coverage measures the default (non-ignored) test suite only; the
+      # #[ignore]d integration tests download real SRA files from NCBI and
+      # would make the number depend on network state.
+      - name: Generate coverage (lcov)
+        run: cargo llvm-cov nextest --all-features --workspace --lcov --output-path lcov.info
+      - name: Coverage summary
+        run: cargo llvm-cov report --summary-only
+      - name: Upload lcov artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: coverage-lcov
+          path: lcov.info
+      - name: Upload to Codecov
+        uses: codecov/codecov-action@v4
+        with:
+          files: lcov.info
+          fail_ci_if_error: false
+
   msrv:
     name: MSRV (1.92)
     runs-on: ubuntu-latest

@@ -278,3 +278,250 @@ pub(crate) fn check_completion_marker(
 
     Some(output_paths)
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::path::PathBuf;
+
+    /// A minimal `PipelineConfig` for marker round-trips. Only the fields the
+    /// marker actually compares (`split_mode`, `compression`, `fasta`,
+    /// `skip_technical`, `min_read_len`) matter here; the rest are defaults.
+    fn test_config(output_dir: &Path) -> PipelineConfig {
+        PipelineConfig {
+            output_dir: output_dir.to_path_buf(),
+            split_mode: crate::fastq::SplitMode::Split3,
+            compression: crate::fastq::CompressionMode::None,
+            threads: 1,
+            connections: 1,
+            skip_technical: true,
+            min_read_len: None,
+            force: false,
+            progress: false,
+            run_info: None,
+            fasta: false,
+            resume: true,
+            stdout: false,
+            cancelled: None,
+            strict: false,
+            http_client: None,
+            keep_sra: false,
+            paired_suffix: crate::fastq::PairedSuffix::Numeric,
+            seq_defline: None,
+            folder_per_accession: false,
+            metadata: None,
+            metadata_url: None,
+            metadata_md5: None,
+            metadata_size: None,
+            metadata_service: None,
+        }
+    }
+
+    /// Create `name` in `dir` with `len` bytes and return its path.
+    fn make_output(dir: &Path, name: &str, len: usize) -> PathBuf {
+        let path = dir.join(name);
+        std::fs::write(&path, vec![b'A'; len]).unwrap();
+        path
+    }
+
+    #[test]
+    fn marker_path_format() {
+        let p = marker_path(Path::new("/out"), "SRR123");
+        assert_eq!(p, PathBuf::from("/out/.sracha-done-SRR123"));
+    }
+
+    #[test]
+    fn compression_key_is_stable() {
+        use crate::fastq::CompressionMode;
+        assert_eq!(compression_key(&CompressionMode::None), "none");
+        assert_eq!(
+            compression_key(&CompressionMode::Gzip { level: 6 }),
+            "gzip:6"
+        );
+        assert_eq!(
+            compression_key(&CompressionMode::Zstd {
+                level: 3,
+                threads: 4
+            }),
+            "zstd:3:4"
+        );
+    }
+
+    #[test]
+    fn iso8601_now_utc_has_rfc3339_shape() {
+        let s = iso8601_now_utc();
+        // YYYY-MM-DDTHH:MM:SSZ
+        assert_eq!(s.len(), 20, "got {s:?}");
+        assert!(s.ends_with('Z'));
+        assert_eq!(&s[4..5], "-");
+        assert_eq!(&s[10..11], "T");
+        assert!(s[0..4].parse::<u32>().unwrap() >= 2026);
+    }
+
+    #[test]
+    fn write_then_check_round_trips() {
+        let dir = tempfile::tempdir().unwrap();
+        let cfg = test_config(dir.path());
+        let f1 = make_output(dir.path(), "SRR1_1.fastq", 10);
+        let f2 = make_output(dir.path(), "SRR1_2.fastq", 20);
+
+        write_completion_marker(
+            dir.path(),
+            "SRR1",
+            Some("abc"),
+            1234,
+            &cfg,
+            &[f1.clone(), f2.clone()],
+        )
+        .unwrap();
+
+        let got = check_completion_marker(dir.path(), "SRR1", &cfg, 1234);
+        assert_eq!(got, Some(vec![f1, f2]));
+    }
+
+    #[test]
+    fn check_returns_none_when_marker_absent() {
+        let dir = tempfile::tempdir().unwrap();
+        let cfg = test_config(dir.path());
+        assert!(check_completion_marker(dir.path(), "SRR1", &cfg, 1234).is_none());
+    }
+
+    #[test]
+    fn check_rejects_sra_size_mismatch() {
+        let dir = tempfile::tempdir().unwrap();
+        let cfg = test_config(dir.path());
+        let f1 = make_output(dir.path(), "SRR1_1.fastq", 10);
+        write_completion_marker(dir.path(), "SRR1", None, 1234, &cfg, &[f1]).unwrap();
+
+        // Same accession + config, but a different upstream SRA size means the
+        // input changed → must re-decode.
+        assert!(check_completion_marker(dir.path(), "SRR1", &cfg, 9999).is_none());
+    }
+
+    #[test]
+    fn check_rejects_config_mismatch() {
+        let dir = tempfile::tempdir().unwrap();
+        let cfg = test_config(dir.path());
+        let f1 = make_output(dir.path(), "SRR1_1.fastq", 10);
+        write_completion_marker(dir.path(), "SRR1", None, 1234, &cfg, &[f1]).unwrap();
+
+        let mut other = test_config(dir.path());
+        other.compression = crate::fastq::CompressionMode::Gzip { level: 6 };
+        assert!(check_completion_marker(dir.path(), "SRR1", &other, 1234).is_none());
+
+        let mut other = test_config(dir.path());
+        other.fasta = true;
+        assert!(check_completion_marker(dir.path(), "SRR1", &other, 1234).is_none());
+
+        let mut other = test_config(dir.path());
+        other.min_read_len = Some(25);
+        assert!(check_completion_marker(dir.path(), "SRR1", &other, 1234).is_none());
+    }
+
+    #[test]
+    fn check_rejects_resized_output_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let cfg = test_config(dir.path());
+        let f1 = make_output(dir.path(), "SRR1_1.fastq", 10);
+        write_completion_marker(
+            dir.path(),
+            "SRR1",
+            None,
+            1234,
+            &cfg,
+            std::slice::from_ref(&f1),
+        )
+        .unwrap();
+
+        // Truncate the output: recorded size no longer matches → re-decode.
+        std::fs::write(&f1, b"short").unwrap();
+        assert!(check_completion_marker(dir.path(), "SRR1", &cfg, 1234).is_none());
+    }
+
+    #[test]
+    fn check_rejects_missing_output_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let cfg = test_config(dir.path());
+        let f1 = make_output(dir.path(), "SRR1_1.fastq", 10);
+        write_completion_marker(
+            dir.path(),
+            "SRR1",
+            None,
+            1234,
+            &cfg,
+            std::slice::from_ref(&f1),
+        )
+        .unwrap();
+
+        std::fs::remove_file(&f1).unwrap();
+        assert!(check_completion_marker(dir.path(), "SRR1", &cfg, 1234).is_none());
+    }
+
+    #[test]
+    fn check_rejects_when_temp_sra_present() {
+        let dir = tempfile::tempdir().unwrap();
+        let cfg = test_config(dir.path());
+        let f1 = make_output(dir.path(), "SRR1_1.fastq", 10);
+        write_completion_marker(dir.path(), "SRR1", None, 1234, &cfg, &[f1]).unwrap();
+
+        // A leftover temp SRA means the prior decode did not finish cleanly.
+        std::fs::write(dir.path().join(".sracha-tmp-SRR1.sra"), b"partial").unwrap();
+        assert!(check_completion_marker(dir.path(), "SRR1", &cfg, 1234).is_none());
+    }
+
+    #[test]
+    fn check_rejects_stale_marker_version() {
+        let dir = tempfile::tempdir().unwrap();
+        let cfg = test_config(dir.path());
+        let f1 = make_output(dir.path(), "SRR1_1.fastq", 10);
+        write_completion_marker(dir.path(), "SRR1", None, 1234, &cfg, &[f1]).unwrap();
+
+        // Rewrite the on-disk marker with a bumped version to simulate a
+        // schema change; the loader must invalidate it.
+        let path = marker_path(dir.path(), "SRR1");
+        let content = std::fs::read_to_string(&path).unwrap();
+        let bumped = content.replace(
+            &format!("\"version\": {MARKER_VERSION}"),
+            &format!("\"version\": {}", MARKER_VERSION + 1),
+        );
+        assert_ne!(bumped, content, "version field not found in marker JSON");
+        std::fs::write(&path, bumped).unwrap();
+
+        assert!(check_completion_marker(dir.path(), "SRR1", &cfg, 1234).is_none());
+    }
+
+    #[test]
+    fn write_stats_file_appends_ndjson() {
+        let dir = tempfile::tempdir().unwrap();
+        let out = make_output(dir.path(), "SRR1_1.fastq", 42);
+        let diag = IntegrityDiag::default();
+
+        for acc in ["SRR1", "SRR2"] {
+            write_stats_file(StatsEntry {
+                output_dir: dir.path(),
+                accession: acc,
+                spots_read: 100,
+                reads_written: 200,
+                sra_md5: Some("deadbeef"),
+                sra_size: 4096,
+                output_files: std::slice::from_ref(&out),
+                diag: &diag,
+            })
+            .unwrap();
+        }
+
+        let content = std::fs::read_to_string(stats_path(dir.path())).unwrap();
+        let lines: Vec<&str> = content.lines().collect();
+        assert_eq!(lines.len(), 2, "append should produce one line per call");
+
+        let first: serde_json::Value = serde_json::from_str(lines[0]).unwrap();
+        assert_eq!(first["accession"], "SRR1");
+        assert_eq!(first["spots_read"], 100);
+        assert_eq!(first["integrity"]["ok"], true);
+        assert_eq!(first["output_files"][0]["name"], "SRR1_1.fastq");
+        assert_eq!(first["output_files"][0]["bytes"], 42);
+
+        let second: serde_json::Value = serde_json::from_str(lines[1]).unwrap();
+        assert_eq!(second["accession"], "SRR2");
+    }
+}
