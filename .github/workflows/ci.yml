@@ -73,16 +73,35 @@ jobs:
       - uses: taiki-e/install-action@cargo-llvm-cov
       # Coverage measures the default (non-ignored) test suite only; the
       # #[ignore]d integration tests download real SRA files from NCBI and
-      # would make the number depend on network state.
-      - name: Generate coverage (lcov)
-        run: cargo llvm-cov nextest --all-features --workspace --lcov --output-path lcov.info
-      - name: Coverage summary
-        run: cargo llvm-cov report --summary-only
+      # would make the number depend on network state. Tests run once with
+      # --no-report; the report steps below reuse the collected profdata.
+      - name: Run tests with coverage instrumentation
+        run: cargo llvm-cov nextest --all-features --workspace --no-report
+      - name: Export lcov
+        run: cargo llvm-cov report --lcov --output-path lcov.info
+      - name: Generate HTML report
+        run: cargo llvm-cov report --html --output-dir coverage-html
+      - name: Detailed per-file report → job summary
+        run: |
+          {
+            echo '## Coverage report'
+            echo
+            echo '_Default (non-ignored) test suite. cSRA / network paths are exercised only by the `#[ignore]`d integration tests and read low here by design._'
+            echo
+            echo '```'
+            cargo llvm-cov report
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
       - name: Upload lcov artifact
         uses: actions/upload-artifact@v4
         with:
           name: coverage-lcov
           path: lcov.info
+      - name: Upload HTML report artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: coverage-html
+          path: coverage-html
       - name: Upload to Codecov
         uses: codecov/codecov-action@v4
         with:
