@@ -2,6 +2,13 @@
 
 ## Unreleased
 
+### Fixes
+
+- Large `--accession-list` runs no longer fail with `HTTP 414 URI Too Long`
+  (#64). The SDL locate request is now split into chunks of 100 accessions
+  instead of packing every accession into one URL, and EUtils RunInfo EFetch
+  uses HTTP POST (no URL-length limit) instead of GET.
+
 ## 0.3.8 (2026-06-03)
 
 ### Performance

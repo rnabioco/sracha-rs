@@ -10,7 +10,7 @@ repository = "https://github.com/rnabioco/sracha-rs"
 license = "MIT"
 
 [workspace.dependencies]
-reqwest = { version = "0.13", features = ["json", "rustls", "stream"] }
+reqwest = { version = "0.13", features = ["form", "json", "rustls", "stream"] }
 # Async
 tokio = { version = "1", features = ["full"] }
 
