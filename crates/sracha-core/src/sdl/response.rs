@@ -2,7 +2,7 @@ use serde::Deserialize;
 use serde_json::Value;
 
 /// Top-level response from the NCBI SDL API.
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Default, Deserialize)]
 pub struct SdlResponse {
     /// API version string (e.g., "2").
     pub version: Option<String>,

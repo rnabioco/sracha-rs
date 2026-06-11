@@ -15,22 +15,35 @@ const EUTILS_ESEARCH_URL: &str = "https://eutils.ncbi.nlm.nih.gov/entrez/eutils/
 /// NCBI EUtils RunInfo endpoint (returns CSV).
 const EUTILS_EFETCH_URL: &str = "https://eutils.ncbi.nlm.nih.gov/entrez/eutils/efetch.fcgi";
 
-/// Maximum UIDs per EFetch request to stay within URL length limits.
+/// Maximum UIDs per EFetch request. EFetch uses HTTP POST (`id` in the body),
+/// so this is a sanity cap on response size, not a URL-length limit.
 const EFETCH_BATCH_SIZE: usize = 500;
+
+/// Maximum accessions per SDL locate `resolve()` call. The SDL API is GET-only
+/// (`?acc=…` repeated per accession), so the request URL grows ~16 bytes per
+/// accession. 100 keeps each URL well under ~2 KB — far below any server's
+/// limit — which prevents HTTP 414 on large `--accession-list` runs (#64).
+const SDL_BATCH_SIZE: usize = 100;
 
 /// Maximum retry attempts for HTTP 429 / 5xx responses.
 const MAX_API_RETRIES: u32 = 3;
 
-/// HTTP GET with automatic retry on 429 (Too Many Requests) and 5xx errors.
+/// Send an HTTP request with automatic retry on 429 (Too Many Requests) and
+/// 5xx errors.
 ///
+/// Takes a closure that builds a fresh `RequestBuilder` on each attempt (a
+/// builder is consumed by `send()`, so it can't be reused across retries).
 /// Uses exponential backoff (1s, 2s, 4s) with random jitter (0-500ms) to
 /// avoid thundering-herd effects when NCBI rate-limits concurrent requests.
-async fn http_get_with_retry(
-    client: &reqwest::Client,
-    url: &str,
+///
+/// Note: 4xx client errors (including 414 URI Too Long) are *not* retried —
+/// they are deterministic and would just fail identically.
+async fn send_with_retry(
+    label: &str,
+    make_req: impl Fn() -> reqwest::RequestBuilder,
 ) -> std::result::Result<reqwest::Response, reqwest::Error> {
     for attempt in 0..=MAX_API_RETRIES {
-        let resp = client.get(url).send().await?;
+        let resp = make_req().send().await?;
         let status = resp.status();
 
         if (status == reqwest::StatusCode::TOO_MANY_REQUESTS || status.is_server_error())
@@ -43,7 +56,7 @@ async fn http_get_with_retry(
             // 3-attempt backoff isn't an error the user needs to see — the
             // exhausted-retry case will surface as a real Error to the caller.
             tracing::info!(
-                "HTTP {status} from {url}, retry {}/{MAX_API_RETRIES} in {delay:?}",
+                "HTTP {status} from {label}, retry {}/{MAX_API_RETRIES} in {delay:?}",
                 attempt + 1
             );
             tokio::time::sleep(delay).await;
@@ -53,6 +66,34 @@ async fn http_get_with_retry(
         return Ok(resp);
     }
     unreachable!()
+}
+
+/// HTTP GET with automatic retry on 429 / 5xx (see [`send_with_retry`]).
+async fn http_get_with_retry(
+    client: &reqwest::Client,
+    url: &str,
+) -> std::result::Result<reqwest::Response, reqwest::Error> {
+    send_with_retry(url, || client.get(url)).await
+}
+
+/// EUtils EFetch RunInfo via HTTP POST (`id` in the body, not the URL).
+///
+/// POST is the NCBI-recommended transport for large UID lists and has no
+/// URL-length limit, so it never hits HTTP 414 regardless of batch size (#64).
+async fn efetch_runinfo_post(
+    client: &reqwest::Client,
+    ids: &str,
+) -> std::result::Result<reqwest::Response, reqwest::Error> {
+    let form = [
+        ("db", "sra"),
+        ("id", ids),
+        ("rettype", "runinfo"),
+        ("retmode", "text"),
+    ];
+    send_with_retry("EUtils EFetch (POST)", || {
+        client.post(EUTILS_EFETCH_URL).form(&form)
+    })
+    .await
 }
 
 /// Cheap pseudo-random jitter (0-500ms) without pulling in the `rand` crate.
@@ -193,10 +234,33 @@ impl SdlClient {
 
     /// Resolve one or more accessions to download locations via the SDL API.
     ///
-    /// Uses GET with query parameters: `?acc=SRR000001&acc=SRR000002`
+    /// The SDL API is GET-only (`?acc=SRR000001&acc=SRR000002`), so the request
+    /// is split into chunks of [`SDL_BATCH_SIZE`] to keep each URL short enough
+    /// to avoid HTTP 414 on large accession lists (#64). The per-chunk results
+    /// are merged into a single [`SdlResponse`].
     /// When `format` is `Sralite`, appends `capability=zqa:z` to request
     /// SRA-lite files from the SDL API.
     pub async fn resolve(
+        &self,
+        accessions: &[String],
+        format: FormatPreference,
+    ) -> Result<SdlResponse> {
+        let mut merged: Option<SdlResponse> = None;
+
+        for chunk in accessions.chunks(SDL_BATCH_SIZE) {
+            let resp = self.resolve_chunk(chunk, format).await?;
+            match merged.as_mut() {
+                Some(acc) => acc.results.extend(resp.results),
+                None => merged = Some(resp),
+            }
+        }
+
+        // Empty input → an empty response, preserving prior behavior.
+        Ok(merged.unwrap_or_default())
+    }
+
+    /// Resolve a single chunk of accessions in one SDL GET request.
+    async fn resolve_chunk(
         &self,
         accessions: &[String],
         format: FormatPreference,
@@ -356,11 +420,10 @@ impl SdlClient {
 
         for chunk in accessions.chunks(EFETCH_BATCH_SIZE) {
             let ids = chunk.join(",");
-            let url = format!("{EUTILS_EFETCH_URL}?db=sra&id={ids}&rettype=runinfo&retmode=text");
 
             tracing::debug!("EUtils RunInfo batch request ({} accessions)", chunk.len());
 
-            let resp = match http_get_with_retry(&self.http, &url).await {
+            let resp = match efetch_runinfo_post(&self.http, &ids).await {
                 Ok(r) => r,
                 Err(e) => {
                     tracing::warn!("EUtils RunInfo batch request failed: {e}");
@@ -451,12 +514,10 @@ impl SdlClient {
 
         for chunk in uids.chunks(EFETCH_BATCH_SIZE) {
             let ids = chunk.join(",");
-            let fetch_url =
-                format!("{EUTILS_EFETCH_URL}?db=sra&id={ids}&rettype=runinfo&retmode=text");
 
             tracing::debug!("EFetch RunInfo batch request ({} UIDs)", chunk.len());
 
-            let resp = http_get_with_retry(&self.http, &fetch_url)
+            let resp = efetch_runinfo_post(&self.http, &ids)
                 .await
                 .map_err(|e| Error::Sdl {
                     message: format!("{accession}: EFetch request failed: {e}"),
@@ -970,5 +1031,67 @@ mod tests {
         assert!(ri.library_strategy.is_none());
         assert!(ri.biosample.is_none());
         assert!(ri.tax_id.is_none());
+    }
+
+    // -----------------------------------------------------------------------
+    // SDL request chunking (regression guard for #64: HTTP 414 URI Too Long)
+    // -----------------------------------------------------------------------
+
+    /// Build the SDL GET URL exactly as `resolve_chunk` does, so the test
+    /// guards the real request the server sees.
+    fn sdl_chunk_url(accessions: &[String], format: FormatPreference) -> String {
+        let mut url = reqwest::Url::parse(SDL_URL).expect("invalid SDL URL");
+        for acc in accessions {
+            url.query_pairs_mut().append_pair("acc", acc);
+        }
+        if format == FormatPreference::Sralite {
+            url.query_pairs_mut().append_pair("capability", "zqa:z");
+        }
+        url.to_string()
+    }
+
+    #[test]
+    fn sdl_full_batch_url_stays_well_under_server_limits() {
+        // A full chunk of long-ish accessions must produce a URL comfortably
+        // below the ~8 KB limit servers reject with 414. We assert < 2 KB.
+        let accessions: Vec<String> = (0..SDL_BATCH_SIZE).map(|i| format!("SRR{i:09}")).collect();
+        let url = sdl_chunk_url(&accessions, FormatPreference::Sralite);
+        assert!(
+            url.len() < 2048,
+            "SDL chunk URL is {} bytes, expected < 2048",
+            url.len()
+        );
+    }
+
+    #[test]
+    fn sdl_chunking_covers_all_accessions_without_loss() {
+        // Mirrors resolve()'s chunk loop: every accession lands in exactly one
+        // chunk, no duplicates, order preserved across chunk boundaries.
+        let accessions: Vec<String> = (0..1650).map(|i| format!("SRR{i:09}")).collect();
+        let chunks: Vec<&[String]> = accessions.chunks(SDL_BATCH_SIZE).collect();
+
+        assert_eq!(chunks.len(), 1650usize.div_ceil(SDL_BATCH_SIZE));
+        let flattened: Vec<&String> = chunks.iter().flat_map(|c| c.iter()).collect();
+        assert_eq!(flattened.len(), accessions.len());
+        assert!(flattened.iter().zip(&accessions).all(|(a, b)| *a == b));
+    }
+
+    #[test]
+    fn sdl_response_merge_preserves_lookups_across_chunks() {
+        // resolve() extends results across chunks; find_result must locate an
+        // accession regardless of which chunk it came from.
+        let chunk_a: SdlResponse = serde_json::from_str(
+            r#"{"version":"2","status":200,"result":[{"query":"SRR000001"}]}"#,
+        )
+        .unwrap();
+        let chunk_b: SdlResponse =
+            serde_json::from_str(r#"{"result":[{"query":"SRR000002"}]}"#).unwrap();
+
+        let mut merged = chunk_a;
+        merged.results.extend(chunk_b.results);
+
+        assert!(merged.find_result("SRR000001").is_some());
+        assert!(merged.find_result("SRR000002").is_some());
+        assert!(merged.find_result("SRR999999").is_none());
     }
 }
