@@ -1,5 +1,14 @@
 # Changelog
 
+## Unreleased
+
+### Fixes
+
+- The info table no longer shows `?`/`-` placeholders for an occasional run
+  when resolving a project. EUtils EFetch sometimes returns HTTP 200 with an
+  incomplete RunInfo CSV, dropping rows; sracha now re-fetches the missing
+  accessions with bounded backoff instead of leaving them unresolved.
+
 ## 0.3.9 (2026-06-12)
 
 ### Fixes
