@@ -415,38 +415,74 @@ impl SdlClient {
     /// Batch-fetch RunInfo for multiple accessions in chunks of [`EFETCH_BATCH_SIZE`].
     ///
     /// Non-fatal: accessions that fail to resolve simply won't appear in the map.
+    ///
+    /// Completeness-aware retry: NCBI EFetch occasionally returns HTTP 200 with an
+    /// *incomplete* runinfo CSV (some requested rows silently dropped under load).
+    /// [`send_with_retry`] only retries 429/5xx, so a partial 200 passes through and
+    /// the missing accessions surface as `?`/`-` placeholders in the info table. To
+    /// heal that, after each round we re-fetch only the accessions still absent from
+    /// the result map, with bounded exponential backoff (1s, 2s, 4s + jitter). This
+    /// also covers whole-chunk failures, since those accessions simply stay pending.
+    /// Genuinely metadata-less runs remain `None` after the bound — no infinite loop.
     pub async fn fetch_run_info_batch(&self, accessions: &[String]) -> HashMap<String, RunInfo> {
         let mut result = HashMap::new();
+        let mut pending: Vec<String> = accessions.to_vec();
 
-        for chunk in accessions.chunks(EFETCH_BATCH_SIZE) {
-            let ids = chunk.join(",");
+        for attempt in 0..=MAX_API_RETRIES {
+            for chunk in pending.chunks(EFETCH_BATCH_SIZE) {
+                let ids = chunk.join(",");
 
-            tracing::debug!("EUtils RunInfo batch request ({} accessions)", chunk.len());
+                tracing::debug!("EUtils RunInfo batch request ({} accessions)", chunk.len());
 
-            let resp = match efetch_runinfo_post(&self.http, &ids).await {
-                Ok(r) => r,
-                Err(e) => {
-                    tracing::warn!("EUtils RunInfo batch request failed: {e}");
+                let resp = match efetch_runinfo_post(&self.http, &ids).await {
+                    Ok(r) => r,
+                    Err(e) => {
+                        tracing::warn!("EUtils RunInfo batch request failed: {e}");
+                        continue;
+                    }
+                };
+
+                if !resp.status().is_success() {
+                    tracing::warn!("EUtils RunInfo batch HTTP {}", resp.status());
                     continue;
                 }
-            };
 
-            if !resp.status().is_success() {
-                tracing::warn!("EUtils RunInfo batch HTTP {}", resp.status());
-                continue;
+                let body = match resp.text().await {
+                    Ok(b) => b,
+                    Err(e) => {
+                        tracing::warn!("EUtils RunInfo batch body read failed: {e}");
+                        continue;
+                    }
+                };
+
+                tracing::debug!("EUtils RunInfo batch response: {body}");
+
+                result.extend(parse_run_info_csv_multi(&body));
             }
 
-            let body = match resp.text().await {
-                Ok(b) => b,
-                Err(e) => {
-                    tracing::warn!("EUtils RunInfo batch body read failed: {e}");
-                    continue;
-                }
-            };
+            // Re-fetch only the accessions still missing from the result map.
+            pending = missing_accessions(accessions, &result);
+            if pending.is_empty() {
+                break;
+            }
 
-            tracing::debug!("EUtils RunInfo batch response: {body}");
+            if attempt < MAX_API_RETRIES {
+                let base = std::time::Duration::from_secs(1 << attempt);
+                let delay = base + std::time::Duration::from_millis(rand_jitter_ms());
+                tracing::info!(
+                    "EUtils RunInfo incomplete: {} accession(s) missing, retry {}/{MAX_API_RETRIES} in {delay:?}",
+                    pending.len(),
+                    attempt + 1
+                );
+                tokio::time::sleep(delay).await;
+            }
+        }
 
-            result.extend(parse_run_info_csv_multi(&body));
+        if !pending.is_empty() {
+            tracing::warn!(
+                "EUtils RunInfo unresolved for {} accession(s) after {MAX_API_RETRIES} retries",
+                pending.len()
+            );
         }
 
         result
@@ -553,6 +589,17 @@ impl SdlClient {
 
         Ok(run_accessions)
     }
+}
+
+/// Return the requested accessions not yet present as keys in `resolved`,
+/// preserving the original request order. Used to drive the completeness-aware
+/// retry in [`SdlClient::fetch_run_info_batch`].
+fn missing_accessions(requested: &[String], resolved: &HashMap<String, RunInfo>) -> Vec<String> {
+    requested
+        .iter()
+        .filter(|acc| !resolved.contains_key(*acc))
+        .cloned()
+        .collect()
 }
 
 /// Parse an EFetch RunInfo CSV with multiple data rows into a map of accession → RunInfo.
@@ -937,6 +984,30 @@ mod tests {
         assert_eq!(r2.nreads, 1);
         assert_eq!(r2.spot_len, 150);
         assert_eq!(r2.avg_read_len, vec![150]);
+    }
+
+    #[test]
+    fn missing_accessions_identifies_dropped_rows() {
+        // Simulates a partial EFetch 200: SRR222 dropped from the response.
+        let requested = vec!["SRR111".into(), "SRR222".into(), "SRR333".into()];
+        let csv = "Run,spots,bases,avgLength,LibraryLayout\n\
+                   SRR111,100,200,302,PAIRED\n\
+                   SRR333,300,600,150,SINGLE\n";
+        let resolved = parse_run_info_csv_multi(csv);
+        assert_eq!(missing_accessions(&requested, &resolved), vec!["SRR222"]);
+    }
+
+    #[test]
+    fn missing_accessions_empty_when_complete() {
+        // A second round that fills in the gap converges to nothing pending.
+        let requested = vec!["SRR111".into(), "SRR222".into()];
+        let mut resolved =
+            parse_run_info_csv_multi("Run,avgLength,LibraryLayout\nSRR111,302,PAIRED\n");
+        assert_eq!(missing_accessions(&requested, &resolved), vec!["SRR222"]);
+        resolved.extend(parse_run_info_csv_multi(
+            "Run,avgLength,LibraryLayout\nSRR222,150,SINGLE\n",
+        ));
+        assert!(missing_accessions(&requested, &resolved).is_empty());
     }
 
     // -----------------------------------------------------------------------
