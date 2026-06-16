@@ -1721,6 +1721,116 @@ async fn poll_cancelled(flag: Arc<AtomicBool>) {
     }
 }
 
+/// Write the run-metadata sidecar(s) requested via `config.metadata`.
+///
+/// Returns the paths of the sidecars that were written. When `only_if_missing`
+/// is set, sidecars that already exist on disk are left untouched and excluded
+/// from the returned list — this is the cache-hit backfill path, where a prior
+/// run produced the FASTQ but the user has since asked for metadata that wasn't
+/// recorded in the completion marker. Returns an empty vec when no metadata is
+/// requested or in stdout mode.
+fn write_run_metadata(
+    config: &PipelineConfig,
+    accession: &str,
+    only_if_missing: bool,
+) -> Vec<PathBuf> {
+    let mut written = Vec::new();
+    if config.stdout {
+        return written;
+    }
+    let Some(format) = config.metadata else {
+        return written;
+    };
+
+    let row = crate::metadata::RunMetadata {
+        accession: accession.to_string(),
+        url: config.metadata_url.clone(),
+        size_bytes: config.metadata_size,
+        md5: config.metadata_md5.clone(),
+        source_service: config.metadata_service.clone(),
+        spots: config.run_info.as_ref().and_then(|r| r.spots),
+        spot_len: config.run_info.as_ref().map(|r| r.spot_len),
+        nreads: config.run_info.as_ref().map(|r| r.nreads),
+        avg_read_len: config
+            .run_info
+            .as_ref()
+            .map(|r| r.avg_read_len.clone())
+            .unwrap_or_default(),
+        platform: config.run_info.as_ref().and_then(|r| r.platform.clone()),
+        instrument_model: config
+            .run_info
+            .as_ref()
+            .and_then(|r| r.instrument_model.clone()),
+        library_strategy: config
+            .run_info
+            .as_ref()
+            .and_then(|r| r.library_strategy.clone()),
+        library_source: config
+            .run_info
+            .as_ref()
+            .and_then(|r| r.library_source.clone()),
+        library_selection: config
+            .run_info
+            .as_ref()
+            .and_then(|r| r.library_selection.clone()),
+        library_layout: config
+            .run_info
+            .as_ref()
+            .and_then(|r| r.library_layout.clone()),
+        library_name: config
+            .run_info
+            .as_ref()
+            .and_then(|r| r.library_name.clone()),
+        experiment: config.run_info.as_ref().and_then(|r| r.experiment.clone()),
+        study: config.run_info.as_ref().and_then(|r| r.study.clone()),
+        bioproject: config.run_info.as_ref().and_then(|r| r.bioproject.clone()),
+        sample: config.run_info.as_ref().and_then(|r| r.sample.clone()),
+        biosample: config.run_info.as_ref().and_then(|r| r.biosample.clone()),
+        scientific_name: config
+            .run_info
+            .as_ref()
+            .and_then(|r| r.scientific_name.clone()),
+        tax_id: config.run_info.as_ref().and_then(|r| r.tax_id),
+        bases: config.run_info.as_ref().and_then(|r| r.bases),
+        size_mb: config.run_info.as_ref().and_then(|r| r.size_mb),
+        release_date: config
+            .run_info
+            .as_ref()
+            .and_then(|r| r.release_date.clone()),
+        load_date: config.run_info.as_ref().and_then(|r| r.load_date.clone()),
+    };
+    let rows = [row];
+    let stem = config.accession_output_dir(accession).join(accession);
+    let tsv_path = stem.with_extension("metadata.tsv");
+    let json_path = stem.with_extension("metadata.json");
+
+    let mut write_one = |path: PathBuf, kind: &str| {
+        if only_if_missing && path.exists() {
+            return;
+        }
+        let result = match kind {
+            "TSV" => crate::metadata::write_tsv(&path, &rows),
+            _ => crate::metadata::write_json(&path, &rows),
+        };
+        match result {
+            Ok(()) => written.push(path),
+            Err(e) => tracing::warn!(
+                "{accession}: failed to write metadata {kind} {}: {e}",
+                path.display(),
+            ),
+        }
+    };
+
+    use crate::metadata::MetadataFormat;
+    if matches!(format, MetadataFormat::Tsv | MetadataFormat::Both) {
+        write_one(tsv_path, "TSV");
+    }
+    if matches!(format, MetadataFormat::Json | MetadataFormat::Both) {
+        write_one(json_path, "JSON");
+    }
+    written
+}
+
 /// Decode a previously downloaded SRA file into FASTQ and clean up the temp file.
 ///
 /// This is the decode phase of `run_get`. Call from within
@@ -1747,6 +1857,30 @@ pub fn decode_sra(downloaded: &DownloadedSra, config: &PipelineConfig) -> Result
         let _ = std::fs::remove_file(&downloaded.temp_path);
         let sidecar = crate::download::progress_path(&downloaded.temp_path);
         let _ = std::fs::remove_file(&sidecar);
+
+        // Backfill metadata sidecar(s) the user asked for that a prior run
+        // didn't record. The completion marker is keyed on the FASTQ output
+        // config (split mode, compression, …), not on `--metadata`, so a
+        // decode skip must not silently drop newly-requested metadata. Refresh
+        // the marker when we add files so subsequent runs skip cleanly.
+        let mut output_files = output_files;
+        let added = write_run_metadata(config, &downloaded.accession, true);
+        if !added.is_empty() {
+            output_files.extend(added);
+            if let Err(e) = write_completion_marker(
+                &acc_dir,
+                &downloaded.accession,
+                downloaded.sra_md5.as_deref(),
+                downloaded.total_sra_size,
+                config,
+                &output_files,
+            ) {
+                tracing::warn!(
+                    "{}: failed to refresh completion marker after metadata backfill: {e}",
+                    downloaded.accession,
+                );
+            }
+        }
 
         return Ok(PipelineStats {
             accession: downloaded.accession.clone(),
@@ -1831,117 +1965,7 @@ pub fn decode_sra(downloaded: &DownloadedSra, config: &PipelineConfig) -> Result
     // Write run-metadata sidecar(s), if requested. Done before the
     // completion marker so the marker records the metadata file sizes too
     // (and rerun-skips will keep the sidecar around).
-    if !config.stdout
-        && let Some(format) = config.metadata
-    {
-        let row = crate::metadata::RunMetadata {
-            accession: downloaded.accession.clone(),
-            url: config.metadata_url.clone(),
-            size_bytes: config.metadata_size,
-            md5: config.metadata_md5.clone(),
-            source_service: config.metadata_service.clone(),
-            spots: config.run_info.as_ref().and_then(|r| r.spots),
-            spot_len: config.run_info.as_ref().map(|r| r.spot_len),
-            nreads: config.run_info.as_ref().map(|r| r.nreads),
-            avg_read_len: config
-                .run_info
-                .as_ref()
-                .map(|r| r.avg_read_len.clone())
-                .unwrap_or_default(),
-            platform: config.run_info.as_ref().and_then(|r| r.platform.clone()),
-            instrument_model: config
-                .run_info
-                .as_ref()
-                .and_then(|r| r.instrument_model.clone()),
-            library_strategy: config
-                .run_info
-                .as_ref()
-                .and_then(|r| r.library_strategy.clone()),
-            library_source: config
-                .run_info
-                .as_ref()
-                .and_then(|r| r.library_source.clone()),
-            library_selection: config
-                .run_info
-                .as_ref()
-                .and_then(|r| r.library_selection.clone()),
-            library_layout: config
-                .run_info
-                .as_ref()
-                .and_then(|r| r.library_layout.clone()),
-            library_name: config
-                .run_info
-                .as_ref()
-                .and_then(|r| r.library_name.clone()),
-            experiment: config.run_info.as_ref().and_then(|r| r.experiment.clone()),
-            study: config.run_info.as_ref().and_then(|r| r.study.clone()),
-            bioproject: config.run_info.as_ref().and_then(|r| r.bioproject.clone()),
-            sample: config.run_info.as_ref().and_then(|r| r.sample.clone()),
-            biosample: config.run_info.as_ref().and_then(|r| r.biosample.clone()),
-            scientific_name: config
-                .run_info
-                .as_ref()
-                .and_then(|r| r.scientific_name.clone()),
-            tax_id: config.run_info.as_ref().and_then(|r| r.tax_id),
-            bases: config.run_info.as_ref().and_then(|r| r.bases),
-            size_mb: config.run_info.as_ref().and_then(|r| r.size_mb),
-            release_date: config
-                .run_info
-                .as_ref()
-                .and_then(|r| r.release_date.clone()),
-            load_date: config.run_info.as_ref().and_then(|r| r.load_date.clone()),
-        };
-        let stem = config
-            .accession_output_dir(&downloaded.accession)
-            .join(&downloaded.accession);
-        let rows = [row];
-        let tsv_path = stem.with_extension("metadata.tsv");
-        let json_path = stem.with_extension("metadata.json");
-        match format {
-            crate::metadata::MetadataFormat::Tsv => {
-                if let Err(e) = crate::metadata::write_tsv(&tsv_path, &rows) {
-                    tracing::warn!(
-                        "{}: failed to write metadata TSV {}: {e}",
-                        downloaded.accession,
-                        tsv_path.display(),
-                    );
-                } else {
-                    output_files.push(tsv_path);
-                }
-            }
-            crate::metadata::MetadataFormat::Json => {
-                if let Err(e) = crate::metadata::write_json(&json_path, &rows) {
-                    tracing::warn!(
-                        "{}: failed to write metadata JSON {}: {e}",
-                        downloaded.accession,
-                        json_path.display(),
-                    );
-                } else {
-                    output_files.push(json_path);
-                }
-            }
-            crate::metadata::MetadataFormat::Both => {
-                if let Err(e) = crate::metadata::write_tsv(&tsv_path, &rows) {
-                    tracing::warn!(
-                        "{}: failed to write metadata TSV {}: {e}",
-                        downloaded.accession,
-                        tsv_path.display(),
-                    );
-                } else {
-                    output_files.push(tsv_path);
-                }
-                if let Err(e) = crate::metadata::write_json(&json_path, &rows) {
-                    tracing::warn!(
-                        "{}: failed to write metadata JSON {}: {e}",
-                        downloaded.accession,
-                        json_path.display(),
-                    );
-                } else {
-                    output_files.push(json_path);
-                }
-            }
-        }
-    }
+    output_files.extend(write_run_metadata(config, &downloaded.accession, false));
 
     // Write completion marker so future runs can skip this accession.
     if !config.stdout
@@ -2046,6 +2070,80 @@ mod tests {
             vdbcache_file: None,
             run_info: None,
         }
+    }
+
+    fn metadata_test_config(
+        output_dir: &std::path::Path,
+        metadata: crate::metadata::MetadataFormat,
+    ) -> PipelineConfig {
+        PipelineConfig {
+            output_dir: output_dir.to_path_buf(),
+            split_mode: crate::fastq::SplitMode::Split3,
+            compression: crate::fastq::CompressionMode::None,
+            threads: 1,
+            connections: 1,
+            skip_technical: true,
+            min_read_len: None,
+            force: false,
+            progress: false,
+            run_info: None,
+            fasta: false,
+            resume: true,
+            stdout: false,
+            cancelled: None,
+            strict: false,
+            http_client: None,
+            keep_sra: false,
+            paired_suffix: crate::fastq::PairedSuffix::Numeric,
+            seq_defline: None,
+            folder_per_accession: false,
+            metadata: Some(metadata),
+            metadata_url: None,
+            metadata_md5: None,
+            metadata_size: None,
+            metadata_service: None,
+        }
+    }
+
+    #[test]
+    fn write_run_metadata_writes_requested_formats() {
+        use crate::metadata::MetadataFormat;
+        let dir = tempfile::tempdir().unwrap();
+        let cfg = metadata_test_config(dir.path(), MetadataFormat::Both);
+        let written = write_run_metadata(&cfg, "SRR000001", false);
+        assert_eq!(written.len(), 2);
+        assert!(dir.path().join("SRR000001.metadata.tsv").exists());
+        assert!(dir.path().join("SRR000001.metadata.json").exists());
+    }
+
+    #[test]
+    fn write_run_metadata_none_when_not_requested() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut cfg = metadata_test_config(dir.path(), crate::metadata::MetadataFormat::Tsv);
+        cfg.metadata = None;
+        assert!(write_run_metadata(&cfg, "SRR000001", false).is_empty());
+    }
+
+    #[test]
+    fn write_run_metadata_only_if_missing_skips_existing() {
+        use crate::metadata::MetadataFormat;
+        let dir = tempfile::tempdir().unwrap();
+        let cfg = metadata_test_config(dir.path(), MetadataFormat::Both);
+
+        // Pre-create the TSV; backfill should only write the missing JSON.
+        std::fs::write(dir.path().join("SRR000001.metadata.tsv"), b"stale").unwrap();
+        let written = write_run_metadata(&cfg, "SRR000001", true);
+        assert_eq!(written.len(), 1);
+        assert_eq!(written[0], dir.path().join("SRR000001.metadata.json"));
+
+        // The existing TSV was left untouched (not clobbered).
+        assert_eq!(
+            std::fs::read(dir.path().join("SRR000001.metadata.tsv")).unwrap(),
+            b"stale",
+        );
+
+        // A second backfill finds everything present and writes nothing.
+        assert!(write_run_metadata(&cfg, "SRR000001", true).is_empty());
     }
 
     #[test]
