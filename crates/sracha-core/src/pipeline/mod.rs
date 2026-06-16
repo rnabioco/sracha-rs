@@ -560,6 +560,7 @@ fn decode_and_write(
             .run_info
             .as_ref()
             .map(|ri| ri.avg_read_len.clone())
+            .filter(|v| !v.is_empty())
             .or_else(|| cursor.metadata_read_lengths())
     } else {
         None

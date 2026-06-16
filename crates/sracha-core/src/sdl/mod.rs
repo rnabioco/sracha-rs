@@ -674,19 +674,24 @@ fn parse_run_info_csv_multi(body: &str) -> HashMap<String, RunInfo> {
             }
         };
 
+        // NCBI often reports avgLength=0 (the stat was never populated, common
+        // for ENA-mirrored runs). That only affects the read-length *fallback*,
+        // which the VDB's own READ_LEN column overrides — so keep all the other
+        // metadata and leave avg_read_len empty rather than dropping the run.
         let per_read = avg_length / nreads as u32;
-        if per_read == 0 {
-            tracing::warn!("{accession}: computed per_read_len=0 from avgLength={avg_length}");
-            continue;
-        }
-
-        let mut avg_read_len = vec![per_read; nreads];
-        let used = per_read * nreads as u32;
-        if used < avg_length
-            && let Some(last) = avg_read_len.last_mut()
-        {
-            *last += avg_length - used;
-        }
+        let avg_read_len = if per_read == 0 {
+            tracing::debug!("{accession}: avgLength=0; read lengths from VDB");
+            Vec::new()
+        } else {
+            let mut v = vec![per_read; nreads];
+            let used = per_read * nreads as u32;
+            if used < avg_length
+                && let Some(last) = v.last_mut()
+            {
+                *last += avg_length - used;
+            }
+            v
+        };
 
         let platform = platform_idx
             .and_then(|i| values.get(i).copied())
@@ -1008,6 +1013,23 @@ mod tests {
             "Run,avgLength,LibraryLayout\nSRR222,150,SINGLE\n",
         ));
         assert!(missing_accessions(&requested, &resolved).is_empty());
+    }
+
+    #[test]
+    fn parse_run_info_zero_avg_length_keeps_metadata() {
+        // NCBI reports avgLength=0 for many runs; the run should still be kept
+        // with its other metadata, just with an empty avg_read_len fallback.
+        let csv = "Run,spots,avgLength,LibraryLayout,Platform\n\
+                   ERR13385430,1000,0,PAIRED,ILLUMINA\n";
+        let map = parse_run_info_csv_multi(csv);
+        let ri = map
+            .get("ERR13385430")
+            .expect("run kept despite avgLength=0");
+        assert!(ri.avg_read_len.is_empty());
+        assert_eq!(ri.spot_len, 0);
+        assert_eq!(ri.nreads, 2);
+        assert_eq!(ri.spots, Some(1000));
+        assert_eq!(ri.platform.as_deref(), Some("ILLUMINA"));
     }
 
     // -----------------------------------------------------------------------
