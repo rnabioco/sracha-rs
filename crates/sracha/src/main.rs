@@ -1187,7 +1187,28 @@ async fn resolve_to_runs_inner(
         }
     }
 
+    // Deduplicate while preserving first-seen order. Duplicates arise from
+    // repeated lines in an accession list or from overlapping project
+    // expansions; processing the same run twice is always wasteful, and with
+    // `--folder-per-accession` it is unsafe — two pipelines race on the same
+    // output directory and temp `.sra`, surfacing as a spurious
+    // "No such file or directory" when one decode removes the temp file the
+    // other is still reading (see issue #69).
+    let dropped = dedup_preserving_order(&mut run_accessions);
+    if dropped > 0 {
+        tracing::info!("dropped {dropped} duplicate accession(s) before processing");
+    }
+
     Ok((run_accessions, has_projects))
+}
+
+/// Remove duplicate entries in place, keeping the first occurrence of each.
+/// Returns the number of duplicates dropped.
+fn dedup_preserving_order(accessions: &mut Vec<String>) -> usize {
+    let before = accessions.len();
+    let mut seen = std::collections::HashSet::new();
+    accessions.retain(|acc| seen.insert(acc.clone()));
+    before - accessions.len()
 }
 
 fn print_local_file_info(path: &std::path::Path) {
@@ -1895,6 +1916,32 @@ mod tests {
             vdbcache_file: None,
             run_info: None,
         }
+    }
+
+    // -----------------------------------------------------------------------
+    // dedup_preserving_order (regression: issue #69)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn dedup_keeps_first_occurrence_in_order() {
+        let mut accs = vec![
+            "SRR2".to_string(),
+            "SRR1".to_string(),
+            "SRR2".to_string(),
+            "SRR3".to_string(),
+            "SRR1".to_string(),
+        ];
+        let dropped = dedup_preserving_order(&mut accs);
+        assert_eq!(dropped, 2);
+        assert_eq!(accs, vec!["SRR2", "SRR1", "SRR3"]);
+    }
+
+    #[test]
+    fn dedup_noop_when_unique() {
+        let mut accs = vec!["SRR1".to_string(), "SRR2".to_string()];
+        let dropped = dedup_preserving_order(&mut accs);
+        assert_eq!(dropped, 0);
+        assert_eq!(accs, vec!["SRR1", "SRR2"]);
     }
 
     // -----------------------------------------------------------------------
