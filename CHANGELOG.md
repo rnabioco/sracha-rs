@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## 0.3.10 (2026-06-17)
 
 ### Fixes
 
@@ -8,6 +8,10 @@
   when resolving a project. EUtils EFetch sometimes returns HTTP 200 with an
   incomplete RunInfo CSV, dropping rows; sracha now re-fetches the missing
   accessions with bounded backoff instead of leaving them unresolved.
+- Runs that NCBI reports with `avgLength=0` keep their RunInfo metadata
+  instead of being dropped, and the spurious warning is silenced (#67, #68).
+- `sracha get` now deduplicates repeated accessions and backfills metadata
+  on a cache hit, so previously-cached runs report complete info (#69, #70).
 
 ## 0.3.9 (2026-06-12)
 
