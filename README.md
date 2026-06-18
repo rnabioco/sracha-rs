@@ -1,6 +1,6 @@
 # 🌶️ sracha 🌶️
 
-[![Anaconda-Server Badge](https://anaconda.org/bioconda/sracha/badges/version.svg?v=1)](https://anaconda.org/bioconda/sracha) [![Anaconda-Server Badge](https://anaconda.org/bioconda/sracha/badges/downloads.svg?v=1)](https://anaconda.org/bioconda/sracha)
+[![Anaconda-Server Badge](https://anaconda.org/bioconda/sracha/badges/version.svg?v=2)](https://anaconda.org/bioconda/sracha) [![Anaconda-Server Badge](https://anaconda.org/bioconda/sracha/badges/downloads.svg?v=2)](https://anaconda.org/bioconda/sracha)
 
 Fast SRA downloader and FASTQ converter, written in pure Rust.
 
