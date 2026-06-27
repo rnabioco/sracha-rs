@@ -1153,6 +1153,24 @@ pub(crate) fn decode_blob_to_fastq(
     const SLOT_LUT_SIZE: usize = 16;
     let mut slot_lut: [Option<BlobSlotOutput>; SLOT_LUT_SIZE] = std::array::from_fn(|_| None);
     let mut slot_overflow: Vec<BlobSlotOutput> = Vec::new();
+
+    // Pre-size each slot's output buffer. Starting from `Vec::new()` made the
+    // thousands of `append_fastq_record` calls per blob re-grow the buffer by
+    // repeated doubling — `RawVec::finish_grow` was ~10% of decode self-time in
+    // a flamegraph of `run_fastq`. The decoded blob tells us the output size up
+    // front: ~1 byte/base for FASTA, ~2 (seq+qual) for FASTQ, plus a defline
+    // allowance per record. Split across the slots a given mode actually emits,
+    // so the reserve matches usage rather than ballooning RSS (decode keeps
+    // many blobs' buffers live at once — see QUEUED_BATCHES).
+    const DEFLINE_OVERHEAD: usize = 40;
+    let expected_slots = match config.split_mode {
+        SplitMode::SplitSpot | SplitMode::Interleaved => 1,
+        SplitMode::Split3 => 2,
+        SplitMode::SplitFiles => rps,
+    };
+    let bytes_per_base = if config.fasta { 1 } else { 2 };
+    let est_output = read_data.len() * bytes_per_base + read_lengths.len() * DEFLINE_OVERHEAD;
+    let per_slot_reserve = est_output / expected_slots.max(1);
     let mut seq_offset: usize = 0;
     let mut qual_offset: usize = 0;
     let mut rt_offset: usize = 0;
@@ -1329,7 +1347,7 @@ pub(crate) fn decode_blob_to_fastq(
                     let buf = if let Some(i) = lut_idx {
                         slot_lut[i].get_or_insert_with(|| BlobSlotOutput {
                             slot,
-                            bytes: Vec::new(),
+                            bytes: Vec::with_capacity(per_slot_reserve),
                             records: 0,
                         })
                     } else {
@@ -1342,7 +1360,7 @@ pub(crate) fn decode_blob_to_fastq(
                             None => {
                                 slot_overflow.push(BlobSlotOutput {
                                     slot,
-                                    bytes: Vec::new(),
+                                    bytes: Vec::with_capacity(per_slot_reserve),
                                     records: 0,
                                 });
                                 slot_overflow.last_mut().unwrap()
