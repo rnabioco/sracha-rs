@@ -119,6 +119,15 @@ or install from source:
 cargo install --git https://github.com/rnabioco/sracha-rs sracha
 ```
 
+On x86_64 the release page carries two variants per platform: pick **`-v2`**
+(the safe default — runs on any CPU since ~2009), or **`-v3`** for extra SIMD
+throughput on Haswell-or-newer (2013+) hardware. A `-v3` binary aborts with an
+illegal-instruction fault at startup on older CPUs, so prefer `-v2` unless you
+know the host has AVX2. ARM builds (`aarch64`) ship a single binary.
+
+To build from source tuned for the current machine, set
+`RUSTFLAGS="-C target-cpu=native"` before `cargo install`/`cargo build --release`.
+
 ### Containers
 
 Because sracha is on Bioconda, [BioContainers](https://biocontainers.pro/)

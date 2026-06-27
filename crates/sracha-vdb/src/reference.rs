@@ -20,10 +20,16 @@ use crate::kdb::ColumnReader;
 
 /// BAM-load's standard chunk size. REFERENCE rows each hold up to this many
 /// bases (last chunk of a reference may be shorter, recorded in SEQ_LEN).
-/// MAX_SEQ_LEN is declared as a static column in the align schema; we
-/// hardcode 5000 for v1 and will read it from metadata once we have a
-/// fixture that uses a different value.
+/// MAX_SEQ_LEN is declared as a static column in the align schema. We resolve
+/// the real value from the archive at open time (see [`resolve_max_seq_len`])
+/// and only fall back to this historical default when neither the column nor
+/// the SEQ_LEN-derived estimate is available — a wrong value silently corrupts
+/// cSRA reads via [`plan_span_start`].
 const DEFAULT_MAX_SEQ_LEN: u32 = 5000;
+
+/// Upper bound on REFERENCE rows sampled when deriving MAX_SEQ_LEN from
+/// SEQ_LEN, keeping `open()` cheap on references with millions of chunks.
+const MAX_SEQ_LEN_SAMPLE_ROWS: u64 = 256;
 
 /// Handle to the REFERENCE table's CMP_READ + SEQ_LEN columns.
 pub struct ReferenceCursor {
@@ -48,10 +54,36 @@ impl ReferenceCursor {
         let first_row = cmp_read.first_row_id().unwrap_or(1);
         let row_count = cmp_read.row_count();
 
+        let cmp_read = CachedColumn::new(cmp_read, ColumnKind::TwoNa);
+        let seq_len = CachedColumn::new(seq_len, ColumnKind::Irzip { elem_bits: 32 });
+
+        // Resolve the real chunk size instead of assuming 5000. Prefer the
+        // static MAX_SEQ_LEN column; if it is absent/unreadable, derive it from
+        // the widest SEQ_LEN we observe (every non-terminal chunk equals
+        // MAX_SEQ_LEN). Both can fail on degenerate archives, hence the default.
+        let col_value =
+            match ColumnReader::open(archive, &format!("{col_base}/MAX_SEQ_LEN"), sra_path) {
+                Ok(col) => {
+                    let fr = col.first_row_id().unwrap_or(1);
+                    CachedColumn::new(col, ColumnKind::Irzip { elem_bits: 32 })
+                        .read_scalar_u32(fr)
+                        .ok()
+                        .filter(|&v| v > 0)
+                }
+                Err(_) => None,
+            };
+        let derived = if col_value.is_none() {
+            derive_max_seq_len_from_seq_len(&seq_len, first_row, row_count)
+        } else {
+            None
+        };
+        let (max_seq_len, source) = resolve_max_seq_len(col_value, derived);
+        tracing::debug!("REFERENCE MAX_SEQ_LEN = {max_seq_len} (source: {source})");
+
         Ok(Self {
-            cmp_read: CachedColumn::new(cmp_read, ColumnKind::TwoNa),
-            seq_len: CachedColumn::new(seq_len, ColumnKind::Irzip { elem_bits: 32 }),
-            max_seq_len: DEFAULT_MAX_SEQ_LEN,
+            cmp_read,
+            seq_len,
+            max_seq_len,
             first_row,
             row_count,
         })
@@ -107,6 +139,43 @@ impl ReferenceCursor {
     }
 }
 
+/// Estimate MAX_SEQ_LEN from SEQ_LEN when the static column is unavailable.
+///
+/// Every non-terminal chunk of a reference is exactly MAX_SEQ_LEN bases, so the
+/// widest SEQ_LEN over a bounded prefix of the table recovers the value as long
+/// as any reference in that prefix spans more than one chunk. Returns `None`
+/// when nothing decodes (caller falls back to [`DEFAULT_MAX_SEQ_LEN`]).
+fn derive_max_seq_len_from_seq_len(
+    seq_len: &CachedColumn,
+    first_row: i64,
+    row_count: u64,
+) -> Option<u32> {
+    if row_count == 0 {
+        return None;
+    }
+    let sampled = row_count.min(MAX_SEQ_LEN_SAMPLE_ROWS);
+    let end = first_row + sampled as i64;
+    let mut max = 0u32;
+    for row in first_row..end {
+        if let Ok(v) = seq_len.read_scalar_u32(row) {
+            max = max.max(v);
+        }
+    }
+    (max > 0).then_some(max)
+}
+
+/// Pick the MAX_SEQ_LEN value and a label for diagnostics, in priority order:
+/// the static column, then the SEQ_LEN-derived estimate, then the default.
+fn resolve_max_seq_len(col_value: Option<u32>, derived: Option<u32>) -> (u32, &'static str) {
+    if let Some(v) = col_value {
+        (v, "MAX_SEQ_LEN column")
+    } else if let Some(v) = derived {
+        (v, "derived from SEQ_LEN")
+    } else {
+        (DEFAULT_MAX_SEQ_LEN, "default")
+    }
+}
+
 /// Translate a global reference position to `(chunk_row, offset_in_chunk)`.
 ///
 /// REFERENCE rows are 1-based and each holds up to `max_seq_len` bases, laid
@@ -159,5 +228,29 @@ mod tests {
         assert_eq!(plan_span_start(100, 100), (2, 0));
         assert_eq!(plan_span_start(199, 100), (2, 99));
         assert_eq!(plan_span_start(200, 100), (3, 0));
+    }
+
+    #[test]
+    fn resolve_max_seq_len_prefers_column() {
+        assert_eq!(
+            resolve_max_seq_len(Some(10_000), Some(5000)),
+            (10_000, "MAX_SEQ_LEN column")
+        );
+    }
+
+    #[test]
+    fn resolve_max_seq_len_falls_back_to_derived() {
+        assert_eq!(
+            resolve_max_seq_len(None, Some(4096)),
+            (4096, "derived from SEQ_LEN")
+        );
+    }
+
+    #[test]
+    fn resolve_max_seq_len_falls_back_to_default() {
+        assert_eq!(
+            resolve_max_seq_len(None, None),
+            (DEFAULT_MAX_SEQ_LEN, "default")
+        );
     }
 }

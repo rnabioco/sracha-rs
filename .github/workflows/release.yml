@@ -16,13 +16,29 @@ jobs:
     name: Build (${{ matrix.target }})
     strategy:
       matrix:
+        # x86_64 ships two microarchitecture variants: v2 (SSE4.2, every CPU
+        # since ~2009 — the safe default) and v3 (AVX2/BMI, Haswell 2013+ —
+        # best SIMD throughput on the byte-plane decode loops). ARM targets
+        # build a single artifact (no x86 microarch levels apply).
         include:
           - target: x86_64-unknown-linux-musl
             os: ubuntu-latest
+            cpu: x86-64-v2
+            suffix: -v2
+          - target: x86_64-unknown-linux-musl
+            os: ubuntu-latest
+            cpu: x86-64-v3
+            suffix: -v3
           - target: aarch64-unknown-linux-musl
             os: ubuntu-latest
           - target: x86_64-apple-darwin
             os: macos-latest
+            cpu: x86-64-v2
+            suffix: -v2
+          - target: x86_64-apple-darwin
+            os: macos-latest
+            cpu: x86-64-v3
+            suffix: -v3
           - target: aarch64-apple-darwin
             os: macos-latest
     runs-on: ${{ matrix.os }}
@@ -33,7 +49,7 @@ jobs:
           targets: ${{ matrix.target }}
       - uses: Swatinem/rust-cache@v2
         with:
-          key: ${{ matrix.target }}
+          key: ${{ matrix.target }}${{ matrix.suffix }}
 
       - name: Install musl tools (x86_64)
         if: matrix.target == 'x86_64-unknown-linux-musl'
@@ -51,6 +67,9 @@ jobs:
 
       - name: Build (native)
         if: matrix.target != 'aarch64-unknown-linux-musl'
+        env:
+          # Empty for ARM (no cpu set); raises the ISA floor for x86 variants.
+          RUSTFLAGS: ${{ matrix.cpu && format('-C target-cpu={0}', matrix.cpu) || '' }}
         run: cargo build --release --target ${{ matrix.target }}
 
       - name: Package
@@ -58,14 +77,14 @@ jobs:
         run: |
           version="${GITHUB_REF_NAME#v}"
           cd target/${{ matrix.target }}/release
-          tar czf ../../../sracha-${version}-${{ matrix.target }}.tar.gz sracha
+          tar czf ../../../sracha-${version}-${{ matrix.target }}${{ matrix.suffix }}.tar.gz sracha
           cd ../../..
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:
-          name: sracha-${{ github.ref_name }}-${{ matrix.target }}
-          path: sracha-*-${{ matrix.target }}.tar.gz
+          name: sracha-${{ github.ref_name }}-${{ matrix.target }}${{ matrix.suffix }}
+          path: sracha-*-${{ matrix.target }}${{ matrix.suffix }}.tar.gz
 
   release:
     name: Create Release
