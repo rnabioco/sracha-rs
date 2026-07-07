@@ -72,4 +72,7 @@ Home = "index.md"
 "CLI Reference" = "cli.md"
 
 [[project.nav]]
+"Performance" = "performance.md"
+
+[[project.nav]]
 "Changelog" = "changelog.md"

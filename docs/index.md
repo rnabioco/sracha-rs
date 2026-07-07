@@ -103,6 +103,8 @@ The tags above are examples — check
 [quay.io](https://quay.io/repository/biocontainers/sracha?tab=tags) for the
 latest `<version>--<build>` tag and substitute it in.
 
+### Nextflow
+
 In [Nextflow](https://www.nextflow.io/), point a process at the image directly
 or let the `conda` directive resolve it:
 
