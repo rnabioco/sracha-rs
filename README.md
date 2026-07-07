@@ -8,7 +8,7 @@ Fast SRA downloader and FASTQ converter, written in pure Rust.
 
 ## Features
 
-- **Fast** -- 5-12x faster than `fasterq-dump` on typical SRA files
+- **Fast** -- 5-13x faster than `fasterq-dump` on typical SRA files
 - **One command** -- download, convert to FASTQ, and compress
 - **Batch input** -- accessions, BioProjects (PRJNA), studies (SRP), or a file via `--accession-list`
 - **gzip or zstd output** -- parallel compression, or plain FASTQ
@@ -55,9 +55,9 @@ Uncompressed output, measured with
 
 | File | Size | sracha | fasterq-dump | fastq-dump | Speedup vs fasterq-dump |
 |:---|---:|---:|---:|---:|---:|
-| SRR28588231 | 23 MiB | 0.15 s | 1.78 s | 1.94 s | **12.3x** |
-| SRR2584863 | 288 MiB | 1.07 s | 5.53 s | 12.99 s | **5.2x** |
-| ERR1018173 | 1.94 GiB | 6.45 s | 33.41 s | -- | **5.2x** |
+| SRR28588231 | 23 MiB | 0.14 s | 1.81 s | 1.95 s | **13.1x** |
+| SRR2584863 | 288 MiB | 1.02 s | 5.63 s | 12.99 s | **5.5x** |
+| ERR1018173 | 1.94 GiB | 6.26 s | 33.96 s | -- | **5.4x** |
 
 `sracha` produces gzipped FASTQ by default (level 1, ~1.4× the
 uncompressed time on small files thanks to parallel block compression),
@@ -71,35 +71,35 @@ without a separate gzip step.
 
 | Command | Mean [ms] | Min [ms] | Max [ms] | Relative |
 |:---|---:|---:|---:|---:|
-| `sracha` | 145.1 ± 2.3 | 141.7 | 149.8 | 1.00 |
-| `fasterq-dump` | 1782.6 ± 11.7 | 1769.3 | 1794.4 | 12.28 ± 0.21 |
-| `fastq-dump` | 1942.0 ± 3.6 | 1938.0 | 1945.6 | 13.38 ± 0.22 |
+| `sracha` | 138.2 ± 2.5 | 134.8 | 145.0 | 1.00 |
+| `fasterq-dump` | 1812.0 ± 21.6 | 1791.4 | 1844.1 | 13.11 ± 0.28 |
+| `fastq-dump` | 1951.8 ± 5.6 | 1944.4 | 1956.7 | 14.13 ± 0.26 |
 
 **SRR2584863 (288 MiB, Illumina paired)**
 
 | Command | Mean [s] | Min [s] | Max [s] | Relative |
 |:---|---:|---:|---:|---:|
-| `sracha` | 1.070 ± 0.006 | 1.064 | 1.076 | 1.00 |
-| `fasterq-dump` | 5.526 ± 0.081 | 5.441 | 5.602 | 5.16 ± 0.08 |
-| `fastq-dump` | 12.989 ± 0.031 | 12.967 | 13.025 | 12.14 ± 0.07 |
+| `sracha` | 1.021 ± 0.010 | 1.011 | 1.031 | 1.00 |
+| `fasterq-dump` | 5.633 ± 0.177 | 5.441 | 5.790 | 5.52 ± 0.18 |
+| `fastq-dump` | 12.986 ± 0.019 | 12.973 | 13.008 | 12.71 ± 0.13 |
 
 **ERR1018173 (1.94 GiB, 15.6M spots, Illumina paired, single run)**
 
 | Command | Time [s] |
 |:---|---:|
-| `sracha` | 6.45 |
-| `fasterq-dump` | 33.41 |
+| `sracha` | 6.26 |
+| `fasterq-dump` | 33.96 |
 
 **sracha gzip overhead (SRR28588231, default `--gzip-level 1`)**
 
 | Command | Mean [ms] | Min [ms] | Max [ms] | Relative |
 |:---|---:|---:|---:|---:|
-| `sracha (no compression)` | 150.4 ± 2.5 | 145.7 | 154.4 | 1.00 |
-| `sracha (gzip)` | 213.7 ± 2.8 | 208.9 | 218.3 | 1.42 ± 0.03 |
+| `sracha (no compression)` | 138.1 ± 2.7 | 133.7 | 143.5 | 1.00 |
+| `sracha (gzip)` | 204.6 ± 1.7 | 202.3 | 208.8 | 1.48 ± 0.03 |
 
 </details>
 
-Benchmarks run with `sracha` v0.3.8, `sra-tools` v3.4.1, on Linux
+Benchmarks run with `sracha` v0.3.10, `sra-tools` v3.4.1, on Linux
 (8 CPUs). Install the reference toolkit with `pixi run install-sratools`
 and reproduce with `validation/benchmark.sh`.
 
@@ -147,16 +147,9 @@ The tags above are examples — check
 [quay.io](https://quay.io/repository/biocontainers/sracha?tab=tags) for the
 latest `<version>--<build>` tag and substitute it in.
 
-In [Nextflow](https://www.nextflow.io/), point a process at the image directly
-or let the `conda` directive resolve it:
-
-```groovy
-process SRACHA_GET {
-    container 'quay.io/biocontainers/sracha:0.3.7--h54198d6_0'
-    // or: conda 'bioconda::sracha=0.3.7'
-    // ...
-}
-```
+Using sracha in a workflow manager? See
+[Nextflow and workflow integration](https://rnabioco.github.io/sracha-rs/#nextflow)
+in the docs.
 
 ## Documentation
 
