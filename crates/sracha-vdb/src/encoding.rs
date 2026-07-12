@@ -61,7 +61,7 @@ const DNA_4NA: [u8; 16] = [
 /// `.rodata` with zero runtime cost.
 const LUT_2NA: [[u8; 4]; 256] = {
     let mut lut = [[0u8; 4]; 256];
-    let bases = [b'A', b'C', b'G', b'T'];
+    let bases = *b"ACGT";
     let mut i = 0u16;
     while i < 256 {
         let b = i as u8;

@@ -72,7 +72,7 @@ Download pre-built binaries from the
 
 ### From source
 
-Requires Rust 1.92+.
+Requires Rust 1.95+.
 
 ```bash
 cargo install --git https://github.com/rnabioco/sracha-rs sracha

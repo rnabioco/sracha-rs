@@ -111,11 +111,10 @@ fn open_kar(path: &Path) -> Result<KarArchive<std::io::BufReader<std::fs::File>>
 /// actionable message beats the opaque "idx1 not found" that bubbles
 /// up from `ColumnReader::open`.
 fn external_refseq_error() -> Error {
-    Error::Format(
+    Error::CsraUnsupported(
         "cSRA: REFERENCE table has no embedded CMP_READ column — reference \
-         bases are stored externally (fetched from NCBI refseq by SEQ_ID). \
-         sracha does not yet implement external refseq fetch; decode this \
-         archive with `fasterq-dump` for now."
+         bases are stored externally (fetched from NCBI refseq by SEQ_ID), \
+         which sracha does not yet reconstruct."
             .into(),
     )
 }
@@ -127,10 +126,10 @@ fn external_refseq_error() -> Error {
 /// requires physical READ_LEN; the static-metadata fallback is tracked
 /// as a follow-up.
 fn fixed_length_readlen_error() -> Error {
-    Error::Format(
+    Error::CsraUnsupported(
         "cSRA: SEQUENCE.READ_LEN is not a physical column — this archive \
          encodes a fixed spot layout in static metadata, which sracha does \
-         not yet synthesize. Decode this archive with `fasterq-dump` for now."
+         not yet synthesize."
             .into(),
     )
 }

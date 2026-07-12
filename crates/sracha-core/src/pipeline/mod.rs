@@ -1071,8 +1071,23 @@ pub fn run_fastq(
 
     let diag = Arc::new(IntegrityDiag::default());
     let (spots_read, reads_written, output_files) =
-        decode_and_write(sra_path, &acc, config, is_lite, &diag)
-            .map_err(|e| wrap_blob_integrity(&acc, e))?;
+        match decode_and_write(sra_path, &acc, config, is_lite, &diag) {
+            Ok(v) => v,
+            // An unsupported archive shape — most commonly an aligned /
+            // reference-compressed cSRA whose PRIMARY_ALIGNMENT + REFERENCE
+            // tables aren't present locally (they live in an undownloaded
+            // .vdbcache), so `looks_like_decodable_csra` routed it here rather
+            // than to CsraCursor. sracha can't emit correct FASTQ for these.
+            // Surface it as CsraUnsupported so the CLI can offer ENA's FASTQ
+            // mirror instead of a dead-end decode error.
+            Err(Error::Vdb(sracha_vdb::Error::UnsupportedFormat { format, hint })) => {
+                return Err(Error::CsraUnsupported {
+                    accession: acc.clone(),
+                    message: format!("{format} — {hint}"),
+                });
+            }
+            Err(e) => return Err(wrap_blob_integrity(&acc, e)),
+        };
 
     // Warn (but don't fail) when a paired layout was requested on an
     // effectively single-end run: every spot produced exactly one read, so
@@ -1233,7 +1248,19 @@ fn run_fastq_csra(
                 (Some(a), Some(p)) => Some((a, p)),
                 _ => None,
             };
-        CsraCursor::open_any(&mut archive, sra_path, vdbcache_for_open)?
+        match CsraCursor::open_any(&mut archive, sra_path, vdbcache_for_open) {
+            Ok(c) => c,
+            // Known-unsupported cSRA shape (external refseq, static READ_LEN).
+            // Surface a distinct error carrying the accession so the CLI can
+            // check ENA for a FASTQ mirror rather than reporting a decode bug.
+            Err(sracha_vdb::Error::CsraUnsupported(message)) => {
+                return Err(Error::CsraUnsupported {
+                    accession: acc.to_string(),
+                    message,
+                });
+            }
+            Err(e) => return Err(e.into()),
+        }
     };
 
     let fastq_config = FastqConfig {
@@ -1935,6 +1962,18 @@ pub fn decode_sra(downloaded: &DownloadedSra, config: &PipelineConfig) -> Result
             }
             return Err(Error::Cancelled {
                 output_files: vec![],
+            });
+        }
+        // Aligned / reference-compressed cSRA sracha can't reconstruct (its
+        // PRIMARY_ALIGNMENT + REFERENCE tables live in an undownloaded
+        // .vdbcache, or the shape has no validated decoder). Surface as
+        // CsraUnsupported so the CLI can point the user at ENA's FASTQ mirror.
+        // The temp SRA is left in place (only the success path below removes
+        // it), so the suggested `--prefer-ena` re-run doesn't re-download.
+        Err(Error::Vdb(sracha_vdb::Error::UnsupportedFormat { format, hint })) => {
+            return Err(Error::CsraUnsupported {
+                accession: downloaded.accession.clone(),
+                message: format!("{format} — {hint}"),
             });
         }
         Err(e) => return Err(wrap_blob_integrity(&downloaded.accession, e)),

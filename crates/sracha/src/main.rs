@@ -288,6 +288,8 @@ async fn main() -> Result<()> {
                 args.gzip_level,
             );
 
+            // Inputs skipped because sracha can't reconstruct their cSRA.
+            let mut fastq_skipped: Vec<String> = Vec::new();
             for input in &args.inputs {
                 let sra_path = std::path::Path::new(input);
                 if !sra_path.exists() {
@@ -335,7 +337,19 @@ async fn main() -> Result<()> {
                     metadata_service: None,
                 };
 
-                let stats = sracha_core::pipeline::run_fastq(sra_path, None, &pipeline_config)?;
+                let stats = match sracha_core::pipeline::run_fastq(sra_path, None, &pipeline_config)
+                {
+                    Ok(s) => s,
+                    // Undecodable cSRA — suggest ENA and skip this input
+                    // instead of aborting the whole invocation.
+                    Err(sracha_core::error::Error::CsraUnsupported { accession, message }) => {
+                        let client = sracha_core::http::default_client();
+                        suggest_ena_fallback(&client, &accession, &message).await;
+                        fastq_skipped.push(accession);
+                        continue;
+                    }
+                    Err(e) => return Err(e.into()),
+                };
 
                 eprintln!(
                     "{}: {} spots, {} reads written",
@@ -348,6 +362,15 @@ async fn main() -> Result<()> {
                         eprintln!("  wrote {}", style::path(path.display()));
                     }
                 }
+            }
+
+            if !fastq_skipped.is_empty() {
+                anyhow::bail!(
+                    "{} input(s) skipped — sracha can't reconstruct their cSRA: {} \
+                     (see the per-input hints above for the ENA fallback)",
+                    fastq_skipped.len(),
+                    fastq_skipped.join(", "),
+                );
             }
 
             Ok(())
@@ -522,6 +545,10 @@ async fn main() -> Result<()> {
             }
 
             let mut completed_accessions: Vec<String> = Vec::new();
+            // Accessions skipped because sracha can't reconstruct their cSRA
+            // (external refseq, static READ_LEN). Each gets an ENA suggestion
+            // inline; collected here so the batch exits non-zero at the end.
+            let mut skipped_accessions: Vec<String> = Vec::new();
             let mut interrupted_accession: Option<String> = None;
             let mut interrupt_phase: Option<InterruptPhase> = None;
 
@@ -753,6 +780,12 @@ async fn main() -> Result<()> {
                         interrupt_phase = Some(InterruptPhase::Decode);
                         break;
                     }
+                    // cSRA sracha can't reconstruct — don't abort the whole
+                    // batch. Point the user at ENA's FASTQ mirror and move on.
+                    Err(sracha_core::error::Error::CsraUnsupported { accession, message }) => {
+                        suggest_ena_fallback(&http_client, &accession, &message).await;
+                        skipped_accessions.push(accession);
+                    }
                     Err(e) => return Err(e.into()),
                 }
             }
@@ -794,6 +827,15 @@ async fn main() -> Result<()> {
                     );
                 }
                 std::process::exit(130);
+            }
+
+            if !skipped_accessions.is_empty() {
+                anyhow::bail!(
+                    "{} accession(s) skipped — sracha can't reconstruct their cSRA: {} \
+                     (see the per-accession hints above for the ENA fallback)",
+                    skipped_accessions.len(),
+                    skipped_accessions.join(", "),
+                );
             }
 
             Ok(())
@@ -1102,6 +1144,34 @@ fn collect_accessions(positional: &[String], list_file: Option<&Path>) -> Result
 /// resolved to their constituent runs via the NCBI EUtils API.
 async fn resolve_to_runs(inputs: &[String], client: &SdlClient) -> Result<(Vec<String>, bool)> {
     resolve_to_runs_inner(inputs, client, false).await
+}
+
+/// Report an undecodable cSRA and, where possible, point the user at ENA's
+/// FASTQ mirror. `message` is the decode diagnosis carried by
+/// [`sracha_core::error::Error::CsraUnsupported`]. Best-effort: any ENA lookup
+/// or network failure degrades to a generic `--prefer-ena` hint rather than an
+/// error, since the decode has already failed and this is only guidance.
+async fn suggest_ena_fallback(client: &reqwest::Client, accession: &str, message: &str) {
+    eprintln!(
+        "{} {}: {}",
+        style::warn_label("skipped:"),
+        style::header(accession),
+        message,
+    );
+    let hint = |body: String| eprintln!("  {} {}", style::label("hint:"), body);
+    match sracha_core::ena::resolve_ena(client, accession).await {
+        Ok(Some(_)) => hint(format!(
+            "ENA hosts FASTQ for this run — fetch it with: {}",
+            style::value(format!("sracha get --prefer-ena {accession}")),
+        )),
+        Ok(None) => {
+            hint("no FASTQ mirror on ENA; decode with NCBI sra-tools (fasterq-dump)".to_string())
+        }
+        Err(_) => hint(format!(
+            "could not reach ENA to check for a FASTQ mirror; try: {}",
+            style::value(format!("sracha get --prefer-ena {accession}")),
+        )),
+    }
 }
 
 /// Output filename for `fetch --prefer-ena`. ENA always serves gzip'd FASTQ,

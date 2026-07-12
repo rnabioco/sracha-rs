@@ -34,7 +34,7 @@ pixi run -e dev check          # cargo check
 pixi run -e dev clippy         # cargo clippy --all-targets --all-features -- -D warnings
 ```
 
-The project uses `pixi` for environment management (Rust 1.92+, Python 3.14+, sra-tools for validation reference). All the above are also available as `pixi run build`, `pixi run test`, etc. Swap `pixi run` for `pixi run -e dev` on any linking task to pick up mold.
+The project uses `pixi` for environment management (Rust 1.95+, Python 3.14+, sra-tools for validation reference). All the above are also available as `pixi run build`, `pixi run test`, etc. Swap `pixi run` for `pixi run -e dev` on any linking task to pick up mold.
 
 ## Workspace layout
 
