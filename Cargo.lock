@@ -2203,6 +2203,7 @@ dependencies = [
  "libc",
  "owo-colors",
  "predicates",
+ "reqwest",
  "serde_json",
  "sracha-core",
  "tabled",

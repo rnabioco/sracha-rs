@@ -58,6 +58,13 @@ pub enum Error {
 
     #[error("integrity check failed for {accession}: {summary}")]
     IntegrityFailure { accession: String, summary: String },
+
+    /// A reference-compressed cSRA that sracha cannot reconstruct (external
+    /// refseq, static-metadata READ_LEN, …). Carries the accession so the CLI
+    /// can probe ENA for a FASTQ mirror and suggest `--prefer-ena`. `message`
+    /// is the diagnosis from `sracha_vdb::Error::CsraUnsupported`.
+    #[error("{accession}: {message}")]
+    CsraUnsupported { accession: String, message: String },
 }
 
 pub type Result<T> = std::result::Result<T, Error>;

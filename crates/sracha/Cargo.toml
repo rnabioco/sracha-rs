@@ -17,6 +17,7 @@ chrono.workspace = true
 clap.workspace = true
 indicatif.workspace = true
 owo-colors.workspace = true
+reqwest.workspace = true
 serde_json.workspace = true
 sracha-core.workspace = true
 tabled.workspace = true
