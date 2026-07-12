@@ -6,7 +6,7 @@ channels = ["conda-forge", "bioconda"]
 platforms = ["linux-64", "osx-arm64"]
 
 [dependencies]
-rust = ">=1.92"
+rust = ">=1.95"
 python = ">=3.14.4,<3.15"
 sra-tools = ">=3.4.1,<4"
 vhs = ">=0.11.0,<0.12"

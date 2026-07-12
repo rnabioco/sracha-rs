@@ -5,7 +5,7 @@ members = ["crates/sracha", "crates/sracha-core", "crates/sracha-vdb"]
 [workspace.package]
 version = "0.3.10"
 edition = "2024"
-rust-version = "1.92"
+rust-version = "1.95"
 repository = "https://github.com/rnabioco/sracha-rs"
 license = "MIT"
 
