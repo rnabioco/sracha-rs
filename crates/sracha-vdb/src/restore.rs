@@ -129,10 +129,7 @@ pub fn reverse_complement_4na(bases: &mut [u8]) {
 pub fn fourna_to_ascii(bases: &[u8]) -> Vec<u8> {
     // Indexed by low 4 bits. 0x0 = gap (we emit 'N' rather than '-' to
     // keep FASTQ callers happy). This is the same mapping vdb-dump uses.
-    const LUT: [u8; 16] = [
-        b'N', b'A', b'C', b'M', b'G', b'R', b'S', b'V', b'T', b'W', b'Y', b'H', b'K', b'D', b'B',
-        b'N',
-    ];
+    const LUT: [u8; 16] = *b"NACMGRSVTWYHKDBN";
     bases.iter().map(|&b| LUT[(b & 0x0F) as usize]).collect()
 }
 
