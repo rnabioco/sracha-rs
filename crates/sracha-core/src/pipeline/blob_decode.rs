@@ -1519,7 +1519,7 @@ mod tests {
         // Bytes in [33, 126] are NOT treated as already-encoded. This
         // regression test pins the boundary: any non-zero numeric input
         // must have +33 applied.
-        let raw = [b'?', b'I']; // 63, 73 — plausibly ASCII, must still +33
+        let raw = *b"?I"; // 63, 73 — plausibly ASCII, must still +33
         let (out, is_empty) = encode_raw_quality_for_fastq(&raw);
         assert!(!is_empty);
         assert_eq!(out, vec![63 + 33, 73 + 33]);
