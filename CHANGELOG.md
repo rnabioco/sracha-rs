@@ -1,5 +1,34 @@
 # Changelog
 
+## 0.3.11 (2026-07-12)
+
+### Features
+
+- When sracha can't reconstruct a reference-compressed cSRA — its
+  `PRIMARY_ALIGNMENT` + `REFERENCE` tables live in an undownloaded
+  `.vdbcache`, or the reference is stored externally — `sracha get` and
+  `sracha fastq` now check ENA for a FASTQ mirror and suggest
+  `sracha get --prefer-ena <acc>` instead of failing (#75). The accession is
+  skipped rather than aborting the whole batch, and the run exits non-zero so
+  the skip stays visible to scripts.
+
+### Fixes
+
+- cSRA reference chunking derives `MAX_SEQ_LEN` from the archive instead of
+  assuming 5000, fixing reconstruction of runs with a different reference
+  chunk size (#71).
+
+### Performance
+
+- Pre-size per-slot FASTQ output buffers to cut reallocations during decode
+  (#72).
+
+### Changed
+
+- Release binaries now ship x86-64 microarchitecture variants (v2 and v3)
+  alongside the ARM build (#71).
+- Minimum supported Rust version is now 1.95.
+
 ## 0.3.10 (2026-06-17)
 
 ### Fixes
