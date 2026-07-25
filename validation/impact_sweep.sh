@@ -21,6 +21,7 @@
 #   bash validation/impact_sweep.sh --sbatch -n 2000 --concurrency 40
 #   bash validation/impact_sweep.sh -a accessions.txt        # serial, explicit list
 #   bash validation/impact_sweep.sh --summary --resume-dir DIR
+#   bash validation/impact_sweep.sh --by-type --resume-dir DIR  # breakdown by platform
 #   bash validation/impact_sweep.sh --hits --resume-dir DIR  # affected accessions, for ab_corpus.sh
 #
 # Results: validation/impact-sweep-results/<YYYYMMDD-HHMMSS>/
@@ -57,6 +58,7 @@ INDEX_OFFSET=0
 SBATCH_SUBMIT=0
 SUMMARY_ONLY=0
 HITS_ONLY=0
+BY_TYPE_ONLY=0
 CONCURRENCY=25
 CPUS_PER_TASK=2
 MEM="2G"
@@ -79,6 +81,7 @@ while [[ $# -gt 0 ]]; do
         --index-offset) INDEX_OFFSET="$2"; shift 2 ;;
         --sbatch) SBATCH_SUBMIT=1; shift ;;
         --summary) SUMMARY_ONLY=1; shift ;;
+        --by-type) BY_TYPE_ONLY=1; shift ;;
         --hits) HITS_ONLY=1; shift ;;
         --concurrency) CONCURRENCY="$2"; shift 2 ;;
         --cpus) CPUS_PER_TASK="$2"; shift 2 ;;
@@ -145,7 +148,81 @@ print_hits() {
     awk -F'\t' 'NR>1 && $2 != "UNAFFECTED" && $2 != "PROBE_ERR" {print $1}' "$RESULTS_TSV"
 }
 
+# Archive shape correlates strongly with the submitting platform, so an
+# aggregate rate hides the thing users actually need to know. Platform and
+# layout are not recorded during classification -- they are pure metadata and
+# can be fetched for any accession after the fact, which also means this works
+# on a results dir built from an explicit -a list (no strata.tsv).
+print_by_type() {
+    local meta accs chunk q
+    meta=$(mktemp); accs=$(mktemp)
+    awk -F'\t' 'NR>1 && $2 != "PROBE_ERR" {print $1}' "$RESULTS_TSV" | sort -u > "$accs"
+    if [[ ! -s "$accs" ]]; then echo "no classified runs in $RESULTS_TSV" >&2; rm -f "$meta" "$accs"; return 1; fi
+
+    # ENA rejects very long queries, so ask in chunks. POST keeps it off the URL.
+    while read -r -a chunk; do
+        (( ${#chunk[@]} )) || continue
+        q=$(printf 'run_accession=%s OR ' "${chunk[@]}"); q="${q% OR }"
+        curl -sS -X POST "https://www.ebi.ac.uk/ena/portal/api/search" \
+            --data-urlencode "result=read_run" \
+            --data-urlencode "query=$q" \
+            --data-urlencode "fields=run_accession,instrument_platform,library_layout" \
+            --data-urlencode "format=tsv" 2>/dev/null | tail -n +2
+    done < <(xargs -n 100 < "$accs") >> "$meta"
+
+    echo "== affected by platform x layout: $RESULTS_DIR"
+    awk -F'\t' '
+      NR==FNR { plat[$1]=$2; lay[$1]=$3; next }
+      FNR==1 || $2 == "PROBE_ERR" { next }
+      { p=plat[$1]; l=lay[$1]
+        if (p == "") { unknown++; next }
+        k=p"\t"l; n[k]++; if ($2 != "UNAFFECTED") h[k]++
+        pn[p]++;   if ($2 != "UNAFFECTED") ph[p]++
+        cls[p"\t"$2]++; seen[$2]=1; plats[p]=1 }
+      END {
+        printf "\n%-18s %-8s %7s %6s %8s\n","platform","layout","runs","hits","rate"
+        for (k in n) { split(k,a,"\t")
+          printf "%-18s %-8s %7d %6d %7.1f%%\n", a[1], a[2], n[k], h[k], 100*h[k]/n[k] }
+        printf "\n%-18s %7s", "platform", "runs"
+        for (c in seen) printf " %20s", c
+        printf "\n"
+        for (p in plats) { printf "%-18s %7d", p, pn[p]
+          for (c in seen) printf " %20d", cls[p"\t"c]
+          printf "\n" }
+        if (unknown) printf "\n  %d classified run(s) had no ENA metadata and were skipped\n", unknown
+      }' "$meta" "$RESULTS_TSV"
+
+    # The sweep samples evenly across platforms on purpose, which over-weights
+    # rare ones relative to SRA as a whole. Reweighting by real platform counts
+    # is the difference between "a quarter of runs change" and the truth.
+    echo
+    echo "  reweighting sample rates by ENA platform totals:"
+    awk -F'\t' '
+      NR==FNR { plat[$1]=$2; next }
+      FNR==1 || $2 == "PROBE_ERR" { next }
+      { p=plat[$1]; if (p=="") next; n[p]++; if ($2 != "UNAFFECTED") h[p]++ }
+      END { for (p in n) printf "%s\t%d\t%d\n", p, n[p], h[p] }' "$meta" "$RESULTS_TSV" \
+    | while IFS=$'\t' read -r p np hp; do
+        tot=$(curl -sS -X POST "https://www.ebi.ac.uk/ena/portal/api/count" \
+              --data-urlencode "result=read_run" \
+              --data-urlencode "query=instrument_platform=${p}" 2>/dev/null | tr -d '\r' | tail -1)
+        [[ "$tot" =~ ^[0-9]+$ ]] || tot=0
+        printf '%s\t%s\t%s\t%s\n' "$p" "$np" "$hp" "$tot"
+      done \
+    | awk -F'\t' '{ p[NR]=$1; n[NR]=$2; h[NR]=$3; t[NR]=$4; T+=$4; rows=NR }
+      END {
+        if (T == 0) { print "  (ENA counts unavailable; showing sample rates only)"; exit }
+        printf "  %-18s %9s %10s %12s\n","platform","obs rate","SRA share","contribution"
+        for (i=1; i<=rows; i++) { r=h[i]/n[i]; s=t[i]/T; w += s*r
+          printf "  %-18s %8.1f%% %9.2f%% %11.3f%%\n", p[i], 100*r, 100*s, 100*s*r }
+        printf "\n  population-weighted affected rate: %.1f%%\n", 100*w
+        print  "  (the --summary rate is within the stratified sample, not SRA as a whole)"
+      }'
+    rm -f "$meta" "$accs"
+}
+
 [[ "$SUMMARY_ONLY" == "1" ]] && { print_summary; exit 0; }
+[[ "$BY_TYPE_ONLY" == "1" ]] && { print_by_type; exit 0; }
 [[ "$HITS_ONLY" == "1" ]] && { print_hits; exit 0; }
 
 # ---------- sampling ----------
