@@ -51,6 +51,9 @@ MAX_BASES=50000000000
 SAMPLE_ROWS=0
 TIMEOUT_MIN=20
 RESUME_DIR=""
+# Added to SLURM_ARRAY_TASK_ID to get the accessions.txt line. Non-zero only
+# for the second and later chunks when the list exceeds Slurm MaxArraySize.
+INDEX_OFFSET=0
 SBATCH_SUBMIT=0
 SUMMARY_ONLY=0
 HITS_ONLY=0
@@ -73,6 +76,7 @@ while [[ $# -gt 0 ]]; do
         --sample) SAMPLE_ROWS="$2"; shift 2 ;;
         --timeout) TIMEOUT_MIN="$2"; shift 2 ;;
         --resume-dir) RESUME_DIR="$2"; shift 2 ;;
+        --index-offset) INDEX_OFFSET="$2"; shift 2 ;;
         --sbatch) SBATCH_SUBMIT=1; shift ;;
         --summary) SUMMARY_ONLY=1; shift ;;
         --hits) HITS_ONLY=1; shift ;;
@@ -212,24 +216,58 @@ if [[ "$SBATCH_SUBMIT" == "1" ]]; then
     echo "partition   : $PARTITION   concurrency: $CONCURRENCY"
     echo "per task    : ${CPUS_PER_TASK} cpu, ${MEM}, ${SLURM_TIME}min"
 
-    SBATCH_ARGS=(
-        --job-name="$JOB_NAME"
-        --comment="$JOB_NAME"
-        --partition="$PARTITION"
-        --array="1-${TOTAL}%${CONCURRENCY}"
-        --cpus-per-task="$CPUS_PER_TASK"
-        --mem="$MEM"
-        --time="${SLURM_TIME}"
-        --output="$RESULTS_DIR/logs/slurm-%A_%a.out"
-        --parsable
-    )
-    # --tmp stays opt-in: idle nodes on this cluster advertise TmpDisk=0 even
-    # though /tmp exists, and a non-empty value makes the array un-schedulable.
-    [[ -n "$TMP" ]] && SBATCH_ARGS+=(--tmp="$TMP")
+    # Slurm caps the highest array index (MaxArraySize - 1), and it is a cap on
+    # the *index*, not the element count -- so a 2000-run list cannot be
+    # submitted as 1-2000 nor as 1001-2000. Split it into chunks of at most
+    # MAX_IDX and give each chunk an --index-offset into accessions.txt.
+    MAX_ARRAY=$(scontrol show config 2>/dev/null \
+        | awk -F= '/^MaxArraySize/ {gsub(/ /,"",$2); print $2}')
+    [[ -n "$MAX_ARRAY" ]] || MAX_ARRAY=1001
+    MAX_IDX=$(( MAX_ARRAY - 1 ))
+    (( MAX_IDX < 1 )) && MAX_IDX=1
 
-    JOB_ID=$(sbatch "${SBATCH_ARGS[@]}" "$SCRIPT_SELF" \
-        --resume-dir "$RESULTS_DIR" --timeout "$TIMEOUT_MIN" --sample "$SAMPLE_ROWS")
-    echo "submitted array job $JOB_ID"
+    # Spread the requested concurrency across chunks so the total in flight
+    # matches what the caller asked for.
+    CHUNKS=$(( (TOTAL + MAX_IDX - 1) / MAX_IDX ))
+    PER_CHUNK_CONC=$(( CONCURRENCY / CHUNKS ))
+    (( PER_CHUNK_CONC < 1 )) && PER_CHUNK_CONC=1
+    (( CHUNKS > 1 )) && echo "chunks      : $CHUNKS x <=${MAX_IDX} (MaxArraySize=$MAX_ARRAY), ${PER_CHUNK_CONC} concurrent each"
+
+    JOB_IDS=()
+    offset=0
+    while (( offset < TOTAL )); do
+        span=$(( TOTAL - offset ))
+        (( span > MAX_IDX )) && span=$MAX_IDX
+
+        SBATCH_ARGS=(
+            --job-name="$JOB_NAME"
+            --comment="$JOB_NAME"
+            --partition="$PARTITION"
+            --array="1-${span}%${PER_CHUNK_CONC}"
+            --cpus-per-task="$CPUS_PER_TASK"
+            --mem="$MEM"
+            --time="${SLURM_TIME}"
+            --output="$RESULTS_DIR/logs/slurm-%A_%a.out"
+            --parsable
+        )
+        # --tmp stays opt-in: idle nodes on this cluster advertise TmpDisk=0 even
+        # though /tmp exists, and a non-empty value makes the array un-schedulable.
+        [[ -n "$TMP" ]] && SBATCH_ARGS+=(--tmp="$TMP")
+
+        # An unchecked sbatch here used to print "submitted array job " with an
+        # empty id and exit 0, so a rejected array looked like a running sweep
+        # until someone noticed results.tsv never filled up.
+        if ! JOB_ID=$(sbatch "${SBATCH_ARGS[@]}" "$SCRIPT_SELF" \
+            --resume-dir "$RESULTS_DIR" --timeout "$TIMEOUT_MIN" \
+            --sample "$SAMPLE_ROWS" --index-offset "$offset") || [[ -z "$JOB_ID" ]]; then
+            echo "sbatch rejected the array for lines $((offset+1))-$((offset+span))" >&2
+            (( ${#JOB_IDS[@]} )) && echo "already-submitted jobs: ${JOB_IDS[*]} (scancel them if you resubmit)" >&2
+            exit 1
+        fi
+        JOB_IDS+=("$JOB_ID")
+        offset=$(( offset + span ))
+    done
+    echo "submitted array job(s) ${JOB_IDS[*]}"
     echo "watch   : squeue -u \$USER -n $JOB_NAME"
     echo "summary : bash validation/impact_sweep.sh --summary --resume-dir $RESULTS_DIR"
     echo "hits    : bash validation/impact_sweep.sh --hits --resume-dir $RESULTS_DIR"
@@ -372,9 +410,10 @@ process_accession() {
 
 # ---------- dispatch ----------
 if [[ -n "${SLURM_ARRAY_TASK_ID:-}" ]]; then
-    ACC=$(awk 'NF && !/^#/' "$ACC_LIST" | sed -n "${SLURM_ARRAY_TASK_ID}p")
-    [[ -z "$ACC" ]] && { echo "no accession at index $SLURM_ARRAY_TASK_ID" >&2; exit 1; }
-    echo "# array task $SLURM_ARRAY_TASK_ID on $(hostname) -> $ACC"
+    IDX=$(( SLURM_ARRAY_TASK_ID + INDEX_OFFSET ))
+    ACC=$(awk 'NF && !/^#/' "$ACC_LIST" | sed -n "${IDX}p")
+    [[ -z "$ACC" ]] && { echo "no accession at index $IDX" >&2; exit 1; }
+    echo "# array task $SLURM_ARRAY_TASK_ID (line $IDX) on $(hostname) -> $ACC"
     process_accession "$ACC"
     exit 0
 fi
