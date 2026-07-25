@@ -20,7 +20,7 @@ Fast SRA downloader and FASTQ converter, written in pure Rust.
 - **Stdout streaming** -- pipe interleaved FASTQ to downstream tools with `-Z`
 - **Resumable downloads** -- automatically resumes interrupted transfers
 - **File validation** -- verify SRA file integrity with `sracha validate`
-- **VDB introspection** -- `sracha vdb` inspects local `.sra` files (tables, columns, metadata, schema) as a pure-Rust replacement for `vdb-dump`
+- **VDB introspection** -- `sracha vdb` inspects `.sra` archives (tables, columns, metadata, schema) as a pure-Rust replacement for `vdb-dump`, either from a local file or straight from an accession over HTTP range requests, no download needed
 
 ## How it works
 

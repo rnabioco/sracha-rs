@@ -9,6 +9,7 @@ pub mod http;
 pub mod info;
 pub mod metadata;
 pub mod pipeline;
+pub mod remote;
 pub mod s3;
 pub mod sdl;
 pub mod util;

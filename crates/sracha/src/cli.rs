@@ -72,7 +72,7 @@ pub enum Command {
     /// Validate SRA file integrity
     Validate(ValidateArgs),
 
-    /// Inspect VDB structure of a local .sra file (replacement for vdb-dump)
+    /// Inspect VDB structure of a local or remote .sra archive (replacement for vdb-dump)
     Vdb(VdbArgs),
 }
 
@@ -86,21 +86,21 @@ pub struct VdbArgs {
 pub enum VdbCmd {
     /// Print summary metadata (schema, platform, row counts, dates)
     Info {
-        /// Local .sra file path
-        file: PathBuf,
+        /// Local .sra path, https:// URL, or accession (fetched via HTTP range requests)
+        source: String,
         /// Emit a single JSON object instead of human-readable text
         #[arg(long)]
         json: bool,
     },
     /// List tables in the archive (Database only)
     Tables {
-        /// Local .sra file path
-        file: PathBuf,
+        /// Local .sra path, https:// URL, or accession (fetched via HTTP range requests)
+        source: String,
     },
     /// List columns in the chosen table
     Columns {
-        /// Local .sra file path
-        file: PathBuf,
+        /// Local .sra path, https:// URL, or accession (fetched via HTTP range requests)
+        source: String,
         /// Table to inspect (defaults to SEQUENCE / first table)
         #[arg(short = 'T', long)]
         table: Option<String>,
@@ -110,8 +110,8 @@ pub enum VdbCmd {
     },
     /// Dump the metadata tree (schema/stats/LOAD/SOFTWARE nodes)
     Meta {
-        /// Local .sra file path
-        file: PathBuf,
+        /// Local .sra path, https:// URL, or accession (fetched via HTTP range requests)
+        source: String,
         /// Table whose metadata tree to walk (defaults to SEQUENCE)
         #[arg(short = 'T', long)]
         table: Option<String>,
@@ -127,14 +127,14 @@ pub enum VdbCmd {
     },
     /// Print the embedded schema text
     Schema {
-        /// Local .sra file path
-        file: PathBuf,
+        /// Local .sra path, https:// URL, or accession (fetched via HTTP range requests)
+        source: String,
     },
     /// Print first row id and row count for the chosen table/column
     #[command(name = "id-range")]
     IdRange {
-        /// Local .sra file path
-        file: PathBuf,
+        /// Local .sra path, https:// URL, or accession (fetched via HTTP range requests)
+        source: String,
         /// Table to inspect (defaults to SEQUENCE / first table)
         #[arg(short = 'T', long)]
         table: Option<String>,
@@ -144,8 +144,8 @@ pub enum VdbCmd {
     },
     /// Dump row-level data for the chosen columns
     Dump {
-        /// Local .sra file path
-        file: PathBuf,
+        /// Local .sra path, https:// URL, or accession (fetched via HTTP range requests)
+        source: String,
         /// Table to dump from (defaults to SEQUENCE / first table)
         #[arg(short = 'T', long)]
         table: Option<String>,
