@@ -1,6 +1,35 @@
 # Changelog
 
-## Unreleased
+## 0.4.0 (2026-07-25)
+
+### Upgrade note
+
+The split-mode fixes below change which FASTQ file a read lands in, and can
+change how many records a run emits. A sweep of 2,000 public runs put this at
+roughly **9% of SRA**, heavily concentrated by platform:
+
+| platform | runs affected |
+|----------|---------------|
+| PacBio SMRT | 65% |
+| BGISEQ | 31% |
+| DNBSEQ | 19% |
+| Element | 8% |
+| Illumina | 8% |
+| Oxford Nanopore | 1% |
+| Ultima | 0% |
+
+Two consequences worth checking before upgrading a pipeline:
+
+- Runs whose leading read slot is technical or zero-length now produce **no
+  `_1` file at all** — the first output is `_2`. This matches fasterq-dump,
+  but breaks globs that assume `_1.fastq.gz` exists.
+- Runs affected by the READ_TYPE page-map bug previously **dropped a small
+  number of reads** (2-4 per run on the reported archives). Output from
+  earlier versions for those runs is incomplete and should be regenerated.
+
+`sracha vdb dump <acc> -C READ_LEN,READ_TYPE -R 1` now works without
+downloading, which is the quickest way to check whether a run stores reads in
+a non-leading slot.
 
 ### Features
 
