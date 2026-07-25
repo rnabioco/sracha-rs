@@ -93,7 +93,10 @@ pub struct SpotRecord {
     pub quality: Vec<u8>,
     /// Length of each read segment within `sequence`/`quality`.
     pub read_lengths: Vec<u32>,
-    /// Read type per segment: 0 = biological, 1 = technical.
+    /// Read type per segment, as INSDC `xread_type` bits: bit 0 is the
+    /// biological flag (0 = technical, 1 = biological) and bits 1-2 carry
+    /// orientation (`FORWARD` = 2, `REVERSE` = 4). Read it through
+    /// [`read_is_biological`] rather than comparing against 0.
     pub read_types: Vec<u8>,
     /// Read filter per segment: 0 = pass, 1 = reject.
     pub read_filter: Vec<u8>,
@@ -445,6 +448,22 @@ pub fn append_fasta_record(
     out.push(b'\n');
 }
 
+/// INSDC `xread_type` bit 0: set for biological reads, clear for technical.
+const READ_TYPE_BIOLOGICAL: u8 = 1;
+
+/// Whether read `i` of a spot is biological, given the spot's READ_TYPE row.
+///
+/// Bits 1-2 of `xread_type` carry orientation (`FORWARD` = 2, `REVERSE` = 4),
+/// so a plain `!= 0` test misreads `BIOLOGICAL|FORWARD` (3) as technical. A
+/// read with no READ_TYPE entry is biological, matching fasterq-dump's
+/// `num_read_type > read_id_0` guard in `tbl_join.c`.
+pub fn read_is_biological(read_types: &[u8], i: usize) -> bool {
+    match read_types.get(i) {
+        Some(&rtype) => rtype & READ_TYPE_BIOLOGICAL != 0,
+        None => true,
+    }
+}
+
 /// A read segment extracted from a spot, after filtering.
 struct ReadSegment<'a> {
     sequence: &'a [u8],
@@ -452,6 +471,51 @@ struct ReadSegment<'a> {
     /// 1-based read index within the spot, before filtering (the `$ri`
     /// value for custom deflines).
     mate_idx: u32,
+    /// Whether this segment's READ_TYPE marks it biological. Technical
+    /// segments only survive filtering under `--include-technical`, but
+    /// split-3 still counts biological reads to decide pairing.
+    biological: bool,
+}
+
+/// Destination slot for one surviving read segment.
+///
+/// Mirrors fasterq-dump's `tbl_join.c`, where the two split modes number
+/// their output files differently:
+///
+/// - `--split-files` (`print_fastq_n_reads_split_file`) bumps `write_id_1`
+///   once per *slot*, outside the filter branch, so a read always lands in
+///   the file matching its original READ_LEN position. Zero-length,
+///   technical, and too-short reads still consume their file number — a
+///   spot of `[0, 150]` writes to `_2`, never `_1`.
+/// - `--split-3` (`print_fastq_n_reads_split_3`) bumps `write_id_1` only for
+///   reads it actually emits, so survivors compact into `_1.._N`; and when
+///   the spot holds fewer than two biological reads it forces `write_id_1`
+///   to 0, sending everything to the unpaired file.
+///
+/// `mate_idx` is the 1-based original slot, `emit_idx` the 0-based position
+/// among surviving segments, and `bio_reads` the number of biological reads
+/// that passed the zero-length and min-length filters.
+pub(crate) fn slot_for_segment(
+    split_mode: SplitMode,
+    mate_idx: u32,
+    emit_idx: usize,
+    bio_reads: usize,
+) -> OutputSlot {
+    match split_mode {
+        SplitMode::SplitFiles => OutputSlot::ReadN(mate_idx.saturating_sub(1)),
+        SplitMode::Split3 => {
+            if bio_reads < 2 {
+                OutputSlot::Unpaired
+            } else {
+                match emit_idx {
+                    0 => OutputSlot::Read1,
+                    1 => OutputSlot::Read2,
+                    n => OutputSlot::ReadN(n as u32),
+                }
+            }
+        }
+        SplitMode::Interleaved | SplitMode::SplitSpot => OutputSlot::Single,
+    }
 }
 
 /// Format a spot into FASTQ records, routing each to the appropriate output slot.
@@ -460,14 +524,12 @@ struct ReadSegment<'a> {
 /// writing each record to the file corresponding to its slot.
 ///
 /// Filtering rules applied in order:
-/// 1. Technical reads are dropped when `config.skip_technical` is `true`.
-/// 2. Reads shorter than `config.min_read_len` are dropped.
+/// 1. Zero-length reads are dropped.
+/// 2. Technical reads are dropped when `config.skip_technical` is `true`.
+/// 3. Reads shorter than `config.min_read_len` are dropped.
 ///
-/// Routing depends on `config.split_mode`:
-/// - **Split3**: 2 biological reads -> `Read1` + `Read2`; otherwise each to `Unpaired`.
-/// - **SplitFiles**: Nth surviving read -> `ReadN(N)` (0-indexed).
-/// - **SplitSpot**: all reads -> `Single`.
-/// - **Interleaved**: all reads -> `Single` (R1/R2 alternating in one file).
+/// Surviving segments are then routed by [`slot_for_segment`]; note that
+/// dropping a read never renumbers the files in `--split-files` mode.
 pub fn format_spot(
     spot: &SpotRecord,
     run_name: &str,
@@ -509,11 +571,10 @@ fn filter_spot_segments<'a>(spot: &'a SpotRecord, config: &FastqConfig) -> Vec<R
             continue;
         }
 
+        let biological = read_is_biological(&spot.read_types, i);
+
         // Filter: skip technical reads if configured.
-        if config.skip_technical
-            && let Some(&rtype) = spot.read_types.get(i)
-            && rtype != 0
-        {
+        if config.skip_technical && !biological {
             continue;
         }
 
@@ -528,17 +589,16 @@ fn filter_spot_segments<'a>(spot: &'a SpotRecord, config: &FastqConfig) -> Vec<R
             sequence: seq,
             quality: qual,
             mate_idx: (i + 1) as u32,
+            biological,
         });
     }
 
     segments
 }
 
-/// Route the filtered `segments` to output slots per [`SplitMode`].
-/// Extracted from [`format_spot`]: the routing decision tree is the only
-/// thing that varies across split modes, and pulling it out makes the
-/// Split3 / Interleaved / SplitFiles / SplitSpot behaviors trivial to
-/// eyeball side-by-side.
+/// Format the filtered `segments` and pair each with its [`slot_for_segment`]
+/// destination. Extracted from [`format_spot`] so the record-formatting
+/// concern stays separate from the slot-numbering rules.
 fn route_segments_to_slots(
     segments: &[ReadSegment<'_>],
     spot_name: &[u8],
@@ -568,27 +628,10 @@ fn route_segments_to_slots(
         }
     };
 
-    match config.split_mode {
-        SplitMode::Split3 => {
-            if segments.len() == 2 {
-                results.push((OutputSlot::Read1, format(&segments[0])));
-                results.push((OutputSlot::Read2, format(&segments[1])));
-            } else {
-                for seg in segments {
-                    results.push((OutputSlot::Unpaired, format(seg)));
-                }
-            }
-        }
-        SplitMode::Interleaved | SplitMode::SplitSpot => {
-            for seg in segments {
-                results.push((OutputSlot::Single, format(seg)));
-            }
-        }
-        SplitMode::SplitFiles => {
-            for (file_idx, seg) in segments.iter().enumerate() {
-                results.push((OutputSlot::ReadN(file_idx as u32), format(seg)));
-            }
-        }
+    let bio_reads = segments.iter().filter(|s| s.biological).count();
+    for (emit_idx, seg) in segments.iter().enumerate() {
+        let slot = slot_for_segment(config.split_mode, seg.mate_idx, emit_idx, bio_reads);
+        results.push((slot, format(seg)));
     }
 
     results
@@ -663,6 +706,11 @@ mod tests {
     // Helpers
     // -----------------------------------------------------------------------
 
+    /// INSDC `xread_type` values, spelled out so the fixtures below read as
+    /// read-type tables rather than bare 0/1 columns.
+    const BIO: u8 = 1;
+    const TECH: u8 = 0;
+
     /// Build a simple single-read spot with the given sequence.
     fn single_read_spot(name: &[u8], seq: &[u8], qual: &[u8]) -> SpotRecord {
         let len = seq.len() as u32;
@@ -671,7 +719,7 @@ mod tests {
             sequence: seq.to_vec(),
             quality: qual.to_vec(),
             read_lengths: vec![len],
-            read_types: vec![0],  // biological
+            read_types: vec![BIO],
             read_filter: vec![0], // pass
             spot_group: Vec::new(),
         }
@@ -694,7 +742,7 @@ mod tests {
             sequence: seq,
             quality: qual,
             read_lengths: vec![seq1.len() as u32, seq2.len() as u32],
-            read_types: vec![0, 0], // both biological
+            read_types: vec![BIO, BIO],
             read_filter: vec![0, 0],
             spot_group: Vec::new(),
         }
@@ -725,7 +773,7 @@ mod tests {
                 bio1_seq.len() as u32,
                 bio2_seq.len() as u32,
             ],
-            read_types: vec![1, 0, 0], // technical, biological, biological
+            read_types: vec![TECH, BIO, BIO],
             read_filter: vec![0, 0, 0],
             spot_group: Vec::new(),
         }
@@ -945,14 +993,14 @@ mod tests {
         };
         let results = format_spot(&spot, "SRR1", &config);
 
-        // All three reads should be present. With 3 reads in Split3 mode, all
-        // go to Unpaired because there are not exactly 2.
+        // Two biological reads make the spot "paired" for split-3 purposes
+        // even though the technical read is also emitted, so all three
+        // compact into _1/_2/_3 — fasterq-dump counts only biological reads
+        // when deciding, but numbers every read it writes.
         assert_eq!(results.len(), 3);
-        assert!(
-            results
-                .iter()
-                .all(|(slot, _)| *slot == OutputSlot::Unpaired)
-        );
+        assert_eq!(results[0].0, OutputSlot::Read1);
+        assert_eq!(results[1].0, OutputSlot::Read2);
+        assert_eq!(results[2].0, OutputSlot::ReadN(2));
     }
 
     #[test]
@@ -1043,7 +1091,7 @@ mod tests {
             sequence: b"ACGT".to_vec(),
             quality: b"????".to_vec(),
             read_lengths: vec![4, 0],
-            read_types: vec![0, 0],
+            read_types: vec![BIO, BIO],
             read_filter: vec![0, 0],
             spot_group: Vec::new(),
         };
@@ -1064,7 +1112,7 @@ mod tests {
             sequence: b"ACGT".to_vec(),
             quality: b"????".to_vec(),
             read_lengths: vec![0, 4],
-            read_types: vec![0, 0],
+            read_types: vec![BIO, BIO],
             read_filter: vec![0, 0],
             spot_group: Vec::new(),
         };
@@ -1085,7 +1133,7 @@ mod tests {
             sequence: b"ACGTACGT".to_vec(),
             quality: b"????????".to_vec(),
             read_lengths: vec![8, 0],
-            read_types: vec![0, 0],
+            read_types: vec![BIO, BIO],
             read_filter: vec![0, 0],
             spot_group: Vec::new(),
         };
@@ -1141,7 +1189,7 @@ mod tests {
     }
 
     #[test]
-    fn three_biological_reads_in_split3_are_unpaired() {
+    fn three_biological_reads_in_split3_compact_into_numbered_files() {
         let mut seq = b"AAAA".to_vec();
         seq.extend_from_slice(b"CCCC");
         seq.extend_from_slice(b"GGGG");
@@ -1154,7 +1202,7 @@ mod tests {
             sequence: seq,
             quality: qual,
             read_lengths: vec![4, 4, 4],
-            read_types: vec![0, 0, 0],
+            read_types: vec![BIO, BIO, BIO],
             read_filter: vec![0, 0, 0],
             spot_group: Vec::new(),
         };
@@ -1165,12 +1213,12 @@ mod tests {
         };
         let results = format_spot(&spot, "SRR1", &config);
 
+        // >= 2 biological reads means "paired", and the surviving reads are
+        // numbered 1..N rather than collapsed into the unpaired file.
         assert_eq!(results.len(), 3);
-        assert!(
-            results
-                .iter()
-                .all(|(slot, _)| *slot == OutputSlot::Unpaired)
-        );
+        assert_eq!(results[0].0, OutputSlot::Read1);
+        assert_eq!(results[1].0, OutputSlot::Read2);
+        assert_eq!(results[2].0, OutputSlot::ReadN(2));
     }
 
     #[test]
@@ -1187,7 +1235,7 @@ mod tests {
             sequence: seq,
             quality: qual,
             read_lengths: vec![4, 4, 4],
-            read_types: vec![0, 0, 0],
+            read_types: vec![BIO, BIO, BIO],
             read_filter: vec![0, 0, 0],
             spot_group: Vec::new(),
         };
@@ -1202,6 +1250,222 @@ mod tests {
         assert_eq!(results[0].0, OutputSlot::ReadN(0));
         assert_eq!(results[1].0, OutputSlot::ReadN(1));
         assert_eq!(results[2].0, OutputSlot::ReadN(2));
+    }
+
+    // -----------------------------------------------------------------------
+    // Slot preservation in split-files (issue #76)
+    //
+    // fasterq-dump's `print_fastq_n_reads_split_file` (tbl_join.c) advances
+    // its destination counter once per READ_LEN slot, outside the filter
+    // branch, so a dropped read still consumes its file number. Deriving the
+    // number from the surviving-read order instead silently rewrites mates
+    // into the wrong file.
+    // -----------------------------------------------------------------------
+
+    /// Build a spot from `(read_len, read_type)` pairs, filling each read with
+    /// a distinct base so records can be told apart.
+    fn spot_from_slots(slots: &[(u32, u8)]) -> SpotRecord {
+        const BASES: &[u8] = b"ACGTN";
+        let mut sequence = Vec::new();
+        let mut quality = Vec::new();
+        for (i, &(len, _)) in slots.iter().enumerate() {
+            sequence.extend(std::iter::repeat_n(BASES[i % BASES.len()], len as usize));
+            quality.extend(std::iter::repeat_n(b'?', len as usize));
+        }
+        SpotRecord {
+            name: b"1".to_vec(),
+            sequence,
+            quality,
+            read_lengths: slots.iter().map(|&(len, _)| len).collect(),
+            read_types: slots.iter().map(|&(_, ty)| ty).collect(),
+            read_filter: vec![0; slots.len()],
+            spot_group: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn zero_length_leading_slot_still_routes_read_2_to_read_n1() {
+        // The issue #76 shape: SRR18959644's second half stores every spot as
+        // READ_LEN=[0, 150], so the surviving read belongs in `_2.fastq`.
+        let spot = spot_from_slots(&[(0, TECH), (150, BIO)]);
+        let config = FastqConfig {
+            split_mode: SplitMode::SplitFiles,
+            ..default_config()
+        };
+        let results = format_spot(&spot, "SRR1", &config);
+
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].0, OutputSlot::ReadN(1));
+    }
+
+    #[test]
+    fn technical_leading_slot_still_routes_read_2_to_read_n1() {
+        // 10x-style layout: a technical barcode read in slot 1 is dropped by
+        // default, but the biological read stays in `_2.fastq`.
+        let spot = spot_from_slots(&[(26, TECH), (98, BIO)]);
+        let config = FastqConfig {
+            split_mode: SplitMode::SplitFiles,
+            ..default_config()
+        };
+        let results = format_spot(&spot, "SRR1", &config);
+
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].0, OutputSlot::ReadN(1));
+    }
+
+    #[test]
+    fn split_files_preserves_slots_across_alternating_technical_reads() {
+        // SRR000001 spot 2: READ_LEN=[4, 115, 44, 99] with READ_TYPE
+        // [T, B, T, B]. Verified against fasterq-dump 3.2.1, which writes
+        // only SRR000001_2.fastq and SRR000001_4.fastq for this run.
+        let spot = spot_from_slots(&[(4, TECH), (115, BIO), (44, TECH), (99, BIO)]);
+        let config = FastqConfig {
+            split_mode: SplitMode::SplitFiles,
+            ..default_config()
+        };
+        let results = format_spot(&spot, "SRR1", &config);
+
+        assert_eq!(results.len(), 2);
+        assert_eq!(results[0].0, OutputSlot::ReadN(1));
+        assert_eq!(results[1].0, OutputSlot::ReadN(3));
+    }
+
+    #[test]
+    fn split_files_slot_survives_min_read_len_drop() {
+        // A read removed by --min-read-len consumes its slot too, so the
+        // survivor keeps its own number rather than sliding down to `_1`.
+        let spot = spot_from_slots(&[(5, BIO), (100, BIO)]);
+        let config = FastqConfig {
+            split_mode: SplitMode::SplitFiles,
+            min_read_len: Some(10),
+            ..default_config()
+        };
+        let results = format_spot(&spot, "SRR1", &config);
+
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].0, OutputSlot::ReadN(1));
+    }
+
+    #[test]
+    fn split_files_filenames_follow_slot_numbers() {
+        let compression = CompressionMode::None;
+        assert_eq!(
+            output_filename(
+                "SRR18959644",
+                OutputSlot::ReadN(1),
+                false,
+                &compression,
+                PairedSuffix::Numeric,
+            ),
+            "SRR18959644_2.fastq"
+        );
+        assert_eq!(
+            output_filename(
+                "SRR000001",
+                OutputSlot::ReadN(3),
+                false,
+                &compression,
+                PairedSuffix::Numeric,
+            ),
+            "SRR000001_4.fastq"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // split-3 pairing rule
+    //
+    // `print_fastq_n_reads_split_3` counts biological reads across the whole
+    // spot, forces the unpaired file when there are fewer than two, and
+    // otherwise numbers the reads it writes 1..N.
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn split3_sends_lone_read_to_unpaired_regardless_of_slot() {
+        for slots in [
+            [(0, TECH), (150, BIO)].as_slice(),
+            [(150, BIO), (0, TECH)].as_slice(),
+        ] {
+            let spot = spot_from_slots(slots);
+            let config = FastqConfig {
+                split_mode: SplitMode::Split3,
+                ..default_config()
+            };
+            let results = format_spot(&spot, "SRR1", &config);
+
+            assert_eq!(results.len(), 1);
+            assert_eq!(results[0].0, OutputSlot::Unpaired, "slots={slots:?}");
+        }
+    }
+
+    #[test]
+    fn split3_compacts_surviving_reads_past_technical_slots() {
+        // SRR000001 spot 2 again: slots 2 and 4 are the biological reads, and
+        // split-3 renumbers them into `_1`/`_2` (unlike split-files). Matches
+        // fasterq-dump, which reports 236,041 pairs for that run.
+        let spot = spot_from_slots(&[(4, TECH), (115, BIO), (44, TECH), (99, BIO)]);
+        let config = FastqConfig {
+            split_mode: SplitMode::Split3,
+            ..default_config()
+        };
+        let results = format_spot(&spot, "SRR1", &config);
+
+        assert_eq!(results.len(), 2);
+        assert_eq!(results[0].0, OutputSlot::Read1);
+        assert_eq!(results[1].0, OutputSlot::Read2);
+    }
+
+    #[test]
+    fn split3_counts_only_biological_reads_when_technical_included() {
+        // One biological read plus an included technical read is still
+        // "unpaired" for split-3 — fasterq-dump's valid_bio_reads ignores
+        // skip_tech, so both records land in the unpaired file.
+        let spot = spot_from_slots(&[(26, TECH), (98, BIO)]);
+        let config = FastqConfig {
+            split_mode: SplitMode::Split3,
+            skip_technical: false,
+            ..default_config()
+        };
+        let results = format_spot(&spot, "SRR1", &config);
+
+        assert_eq!(results.len(), 2);
+        assert!(results.iter().all(|(s, _)| *s == OutputSlot::Unpaired));
+    }
+
+    // -----------------------------------------------------------------------
+    // READ_TYPE interpretation
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn read_type_orientation_bits_do_not_make_a_read_technical() {
+        // xread_type packs orientation into bits 1-2, so BIOLOGICAL|FORWARD
+        // (3) and BIOLOGICAL|REVERSE (5) are still biological reads. Aligned
+        // cSRA rows routinely carry these.
+        let bio_forward = BIO | 2;
+        let bio_reverse = BIO | 4;
+        let tech_forward = TECH | 2;
+
+        assert!(read_is_biological(&[bio_forward], 0));
+        assert!(read_is_biological(&[bio_reverse], 0));
+        assert!(!read_is_biological(&[tech_forward], 0));
+
+        // A read with no READ_TYPE entry is biological, matching
+        // fasterq-dump's `num_read_type > read_id_0` guard.
+        assert!(read_is_biological(&[], 0));
+        assert!(read_is_biological(&[BIO], 5));
+    }
+
+    #[test]
+    fn oriented_biological_read_is_not_filtered_as_technical() {
+        let spot = spot_from_slots(&[(50, BIO | 4), (50, BIO | 2)]);
+        let config = FastqConfig {
+            split_mode: SplitMode::SplitFiles,
+            ..default_config()
+        };
+        let results = format_spot(&spot, "SRR1", &config);
+
+        assert_eq!(results.len(), 2);
+        assert_eq!(results[0].0, OutputSlot::ReadN(0));
+        assert_eq!(results[1].0, OutputSlot::ReadN(1));
     }
 
     #[test]
