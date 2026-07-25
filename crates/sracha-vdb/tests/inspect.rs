@@ -15,6 +15,7 @@ use std::sync::Once;
 use sracha_vdb::dump::{self, DumpFormat, DumpSpec};
 use sracha_vdb::inspect::{self, VdbKind};
 use sracha_vdb::kar::KarArchive;
+use sracha_vdb::kdb::ColumnData;
 use sracha_vdb::metadata;
 use sracha_vdb::row_range::RowRanges;
 
@@ -73,7 +74,7 @@ fn srr28588231_info_smoke() {
     let cols = inspect::list_columns(&kar, None).unwrap();
     assert!(cols.iter().any(|c| c == "READ"), "READ column missing");
 
-    let report = inspect::gather_info(&mut kar, &path).unwrap();
+    let report = inspect::gather_info(&mut kar, ColumnData::Local(&path)).unwrap();
     assert!(report.primary_row_count().unwrap() > 0);
 
     if let Some(nodes) = inspect::read_table_metadata(&mut kar, None) {
@@ -88,7 +89,7 @@ fn srr28588231_id_range_matches_row_count() {
     let path = ensure_srr28588231();
     let f = File::open(&path).unwrap();
     let mut kar = KarArchive::open(BufReader::new(f)).unwrap();
-    let (first, count) = inspect::id_range(&mut kar, &path, None, None).unwrap();
+    let (first, count) = inspect::id_range(&mut kar, ColumnData::Local(&path), None, None).unwrap();
     assert!(count > 0);
     assert_eq!(first, 1, "row IDs are 1-indexed");
 }
@@ -108,7 +109,7 @@ fn srr28588231_dump_json_is_valid_ndjson() {
         format: DumpFormat::Json,
         raw: false,
     };
-    let buf = dump::dump_to_vec(&mut kar, &path, None, spec).unwrap();
+    let buf = dump::dump_to_vec(&mut kar, ColumnData::Local(&path), None, spec).unwrap();
     let text = std::str::from_utf8(&buf).unwrap();
     let lines: Vec<&str> = text.lines().collect();
     assert_eq!(lines.len(), 5, "expected 5 JSON lines, got {}", lines.len());
@@ -136,7 +137,7 @@ fn srr28588231_dump_csv_emits_row_per_line() {
         format: DumpFormat::Csv,
         raw: false,
     };
-    let buf = dump::dump_to_vec(&mut kar, &path, None, spec).unwrap();
+    let buf = dump::dump_to_vec(&mut kar, ColumnData::Local(&path), None, spec).unwrap();
     let text = std::str::from_utf8(&buf).unwrap();
     let lines: Vec<&str> = text.lines().collect();
     assert_eq!(lines.len(), 5);

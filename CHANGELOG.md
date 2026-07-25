@@ -2,6 +2,14 @@
 
 ## Unreleased
 
+### Features
+
+- `sracha vdb` subcommands now accept an accession or URL as well as a local
+  path, reading the archive in place over HTTP range requests (#78).
+  `sracha vdb info SRR18959644` answers in ~1 s and ~256 KiB against a 4.2 GB
+  run. `dump` fetches only the blobs covering `-R`. Remote decode
+  (`sracha fastq`) is unchanged — it still needs a local file.
+
 ### Fixes
 
 - `--split-files` now numbers output files by each read's original slot

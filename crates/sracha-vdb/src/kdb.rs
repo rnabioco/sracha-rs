@@ -26,6 +26,7 @@ use byteorder::{ByteOrder, LittleEndian};
 
 use crate::error::{Error, Result};
 use crate::kar::KarArchive;
+use crate::row_range::RowRanges;
 
 // ---------------------------------------------------------------------------
 // Constants
@@ -150,6 +151,9 @@ pub struct BlockLoc {
 /// `OnDisk` stores the location of the data file within the SRA/KAR file
 /// so that individual blobs can be read on demand without loading the
 /// entire (potentially multi-GiB) data file into memory.
+/// `Windows` holds a sparse set of byte ranges fetched up front, for the
+/// case where the archive is behind a range-request reader and pulling the
+/// whole `data` file would defeat the point.
 enum DataSource {
     /// Data loaded in memory (for `from_parts` / selective fetch).
     InMemory(Vec<u8>),
@@ -163,7 +167,55 @@ enum DataSource {
         /// we map only the column's portion).
         _file_offset: u64,
     },
+    /// A sparse set of byte windows into the column's `data` file, fetched
+    /// eagerly when the reader was opened. Sorted by `start` and
+    /// non-overlapping, so a blob lookup is a binary search.
+    Windows(Vec<DataWindow>),
 }
+
+/// One contiguous stretch of a column's `data` file held in memory.
+struct DataWindow {
+    /// Byte offset of `bytes[0]` within the column's `data` file.
+    start: usize,
+    bytes: Vec<u8>,
+}
+
+/// Which rows' blob bytes a [`ColumnReader`] should fetch when it is opened
+/// against a range-backed archive.
+///
+/// Only meaningful for [`ColumnData::Ranged`] — a local mmap always covers
+/// the whole column, so the window is ignored there.
+#[derive(Debug, Clone, Default)]
+pub enum RowWindow {
+    /// Fetch nothing. The reader can report row counts, blob counts, and
+    /// column metadata, but [`ColumnReader::read_raw_blob_slice`] will fail.
+    #[default]
+    None,
+    /// Fetch only the first blob — enough for header/stats inspection.
+    First,
+    /// Fetch the blobs covering these rows, resolved against the column's
+    /// own row range. An empty `RowRanges` means every row.
+    Rows(RowRanges),
+    /// Fetch the entire `data` file.
+    All,
+}
+
+/// Where a column's `data` bytes come from.
+#[derive(Debug, Clone, Copy)]
+pub enum ColumnData<'a> {
+    /// A local archive file: mmap the column's data section. Zero-copy and
+    /// covers every blob, so [`RowWindow`] does not apply.
+    Local(&'a std::path::Path),
+    /// Read through the archive's own reader. Used when the archive is
+    /// backed by HTTP range requests, where only the requested
+    /// [`RowWindow`] is transferred.
+    Ranged,
+}
+
+/// Maximum gap between two wanted blobs that is still cheaper to swallow
+/// than to pay for a second round trip. Windows separated by less than this
+/// are merged into one fetch.
+const WINDOW_COALESCE_GAP: usize = 1 << 20;
 
 /// Reader for a single physical column within a KAR archive.
 ///
@@ -789,6 +841,31 @@ impl ColumnReader {
         col_path: &str,
         sra_path: &std::path::Path,
     ) -> Result<Self> {
+        Self::open_windowed(
+            archive,
+            col_path,
+            ColumnData::Local(sra_path),
+            &RowWindow::All,
+        )
+    }
+
+    /// Open a column, choosing where its `data` bytes come from.
+    ///
+    /// [`ColumnData::Local`] behaves exactly like [`open`](Self::open):
+    /// the column's data section is mmap'd and `window` is ignored.
+    ///
+    /// [`ColumnData::Ranged`] reads the index files through the archive's
+    /// own reader (as it always did) and then fetches only the byte windows
+    /// covering `window`. That keeps a remote archive's transfer
+    /// proportional to the rows actually asked for instead of to the file
+    /// size. Rows outside the window are not readable — `read_raw_blob_slice`
+    /// reports them rather than silently returning wrong bytes.
+    pub fn open_windowed<R: std::io::Read + Seek>(
+        archive: &mut KarArchive<R>,
+        col_path: &str,
+        data: ColumnData<'_>,
+        window: &RowWindow,
+    ) -> Result<Self> {
         let idx1_path = format!("{col_path}/idx1");
         let idx0_path = format!("{col_path}/idx0");
         let idx_path = format!("{col_path}/idx");
@@ -816,8 +893,8 @@ impl ColumnReader {
         // (the index files are small; only the data file is large).
         let mut reader = Self::from_parts(&idx1_buf, &idx0_buf, &idx_buf, &idx2_buf, Vec::new())?;
 
-        // Replace the InMemory(empty) data source with OnDisk if the data
-        // file exists in the archive.
+        // Replace the InMemory(empty) data source with the real one if the
+        // data file exists in the archive.
         if let Some((file_offset, file_size)) = data_location {
             // If no blob locators were found (from_parts skipped the
             // synthetic blob because data_bytes was empty), create one
@@ -828,21 +905,81 @@ impl ColumnReader {
                     .push(synthetic_single_blob(&reader.meta, file_size));
             }
 
-            let file = std::fs::File::open(sra_path)?;
-            let mmap = unsafe {
-                memmap2::MmapOptions::new()
-                    .offset(file_offset)
-                    .len(file_size as usize)
-                    .map(&file)
-                    .map_err(|e| Error::Format(format!("mmap failed: {e}")))?
-            };
-            reader.data = DataSource::Mmap {
-                mmap,
-                _file_offset: file_offset,
-            };
+            match data {
+                ColumnData::Local(sra_path) => {
+                    let file = std::fs::File::open(sra_path)?;
+                    let mmap = unsafe {
+                        memmap2::MmapOptions::new()
+                            .offset(file_offset)
+                            .len(file_size as usize)
+                            .map(&file)
+                            .map_err(|e| Error::Format(format!("mmap failed: {e}")))?
+                    };
+                    reader.data = DataSource::Mmap {
+                        mmap,
+                        _file_offset: file_offset,
+                    };
+                }
+                ColumnData::Ranged => {
+                    let ranges = reader.window_byte_ranges(window, file_size as usize);
+                    let mut windows = Vec::with_capacity(ranges.len());
+                    for (start, len) in ranges {
+                        let bytes =
+                            archive.read_file_range(&data_path, start as u64, len as u64)?;
+                        tracing::debug!(
+                            "{col_path}: fetched {} bytes at data+{start}",
+                            bytes.len()
+                        );
+                        windows.push(DataWindow { start, bytes });
+                    }
+                    reader.data = DataSource::Windows(windows);
+                }
+            }
         }
 
         Ok(reader)
+    }
+
+    /// Resolve a [`RowWindow`] to the coalesced byte ranges of the column's
+    /// `data` file that must be fetched to serve it.
+    fn window_byte_ranges(&self, window: &RowWindow, data_size: usize) -> Vec<(usize, usize)> {
+        let wanted: Vec<&BlobLoc> = match window {
+            RowWindow::None => Vec::new(),
+            RowWindow::All => return vec![(0, data_size)],
+            RowWindow::First => self.blobs.first().into_iter().collect(),
+            RowWindow::Rows(rows) if rows.is_empty() => return vec![(0, data_size)],
+            RowWindow::Rows(rows) => {
+                let first = self.first_row_id().unwrap_or(0);
+                let spans = rows.spans(first, self.row_count());
+                self.blobs
+                    .iter()
+                    .filter(|b| spans.iter().any(|&(lo, hi)| blob_overlaps(b, lo, hi)))
+                    .collect()
+            }
+        };
+
+        // Blobs are sorted by start_id, which need not be byte order, so
+        // sort by offset before coalescing.
+        let mut ranges: Vec<(usize, usize)> = wanted
+            .iter()
+            .map(|b| (self.blob_data_offset(b), b.size as usize))
+            .filter(|&(start, len)| len > 0 && start < data_size)
+            .map(|(start, len)| (start, len.min(data_size - start)))
+            .collect();
+        ranges.sort_unstable();
+
+        let mut out: Vec<(usize, usize)> = Vec::new();
+        for (start, len) in ranges {
+            match out.last_mut() {
+                Some((prev_start, prev_len))
+                    if start <= *prev_start + *prev_len + WINDOW_COALESCE_GAP =>
+                {
+                    *prev_len = (start + len).saturating_sub(*prev_start).max(*prev_len);
+                }
+                _ => out.push((start, len)),
+            }
+        }
+        out
     }
 
     /// Read the raw (unprocessed) blob bytes for a given row ID.
@@ -881,6 +1018,22 @@ impl ColumnReader {
                     )));
                 }
                 Ok(&mmap[blob_offset..blob_offset + size])
+            }
+            DataSource::Windows(windows) => {
+                let idx = windows
+                    .partition_point(|w| w.start <= blob_offset)
+                    .checked_sub(1);
+                let win = idx.map(|i| &windows[i]).filter(|w| {
+                    blob_offset >= w.start && blob_offset + size <= w.start + w.bytes.len()
+                });
+                let win = win.ok_or_else(|| {
+                    Error::Format(format!(
+                        "row {row_id} was not fetched: its blob at data+{blob_offset} \
+                         ({size} bytes) lies outside the requested row window"
+                    ))
+                })?;
+                let lo = blob_offset - win.start;
+                Ok(&win.bytes[lo..lo + size])
             }
         }
     }
@@ -947,6 +1100,18 @@ impl ColumnReader {
             (blob.pg * u64::from(self.meta.page_size)) as usize
         }
     }
+}
+
+/// Whether a blob covers any row in the inclusive span `lo..=hi`.
+///
+/// `id_range == 0` marks a synthetic blob standing in for a column with no
+/// locators, which covers every row by convention.
+fn blob_overlaps(blob: &BlobLoc, lo: i64, hi: i64) -> bool {
+    if blob.id_range == 0 {
+        return true;
+    }
+    let end = blob.start_id + i64::from(blob.id_range) - 1;
+    blob.start_id <= hi && end >= lo
 }
 
 // ---------------------------------------------------------------------------
@@ -1643,6 +1808,194 @@ mod tests {
 
         let blob_data = reader.read_blob_for_row(1).unwrap();
         assert_eq!(blob_data, b"ACGTN");
+
+        let _ = std::fs::remove_file(&sra_path);
+    }
+
+    // -----------------------------------------------------------------------
+    // Windowed (range-backed) opens
+    // -----------------------------------------------------------------------
+
+    /// Wraps a reader and tallies how many bytes come out of it — a stand-in
+    /// for "bytes pulled over the wire" in a hermetic test.
+    struct Counting<R> {
+        inner: R,
+        read: std::rc::Rc<std::cell::Cell<u64>>,
+    }
+
+    impl<R: std::io::Read> std::io::Read for Counting<R> {
+        fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+            let n = self.inner.read(buf)?;
+            self.read.set(self.read.get() + n as u64);
+            Ok(n)
+        }
+    }
+
+    impl<R: Seek> Seek for Counting<R> {
+        fn seek(&mut self, pos: std::io::SeekFrom) -> std::io::Result<u64> {
+            self.inner.seek(pos)
+        }
+    }
+
+    /// Four 1000-byte blobs, one row each, in a column named READ.
+    ///
+    /// Returns the archive bytes and the literal contents of each blob so a
+    /// test can check it got the right window, not merely the right size.
+    fn four_blob_archive() -> (Vec<u8>, Vec<Vec<u8>>) {
+        use crate::kar::test_helpers::*;
+
+        const BLOB_SIZE: usize = 1000;
+        let blobs: Vec<Vec<u8>> = (0..4).map(|i| vec![b'A' + i as u8; BLOB_SIZE]).collect();
+
+        let col_data: Vec<u8> = blobs.iter().flatten().copied().collect();
+        let idx1 = build_idx1_v1(col_data.len() as u64, 1, 0);
+        let idx0: Vec<u8> = (0..4)
+            .flat_map(|i| {
+                build_blob_loc((i * BLOB_SIZE) as u64, BLOB_SIZE as u32, 1, (i + 1) as i64)
+            })
+            .collect();
+
+        let mut data_section = Vec::new();
+        let idx1_offset = data_section.len() as u64;
+        data_section.extend_from_slice(&idx1);
+        let idx0_offset = data_section.len() as u64;
+        data_section.extend_from_slice(&idx0);
+        let col_data_offset = data_section.len() as u64;
+        data_section.extend_from_slice(&col_data);
+
+        let idx1_node = build_file_node("idx1", idx1_offset, idx1.len() as u64);
+        let idx0_node = build_file_node("idx0", idx0_offset, idx0.len() as u64);
+        let data_node = build_file_node("data", col_data_offset, col_data.len() as u64);
+        let read_dir = build_dir_node("READ", &[&data_node, &idx0_node, &idx1_node]);
+        let col_dir = build_dir_node("col", &[&read_dir]);
+        let seq_dir = build_dir_node("SEQUENCE", &[&col_dir]);
+        let tbl_dir = build_dir_node("tbl", &[&seq_dir]);
+        let root_dir = build_dir_node("SRR", &[&tbl_dir]);
+
+        (build_kar_archive(&[&root_dir], &data_section), blobs)
+    }
+
+    /// Open the fixture column with `window`, returning the reader and how
+    /// many bytes were pulled from the archive after the TOC was parsed.
+    fn open_ranged(archive_bytes: Vec<u8>, window: &RowWindow) -> (ColumnReader, u64) {
+        let counter = std::rc::Rc::new(std::cell::Cell::new(0u64));
+        let mut archive = KarArchive::open(Counting {
+            inner: std::io::Cursor::new(archive_bytes),
+            read: counter.clone(),
+        })
+        .unwrap();
+        counter.set(0);
+        let reader = ColumnReader::open_windowed(
+            &mut archive,
+            "SRR/tbl/SEQUENCE/col/READ",
+            ColumnData::Ranged,
+            window,
+        )
+        .unwrap();
+        (reader, counter.get())
+    }
+
+    #[test]
+    fn ranged_open_without_a_window_reads_no_blob_bytes() {
+        let (archive_bytes, _) = four_blob_archive();
+        let (reader, bytes) = open_ranged(archive_bytes, &RowWindow::None);
+
+        // Row bounds come from the index alone.
+        assert_eq!(reader.row_count(), 4);
+        assert_eq!(reader.first_row_id(), Some(1));
+        // Only the index files were touched — nothing from the 4000-byte
+        // data file. This is the property that keeps `vdb info` cheap.
+        assert!(bytes < 200, "read {bytes} bytes, expected index only");
+        assert!(reader.read_raw_blob_slice(1).is_err());
+    }
+
+    #[test]
+    fn ranged_open_fetches_only_the_requested_rows() {
+        let (archive_bytes, blobs) = four_blob_archive();
+        let (_, index_bytes) = open_ranged(archive_bytes.clone(), &RowWindow::None);
+
+        let rows = RowRanges::parse("2-3").unwrap();
+        let (reader, bytes) = open_ranged(archive_bytes, &RowWindow::Rows(rows));
+
+        assert_eq!(bytes - index_bytes, 2000, "expected two 1000-byte blobs");
+        assert_eq!(reader.read_raw_blob_slice(2).unwrap(), &blobs[1][..]);
+        assert_eq!(reader.read_raw_blob_slice(3).unwrap(), &blobs[2][..]);
+    }
+
+    #[test]
+    fn rows_outside_the_window_report_rather_than_mislead() {
+        let (archive_bytes, _) = four_blob_archive();
+        let rows = RowRanges::parse("2").unwrap();
+        let (reader, _) = open_ranged(archive_bytes, &RowWindow::Rows(rows));
+
+        let err = reader.read_raw_blob_slice(4).unwrap_err().to_string();
+        assert!(
+            err.contains("not fetched"),
+            "unhelpful error for an unfetched row: {err}"
+        );
+    }
+
+    #[test]
+    fn first_window_fetches_one_blob() {
+        let (archive_bytes, blobs) = four_blob_archive();
+        let (_, index_bytes) = open_ranged(archive_bytes.clone(), &RowWindow::None);
+        let (reader, bytes) = open_ranged(archive_bytes, &RowWindow::First);
+
+        assert_eq!(bytes - index_bytes, 1000);
+        assert_eq!(reader.read_raw_blob_slice(1).unwrap(), &blobs[0][..]);
+    }
+
+    #[test]
+    fn scattered_rows_coalesce_into_one_fetch() {
+        // Rows 1 and 4 sit 2000 bytes apart, well inside the coalescing
+        // gap, so swallowing the middle beats a second round trip.
+        let (archive_bytes, blobs) = four_blob_archive();
+        let rows = RowRanges::parse("1,4").unwrap();
+        let (reader, _) = open_ranged(archive_bytes, &RowWindow::Rows(rows));
+
+        match &reader.data {
+            DataSource::Windows(w) => {
+                assert_eq!(w.len(), 1, "expected a single coalesced window");
+                assert_eq!(w[0].bytes.len(), 4000);
+            }
+            _ => panic!("expected a windowed data source"),
+        }
+        assert_eq!(reader.read_raw_blob_slice(1).unwrap(), &blobs[0][..]);
+        assert_eq!(reader.read_raw_blob_slice(4).unwrap(), &blobs[3][..]);
+    }
+
+    #[test]
+    fn an_empty_row_range_means_every_row() {
+        let (archive_bytes, blobs) = four_blob_archive();
+        let (reader, _) = open_ranged(archive_bytes, &RowWindow::Rows(RowRanges::default()));
+        for (i, blob) in blobs.iter().enumerate() {
+            assert_eq!(reader.read_raw_blob_slice(i as i64 + 1).unwrap(), &blob[..]);
+        }
+    }
+
+    #[test]
+    fn windowed_and_local_opens_agree() {
+        let (archive_bytes, _) = four_blob_archive();
+        let sra_path = std::env::temp_dir().join(format!(
+            "sracha-kdb-window-{}-{:p}.sra",
+            std::process::id(),
+            &archive_bytes
+        ));
+        std::fs::write(&sra_path, &archive_bytes).unwrap();
+
+        let mut local_archive =
+            KarArchive::open(std::io::Cursor::new(archive_bytes.clone())).unwrap();
+        let local =
+            ColumnReader::open(&mut local_archive, "SRR/tbl/SEQUENCE/col/READ", &sra_path).unwrap();
+        let (ranged, _) = open_ranged(archive_bytes, &RowWindow::All);
+
+        assert_eq!(local.row_count(), ranged.row_count());
+        for row in 1..=4 {
+            assert_eq!(
+                local.read_raw_blob_slice(row).unwrap(),
+                ranged.read_raw_blob_slice(row).unwrap(),
+            );
+        }
 
         let _ = std::fs::remove_file(&sra_path);
     }

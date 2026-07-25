@@ -389,6 +389,49 @@ impl<R: Read + Seek> KarArchive<R> {
         }
     }
 
+    /// Read a byte sub-range of a file in the archive.
+    ///
+    /// `offset` and `len` are relative to the start of the file entry, not
+    /// the archive. The request is clamped to the entry's size, so a caller
+    /// asking for more than is there gets a short buffer rather than an
+    /// error. Reading past the end of a file entry returns an empty vector.
+    ///
+    /// This exists so a range-backed reader (HTTP, object store) can pull
+    /// just the blobs it needs out of a multi-gigabyte `data` file instead
+    /// of the whole thing — see [`crate::kdb::ColumnReader::open_windowed`].
+    pub fn read_file_range(&mut self, path: &str, offset: u64, len: u64) -> Result<Vec<u8>> {
+        let entry = self
+            .entries
+            .get(path)
+            .ok_or_else(|| Error::InvalidKar(format!("file not found in archive: {path}")))?;
+
+        match entry {
+            KarEntry::File {
+                byte_offset,
+                byte_size,
+            } => {
+                if offset >= *byte_size {
+                    return Ok(Vec::new());
+                }
+                let avail = *byte_size - offset;
+                let size = len.min(avail) as usize;
+                let abs_offset = self.header.file_offset + byte_offset + offset;
+
+                self.reader.seek(SeekFrom::Start(abs_offset))?;
+                let mut buf = vec![0u8; size];
+                self.reader.read_exact(&mut buf)?;
+                Ok(buf)
+            }
+            KarEntry::EmptyFile => Ok(Vec::new()),
+            KarEntry::Directory => Err(Error::InvalidKar(format!(
+                "cannot read directory as file: {path}"
+            ))),
+            KarEntry::Softlink { .. } => Err(Error::InvalidKar(format!(
+                "cannot read softlink as file: {path}"
+            ))),
+        }
+    }
+
     /// Return the absolute byte offset and size of a file in the archive,
     /// without reading its contents.
     ///

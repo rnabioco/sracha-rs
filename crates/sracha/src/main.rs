@@ -1099,7 +1099,7 @@ async fn main() -> Result<()> {
 
             Ok(())
         }
-        Command::Vdb(args) => vdb_cmd::run(args.cmd),
+        Command::Vdb(args) => vdb_cmd::run(args.cmd).await,
     }
 }
 

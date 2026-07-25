@@ -55,6 +55,32 @@ impl RowRanges {
         &self.segments
     }
 
+    /// Resolve every segment to an inclusive `(lo, hi)` row-id span clamped
+    /// to `[first_row, first_row + row_count)`, dropping segments that fall
+    /// entirely outside. Unlike [`iter_row_ids`](Self::iter_row_ids) this
+    /// keeps the spans intact, which is what a range-backed reader needs to
+    /// decide which blobs to fetch without enumerating every row.
+    pub fn spans(&self, first_row: i64, row_count: u64) -> Vec<(i64, i64)> {
+        if row_count == 0 {
+            return Vec::new();
+        }
+        let last_row = first_row.saturating_add(row_count.saturating_sub(1) as i64);
+        self.segments
+            .iter()
+            .filter_map(|seg| {
+                let (lo, hi) = match *seg {
+                    Segment::Single(id) => (id, id),
+                    Segment::Closed(a, b) => (a.min(b), a.max(b)),
+                    Segment::FromStart(a) => (a, last_row),
+                    Segment::ToEnd(b) => (first_row, b),
+                };
+                let lo = lo.max(first_row);
+                let hi = hi.min(last_row);
+                (lo <= hi).then_some((lo, hi))
+            })
+            .collect()
+    }
+
     /// Iterate every row id covered by any segment, clamped to
     /// `[first_row, first_row + row_count)`. Preserves segment order;
     /// does not deduplicate across segments.

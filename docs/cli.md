@@ -267,13 +267,35 @@ sracha validate [OPTIONS] <INPUT>...
 
 ## sracha vdb
 
-Inspect the VDB structure of a local `.sra` file. Pure-Rust
-replacement for `vdb-dump` — no network, no C FFI, no subprocess to
-sra-tools.
+Inspect the VDB structure of an `.sra` archive. Pure-Rust replacement for
+`vdb-dump` — no C FFI, no subprocess to sra-tools.
 
 ```
-sracha vdb <SUBCOMMAND> <FILE> [OPTIONS]
+sracha vdb <SUBCOMMAND> <SOURCE> [OPTIONS]
 ```
+
+`<SOURCE>` is a local `.sra` path, an `https://` URL, or a run accession.
+Accessions and URLs are read **in place over HTTP range requests** — the
+archive is never downloaded. The table of contents is a file prefix and the
+column indexes are kilobytes, so inspecting a multi-gigabyte run transfers a
+few hundred KiB:
+
+```bash
+# ~1 s and ~256 KiB transferred against a 4.2 GB archive
+sracha vdb info SRR18959644
+
+# spot-check read structure without downloading anything
+sracha vdb dump SRR18959644 -C READ_LEN,READ_TYPE -R 1,22228622
+```
+
+Pass `-v` to see how much was transferred. Only inspection works remotely;
+`sracha fastq` needs a local file, since decoding touches essentially every
+byte and would transfer the whole archive anyway.
+
+!!! note "Row ranges matter for remote `dump`"
+
+    `dump` fetches only the blobs covering `-R`. Without `-R` it reads every
+    selected column in full, which over the network means downloading them.
 
 ### sracha vdb info
 
@@ -281,7 +303,7 @@ Print summary metadata: schema, platform, table row counts, load
 timestamp, and formatter / loader / update software events.
 
 ```
-sracha vdb info <FILE> [--json]
+sracha vdb info <SOURCE> [--json]
 ```
 
 | Option | Default | Description |
@@ -294,7 +316,7 @@ List tables in the archive. Only meaningful for Database archives
 (cSRA / aligned); flat Tables print a note.
 
 ```
-sracha vdb tables <FILE>
+sracha vdb tables <SOURCE>
 ```
 
 ### sracha vdb columns
@@ -302,7 +324,7 @@ sracha vdb tables <FILE>
 List columns in a table.
 
 ```
-sracha vdb columns <FILE> [-T TABLE] [-s]
+sracha vdb columns <SOURCE> [-T TABLE] [-s]
 ```
 
 | Option | Default | Description |
@@ -315,7 +337,7 @@ sracha vdb columns <FILE> [-T TABLE] [-s]
 Dump the metadata tree (schema / stats / LOAD / SOFTWARE nodes).
 
 ```
-sracha vdb meta <FILE> [-T TABLE] [-P PATH] [-d DEPTH] [--db]
+sracha vdb meta <SOURCE> [-T TABLE] [-P PATH] [-d DEPTH] [--db]
 ```
 
 | Option | Default | Description |
@@ -330,7 +352,7 @@ sracha vdb meta <FILE> [-T TABLE] [-P PATH] [-d DEPTH] [--db]
 Print the embedded schema text.
 
 ```
-sracha vdb schema <FILE>
+sracha vdb schema <SOURCE>
 ```
 
 ### sracha vdb id-range
@@ -338,13 +360,31 @@ sracha vdb schema <FILE>
 Print the first row id and row count for a table/column.
 
 ```
-sracha vdb id-range <FILE> [-T TABLE] [-C COLUMN]
+sracha vdb id-range <SOURCE> [-T TABLE] [-C COLUMN]
 ```
 
 | Option | Default | Description |
 |--------|---------|-------------|
 | `-T, --table <NAME>` | `SEQUENCE` (or first) | Table to inspect |
 | `-C, --column <NAME>` | first alphabetically | Column to read |
+
+### sracha vdb dump
+
+Dump row-level data for the chosen columns. Values are typed by a
+name-based heuristic (READ as bases, READ_LEN as an array, and so on);
+unrecognized columns render as hex.
+
+```
+sracha vdb dump <SOURCE> [-T TABLE] [-C COLUMNS] [-x COLUMNS] [-R ROWS] [-f FORMAT]
+```
+
+| Option | Default | Description |
+|--------|---------|-------------|
+| `-T, --table <NAME>` | `SEQUENCE` (or first) | Table to dump from |
+| `-C, --columns <LIST>` | all known columns | Comma-separated columns to include |
+| `-x, --exclude <LIST>` | | Columns to drop, applied after `-C` |
+| `-R, --rows <RANGES>` | all rows | Comma-separated, 1-indexed, inclusive: `5`, `5-20`, `100-`, `-50`, `1-10,200` |
+| `-f, --format <FMT>` | `default` | `default`, `csv`, `tab`, or `json` (NDJSON) |
 
 ---
 

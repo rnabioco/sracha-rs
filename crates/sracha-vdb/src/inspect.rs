@@ -6,12 +6,11 @@
 //! `vdb-dump` modes: `--info`, `-E`, `-o`, `-A`, `-r`).
 
 use std::io::{Read, Seek};
-use std::path::Path;
 
 use crate::blob::decode_blob;
 use crate::error::{Error, Result};
 use crate::kar::{KarArchive, KarEntry};
-use crate::kdb::ColumnReader;
+use crate::kdb::{ColumnData, ColumnReader, RowWindow};
 use crate::metadata::{self, MetaNode, SoftwareEvent};
 
 /// Whether a VDB archive is a Database (has `tbl/` subdirectories) or a
@@ -171,7 +170,7 @@ pub struct FirstBlobStats {
 /// Collect per-column stats for every column in a table.
 pub fn column_stats_all<R: Read + Seek>(
     archive: &mut KarArchive<R>,
-    sra_path: &Path,
+    data: ColumnData<'_>,
     table: Option<&str>,
 ) -> Result<Vec<ColumnStats>> {
     let cols = list_columns(archive, table)?;
@@ -179,7 +178,9 @@ pub fn column_stats_all<R: Read + Seek>(
     let mut out = Vec::with_capacity(cols.len());
     for col in cols {
         let full = format!("{col_base}/{col}");
-        match ColumnReader::open(archive, &full, sra_path) {
+        // Only the first blob is decoded for stats, so that is all a
+        // range-backed archive needs to transfer.
+        match ColumnReader::open_windowed(archive, &full, data, &RowWindow::First) {
             Ok(reader) => out.push(build_column_stats(col, &reader)),
             Err(e) => {
                 tracing::debug!("column_stats: skipping {full}: {e}");
@@ -224,7 +225,7 @@ fn build_column_stats(name: String, reader: &ColumnReader) -> ColumnStats {
 /// `vdb-dump --id_range` behavior of using whatever column is available.
 pub fn id_range<R: Read + Seek>(
     archive: &mut KarArchive<R>,
-    sra_path: &Path,
+    data: ColumnData<'_>,
     table: Option<&str>,
     column: Option<&str>,
 ) -> Result<(i64, u64)> {
@@ -239,7 +240,8 @@ pub fn id_range<R: Read + Seek>(
     };
 
     let col_full = format!("{col_base}/{column_name}");
-    let reader = ColumnReader::open(archive, &col_full, sra_path)?;
+    // Row bounds come entirely from the index files; no blob bytes needed.
+    let reader = ColumnReader::open_windowed(archive, &col_full, data, &RowWindow::None)?;
     let first = reader.first_row_id().unwrap_or(0);
     let count = reader.row_count();
     Ok((first, count))
@@ -250,10 +252,10 @@ pub fn id_range<R: Read + Seek>(
 /// Mirrors how vdb-dump fills `SEQ` etc. in `--info` output.
 pub fn table_row_count<R: Read + Seek>(
     archive: &mut KarArchive<R>,
-    sra_path: &Path,
+    data: ColumnData<'_>,
     table: Option<&str>,
 ) -> Result<u64> {
-    Ok(id_range(archive, sra_path, table, None)?.1)
+    Ok(id_range(archive, data, table, None)?.1)
 }
 
 /// Read and parse the metadata tree for a given table (or for the root in a
@@ -399,7 +401,7 @@ impl InfoReport {
 /// Collect everything needed for the `info` command.
 pub fn gather_info<R: Read + Seek>(
     archive: &mut KarArchive<R>,
-    sra_path: &Path,
+    data: ColumnData<'_>,
 ) -> Result<InfoReport> {
     let kind = detect_kind(archive)?;
 
@@ -453,13 +455,13 @@ pub fn gather_info<R: Read + Seek>(
             let names = list_tables(archive)?;
             let mut out = Vec::with_capacity(names.len());
             for name in names {
-                let count = table_row_count(archive, sra_path, Some(&name)).unwrap_or(0);
+                let count = table_row_count(archive, data, Some(&name)).unwrap_or(0);
                 out.push((name, count));
             }
             out
         }
         VdbKind::Table => {
-            let count = table_row_count(archive, sra_path, None).unwrap_or(0);
+            let count = table_row_count(archive, data, None).unwrap_or(0);
             vec![("SEQUENCE".into(), count)]
         }
     };
@@ -706,7 +708,7 @@ mod tests {
     fn column_stats_all_populates_first_blob() {
         let (bytes, sra_path) = single_column_kar();
         let mut kar = KarArchive::open(Cursor::new(bytes)).unwrap();
-        let stats = column_stats_all(&mut kar, &sra_path, None).unwrap();
+        let stats = column_stats_all(&mut kar, ColumnData::Local(&sra_path), None).unwrap();
         assert_eq!(stats.len(), 1);
         assert_eq!(stats[0].name, "READ");
         assert_eq!(stats[0].row_count, 1);

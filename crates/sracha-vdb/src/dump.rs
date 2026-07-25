@@ -16,7 +16,6 @@
 
 use std::collections::HashSet;
 use std::io::{Read, Seek, Write};
-use std::path::Path;
 
 use serde_json::{Value, json};
 
@@ -28,7 +27,7 @@ use crate::encoding::{phred_to_ascii, unpack_2na, unpack_4na};
 use crate::error::{Error, Result};
 use crate::inspect::{column_base_path_public, detect_kind, list_columns};
 use crate::kar::KarArchive;
-use crate::kdb::ColumnReader;
+use crate::kdb::{ColumnData, ColumnReader, RowWindow};
 use crate::row_range::RowRanges;
 
 // ---------------------------------------------------------------------------
@@ -173,7 +172,7 @@ impl<R: Read + Seek> DumpRunner<R> {
     /// Open the requested columns in the archive and prepare to iterate.
     pub fn new(
         archive: &mut KarArchive<R>,
-        sra_path: &Path,
+        data: ColumnData<'_>,
         table: Option<&str>,
         spec: DumpSpec,
     ) -> Result<Self> {
@@ -188,10 +187,15 @@ impl<R: Read + Seek> DumpRunner<R> {
             ));
         }
 
+        // Each column resolves the requested rows against its own row
+        // range, so a range-backed archive transfers only the blobs those
+        // rows land in. An empty `-R` still means every row.
+        let window = RowWindow::Rows(spec.rows.clone());
+
         let mut cols = Vec::with_capacity(requested.len());
         for name in &requested {
             let full = format!("{col_base}/{name}");
-            match ColumnReader::open(archive, &full, sra_path) {
+            match ColumnReader::open_windowed(archive, &full, data, &window) {
                 Ok(reader) => {
                     let kind = if spec.raw {
                         CellKind::HexRaw
@@ -865,11 +869,11 @@ fn write_hex<W: Write>(w: &mut W, bytes: &[u8]) -> Result<()> {
 /// against a `Vec<u8>` writer.
 pub fn dump_to_vec<R: Read + Seek>(
     archive: &mut KarArchive<R>,
-    sra_path: &Path,
+    data: ColumnData<'_>,
     table: Option<&str>,
     spec: DumpSpec,
 ) -> Result<Vec<u8>> {
-    let mut runner = DumpRunner::new(archive, sra_path, table, spec)?;
+    let mut runner = DumpRunner::new(archive, data, table, spec)?;
     let mut buf = Vec::new();
     runner.run(&mut buf)?;
     Ok(buf)
