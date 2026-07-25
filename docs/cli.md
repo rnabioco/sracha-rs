@@ -392,7 +392,7 @@ How common `fasterq-dump` / `fastq-dump` options map to sracha:
 | `-O, --outdir <DIR>` | `-O, --output-dir <DIR>` | Same |
 | `-e, --threads <N>` | `-t, --threads <N>` | Decode + compression threads |
 | `--split-3` | `--split split-3` | Default in both |
-| `--split-files` | `--split split-files` | One file per read |
+| `--split-files` | `--split split-files` | One file per read slot; skipped reads still consume their number |
 | `--split-spot` | `--split split-spot` | All reads of a spot in one file |
 | `--concatenate-reads` / no split | `--split interleaved` | Single interleaved stream |
 | `-Z, --stdout` | `-Z, --stdout` | Interleaved FASTQ to stdout |

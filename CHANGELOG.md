@@ -1,5 +1,38 @@
 # Changelog
 
+## Unreleased
+
+### Fixes
+
+- `--split-files` now numbers output files by each read's original slot
+  instead of its position among the reads that survived filtering (#76).
+  Zero-length, technical, and too-short reads still consume their file
+  number, matching fasterq-dump. Runs whose spots store an empty leading
+  slot (`READ_LEN=[0, 150]`, e.g. SRR18959644) wrote every read to `_1`,
+  silently concatenating R2 onto R1; they now split into `_1`/`_2`.
+  Runs whose leading read is marked technical (e.g. DRR004435, a 2 bp
+  adapter ahead of a 34 bp biological read) now write that read to `_2`
+  rather than `_1`, and produce no `_1` at all.
+- `--split-3` decides pairing from the spot's biological read count rather
+  than the number of surviving segments, so `--include-technical` no longer
+  turns an unpaired spot into a `_1`/`_2` pair, and spots with more than two
+  reads are numbered `_1.._N` instead of collapsing into the unpaired file.
+- READ_TYPE is interpreted as INSDC `xread_type` bits throughout. Bit 0 is
+  the biological flag and bits 1-2 carry orientation, so reads typed
+  `BIOLOGICAL|FORWARD` or `BIOLOGICAL|REVERSE` — common in aligned cSRA — are
+  no longer dropped as technical. Previously the physical `READ_TYPE` column
+  was compared against 0 using the inverted convention that only the
+  metadata and cSRA fallbacks produced.
+- READ_TYPE blobs are expanded through their page map. VDB stores only the
+  distinct type rows plus run lengths, so indexing the raw buffer per spot
+  read the wrong row for every spot after the first — technical reads were
+  effectively filtered on one spot per blob and ignored for the rest, and a
+  spot sitting on a change in read types could lose its biological read
+  entirely. SRR18959644 dropped exactly one read this way.
+- The physical `READ_TYPE` column is located by row id rather than blob
+  index, matching what ALTREAD and NAME_FMT already do — its blobs can be
+  coarser than READ's, so index pairing read types from the wrong rows.
+
 ## 0.3.11 (2026-07-12)
 
 ### Features

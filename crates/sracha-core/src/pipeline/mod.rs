@@ -794,17 +794,25 @@ fn decode_and_write(
                             (&[], 0)
                         };
 
-                        let (rt_raw, rt_id_range): (&[u8], u64) =
-                            if has_read_type && bi < read_type_blob_count {
-                                let rtcol = cursor.read_type_col().unwrap();
-                                let rtblob = &rtcol.blobs()[bi];
-                                (
+                        // READ_TYPE by row id, not blob index: its blobs can
+                        // be coarser than READ's (SRR18959644 stores READ in
+                        // 43,415 blobs of 1,024 rows but READ_TYPE in 21,709
+                        // of 2,048), and that run's read types flip halfway
+                        // through, so index pairing reads the wrong half.
+                        let (rt_raw, rt_id_range, rt_start_id): (&[u8], u64, i64) = if has_read_type
+                        {
+                            let rtcol = cursor.read_type_col().unwrap();
+                            match rtcol.find_blob(read_start_id) {
+                                Some(rtblob) => (
                                     rtcol.read_raw_blob_slice(rtblob.start_id)?,
                                     rtblob.id_range as u64,
-                                )
-                            } else {
-                                (&[], 0)
-                            };
+                                    rtblob.start_id,
+                                ),
+                                None => (&[], 0, 0),
+                            }
+                        } else {
+                            (&[], 0, 0)
+                        };
 
                         // ALTREAD column: 4na ambiguity mask (also triggers
                         // Illumina name reconstruction when X + Y present).
@@ -885,6 +893,7 @@ fn decode_and_write(
                             name_cs,
                             read_type_raw: rt_raw,
                             read_type_id_range: rt_id_range,
+                            read_type_start_id: rt_start_id,
                             read_type_cs,
                             altread_raw: alt_raw,
                             altread_id_range: alt_id_range,
@@ -1371,18 +1380,15 @@ fn run_fastq_csra(
             let s = csra.read_spot(row_id)?;
             let sequence = fourna_to_ascii(&s.bases);
             let quality: Vec<u8> = s.quality.iter().map(|q| q.wrapping_add(33)).collect();
-            let read_types: Vec<u8> = s
-                .read_types
-                .iter()
-                .map(|&rt| if rt & 0x01 != 0 { 0 } else { 1 })
-                .collect();
             let spot_num_str = itoa_buf.format(row_id).to_string();
             let spot = SpotRecord {
                 name: spot_num_str.as_bytes().to_vec(),
                 sequence,
                 quality,
                 read_lengths: s.read_lens,
-                read_types,
+                // Already INSDC `xread_type` bytes, orientation bits and all;
+                // `SpotRecord::read_types` takes them as-is.
+                read_types: s.read_types,
                 read_filter: Vec::new(),
                 spot_group: Vec::new(),
             };

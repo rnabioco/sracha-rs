@@ -305,16 +305,28 @@ test_3_splitfiles_fastq() {
     echo "  sracha files:      $(ls "$sracha_out"/)"
     echo "  fasterq-dump files: $(ls "$fasterq_out"/)"
 
-    # split-files for 2-read paired data should produce _1 and _2
-    for suffix in _1 _2; do
-        local sf="$sracha_out/${ACCESSION}${suffix}.fastq"
-        local ff="$fasterq_out/${ACCESSION}${suffix}.fastq"
+    # Compare every file either tool produced, not a hardcoded _1/_2 pair.
+    # split-files numbers by read slot, so a run whose odd slots are empty or
+    # technical yields _2 and _4 with no _1/_3 (SRR000001 does exactly this);
+    # a fixed pair would silently skip the files that actually got written.
+    local names
+    names=$(ls "$sracha_out"/*.fastq "$fasterq_out"/*.fastq 2>/dev/null |
+        xargs -n1 basename 2>/dev/null | sort -u)
+
+    if [[ -z "$names" ]]; then
+        fail "split-files — neither tool produced any FASTQ"
+    fi
+
+    local name
+    for name in $names; do
+        local sf="$sracha_out/$name"
+        local ff="$fasterq_out/$name"
         if [[ -f "$sf" && -f "$ff" ]]; then
-            compare_files "$sf" "$ff" "split-files ${suffix}"
+            compare_files "$sf" "$ff" "split-files ${name}"
         elif [[ -f "$sf" ]]; then
-            fail "split-files ${suffix} — fasterq-dump did not produce ${suffix}.fastq"
-        elif [[ -f "$ff" ]]; then
-            fail "split-files ${suffix} — sracha did not produce ${suffix}.fastq"
+            fail "split-files ${name} — fasterq-dump did not produce it"
+        else
+            fail "split-files ${name} — sracha did not produce it"
         fi
     done
     echo
@@ -406,21 +418,24 @@ test_7_sralite_splitspot() {
 test_8_interleaved() {
     log "Test 8: interleaved (FASTQ, paired-end)"
 
-    # sracha's interleaved mode currently produces _1/_2 files (same routing
-    # as split-3; the writer doesn't merge into one stream yet). Verify that
-    # the content matches fasterq-dump split-3 output.
+    # Interleaved writes one file with both mates alternating and `/1`,`/2`
+    # defline suffixes -- the same stream fasterq-dump produces for
+    # --split-spot. (This test used to expect _1/_2 files, left over from
+    # before the writer merged them into a single stream.)
     local sracha_out="$TMPDIR_BASE/test8_sracha"
     local fasterq_out="$TMPDIR_BASE/test8_fasterq"
     mkdir -p "$sracha_out" "$fasterq_out"
 
     "$SRACHA" fastq "$SRA_FILE" --split interleaved --no-gzip -O "$sracha_out" -f --no-progress 2>&1 | tail -2
-    "$FASTERQ_DUMP" "$SRA_FILE" --split-3 -O "$fasterq_out" -f 2>&1 | tail -2
+    "$FASTERQ_DUMP" "$SRA_FILE" --split-spot -O "$fasterq_out" -f 2>&1 | tail -2
 
     echo "  sracha files:      $(ls "$sracha_out"/)"
     echo "  fasterq-dump files: $(ls "$fasterq_out"/)"
 
-    compare_files "$sracha_out/${ACCESSION}_1.fastq" "$fasterq_out/${ACCESSION}_1.fastq" "interleaved read 1"
-    compare_files "$sracha_out/${ACCESSION}_2.fastq" "$fasterq_out/${ACCESSION}_2.fastq" "interleaved read 2"
+    for stray in "$sracha_out/${ACCESSION}_1.fastq" "$sracha_out/${ACCESSION}_2.fastq"; do
+        [[ -f "$stray" ]] && fail "interleaved — split output $(basename "$stray") should not exist"
+    done
+    compare_files "$sracha_out/${ACCESSION}.fastq" "$fasterq_out/${ACCESSION}.fastq" "interleaved"
     echo
 }
 

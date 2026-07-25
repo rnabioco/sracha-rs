@@ -305,16 +305,17 @@ impl VdbCursor {
 
     /// Per-read technical/biological types from VDB metadata, if available.
     ///
-    /// Returns a byte per read: `0` for biological (`B`), `1` for technical
-    /// (`T`, any other flag). Used as a fallback when the physical
-    /// `READ_TYPE` column is absent — common in older DDBJ/SRA submissions
-    /// where read-type info lives only in the schema metadata.
+    /// Returns one INSDC `xread_type` byte per read — `1` for biological
+    /// (`B`), `0` for technical (`T`, any other flag) — so callers can treat
+    /// it interchangeably with the physical `READ_TYPE` column. Used as a
+    /// fallback when that column is absent, common in older DDBJ/SRA
+    /// submissions where read-type info lives only in the schema metadata.
     pub fn metadata_read_types(&self) -> Option<Vec<u8>> {
         let descs = self.metadata_read_descs.as_ref()?;
         Some(
             descs
                 .iter()
-                .map(|d| if d.read_type == b'B' { 0u8 } else { 1u8 })
+                .map(|d| u8::from(d.read_type == b'B'))
                 .collect(),
         )
     }
@@ -1391,8 +1392,8 @@ mod tests {
         let mut archive = KarArchive::open(Cursor::new(archive_bytes)).unwrap();
         let cursor = VdbCursor::open(&mut archive, &sra_path).unwrap();
 
-        // 1 = technical, 0 = biological.
-        assert_eq!(cursor.metadata_read_types(), Some(vec![1, 0]));
+        // INSDC xread_type: 0 = technical, 1 = biological.
+        assert_eq!(cursor.metadata_read_types(), Some(vec![0, 1]));
         let _ = std::fs::remove_file(&sra_path);
     }
 

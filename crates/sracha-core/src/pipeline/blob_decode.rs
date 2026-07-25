@@ -118,6 +118,72 @@ pub(crate) use crate::vdb::blob_codecs::{
     decode_irzip_column, decode_quality_encoding, decode_raw, decode_zip_encoding,
 };
 
+/// Materialize the READ_TYPE rows covering one READ blob, one row per spot.
+///
+/// VDB stores only the distinct READ_TYPE rows; the page map's `data_runs[i]`
+/// says how many consecutive spots share record `i`. A run whose read types
+/// never change collapses to a single record — SRR18959644's first record
+/// covers 22,227,968 spots — and a blob straddling a change in read types
+/// holds two. Indexing the unexpanded buffer per spot therefore reads the
+/// wrong record for every spot past the first, which silently dropped the one
+/// spot whose biological read picked up its neighbour's technical flag.
+///
+/// Expanding the whole blob would cost tens of MiB per READ blob against
+/// those long runs, so only the `[skip_rows, skip_rows + take_rows)` window
+/// this blob needs is built. The result is indexed from row 0.
+///
+/// Blobs with no page map (or no `data_runs`) already carry one row per spot
+/// and are sliced directly.
+fn read_type_rows_for_blob(
+    data: &[u8],
+    page_map: Option<&crate::vdb::blob::PageMap>,
+    reads_per_spot: usize,
+    skip_rows: usize,
+    take_rows: usize,
+) -> Vec<u8> {
+    if data.is_empty() || reads_per_spot == 0 || take_rows == 0 {
+        return Vec::new();
+    }
+    // `lengths` counts elements per row; READ_TYPE elements are single bytes.
+    let row_len = page_map
+        .and_then(|pm| pm.lengths.first().copied())
+        .filter(|&l| l > 0)
+        .map_or(reads_per_spot, |l| l as usize);
+    if data.len() < row_len {
+        return Vec::new();
+    }
+
+    let runs = page_map.map(|pm| pm.data_runs.as_slice()).unwrap_or(&[]);
+    if runs.is_empty() {
+        // One row per spot already. A blob holding a single row against many
+        // spots is a constant column stored without runs; repeat it.
+        if data.len() == row_len {
+            return data.repeat(take_rows);
+        }
+        let start = (skip_rows * row_len).min(data.len());
+        let end = (start + take_rows * row_len).min(data.len());
+        return data[start..end].to_vec();
+    }
+
+    let mut out = Vec::with_capacity(take_rows * row_len);
+    let mut row = 0usize; // first logical row of the current record
+    for (i, record) in data.chunks_exact(row_len).enumerate() {
+        let repeat = runs.get(i).copied().unwrap_or(1) as usize;
+        let end = row + repeat;
+        // Overlap of this record's row span with the requested window.
+        let from = row.max(skip_rows);
+        let to = end.min(skip_rows + take_rows);
+        for _ in from..to {
+            out.extend_from_slice(record);
+        }
+        row = end;
+        if row >= skip_rows + take_rows {
+            break;
+        }
+    }
+    out
+}
+
 // ---------------------------------------------------------------------------
 // Phase 2: Parse VDB + output FASTQ
 // ---------------------------------------------------------------------------
@@ -191,6 +257,11 @@ pub(crate) struct RawBlobData<'a> {
     pub(crate) read_type_raw: &'a [u8],
     /// Row count for the READ_TYPE blob (0 if absent).
     pub(crate) read_type_id_range: u64,
+    /// First row id covered by the READ_TYPE blob. Like READ_LEN, the
+    /// column's blob boundaries need not line up with READ's, so the blob is
+    /// located by row id and this offset skips to the rows that pair with
+    /// this READ blob.
+    pub(crate) read_type_start_id: i64,
     /// Checksum type for the READ_TYPE column.
     pub(crate) read_type_cs: u8,
     /// Whether there is a READ_LEN column at all.
@@ -1120,20 +1191,42 @@ pub(crate) fn decode_blob_to_fastq(
     };
 
     // ------------------------------------------------------------------
-    // Decode READ_TYPE blob -> byte array of per-read type codes.
-    // 0 = biological, 1 = technical (SRA_READ_TYPE values).
+    // Decode READ_TYPE blob -> byte array of per-read INSDC xread_type
+    // codes (bit 0 = biological flag, bits 1-2 = orientation). Interpret
+    // via `read_is_biological`, never by comparing against 0.
+    //
+    // The blob stores only the *distinct* type rows plus a page map saying
+    // how many consecutive spots share each; expand it so the buffer holds
+    // one row per spot and can be indexed positionally below.
     // ------------------------------------------------------------------
     let read_type_data: Vec<u8> = if raw.has_read_type && !raw.read_type_raw.is_empty() {
         let rtdecoded = decode_raw(raw.read_type_raw, raw.read_type_cs, raw.read_type_id_range)?;
         let raw_bytes = decode_zip_encoding(&rtdecoded)?;
-        if !raw_bytes.is_empty() {
+        let page_map = rtdecoded.page_map;
+        let bytes = if !raw_bytes.is_empty() {
             raw_bytes
         } else {
             rtdecoded.data.into_owned()
-        }
+        };
+        read_type_rows_for_blob(
+            &bytes,
+            page_map.as_ref(),
+            reads_per_spot.max(1),
+            (raw.read_start_id - raw.read_type_start_id).max(0) as usize,
+            raw.read_id_range as usize,
+        )
     } else {
         Vec::new()
     };
+
+    if blob_idx == 0 {
+        tracing::debug!(
+            "READ_TYPE: {} values, has_read_type={}, first_10={:?}",
+            read_type_data.len(),
+            raw.has_read_type,
+            &read_type_data[..read_type_data.len().min(10)],
+        );
+    }
 
     // ------------------------------------------------------------------
     // Iterate spots and produce FASTQ records directly (fused path).
@@ -1173,6 +1266,8 @@ pub(crate) fn decode_blob_to_fastq(
     let per_slot_reserve = est_output / expected_slots.max(1);
     let mut seq_offset: usize = 0;
     let mut qual_offset: usize = 0;
+    // `read_type_rows_for_blob` already trimmed to this blob's rows, so this
+    // walks it from the start, one row per spot.
     let mut rt_offset: usize = 0;
     let mut spot_idx_in_blob: usize = 0;
     let mut rl_cursor = 0usize;
@@ -1191,6 +1286,7 @@ pub(crate) fn decode_blob_to_fastq(
         start: usize,
         len: usize,
         mate_idx: u32,
+        biological: bool,
     }
     let mut segments: Vec<ReadSeg> = Vec::with_capacity(rps);
 
@@ -1272,18 +1368,17 @@ pub(crate) fn decode_blob_to_fastq(
         };
 
         // Read types for this spot: borrow from decoded data or default to biological.
-        let spot_read_types: &[u8] =
-            if !read_type_data.is_empty() && rt_offset + rps <= read_type_data.len() {
-                let rt = &read_type_data[rt_offset..rt_offset + rps];
-                rt_offset += rps;
-                rt
-            } else if let Some(meta_rt) = raw.fallback_read_types.filter(|rt| rt.len() == rps) {
-                rt_offset += rps;
-                meta_rt
-            } else {
-                rt_offset += rps;
-                &[] // empty = all biological (checked below)
-            };
+        let spot_read_types: &[u8] = if rt_offset + rps <= read_type_data.len() {
+            let rt = &read_type_data[rt_offset..rt_offset + rps];
+            rt_offset += rps;
+            rt
+        } else if let Some(meta_rt) = raw.fallback_read_types.filter(|rt| rt.len() == rps) {
+            rt_offset += rps;
+            meta_rt
+        } else {
+            rt_offset += rps;
+            &[] // empty = all biological (checked below)
+        };
 
         // ------------------------------------------------------------------
         // Inline format_spot logic: split reads, filter, route, format.
@@ -1301,18 +1396,18 @@ pub(crate) fn decode_blob_to_fastq(
             // so mirroring keeps split-3 routing consistent (e.g., SINGLE
             // runs with a 0-length placeholder segment would otherwise
             // route into `_1.fastq`/`_2.fastq` instead of `.fastq`).
+            // The slot is still consumed: `mate_idx` below preserves it.
             if rlen_usize == 0 {
                 read_offset = end;
                 continue;
             }
 
+            let biological = crate::fastq::read_is_biological(spot_read_types, i);
+
             // Filter: skip technical reads if configured.
-            if config.skip_technical {
-                let rtype = spot_read_types.get(i).copied().unwrap_or(0);
-                if rtype != 0 {
-                    read_offset = end;
-                    continue;
-                }
+            if config.skip_technical && !biological {
+                read_offset = end;
+                continue;
             }
 
             // Filter: skip reads shorter than the minimum length.
@@ -1327,6 +1422,7 @@ pub(crate) fn decode_blob_to_fastq(
                 start: read_offset,
                 len: rlen_usize,
                 mate_idx: (i + 1) as u32,
+                biological,
             });
             read_offset = end;
         }
@@ -1405,14 +1501,16 @@ pub(crate) fn decode_blob_to_fastq(
                 };
 
             match config.split_mode {
-                SplitMode::Split3 => {
-                    if segments.len() == 2 {
-                        emit(OutputSlot::Read1, &segments[0], spot_number, description);
-                        emit(OutputSlot::Read2, &segments[1], spot_number, description);
-                    } else {
-                        for seg in &segments {
-                            emit(OutputSlot::Unpaired, seg, spot_number, description);
-                        }
+                SplitMode::Split3 | SplitMode::SplitFiles => {
+                    let bio_reads = segments.iter().filter(|s| s.biological).count();
+                    for (emit_idx, seg) in segments.iter().enumerate() {
+                        let slot = crate::fastq::slot_for_segment(
+                            config.split_mode,
+                            seg.mate_idx,
+                            emit_idx,
+                            bio_reads,
+                        );
+                        emit(slot, seg, spot_number, description);
                     }
                 }
                 SplitMode::Interleaved | SplitMode::SplitSpot => {
@@ -1438,16 +1536,6 @@ pub(crate) fn decode_blob_to_fastq(
                         emit(OutputSlot::Single, seg, &name_buf, desc);
                     }
                 }
-                SplitMode::SplitFiles => {
-                    for (file_idx, seg) in segments.iter().enumerate() {
-                        emit(
-                            OutputSlot::ReadN(file_idx as u32),
-                            seg,
-                            spot_number,
-                            description,
-                        );
-                    }
-                }
             }
         }
 
@@ -1468,6 +1556,93 @@ pub(crate) fn decode_blob_to_fastq(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::vdb::blob::PageMap;
+
+    // -----------------------------------------------------------------------
+    // expand_read_type_rows — run-length-encoded READ_TYPE blobs
+    //
+    // READ_TYPE blobs store only the distinct type rows. Indexing the
+    // unexpanded buffer per spot reads the wrong row for every spot after
+    // the first, which cost SRR18959644 exactly one read: the spot whose
+    // `[biological, technical]` row was read as its neighbour's
+    // `[technical, biological]`, leaving nothing to emit.
+    // -----------------------------------------------------------------------
+
+    fn page_map(lengths: Vec<u32>, leng_runs: Vec<u32>, data_runs: Vec<u32>) -> PageMap {
+        PageMap {
+            data_recs: data_runs.len() as u64,
+            lengths,
+            leng_runs,
+            data_runs,
+        }
+    }
+
+    #[test]
+    fn read_type_constant_row_expands_to_every_spot() {
+        // One record covering 4 spots of 2 reads each.
+        let pm = page_map(vec![2], vec![4], vec![4]);
+        let out = read_type_rows_for_blob(&[1, 0], Some(&pm), 2, 0, 4);
+        assert_eq!(out, vec![1, 0, 1, 0, 1, 0, 1, 0]);
+    }
+
+    #[test]
+    fn read_type_blob_spanning_a_change_expands_both_rows() {
+        // The SRR18959644 shape: [biological, technical] for the first two
+        // spots, then [technical, biological] for the next three.
+        let pm = page_map(vec![2], vec![5], vec![2, 3]);
+        let out = read_type_rows_for_blob(&[1, 0, 0, 1], Some(&pm), 2, 0, 5);
+        assert_eq!(out, vec![1, 0, 1, 0, 0, 1, 0, 1, 0, 1]);
+
+        // Spot 1 must keep its own row rather than borrowing spot 2's — that
+        // borrow is what cost SRR18959644 a read.
+        assert!(crate::fastq::read_is_biological(&out[2..4], 0));
+        assert!(!crate::fastq::read_is_biological(&out[4..6], 0));
+    }
+
+    #[test]
+    fn read_type_window_starts_at_the_requested_row() {
+        // A READ blob starting mid-record only materializes its own rows,
+        // so a long constant run costs nothing to skip past.
+        let pm = page_map(vec![2], vec![5], vec![2, 3]);
+        let out = read_type_rows_for_blob(&[1, 0, 0, 1], Some(&pm), 2, 1, 3);
+        assert_eq!(out, vec![1, 0, 0, 1, 0, 1]);
+
+        let tail = read_type_rows_for_blob(&[1, 0, 0, 1], Some(&pm), 2, 4, 4);
+        assert_eq!(tail, vec![0, 1], "window clamps at the last row");
+    }
+
+    #[test]
+    fn read_type_without_page_map_is_sliced_not_expanded() {
+        let data = [1, 0, 0, 1];
+        assert_eq!(read_type_rows_for_blob(&data, None, 2, 0, 2), data.to_vec());
+        assert_eq!(read_type_rows_for_blob(&data, None, 2, 1, 1), vec![0, 1]);
+
+        // A page map with no data_runs already holds one row per spot.
+        let pm = page_map(vec![2], vec![2], vec![]);
+        assert_eq!(
+            read_type_rows_for_blob(&data, Some(&pm), 2, 0, 2),
+            data.to_vec()
+        );
+    }
+
+    #[test]
+    fn read_type_single_row_without_runs_is_treated_as_constant() {
+        // No page map to describe the repeat, but one row against many spots
+        // can only mean a column that never varies.
+        assert_eq!(
+            read_type_rows_for_blob(&[1, 0], None, 2, 0, 3),
+            vec![1, 0, 1, 0, 1, 0]
+        );
+    }
+
+    #[test]
+    fn read_type_falls_back_when_row_length_exceeds_data() {
+        // Truncated payload: yield nothing rather than panicking on
+        // chunks_exact or fabricating rows. An empty result reads as "no
+        // READ_TYPE", which treats every read as biological.
+        let pm = page_map(vec![4], vec![2], vec![2]);
+        assert!(read_type_rows_for_blob(&[1, 0], Some(&pm), 4, 0, 2).is_empty());
+    }
 
     // -----------------------------------------------------------------------
     // encode_raw_quality_for_fastq — PHRED+33 invariant
