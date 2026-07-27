@@ -136,16 +136,18 @@ local build required.
 
 ```bash
 # Docker / Podman
-docker run --rm quay.io/biocontainers/sracha:0.3.7--h54198d6_0 sracha --help
+docker run --rm quay.io/biocontainers/sracha:0.3.11--h54198d6_0 sracha --help
 
 # Singularity / Apptainer
 singularity run \
-  https://depot.galaxyproject.org/singularity/sracha:0.3.7--h54198d6_0 sracha --help
+  https://depot.galaxyproject.org/singularity/sracha:0.3.11--h54198d6_0 sracha --help
 ```
 
-The tags above are examples — check
-[quay.io](https://quay.io/repository/biocontainers/sracha?tab=tags) for the
-latest `<version>--<build>` tag and substitute it in.
+These tags track the current Bioconda release and are refreshed weekly by a
+CI job. BioContainers builds an image a day or two behind a new release, so
+just after a release the tag here may still name the previous version — see
+[quay.io](https://quay.io/repository/biocontainers/sracha?tab=tags) for every
+published `<version>--<build>` tag.
 
 Using sracha in a workflow manager? See
 [Nextflow and workflow integration](https://rnabioco.github.io/sracha-rs/#nextflow)
