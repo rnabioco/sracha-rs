@@ -92,16 +92,18 @@ local build required.
 
 ```bash
 # Docker / Podman
-docker run --rm quay.io/biocontainers/sracha:0.3.7--h54198d6_0 sracha --help
+docker run --rm quay.io/biocontainers/sracha:0.3.11--h54198d6_0 sracha --help
 
 # Singularity / Apptainer
 singularity run \
-  https://depot.galaxyproject.org/singularity/sracha:0.3.7--h54198d6_0 sracha --help
+  https://depot.galaxyproject.org/singularity/sracha:0.3.11--h54198d6_0 sracha --help
 ```
 
-The tags above are examples — check
-[quay.io](https://quay.io/repository/biocontainers/sracha?tab=tags) for the
-latest `<version>--<build>` tag and substitute it in.
+These tags track the current Bioconda release and are refreshed weekly by a
+CI job. BioContainers builds an image a day or two behind a new release, so
+just after a release the tag here may still name the previous version — see
+[quay.io](https://quay.io/repository/biocontainers/sracha?tab=tags) for every
+published `<version>--<build>` tag.
 
 ### Nextflow
 
@@ -110,11 +112,16 @@ or let the `conda` directive resolve it:
 
 ```groovy
 process SRACHA_GET {
-    container 'quay.io/biocontainers/sracha:0.3.7--h54198d6_0'
-    // or: conda 'bioconda::sracha=0.3.7'
+    container 'quay.io/biocontainers/sracha:0.3.11--h54198d6_0'
+    // or: conda 'bioconda::sracha=0.3.11'
     // ...
 }
 ```
+
+Pin the version for reproducibility, as above. Dropping the version from the
+`conda` directive (`conda 'bioconda::sracha'`) resolves to whatever is current
+in Bioconda instead, which is convenient for ad-hoc runs but makes the
+pipeline non-reproducible.
 
 ## Acknowledgments
 
