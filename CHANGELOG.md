@@ -1,5 +1,18 @@
 # Changelog
 
+## Unreleased
+
+### Fixes
+
+- Read lengths now come from the archive's own static `READ_LEN` metadata in
+  preference to the NCBI EUtils average (#84). RunInfo carries only
+  `avgLength` and a SINGLE/PAIRED flag, so it can never describe more than two
+  reads and always split the spot evenly — scrambling any run whose reads
+  differ in length. SRR9827735 (10x, 26/55/8) was cut into 44/45; it now
+  matches fasterq-dump byte for byte. A probe of 120 public runs put this at
+  roughly 25% of 10x-style runs. When no static structure exists and the
+  EUtils average is used, sracha now warns instead of guessing silently.
+
 ## 0.4.0 (2026-07-25)
 
 ### Upgrade note

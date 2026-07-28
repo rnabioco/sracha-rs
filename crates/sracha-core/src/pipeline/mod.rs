@@ -225,6 +225,37 @@ pub fn is_unsupported_platform(platform: &str) -> bool {
     UNSUPPORTED_PLATFORMS.contains(&platform)
 }
 
+/// Where [`resolve_fallback_read_lengths`] got its answer, for logging.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ReadLenSource {
+    /// The archive's own static `col/READ_LEN/row` metadata node.
+    VdbMetadata,
+    /// Derived from the EUtils RunInfo `avgLength` and library layout.
+    EutilsAverage,
+}
+
+/// Pick per-read lengths for an archive with no physical `READ_LEN` column.
+///
+/// The archive's own static read structure wins over the EUtils RunInfo
+/// average. RunInfo carries only `avgLength` plus a SINGLE/PAIRED layout, so
+/// it can never describe more than two reads and always splits the spot
+/// evenly. That silently scrambles any run whose reads differ in length —
+/// 10x-style barcode/UMI + cDNA + sample index layouts get cut at the wrong
+/// offsets rather than at the submitted boundaries (issue #84). Where both
+/// sources exist they agree on the total spot length, so preferring the
+/// metadata only refines where the split points fall.
+fn resolve_fallback_read_lengths(
+    metadata_lengths: Option<Vec<u32>>,
+    api_lengths: Option<&[u32]>,
+) -> Option<(Vec<u32>, ReadLenSource)> {
+    if let Some(lens) = metadata_lengths.filter(|v| !v.is_empty()) {
+        return Some((lens, ReadLenSource::VdbMetadata));
+    }
+    api_lengths
+        .filter(|v| !v.is_empty())
+        .map(|v| (v.to_vec(), ReadLenSource::EutilsAverage))
+}
+
 /// Map a raw `sracha_vdb::Error::BlobIntegrity` from `decode_blob` into the
 /// user-facing [`Error::IntegrityFailure`], attaching the accession and the
 /// shared [`crate::error::BLOB_INTEGRITY_GUIDANCE`] text. Passes other errors
@@ -552,16 +583,32 @@ fn decode_and_write(
         tracing::debug!("fixed_spot_len={fsl} (from blob 0)");
     }
 
-    // Fallback per-read lengths (from NCBI EUtils API or VDB metadata).
+    // Fallback per-read lengths (from VDB metadata or the NCBI EUtils API).
     // Only used when READ_LEN column is absent. Cloned once here so rayon
     // closures can borrow it without moving the config.
     let fallback_read_lengths: Option<Vec<u32>> = if !has_read_len {
-        config
-            .run_info
-            .as_ref()
-            .map(|ri| ri.avg_read_len.clone())
-            .filter(|v| !v.is_empty())
-            .or_else(|| cursor.metadata_read_lengths())
+        let picked = resolve_fallback_read_lengths(
+            cursor.metadata_read_lengths(),
+            config
+                .run_info
+                .as_ref()
+                .map(|ri| ri.avg_read_len.as_slice()),
+        );
+        match &picked {
+            Some((lens, ReadLenSource::VdbMetadata)) => tracing::debug!(
+                "{accession}: no physical READ_LEN; per-read lengths {lens:?} \
+                 from static VDB metadata",
+            ),
+            Some((lens, ReadLenSource::EutilsAverage)) => tracing::warn!(
+                "{accession}: no physical READ_LEN column and no static read \
+                 structure in the archive metadata; splitting each spot as \
+                 {lens:?} from the NCBI EUtils average. This is a guess — if \
+                 the run's reads differ in length the split points will be \
+                 wrong.",
+            ),
+            None => {}
+        }
+        picked.map(|(lens, _)| lens)
     } else {
         None
     };
@@ -2102,6 +2149,38 @@ mod tests {
     use super::*;
     use crate::sdl::{ResolvedFile, ResolvedMirror};
     use crate::vdb::blob;
+
+    #[test]
+    fn fallback_read_lengths_prefer_vdb_metadata() {
+        // SRR9827735 (issue #84): the archive's static metadata says
+        // 26/55/8, while EUtils only knows avgLength=89 + PAIRED and so
+        // proposes an even 44/45 split. The archive must win, or the FASTQ
+        // is silently cut at the wrong offsets.
+        let picked = resolve_fallback_read_lengths(Some(vec![26, 55, 8]), Some(&[44, 45]));
+        assert_eq!(
+            picked,
+            Some((vec![26, 55, 8], ReadLenSource::VdbMetadata)),
+            "static VDB metadata must outrank the EUtils average"
+        );
+    }
+
+    #[test]
+    fn fallback_read_lengths_use_eutils_when_metadata_absent() {
+        let picked = resolve_fallback_read_lengths(None, Some(&[151, 151]));
+        assert_eq!(picked, Some((vec![151, 151], ReadLenSource::EutilsAverage)));
+    }
+
+    #[test]
+    fn fallback_read_lengths_skip_empty_sources() {
+        // avgLength=0 runs yield an empty RunInfo vector; an archive with no
+        // static read structure yields None. Neither should be picked.
+        assert_eq!(
+            resolve_fallback_read_lengths(Some(vec![]), Some(&[75])),
+            Some((vec![75], ReadLenSource::EutilsAverage))
+        );
+        assert_eq!(resolve_fallback_read_lengths(None, Some(&[])), None);
+        assert_eq!(resolve_fallback_read_lengths(None, None), None);
+    }
 
     fn make_resolved(mirrors: Vec<ResolvedMirror>) -> ResolvedAccession {
         ResolvedAccession {
