@@ -1,6 +1,13 @@
 # Changelog
 
-## Unreleased
+## 0.4.1 (2026-07-28)
+
+### Upgrade note
+
+Affected runs change shape: they now emit one file per submitted read instead
+of an even 2-way split, so a 10x run that wrote `_1`/`_2` may now write
+`_1`/`_2`/`_3`. Output from earlier versions for those runs is scrambled, not
+merely mis-split, and should be regenerated.
 
 ### Fixes
 
