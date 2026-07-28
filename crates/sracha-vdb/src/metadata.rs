@@ -100,25 +100,39 @@ pub fn parse_read_structure(tree_data: &[u8]) -> Result<Vec<ReadDescriptor>, Str
 /// Read per-read descriptors from `col/{READ_TYPE,READ_LEN}/row` static
 /// columns. `READ_TYPE/row` stores one `u8` per read (low bit: 1 =
 /// biological, 0 = technical); `READ_LEN/row` stores one little-endian
-/// `u32` per read. `nreads` comes from `READ_TYPE/row` because it is
-/// exactly one byte per read. When `READ_LEN/row` is absent or
-/// mis-sized we emit `read_len=0` so callers fall back to `spot_len /
-/// nreads`.
+/// `u32` per read.
+///
+/// `nreads` comes from `READ_TYPE/row` when present, since it is exactly one
+/// byte per read; failing that, from `READ_LEN/row`'s length in `u32`s, so an
+/// archive carrying only the lengths still yields a usable structure (reads
+/// then default to biological). When `READ_LEN/row` is absent or mis-sized we
+/// emit `read_len=0` so callers fall back to `spot_len / nreads`.
 fn read_static_col_read_structure(nodes: &[MetaNode]) -> Option<Vec<ReadDescriptor>> {
     let col = nodes.iter().find(|n| n.name == "col")?;
-    let read_type = find_meta_node(&col.children, "READ_TYPE/row")?;
-    let nreads = read_type.value.len();
-    if nreads == 0 {
-        return None;
-    }
+    let types_bytes = find_meta_node(&col.children, "READ_TYPE/row")
+        .map(|n| n.value.as_slice())
+        .unwrap_or(&[]);
     let lens_bytes = find_meta_node(&col.children, "READ_LEN/row")
         .map(|n| n.value.as_slice())
         .unwrap_or(&[]);
+
+    let nreads = if !types_bytes.is_empty() {
+        types_bytes.len()
+    } else if !lens_bytes.is_empty() && lens_bytes.len().is_multiple_of(4) {
+        lens_bytes.len() / 4
+    } else {
+        return None;
+    };
+
+    let have_types = types_bytes.len() == nreads;
     let have_lens = lens_bytes.len() == 4 * nreads;
 
     let mut descs = Vec::with_capacity(nreads);
     for i in 0..nreads {
-        let rtype = if read_type.value[i] & 1 != 0 {
+        // Without a READ_TYPE node every read is assumed biological — the
+        // same default the pipeline applies when the physical column is
+        // missing too.
+        let rtype = if !have_types || types_bytes[i] & 1 != 0 {
             b'B'
         } else {
             b'T'
@@ -1129,6 +1143,45 @@ pub(crate) mod tests {
         assert_eq!(descs.len(), 2);
         assert!(descs.iter().all(|d| d.read_type == b'B'));
         assert!(descs.iter().all(|d| d.read_len == 0));
+    }
+
+    #[test]
+    fn read_structure_static_cols_missing_types_keeps_lens() {
+        // No READ_TYPE/row — nreads comes from READ_LEN/row instead, so the
+        // concrete lengths survive rather than being dropped for a
+        // platform-inferred guess.
+        let mut lens_bytes = Vec::new();
+        for l in [26u32, 55, 8] {
+            lens_bytes.extend_from_slice(&l.to_le_bytes());
+        }
+        let row_len = build_meta_node("row", &lens_bytes, None);
+        let read_len = build_meta_node_with_children("READ_LEN", b"", &[&row_len], None);
+        let col = build_meta_node_with_children("col", b"", &[&read_len], None);
+        let tree = build_pbstree(&[&col]);
+
+        let descs = parse_read_structure(&tree).unwrap();
+        assert_eq!(descs.len(), 3);
+        assert_eq!(
+            descs.iter().map(|d| d.read_len).collect::<Vec<_>>(),
+            vec![26, 55, 8]
+        );
+        assert!(descs.iter().all(|d| d.read_type == b'B'));
+    }
+
+    #[test]
+    fn read_structure_static_cols_three_reads_tbt() {
+        // SRR9827735's real layout: 10x barcode+UMI / cDNA / sample index,
+        // stored only as static metadata (issue #84).
+        let tree = static_col_tree(3, &[0, 1, 0], &[26, 55, 8]);
+        let descs = parse_read_structure(&tree).unwrap();
+        assert_eq!(descs.len(), 3);
+        assert_eq!(
+            descs
+                .iter()
+                .map(|d| (d.read_type, d.read_len))
+                .collect::<Vec<_>>(),
+            vec![(b'T', 26), (b'B', 55), (b'T', 8)]
+        );
     }
 
     #[test]
