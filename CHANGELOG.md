@@ -4,6 +4,14 @@
 
 ### Fixes
 
+- Size the disk-space preflight by what will actually be downloaded (#91).
+  The check summed the NCBI `.sra` object size even under `--prefer-ena`,
+  where that object is never fetched — so it measured a file that would not
+  exist. It could refuse a transfer that would have fit, and pass one that
+  then ran out of disk partway (for SRR37428186 the `.sra` is 58.2 GiB while
+  the ENA FASTQs total 72.9 GiB). ENA-served runs are now sized by their
+  filereport totals, and `sracha fetch --prefer-ena` gets a preflight at all —
+  its ENA downloads previously bypassed the check entirely.
 - Stop the download progress bar from overstating progress when chunks retry
   (#89). Bytes were credited as they arrived, but a retried chunk re-fetches
   from byte zero, so every retry counted its bytes again — a stalled 37 GiB

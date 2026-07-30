@@ -108,6 +108,17 @@ async fn main() -> Result<()> {
 
             tokio::fs::create_dir_all(&args.output_dir).await?;
 
+            // Preflight the ENA set. These runs are downloaded below and then
+            // filtered out of `ncbi_accessions`, so without this they would
+            // reach the disk check that runs later — a full-ENA fetch would
+            // get no preflight at all. The NCBI check further down re-stats
+            // the filesystem, by which point these files are on disk, so the
+            // two checks compose rather than double-count.
+            let ena_bytes: u64 = ena_results.iter().flatten().map(|e| e.total_size).sum();
+            if ena_bytes > 0 {
+                check_disk_space(ena_bytes, &args.output_dir)?;
+            }
+
             // Handle ENA hits first (pure HTTP, no SDL involvement).
             for (i, acc) in run_accessions.iter().enumerate() {
                 let Some(ena) = &ena_results[i] else {
@@ -199,7 +210,10 @@ async fn main() -> Result<()> {
                 style::count(resolved_all.len()),
             ));
             check_download_confirmation(&resolved_all, args.yes, has_projects)?;
-            check_disk_space(&resolved_all, &args.output_dir)?;
+            // Only NCBI-served runs reach here; the ENA set was checked and
+            // downloaded above, so `available_space` already reflects it.
+            let sra_bytes: u64 = resolved_all.iter().map(|r| r.sra_file.size).sum();
+            check_disk_space(sra_bytes, &args.output_dir)?;
 
             for resolved in &resolved_all {
                 let acc = &resolved.accession;
@@ -481,20 +495,13 @@ async fn main() -> Result<()> {
                 return Ok(());
             }
 
-            check_download_confirmation(&resolved_all, args.yes, has_projects)?;
-            check_disk_space(&resolved_all, &args.output_dir)?;
-
-            let format_label = if args.fasta { "FASTA" } else { "FASTQ" };
-            tracing::info!(
-                "get {} run accession(s) -> {format_label}",
-                resolved_all.len()
-            );
-
-            let progress = !args.no_progress && !args.stdout;
-
             // If ENA is in play, resolve filereport metadata for every run up
             // front. Accessions ENA can't serve (empty/None) silently fall back
             // to the NCBI pipeline per-accession below.
+            //
+            // Resolved *before* the preflight below so the disk check can size
+            // the transfer by what will actually be written: under
+            // `--prefer-ena` the `.sra` object is never downloaded.
             let ena_results: Vec<Option<sracha_core::ena::EnaResolved>> = if ena_compatible {
                 let sp = progress::Spinner::start(format!(
                     "Querying ENA filereport for {} accession(s)",
@@ -512,6 +519,20 @@ async fn main() -> Result<()> {
             } else {
                 vec![None; resolved_all.len()]
             };
+
+            check_download_confirmation(&resolved_all, args.yes, has_projects)?;
+            check_disk_space(
+                expected_download_bytes(&resolved_all, &ena_results),
+                &args.output_dir,
+            )?;
+
+            let format_label = if args.fasta { "FASTA" } else { "FASTQ" };
+            tracing::info!(
+                "get {} run accession(s) -> {format_label}",
+                resolved_all.len()
+            );
+
+            let progress = !args.no_progress && !args.stdout;
 
             // Check platform — reject legacy platforms with complex read structures.
             // Only applies to accessions that will go through VDB decode; ENA
@@ -1927,13 +1948,39 @@ fn check_download_confirmation(
     Ok(())
 }
 
-/// Check that the target directory has enough free disk space for the download.
+/// Total bytes the run set will actually write into the output directory.
+///
+/// Sizing by `sra_file.size` alone is wrong under `--prefer-ena`: those runs
+/// are served as ENA FASTQ files and the NCBI `.sra` object is never fetched,
+/// so the check would measure a file that will not exist. That misses in both
+/// directions — refusing a transfer that would have fit, and passing one that
+/// runs out of disk partway (for SRR37428186 the `.sra` is 58.2 GiB while the
+/// ENA FASTQs total 72.9 GiB).
+///
+/// `ena_results` is positionally aligned with `resolved`; `None` means ENA
+/// can't serve that run and the NCBI path will be used.
+fn expected_download_bytes(
+    resolved: &[ResolvedAccession],
+    ena_results: &[Option<sracha_core::ena::EnaResolved>],
+) -> u64 {
+    resolved
+        .iter()
+        .enumerate()
+        .map(|(i, r)| match ena_results.get(i).and_then(|e| e.as_ref()) {
+            Some(ena) => ena.total_size,
+            None => r.sra_file.size,
+        })
+        .sum()
+}
+
+/// Check that the target directory has enough free disk space for
+/// `required_bytes`.
 ///
 /// Uses `statvfs` to query available space. Falls back silently if the check
 /// fails (e.g. the directory doesn't exist yet or the filesystem doesn't
 /// support `statvfs`).
-fn check_disk_space(resolved: &[ResolvedAccession], output_dir: &Path) -> Result<()> {
-    let total_size: u64 = resolved.iter().map(|r| r.sra_file.size).sum();
+fn check_disk_space(required_bytes: u64, output_dir: &Path) -> Result<()> {
+    let total_size = required_bytes;
 
     // Find the nearest existing ancestor to stat (output_dir may not exist yet).
     let stat_path = {
@@ -2127,19 +2174,80 @@ mod tests {
 
     #[test]
     fn disk_space_ok_when_sufficient() {
-        let resolved = vec![make_resolved_acc("SRR1", 1024)];
         let dir = tempfile::tempdir().unwrap();
         // Real directory — should have some space available.
-        assert!(check_disk_space(&resolved, dir.path()).is_ok());
+        assert!(check_disk_space(1024, dir.path()).is_ok());
     }
 
     #[test]
     fn disk_space_walks_to_existing_ancestor() {
-        let resolved = vec![make_resolved_acc("SRR1", 1024)];
         let dir = tempfile::tempdir().unwrap();
         let deep_path = dir.path().join("a/b/c/d/e");
         // The directory doesn't exist, but check_disk_space should walk up.
-        assert!(check_disk_space(&resolved, &deep_path).is_ok());
+        assert!(check_disk_space(1024, &deep_path).is_ok());
+    }
+
+    #[test]
+    fn disk_space_rejects_impossible_request() {
+        let dir = tempfile::tempdir().unwrap();
+        assert!(check_disk_space(u64::MAX, dir.path()).is_err());
+    }
+
+    // -----------------------------------------------------------------------
+    // expected_download_bytes (regression: issue #91)
+    // -----------------------------------------------------------------------
+
+    fn make_ena_resolved(accession: &str, total_size: u64) -> sracha_core::ena::EnaResolved {
+        sracha_core::ena::EnaResolved {
+            accession: accession.into(),
+            fastq_files: vec![],
+            total_size,
+        }
+    }
+
+    #[test]
+    fn expected_bytes_uses_sra_size_without_ena() {
+        let resolved = vec![
+            make_resolved_acc("SRR1", 1024),
+            make_resolved_acc("SRR2", 512),
+        ];
+        assert_eq!(expected_download_bytes(&resolved, &[None, None]), 1536);
+    }
+
+    #[test]
+    fn expected_bytes_uses_ena_size_for_ena_served_runs() {
+        // The whole point of #91: an ENA-served run must be sized by the
+        // FASTQs that will be written, not the .sra that never will be.
+        let resolved = vec![make_resolved_acc("SRR1", 1024)];
+        let ena = vec![Some(make_ena_resolved("SRR1", 4096))];
+        assert_eq!(expected_download_bytes(&resolved, &ena), 4096);
+    }
+
+    #[test]
+    fn expected_bytes_mixes_ena_and_ncbi_runs() {
+        // A partial ENA hit set: each run sized by whichever path serves it.
+        let resolved = vec![
+            make_resolved_acc("SRR1", 1024),
+            make_resolved_acc("SRR2", 2048),
+            make_resolved_acc("SRR3", 4096),
+        ];
+        let ena = vec![
+            Some(make_ena_resolved("SRR1", 10)),
+            None,
+            Some(make_ena_resolved("SRR3", 20)),
+        ];
+        assert_eq!(expected_download_bytes(&resolved, &ena), 10 + 2048 + 20);
+    }
+
+    #[test]
+    fn expected_bytes_falls_back_when_ena_results_are_short() {
+        // Defensive: a mis-sized ENA vector must not panic or silently drop
+        // runs — anything unpaired falls back to its .sra size.
+        let resolved = vec![
+            make_resolved_acc("SRR1", 1024),
+            make_resolved_acc("SRR2", 512),
+        ];
+        assert_eq!(expected_download_bytes(&resolved, &[]), 1536);
     }
 
     // -----------------------------------------------------------------------
