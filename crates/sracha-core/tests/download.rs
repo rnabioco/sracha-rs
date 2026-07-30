@@ -388,10 +388,16 @@ async fn download_file_resumes_missing_chunk_via_sidecar() {
 
     // First run: the chunk at `fail_offset` fails all retries → error, but
     // the other four chunks land and get recorded in the sidecar.
-    let err = download_file(&[url.clone()], size as u64, Some(&expected_md5), &out, &cfg)
-        .await
-        .err()
-        .expect("first run must fail on the injected bad chunk");
+    let err = download_file(
+        std::slice::from_ref(&url),
+        size as u64,
+        Some(&expected_md5),
+        &out,
+        &cfg,
+    )
+    .await
+    .err()
+    .expect("first run must fail on the injected bad chunk");
     let _ = err;
 
     let sidecar = out.parent().unwrap().join(format!(
