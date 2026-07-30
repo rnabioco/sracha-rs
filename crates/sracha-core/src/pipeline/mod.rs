@@ -18,7 +18,9 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use rayon::prelude::*;
 
 use crate::compress::{DEFAULT_BLOCK_SIZE, ParGzWriter};
-use crate::download::{DownloadConfig, download_file};
+use crate::download::{
+    DownloadConfig, TransferRetryPolicy, download_file, download_file_with_retries,
+};
 use crate::error::{Error, Result};
 use crate::fastq::{
     CompressionMode, FastqConfig, IntegrityDiag, OutputSlot, SplitMode, output_filename,
@@ -1731,6 +1733,8 @@ pub async fn download_ena_fastq(
         expected_prefix: None,
     };
 
+    let retry_policy = TransferRetryPolicy::default();
+
     let mut output_files: Vec<PathBuf> = Vec::with_capacity(ena.fastq_files.len());
     let mut bytes_transferred: u64 = 0;
 
@@ -1762,7 +1766,17 @@ pub async fn download_ena_fastq(
         );
 
         let urls = vec![file.url.clone()];
-        let dl_future = download_file(&urls, file.size, Some(&file.md5), &target, &dl_config);
+        // ENA outages outlast the per-chunk retry budget, so re-enter the
+        // transfer (resuming from the sidecar) rather than losing a
+        // near-complete multi-GiB download to one bad minute.
+        let dl_future = download_file_with_retries(
+            &urls,
+            file.size,
+            Some(&file.md5),
+            &target,
+            &dl_config,
+            &retry_policy,
+        );
 
         let dl_outcome = if let Some(ref flag) = config.cancelled {
             let flag = flag.clone();
@@ -1784,8 +1798,9 @@ pub async fn download_ena_fastq(
             Ok(r) => r,
             Err(e) => {
                 eprintln!(
-                    "warning: {accession}: ENA transfer failed ({e}); partial download \
-                     and resume state kept at {} — re-run with --prefer-ena to resume",
+                    "warning: {accession}: ENA transfer failed after all resume attempts \
+                     ({e}); partial download and resume state kept at {} — re-run with \
+                     --prefer-ena to pick up where it left off",
                     target.display(),
                 );
                 return Err(e);
