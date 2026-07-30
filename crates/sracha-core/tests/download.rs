@@ -6,10 +6,14 @@
 //! hermetic — no network access required. They're NOT marked `#[ignore]`.
 
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex};
 
-use sracha_core::download::{DownloadConfig, download_file};
+use sracha_core::download::{
+    DownloadConfig, TransferRetryPolicy, download_file, download_file_with_retries,
+};
 use wiremock::matchers::{method, path};
-use wiremock::{Mock, MockServer, ResponseTemplate};
+use wiremock::{Mock, MockServer, Request, Respond, ResponseTemplate};
 
 /// Build a DownloadConfig appropriate for hermetic tests: progress off,
 /// single connection, tiny chunks so we get >1 chunk for small payloads.
@@ -21,6 +25,7 @@ fn test_config() -> DownloadConfig {
         validate: true,
         progress: false,
         resume: false,
+        auto_scale_connections: false,
         client: None,
         expected_prefix: None,
     }
@@ -269,13 +274,395 @@ async fn download_file_force_overwrites_existing_even_when_complete() {
     assert_eq!(std::fs::read(&out).unwrap(), payload);
 }
 
-// NOTE — a full sidecar-driven resume test (pre-populated `.sracha-progress`
-// + partial file → only missing chunks re-fetched) is deliberately absent.
-// The sidecar-aware branch in `download_file` only engages when
-// `file_size >= SMALL_FILE` (32 MiB) so the parallel path is chosen, AND
-// when the existing file doesn't already pass the pre-download MD5
-// shortcut. Crossing both thresholds with an in-process mock requires a
-// Range-aware HTTP server (wiremock's matchers can't condition the
-// response body on the `Range` header), plus a 32+ MiB payload per
-// invocation. Left as a follow-up once either constraint is addressed
-// (custom hyper-based mock, or a tunable SMALL_FILE exposed in config).
+#[tokio::test]
+async fn download_file_recovers_after_transient_failure() {
+    // A chunk fails once (503) then succeeds — exercises the per-chunk
+    // retry/backoff path added for flaky hosts like ENA. The retry loop lives
+    // on the parallel chunked path, which only engages for files >= 32 MiB
+    // (SMALL_FILE); use a single 33 MiB chunk so the whole-body 206 is valid.
+    let server = MockServer::start().await;
+    let size = 33 * 1024 * 1024usize;
+    let payload: Vec<u8> = (0..size).map(|i| (i * 17 + 3) as u8).collect();
+
+    // First GET → 503, consumed after one response...
+    Mock::given(method("GET"))
+        .and(path("/flaky"))
+        .respond_with(ResponseTemplate::new(503))
+        .up_to_n_times(1)
+        .with_priority(1)
+        .mount(&server)
+        .await;
+    // ...subsequent GET (the retry) → 206 with the full body (one chunk).
+    Mock::given(method("GET"))
+        .and(path("/flaky"))
+        .respond_with(ResponseTemplate::new(206).set_body_bytes(payload.clone()))
+        .with_priority(2)
+        .mount(&server)
+        .await;
+
+    let url = format!("{}/flaky", server.uri());
+    let (_dir, out) = tmp_out("flaky.sra");
+    let expected_md5 = md5_hex(&payload);
+
+    let cfg = DownloadConfig {
+        connections: 1,
+        chunk_size: 64 * 1024 * 1024, // one chunk covering the whole file
+        ..test_config()
+    };
+    let res = download_file(&[url], size as u64, Some(&expected_md5), &out, &cfg)
+        .await
+        .expect("download must recover after a transient 503");
+    assert_eq!(std::fs::read(&out).unwrap(), payload);
+    assert!(res.bytes_transferred > 0);
+}
+
+/// A `Range`-aware mock responder: serves the requested byte slice as a 206,
+/// records every requested chunk start, and can be told to fail (503) the
+/// chunk beginning at a specific offset. `fail_start == u64::MAX` disables
+/// failure injection. This is what lets us drive the parallel + sidecar
+/// resume path that plain wiremock matchers can't.
+struct RangeResponder {
+    body: Vec<u8>,
+    fail_start: Arc<AtomicU64>,
+    requested_starts: Arc<Mutex<Vec<u64>>>,
+}
+
+impl Respond for RangeResponder {
+    fn respond(&self, request: &Request) -> ResponseTemplate {
+        let raw = request
+            .headers
+            .get("range")
+            .and_then(|v| v.to_str().ok())
+            .and_then(|v| v.strip_prefix("bytes="))
+            .unwrap_or("");
+        let (start, end) = raw
+            .split_once('-')
+            .and_then(|(a, b)| Some((a.parse::<u64>().ok()?, b.parse::<u64>().ok()?)))
+            .expect("test always sends a well-formed byte range");
+
+        self.requested_starts.lock().unwrap().push(start);
+
+        if self.fail_start.load(Ordering::SeqCst) == start {
+            return ResponseTemplate::new(503);
+        }
+        let slice = &self.body[start as usize..=end as usize];
+        ResponseTemplate::new(206).set_body_bytes(slice.to_vec())
+    }
+}
+
+#[tokio::test]
+async fn download_file_resumes_missing_chunk_via_sidecar() {
+    // Cross both thresholds for the parallel + sidecar path: a > 32 MiB file
+    // (SMALL_FILE) downloaded in 8 MiB chunks. One chunk fails on the first
+    // run, leaving a partial file + `.sracha-progress`; the second run must
+    // resume and re-fetch ONLY that chunk.
+    const CHUNK: u64 = 8 * 1024 * 1024;
+    let size = (5 * CHUNK) as usize; // 40 MiB => chunks at 0,8,16,24,32 MiB
+    let fail_offset = 2 * CHUNK; // fail the chunk starting at 16 MiB
+
+    // Deterministic, non-uniform payload so MD5 is meaningful.
+    let payload: Vec<u8> = (0..size).map(|i| (i * 31 + 7) as u8).collect();
+    let expected_md5 = md5_hex(&payload);
+
+    let fail_start = Arc::new(AtomicU64::new(fail_offset));
+    let requested = Arc::new(Mutex::new(Vec::<u64>::new()));
+
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/big"))
+        .respond_with(RangeResponder {
+            body: payload.clone(),
+            fail_start: fail_start.clone(),
+            requested_starts: requested.clone(),
+        })
+        .mount(&server)
+        .await;
+
+    let url = format!("{}/big", server.uri());
+    let (_dir, out) = tmp_out("big.sra");
+
+    let cfg = DownloadConfig {
+        connections: 4,
+        chunk_size: CHUNK,
+        resume: true,
+        ..test_config()
+    };
+
+    // First run: the chunk at `fail_offset` fails all retries → error, but
+    // the other four chunks land and get recorded in the sidecar.
+    let err = download_file(
+        std::slice::from_ref(&url),
+        size as u64,
+        Some(&expected_md5),
+        &out,
+        &cfg,
+    )
+    .await
+    .err()
+    .expect("first run must fail on the injected bad chunk");
+    let _ = err;
+
+    let sidecar = out.parent().unwrap().join(format!(
+        ".{}.sracha-progress",
+        out.file_name().unwrap().to_str().unwrap()
+    ));
+    assert!(sidecar.exists(), "sidecar must persist partial progress");
+    assert_eq!(
+        std::fs::metadata(&out).unwrap().len(),
+        size as u64,
+        "output is preallocated to full size"
+    );
+
+    // Second run: stop failing and resume. Only the missing chunk should be
+    // fetched this time.
+    fail_start.store(u64::MAX, Ordering::SeqCst);
+    requested.lock().unwrap().clear();
+
+    let res = download_file(&[url], size as u64, Some(&expected_md5), &out, &cfg)
+        .await
+        .expect("resume run must complete");
+
+    assert_eq!(res.md5.as_deref(), Some(expected_md5.as_str()));
+    assert_eq!(std::fs::read(&out).unwrap(), payload);
+
+    let starts = requested.lock().unwrap().clone();
+    assert_eq!(
+        starts,
+        vec![fail_offset],
+        "resume must re-fetch only the previously-failed chunk"
+    );
+    assert!(
+        !sidecar.exists(),
+        "sidecar is cleaned up after a successful completion"
+    );
+}
+
+/// A `Range`-aware responder that fails one chunk hard enough to exhaust the
+/// per-chunk retry budget, then relents. Models an outage that outlives the
+/// inner retries but not the outer resume loop.
+struct OutageResponder {
+    body: Vec<u8>,
+    fail_start: u64,
+    /// How many requests for `fail_start` to reject before serving it.
+    fail_times: u64,
+    failures: Arc<AtomicU64>,
+    requested_starts: Arc<Mutex<Vec<u64>>>,
+}
+
+impl Respond for OutageResponder {
+    fn respond(&self, request: &Request) -> ResponseTemplate {
+        let raw = request
+            .headers
+            .get("range")
+            .and_then(|v| v.to_str().ok())
+            .and_then(|v| v.strip_prefix("bytes="))
+            .unwrap_or("");
+        let (start, end) = raw
+            .split_once('-')
+            .and_then(|(a, b)| Some((a.parse::<u64>().ok()?, b.parse::<u64>().ok()?)))
+            .expect("test always sends a well-formed byte range");
+
+        self.requested_starts.lock().unwrap().push(start);
+
+        if start == self.fail_start && self.failures.load(Ordering::SeqCst) < self.fail_times {
+            self.failures.fetch_add(1, Ordering::SeqCst);
+            return ResponseTemplate::new(503);
+        }
+        ResponseTemplate::new(206).set_body_bytes(self.body[start as usize..=end as usize].to_vec())
+    }
+}
+
+#[tokio::test]
+async fn download_file_with_retries_resumes_after_exhausting_chunk_retries() {
+    // One chunk fails 5 times — the full per-chunk budget (MAX_RETRIES) — so
+    // the first whole-file attempt errors out. The outer loop must then
+    // resume from the sidecar and finish, re-fetching ONLY the failed chunk.
+    const CHUNK: u64 = 8 * 1024 * 1024;
+    const CHUNK_RETRY_BUDGET: u64 = 5;
+    let size = (5 * CHUNK) as usize; // 40 MiB => chunks at 0,8,16,24,32 MiB
+    let fail_offset = 3 * CHUNK;
+
+    let payload: Vec<u8> = (0..size).map(|i| (i * 13 + 5) as u8).collect();
+    let expected_md5 = md5_hex(&payload);
+    let requested = Arc::new(Mutex::new(Vec::<u64>::new()));
+
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/outage"))
+        .respond_with(OutageResponder {
+            body: payload.clone(),
+            fail_start: fail_offset,
+            fail_times: CHUNK_RETRY_BUDGET,
+            failures: Arc::new(AtomicU64::new(0)),
+            requested_starts: requested.clone(),
+        })
+        .mount(&server)
+        .await;
+
+    let url = format!("{}/outage", server.uri());
+    let (_dir, out) = tmp_out("outage.sra");
+
+    let cfg = DownloadConfig {
+        connections: 4,
+        chunk_size: CHUNK,
+        resume: true,
+        ..test_config()
+    };
+    // Near-zero delays: the timing policy is unit-tested separately, this
+    // test is about the loop re-entering and resuming.
+    let policy = TransferRetryPolicy {
+        attempts: 3,
+        base_delay: std::time::Duration::from_millis(10),
+        cap_delay: std::time::Duration::from_millis(10),
+    };
+
+    let res = download_file_with_retries(
+        std::slice::from_ref(&url),
+        size as u64,
+        Some(&expected_md5),
+        &out,
+        &cfg,
+        &policy,
+    )
+    .await
+    .expect("outer retry must resume and complete the transfer");
+
+    assert_eq!(res.md5.as_deref(), Some(expected_md5.as_str()));
+    assert_eq!(std::fs::read(&out).unwrap(), payload);
+
+    // The decisive assertion: chunks that succeeded on the first attempt were
+    // NOT re-fetched by the retry. Only the failed chunk was requested again,
+    // which is what makes an outer retry cheap rather than a full restart.
+    let starts = requested.lock().unwrap().clone();
+    for offset in [0, CHUNK, 2 * CHUNK, 4 * CHUNK] {
+        assert_eq!(
+            starts.iter().filter(|&&s| s == offset).count(),
+            1,
+            "chunk at {offset} must be fetched exactly once across both attempts"
+        );
+    }
+    assert_eq!(
+        starts.iter().filter(|&&s| s == fail_offset).count() as u64,
+        CHUNK_RETRY_BUDGET + 1,
+        "failed chunk: 5 rejected attempts, then one success on the resume"
+    );
+}
+
+#[tokio::test]
+async fn download_file_with_retries_does_not_retry_checksum_mismatch() {
+    // A corrupt body is not a transport failure: download_file deletes the
+    // output, so a "resume" would silently become a full re-download. The
+    // outer loop must surface it on the first attempt instead of burning
+    // every retry re-fetching a file that will hash the same way again.
+    let server = MockServer::start().await;
+    let size = 33 * 1024 * 1024usize;
+    let payload: Vec<u8> = (0..size).map(|i| (i * 7 + 1) as u8).collect();
+    let requested = Arc::new(Mutex::new(Vec::<u64>::new()));
+
+    Mock::given(method("GET"))
+        .and(path("/corrupt"))
+        .respond_with(OutageResponder {
+            body: payload.clone(),
+            fail_start: u64::MAX, // never inject a transport failure
+            fail_times: 0,
+            failures: Arc::new(AtomicU64::new(0)),
+            requested_starts: requested.clone(),
+        })
+        .mount(&server)
+        .await;
+
+    let url = format!("{}/corrupt", server.uri());
+    let (_dir, out) = tmp_out("corrupt.sra");
+
+    let cfg = DownloadConfig {
+        connections: 1,
+        chunk_size: 64 * 1024 * 1024, // one chunk covering the whole file
+        resume: true,
+        ..test_config()
+    };
+    let policy = TransferRetryPolicy {
+        attempts: 3,
+        base_delay: std::time::Duration::from_millis(10),
+        cap_delay: std::time::Duration::from_millis(10),
+    };
+
+    let wrong_md5 = md5_hex(b"not the payload");
+    let err = download_file_with_retries(
+        std::slice::from_ref(&url),
+        size as u64,
+        Some(&wrong_md5),
+        &out,
+        &cfg,
+        &policy,
+    )
+    .await
+    .err()
+    .expect("checksum mismatch must fail");
+    assert!(
+        matches!(err, sracha_core::error::Error::ChecksumMismatch { .. }),
+        "expected ChecksumMismatch, got {err:?}"
+    );
+    assert_eq!(
+        requested.lock().unwrap().len(),
+        1,
+        "must not re-download after a checksum mismatch"
+    );
+}
+
+#[tokio::test]
+async fn download_file_with_retries_skips_retrying_when_resume_disabled() {
+    // With resume off there is no sidecar, so every attempt would restart
+    // from byte zero — retrying a 40 GiB transfer that way is worse than
+    // failing fast. One attempt only.
+    let server = MockServer::start().await;
+    let size = 33 * 1024 * 1024usize;
+    let payload: Vec<u8> = (0..size).map(|i| (i * 3 + 2) as u8).collect();
+    let requested = Arc::new(Mutex::new(Vec::<u64>::new()));
+
+    Mock::given(method("GET"))
+        .and(path("/always-fails"))
+        .respond_with(OutageResponder {
+            body: payload.clone(),
+            fail_start: 0,
+            fail_times: u64::MAX, // never recovers
+            failures: Arc::new(AtomicU64::new(0)),
+            requested_starts: requested.clone(),
+        })
+        .mount(&server)
+        .await;
+
+    let url = format!("{}/always-fails", server.uri());
+    let (_dir, out) = tmp_out("noresume.sra");
+
+    let cfg = DownloadConfig {
+        connections: 1,
+        chunk_size: 64 * 1024 * 1024,
+        resume: false,
+        ..test_config()
+    };
+    let policy = TransferRetryPolicy {
+        attempts: 4,
+        base_delay: std::time::Duration::from_millis(10),
+        cap_delay: std::time::Duration::from_millis(10),
+    };
+
+    let expected_md5 = md5_hex(&payload);
+    let _ = download_file_with_retries(
+        std::slice::from_ref(&url),
+        size as u64,
+        Some(&expected_md5),
+        &out,
+        &cfg,
+        &policy,
+    )
+    .await
+    .err()
+    .expect("transfer must fail");
+
+    // Exactly one whole-file attempt: the chunk's own 5 retries, no more.
+    assert_eq!(
+        requested.lock().unwrap().len(),
+        5,
+        "resume disabled => a single whole-file attempt (5 chunk retries)"
+    );
+}

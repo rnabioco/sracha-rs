@@ -14,7 +14,24 @@ const MEDIUM_FILE: u64 = 256 * 1024 * 1024; // 256 MiB
 const LARGE_FILE: u64 = 2 * 1024 * 1024 * 1024; // 2 GiB
 
 /// Maximum retry attempts per chunk.
-const MAX_RETRIES: u32 = 3;
+const MAX_RETRIES: u32 = 5;
+
+/// Base delay for the first per-chunk retry backoff, in milliseconds.
+const BACKOFF_BASE_MS: u64 = 500;
+
+/// Upper bound on a single per-chunk backoff (before jitter), in milliseconds.
+const BACKOFF_CAP_MS: u64 = 15_000;
+
+/// Deterministic exponential backoff for retry `attempt` (1-based), capped.
+///
+/// Doubles each attempt from [`BACKOFF_BASE_MS`] up to [`BACKOFF_CAP_MS`]:
+/// 500, 1000, 2000, 4000, ... ms. Jitter is added by the caller so this stays
+/// pure and testable.
+fn backoff_base_ms(attempt: u32) -> u64 {
+    BACKOFF_BASE_MS
+        .saturating_mul(1u64 << (attempt - 1))
+        .min(BACKOFF_CAP_MS)
+}
 
 /// Auto-scale floor for parallel TCP connections on medium+ files.
 /// 24 is the safe sweet spot: benched against 16 and 32 on a head-node
@@ -25,6 +42,7 @@ const MAX_RETRIES: u32 = 3;
 const MEDIUM_FILE_CONNECTIONS: usize = 24;
 
 /// Configuration for parallel chunked downloads.
+#[derive(Clone)]
 pub struct DownloadConfig {
     /// Number of parallel connections (default 8).
     pub connections: usize,
@@ -38,6 +56,11 @@ pub struct DownloadConfig {
     pub progress: bool,
     /// Attempt to resume interrupted downloads (default true).
     pub resume: bool,
+    /// Auto-scale to [`MEDIUM_FILE_CONNECTIONS`] on medium+ files (default
+    /// true). Tuned for NCBI S3; ENA's single Apache host chokes under that
+    /// many parallel streams, so the ENA fast path sets this `false` and
+    /// caps `connections` at [`crate::ena::ENA_MAX_CONNECTIONS`] instead.
+    pub auto_scale_connections: bool,
     /// Shared HTTP client. When `None`, a fresh client is built per call.
     /// The orchestrator should pass the same client it uses for SDL/S3 so
     /// TLS sessions and connection pools are reused.
@@ -52,6 +75,151 @@ pub struct DownloadConfig {
     pub expected_prefix: Option<Vec<u8>>,
 }
 
+/// How many times to re-enter a resumable transfer, and how long to wait
+/// between attempts.
+///
+/// The per-chunk retry loop in [`download_chunk`] rides out a host that is
+/// briefly unhappy — a few seconds of backoff across [`MAX_RETRIES`]
+/// attempts. It cannot ride out an outage measured in minutes, which is what
+/// ENA produces during an instability window: one chunk burns its attempts,
+/// its error aborts the whole file, and a multi-hour transfer that was nearly
+/// finished exits with the user left to re-run it by hand.
+///
+/// This policy governs the outer loop, which waits far longer and then
+/// resumes from the `.sracha-progress` sidecar. Completed chunks are not
+/// re-fetched, so a retry costs only the bytes still missing.
+#[derive(Debug, Clone)]
+pub struct TransferRetryPolicy {
+    /// Total whole-file attempts, including the first. `1` disables retrying.
+    pub attempts: u32,
+    /// Delay before the first resume; doubles on each subsequent attempt.
+    pub base_delay: std::time::Duration,
+    /// Upper bound on any single delay, before jitter.
+    pub cap_delay: std::time::Duration,
+}
+
+impl Default for TransferRetryPolicy {
+    fn default() -> Self {
+        Self {
+            attempts: 4,
+            base_delay: std::time::Duration::from_secs(30),
+            cap_delay: std::time::Duration::from_secs(300),
+        }
+    }
+}
+
+impl TransferRetryPolicy {
+    /// Disable outer retries entirely.
+    pub fn none() -> Self {
+        Self {
+            attempts: 1,
+            ..Self::default()
+        }
+    }
+
+    /// Deterministic exponential delay before `attempt` (1-based), capped.
+    /// Jitter is added by the caller so this stays pure and testable.
+    fn base_delay_for(&self, attempt: u32) -> std::time::Duration {
+        let shift = attempt.saturating_sub(1).min(31);
+        self.base_delay
+            .saturating_mul(1u32 << shift)
+            .min(self.cap_delay)
+    }
+}
+
+/// Is `e` worth another whole-file attempt?
+///
+/// Only transport failures are, because those leave the partial file and its
+/// sidecar intact for a resume. The others would either waste the wait or do
+/// the wrong thing: a cancellation is the user's decision; a checksum
+/// mismatch has already deleted the output, so "resuming" would silently
+/// become a full re-download of a file we have no reason to think will hash
+/// differently; and an I/O error is usually a full disk or bad permissions,
+/// which waiting does not fix.
+fn is_resumable_transfer_error(e: &Error) -> bool {
+    matches!(e, Error::Http(_) | Error::Download { .. })
+}
+
+/// [`download_file`], re-entered on transport failure so a resumable transfer
+/// survives an outage longer than the per-chunk retry budget.
+///
+/// Each retry resumes via the progress sidecar rather than starting over.
+/// Retrying is skipped when `config.resume` is off, since every attempt would
+/// then re-fetch the file from byte zero.
+pub async fn download_file_with_retries(
+    urls: &[String],
+    expected_size: u64,
+    expected_md5: Option<&str>,
+    output_path: &Path,
+    config: &DownloadConfig,
+    policy: &TransferRetryPolicy,
+) -> Result<DownloadResult> {
+    let attempts = if config.resume {
+        policy.attempts.max(1)
+    } else {
+        1
+    };
+
+    // `force` means "start fresh". That is right for the first attempt and
+    // wrong for every later one: left set, it would delete the partial file
+    // and sidecar each time, so each "resume" would restart from zero.
+    let resume_config = if config.force {
+        let mut c = config.clone();
+        c.force = false;
+        Some(c)
+    } else {
+        None
+    };
+
+    let mut last_error: Option<Error> = None;
+
+    for attempt in 0..attempts {
+        if attempt > 0 {
+            let base = policy.base_delay_for(attempt);
+            let delay = base
+                + std::time::Duration::from_millis(crate::util::jitter_ms(
+                    base.as_millis().min(u128::from(u64::MAX)) as u64,
+                ));
+            tracing::warn!(
+                "transfer failed ({}); resuming {} in {:?} (attempt {}/{attempts})",
+                last_error
+                    .as_ref()
+                    .map(|e| e.to_string())
+                    .unwrap_or_default(),
+                output_path.display(),
+                delay,
+                attempt + 1,
+            );
+            // The pause can run to minutes; say so rather than leaving a
+            // stalled progress bar as the only sign of life.
+            eprintln!(
+                "warning: transfer interrupted — resuming in {}s (attempt {}/{attempts})",
+                delay.as_secs(),
+                attempt + 1,
+            );
+            tokio::time::sleep(delay).await;
+        }
+
+        let cfg = if attempt == 0 {
+            config
+        } else {
+            resume_config.as_ref().unwrap_or(config)
+        };
+
+        match download_file(urls, expected_size, expected_md5, output_path, cfg).await {
+            Ok(result) => return Ok(result),
+            Err(e) if is_resumable_transfer_error(&e) => last_error = Some(e),
+            // Not worth another attempt — surface it now.
+            Err(e) => return Err(e),
+        }
+    }
+
+    Err(last_error.unwrap_or_else(|| Error::Download {
+        accession: String::new(),
+        message: "transfer failed with no error captured".into(),
+    }))
+}
+
 impl Default for DownloadConfig {
     fn default() -> Self {
         Self {
@@ -61,6 +229,7 @@ impl Default for DownloadConfig {
             validate: true,
             progress: true,
             resume: true,
+            auto_scale_connections: true,
             client: None,
             expected_prefix: None,
         }
@@ -171,10 +340,12 @@ async fn download_chunk(
 
     for attempt in 0..MAX_RETRIES {
         if attempt > 0 {
-            // Short first retry (a read-timeout stall is usually a dead TCP
-            // connection; a fresh one wins fast), then back off in case the
-            // real problem is server-side rate limiting.
-            let delay = std::time::Duration::from_millis(250u64 << (attempt - 1));
+            // Exponential backoff (500 ms → 15 s cap) with full jitter in
+            // `0..base`. The jitter de-synchronizes the many concurrent chunk
+            // retries so a struggling host (e.g. ENA refusing connections)
+            // isn't hit by a thundering herd all backing off in lockstep.
+            let base = backoff_base_ms(attempt);
+            let delay = std::time::Duration::from_millis(base + crate::util::jitter_ms(base));
             tracing::warn!(
                 "Retrying chunk {}-{} (attempt {}/{}), backoff {:?}",
                 chunk.start,
@@ -627,7 +798,9 @@ pub async fn download_file(
     let use_parallel = probe.supports_range && file_size >= SMALL_FILE;
 
     // Scale up connections for medium+ files (see MEDIUM_FILE_CONNECTIONS).
-    let connections = if file_size >= MEDIUM_FILE {
+    // Callers that target a connection-sensitive host (ENA) disable this and
+    // pass their own, gentler `connections` value.
+    let connections = if config.auto_scale_connections && file_size >= MEDIUM_FILE {
         config.connections.max(MEDIUM_FILE_CONNECTIONS)
     } else {
         config.connections
@@ -1138,6 +1311,72 @@ mod tests {
         assert!(config.validate);
         assert!(config.progress);
         assert!(config.resume);
+        assert!(config.auto_scale_connections);
+    }
+
+    #[test]
+    fn test_backoff_base_ms_exponential() {
+        // Doubles from BACKOFF_BASE_MS each attempt.
+        assert_eq!(backoff_base_ms(1), 500);
+        assert_eq!(backoff_base_ms(2), 1000);
+        assert_eq!(backoff_base_ms(3), 2000);
+        assert_eq!(backoff_base_ms(4), 4000);
+        assert_eq!(backoff_base_ms(5), 8000);
+    }
+
+    #[test]
+    fn test_transfer_retry_policy_defaults() {
+        let p = TransferRetryPolicy::default();
+        assert_eq!(p.attempts, 4);
+        assert_eq!(p.base_delay, std::time::Duration::from_secs(30));
+        assert_eq!(p.cap_delay, std::time::Duration::from_secs(300));
+        assert_eq!(TransferRetryPolicy::none().attempts, 1);
+    }
+
+    #[test]
+    fn test_transfer_retry_delay_exponential_and_capped() {
+        let p = TransferRetryPolicy::default();
+        assert_eq!(p.base_delay_for(1), std::time::Duration::from_secs(30));
+        assert_eq!(p.base_delay_for(2), std::time::Duration::from_secs(60));
+        assert_eq!(p.base_delay_for(3), std::time::Duration::from_secs(120));
+        assert_eq!(p.base_delay_for(4), std::time::Duration::from_secs(240));
+        // Capped from here on, with no overflow from the shift.
+        assert_eq!(p.base_delay_for(5), std::time::Duration::from_secs(300));
+        assert_eq!(p.base_delay_for(64), std::time::Duration::from_secs(300));
+        assert_eq!(
+            p.base_delay_for(u32::MAX),
+            std::time::Duration::from_secs(300)
+        );
+    }
+
+    #[test]
+    fn test_only_transport_errors_are_resumable() {
+        assert!(is_resumable_transfer_error(&Error::Download {
+            accession: String::new(),
+            message: "connection reset".into(),
+        }));
+
+        // A cancellation is the user's call, a checksum mismatch already
+        // deleted the output, and I/O errors (e.g. a full disk) don't heal
+        // by waiting — none should burn a retry.
+        assert!(!is_resumable_transfer_error(&Error::Cancelled {
+            output_files: vec![],
+        }));
+        assert!(!is_resumable_transfer_error(&Error::ChecksumMismatch {
+            expected: "a".into(),
+            actual: "b".into(),
+        }));
+        assert!(!is_resumable_transfer_error(&Error::Io(
+            std::io::Error::other("no space left on device"),
+        )));
+    }
+
+    #[test]
+    fn test_backoff_base_ms_capped() {
+        // Never exceeds BACKOFF_CAP_MS, even far past MAX_RETRIES.
+        assert_eq!(backoff_base_ms(6), 15_000);
+        assert_eq!(backoff_base_ms(20), 15_000);
+        assert_eq!(backoff_base_ms(60), 15_000); // no overflow from the shift
     }
 
     #[test]

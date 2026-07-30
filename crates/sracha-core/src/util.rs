@@ -47,9 +47,40 @@ pub fn format_bases(b: u64) -> String {
     }
 }
 
+/// Return a pseudo-random jitter in `0..max` milliseconds.
+///
+/// Derives entropy from the current time's sub-second nanoseconds — good
+/// enough to de-synchronize concurrent retry backoffs (avoiding a thundering
+/// herd against a struggling host) without pulling in a `rand` dependency.
+/// `max == 0` yields `0`.
+pub fn jitter_ms(max: u64) -> u64 {
+    if max == 0 {
+        return 0;
+    }
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .subsec_nanos() as u64;
+    nanos % max
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn jitter_ms_is_bounded() {
+        for max in [1u64, 7, 500, 1000] {
+            for _ in 0..64 {
+                assert!(jitter_ms(max) < max);
+            }
+        }
+    }
+
+    #[test]
+    fn jitter_ms_zero_max() {
+        assert_eq!(jitter_ms(0), 0);
+    }
 
     #[test]
     fn format_size_bytes() {
