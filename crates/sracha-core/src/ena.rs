@@ -21,6 +21,15 @@ const ENA_FILEREPORT_URL: &str = "https://www.ebi.ac.uk/ena/portal/api/filerepor
 /// Maximum retry attempts for HTTP 429 / 5xx responses.
 const MAX_API_RETRIES: u32 = 3;
 
+/// Connection cap for ENA FASTQ downloads.
+///
+/// ENA serves FASTQ from a single Apache host (`ftp.sra.ebi.ac.uk`), which is
+/// far more sensitive to parallel-connection pressure than NCBI's S3 backend.
+/// The download layer's S3-tuned auto-scale floor (24 connections on large
+/// files) triggers connection-limit refusals here, so ENA transfers are capped
+/// to this gentler value. `--connections` may still lower it further.
+pub const ENA_MAX_CONNECTIONS: usize = 6;
+
 /// Concurrency cap for batch queries. ENA allows 50 req/s; 20 in-flight
 /// gives headroom for other API calls sharing the same process.
 const ENA_BATCH_CONCURRENCY: usize = 20;
@@ -32,9 +41,9 @@ const ENA_FIELDS: &str = "run_accession,fastq_ftp,fastq_md5,fastq_bytes";
 /// One downloadable FASTQ file from ENA.
 #[derive(Debug, Clone)]
 pub struct EnaFastqFile {
-    /// HTTP URL (the filereport returns `ftp://` paths; we rewrite to `http://`
-    /// because `ftp.sra.ebi.ac.uk` serves the same paths over HTTP without
-    /// authentication).
+    /// HTTPS URL (the filereport returns `ftp://` paths; we rewrite to
+    /// `https://` because `ftp.sra.ebi.ac.uk` serves the same paths over HTTPS
+    /// without authentication).
     pub url: String,
     /// MD5 hex digest for integrity verification post-download.
     pub md5: String,
@@ -84,7 +93,7 @@ async fn http_get_with_retry(
             && attempt < MAX_API_RETRIES
         {
             let base = std::time::Duration::from_secs(1 << attempt);
-            let jitter = std::time::Duration::from_millis(rand_jitter_ms());
+            let jitter = std::time::Duration::from_millis(crate::util::jitter_ms(500));
             let delay = base + jitter;
             tracing::info!(
                 "HTTP {status} from ENA {url}, retry {}/{MAX_API_RETRIES} in {delay:?}",
@@ -97,14 +106,6 @@ async fn http_get_with_retry(
         return Ok(resp);
     }
     unreachable!()
-}
-
-fn rand_jitter_ms() -> u64 {
-    let nanos = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap_or_default()
-        .subsec_nanos();
-    (nanos % 500) as u64
 }
 
 /// Build the filereport URL for a given accession (run or project).
@@ -191,7 +192,7 @@ fn row_to_resolved(row: FilereportRow) -> Option<EnaResolved> {
             return None;
         }
         files.push(EnaFastqFile {
-            url: ftp_to_http(ftp),
+            url: ftp_to_https(ftp),
             md5: md5s[i].to_string(),
             size,
             slot: slots[i],
@@ -214,22 +215,24 @@ fn split_or_empty(s: &str) -> Vec<&str> {
     }
 }
 
-/// Normalize a `fastq_ftp` value from ENA to an `http://` URL.
+/// Normalize a `fastq_ftp` value from ENA to an `https://` URL.
 ///
 /// ENA's filereport returns values in one of three forms:
 /// `ftp://ftp.sra.ebi.ac.uk/...`, `ftp.sra.ebi.ac.uk/...` (scheme-less,
 /// the common case today), or `http://ftp.sra.ebi.ac.uk/...`. ENA serves
-/// the same paths over HTTP on the same host, so we normalize all three
-/// to `http://...`. HTTP avoids FTP client baggage (PASV, separate
-/// control/data connections) and lets the existing parallel chunked
-/// downloader reuse HTTP connection pools.
-fn ftp_to_http(url: &str) -> String {
+/// the same paths over HTTPS on the same host, so we normalize the `ftp://`
+/// and scheme-less forms to `https://...`. HTTPS avoids FTP client baggage
+/// (PASV, separate control/data connections), keeps the transfer encrypted,
+/// and lets the existing parallel chunked downloader reuse HTTP connection
+/// pools. An already-explicit `http://`/`https://` value is passed through
+/// unchanged (ENA still serves plain HTTP for callers that request it).
+fn ftp_to_https(url: &str) -> String {
     if let Some(rest) = url.strip_prefix("ftp://") {
-        format!("http://{rest}")
+        format!("https://{rest}")
     } else if url.starts_with("http://") || url.starts_with("https://") {
         url.to_string()
     } else {
-        format!("http://{url}")
+        format!("https://{url}")
     }
 }
 
@@ -340,35 +343,36 @@ mod tests {
     use super::*;
 
     #[test]
-    fn ftp_to_http_rewrites_scheme() {
+    fn ftp_to_https_rewrites_scheme() {
         assert_eq!(
-            ftp_to_http("ftp://ftp.sra.ebi.ac.uk/vol1/fastq/SRR000/SRR000001/SRR000001_1.fastq.gz"),
-            "http://ftp.sra.ebi.ac.uk/vol1/fastq/SRR000/SRR000001/SRR000001_1.fastq.gz"
+            ftp_to_https("ftp://ftp.sra.ebi.ac.uk/vol1/fastq/SRR000/SRR000001/SRR000001_1.fastq.gz"),
+            "https://ftp.sra.ebi.ac.uk/vol1/fastq/SRR000/SRR000001/SRR000001_1.fastq.gz"
         );
     }
 
     #[test]
-    fn ftp_to_http_passes_http_through() {
+    fn ftp_to_https_passes_http_through() {
+        // An already-explicit http:// value is left as-is.
         assert_eq!(
-            ftp_to_http("http://example.com/x.fastq.gz"),
+            ftp_to_https("http://example.com/x.fastq.gz"),
             "http://example.com/x.fastq.gz"
         );
     }
 
     #[test]
-    fn ftp_to_http_passes_https_through() {
+    fn ftp_to_https_passes_https_through() {
         assert_eq!(
-            ftp_to_http("https://example.com/x.fastq.gz"),
+            ftp_to_https("https://example.com/x.fastq.gz"),
             "https://example.com/x.fastq.gz"
         );
     }
 
     #[test]
-    fn ftp_to_http_prepends_when_schemeless() {
+    fn ftp_to_https_prepends_when_schemeless() {
         // ENA's filereport often returns schemeless paths like this.
         assert_eq!(
-            ftp_to_http("ftp.sra.ebi.ac.uk/vol1/fastq/SRR000/SRR000001/SRR000001_1.fastq.gz"),
-            "http://ftp.sra.ebi.ac.uk/vol1/fastq/SRR000/SRR000001/SRR000001_1.fastq.gz"
+            ftp_to_https("ftp.sra.ebi.ac.uk/vol1/fastq/SRR000/SRR000001/SRR000001_1.fastq.gz"),
+            "https://ftp.sra.ebi.ac.uk/vol1/fastq/SRR000/SRR000001/SRR000001_1.fastq.gz"
         );
     }
 
@@ -417,7 +421,7 @@ mod tests {
         assert_eq!(resolved.fastq_files[0].md5, "abc123");
         assert_eq!(resolved.fastq_files[0].size, 12345);
         assert_eq!(resolved.total_size, 12345);
-        assert!(resolved.fastq_files[0].url.starts_with("http://"));
+        assert!(resolved.fastq_files[0].url.starts_with("https://"));
     }
 
     #[test]

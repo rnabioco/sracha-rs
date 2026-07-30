@@ -1630,6 +1630,7 @@ pub async fn download_sra(
 
     let dl_config = DownloadConfig {
         connections: config.connections,
+        auto_scale_connections: true,
         chunk_size: 0,
         force: config.force,
         validate: true,
@@ -1715,7 +1716,10 @@ pub async fn download_ena_fastq(
     tokio::fs::create_dir_all(&acc_dir).await?;
 
     let dl_config = DownloadConfig {
-        connections: config.connections,
+        // ENA serves from a single Apache host; cap concurrency and skip the
+        // S3-tuned auto-scale floor so we don't trip connection limits.
+        connections: config.connections.min(crate::ena::ENA_MAX_CONNECTIONS),
+        auto_scale_connections: false,
         chunk_size: 0,
         force: config.force,
         validate: true,
@@ -1760,17 +1764,32 @@ pub async fn download_ena_fastq(
         let urls = vec![file.url.clone()];
         let dl_future = download_file(&urls, file.size, Some(&file.md5), &target, &dl_config);
 
-        let dl_result = if let Some(ref flag) = config.cancelled {
+        let dl_outcome = if let Some(ref flag) = config.cancelled {
             let flag = flag.clone();
             tokio::select! {
-                result = dl_future => result?,
+                result = dl_future => result,
                 _ = poll_cancelled(flag) => {
                     tracing::info!("{accession}: ENA download cancelled");
                     return Err(Error::Cancelled { output_files });
                 }
             }
         } else {
-            dl_future.await?
+            dl_future.await
+        };
+        // On a genuine transfer failure (e.g. ENA refusing connections), the
+        // partial file + `.sracha-progress` sidecar are preserved by
+        // `download_file`; tell the user re-running resumes rather than
+        // silently discarding progress.
+        let dl_result = match dl_outcome {
+            Ok(r) => r,
+            Err(e) => {
+                eprintln!(
+                    "warning: {accession}: ENA transfer failed ({e}); partial download \
+                     and resume state kept at {} — re-run with --prefer-ena to resume",
+                    target.display(),
+                );
+                return Err(e);
+            }
         };
 
         bytes_transferred += dl_result.bytes_transferred;

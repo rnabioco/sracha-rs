@@ -4,6 +4,18 @@
 
 ### Fixes
 
+- Make `--prefer-ena` transfers resilient to ENA instability (#89). ENA FASTQ
+  URLs are now fetched over `https://` instead of plain `http://`. ENA serves
+  from a single Apache host that chokes under the S3-tuned connection floor
+  (which forced ≥24 parallel streams on large files regardless of
+  `--connections`); ENA downloads are now capped at 6 connections and honor a
+  lower `--connections`, and the S3 auto-scale floor is confined to the NCBI
+  path. Per-chunk retry backoff was widened from 250 ms/500 ms (3 attempts, no
+  jitter) to exponential 500 ms→15 s with full jitter over 5 attempts, so a
+  transient connection-refusal window is ridden out instead of amplified by a
+  thundering herd of lockstep retries. On a failed ENA transfer the partial
+  file and `.sracha-progress` sidecar are preserved with a message that
+  re-running resumes.
 - Resolve the `idx0` write-ahead overlay together with the `idx1`/`idx2` block
   index instead of treating `idx0` as authoritative (#87). NCBI's VDB writer
   appends new blobs to `idx0`, periodically compacts them into `idx1`/`idx2`,

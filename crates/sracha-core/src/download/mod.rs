@@ -14,7 +14,24 @@ const MEDIUM_FILE: u64 = 256 * 1024 * 1024; // 256 MiB
 const LARGE_FILE: u64 = 2 * 1024 * 1024 * 1024; // 2 GiB
 
 /// Maximum retry attempts per chunk.
-const MAX_RETRIES: u32 = 3;
+const MAX_RETRIES: u32 = 5;
+
+/// Base delay for the first per-chunk retry backoff, in milliseconds.
+const BACKOFF_BASE_MS: u64 = 500;
+
+/// Upper bound on a single per-chunk backoff (before jitter), in milliseconds.
+const BACKOFF_CAP_MS: u64 = 15_000;
+
+/// Deterministic exponential backoff for retry `attempt` (1-based), capped.
+///
+/// Doubles each attempt from [`BACKOFF_BASE_MS`] up to [`BACKOFF_CAP_MS`]:
+/// 500, 1000, 2000, 4000, ... ms. Jitter is added by the caller so this stays
+/// pure and testable.
+fn backoff_base_ms(attempt: u32) -> u64 {
+    BACKOFF_BASE_MS
+        .saturating_mul(1u64 << (attempt - 1))
+        .min(BACKOFF_CAP_MS)
+}
 
 /// Auto-scale floor for parallel TCP connections on medium+ files.
 /// 24 is the safe sweet spot: benched against 16 and 32 on a head-node
@@ -38,6 +55,11 @@ pub struct DownloadConfig {
     pub progress: bool,
     /// Attempt to resume interrupted downloads (default true).
     pub resume: bool,
+    /// Auto-scale to [`MEDIUM_FILE_CONNECTIONS`] on medium+ files (default
+    /// true). Tuned for NCBI S3; ENA's single Apache host chokes under that
+    /// many parallel streams, so the ENA fast path sets this `false` and
+    /// caps `connections` at [`crate::ena::ENA_MAX_CONNECTIONS`] instead.
+    pub auto_scale_connections: bool,
     /// Shared HTTP client. When `None`, a fresh client is built per call.
     /// The orchestrator should pass the same client it uses for SDL/S3 so
     /// TLS sessions and connection pools are reused.
@@ -61,6 +83,7 @@ impl Default for DownloadConfig {
             validate: true,
             progress: true,
             resume: true,
+            auto_scale_connections: true,
             client: None,
             expected_prefix: None,
         }
@@ -171,10 +194,12 @@ async fn download_chunk(
 
     for attempt in 0..MAX_RETRIES {
         if attempt > 0 {
-            // Short first retry (a read-timeout stall is usually a dead TCP
-            // connection; a fresh one wins fast), then back off in case the
-            // real problem is server-side rate limiting.
-            let delay = std::time::Duration::from_millis(250u64 << (attempt - 1));
+            // Exponential backoff (500 ms → 15 s cap) with full jitter in
+            // `0..base`. The jitter de-synchronizes the many concurrent chunk
+            // retries so a struggling host (e.g. ENA refusing connections)
+            // isn't hit by a thundering herd all backing off in lockstep.
+            let base = backoff_base_ms(attempt);
+            let delay = std::time::Duration::from_millis(base + crate::util::jitter_ms(base));
             tracing::warn!(
                 "Retrying chunk {}-{} (attempt {}/{}), backoff {:?}",
                 chunk.start,
@@ -627,7 +652,9 @@ pub async fn download_file(
     let use_parallel = probe.supports_range && file_size >= SMALL_FILE;
 
     // Scale up connections for medium+ files (see MEDIUM_FILE_CONNECTIONS).
-    let connections = if file_size >= MEDIUM_FILE {
+    // Callers that target a connection-sensitive host (ENA) disable this and
+    // pass their own, gentler `connections` value.
+    let connections = if config.auto_scale_connections && file_size >= MEDIUM_FILE {
         config.connections.max(MEDIUM_FILE_CONNECTIONS)
     } else {
         config.connections
@@ -1138,6 +1165,25 @@ mod tests {
         assert!(config.validate);
         assert!(config.progress);
         assert!(config.resume);
+        assert!(config.auto_scale_connections);
+    }
+
+    #[test]
+    fn test_backoff_base_ms_exponential() {
+        // Doubles from BACKOFF_BASE_MS each attempt.
+        assert_eq!(backoff_base_ms(1), 500);
+        assert_eq!(backoff_base_ms(2), 1000);
+        assert_eq!(backoff_base_ms(3), 2000);
+        assert_eq!(backoff_base_ms(4), 4000);
+        assert_eq!(backoff_base_ms(5), 8000);
+    }
+
+    #[test]
+    fn test_backoff_base_ms_capped() {
+        // Never exceeds BACKOFF_CAP_MS, even far past MAX_RETRIES.
+        assert_eq!(backoff_base_ms(6), 15_000);
+        assert_eq!(backoff_base_ms(20), 15_000);
+        assert_eq!(backoff_base_ms(60), 15_000); // no overflow from the shift
     }
 
     #[test]
