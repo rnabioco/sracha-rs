@@ -1,5 +1,19 @@
 # Changelog
 
+## Unreleased
+
+### Fixes
+
+- Resolve the `idx0` write-ahead overlay together with the `idx1`/`idx2` block
+  index instead of treating `idx0` as authoritative (#87). NCBI's VDB writer
+  appends new blobs to `idx0`, periodically compacts them into `idx1`/`idx2`,
+  then keeps appending to `idx0`, so a finalized archive can have both tiers
+  populated at once. sracha previously decoded `idx1`/`idx2` only when `idx0`
+  was empty, silently truncating large accessions to the recent `idx0` tail
+  (SRR39695091 dropped ~2^29 rows and failed the spot-count check). Both tiers
+  are now merged into one logical column, with `idx0` winning on any overlapping
+  row range.
+
 ## 0.4.1 (2026-07-28)
 
 ### Upgrade note

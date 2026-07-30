@@ -755,11 +755,20 @@ impl ColumnReader {
             update_meta_from_idx_file(&mut meta, idx_bytes);
         }
 
-        let mut blobs = parse_idx0(idx0_bytes, meta.idx0_count)?;
+        // `idx0` is a write-ahead overlay, not the whole story. NCBI's VDB
+        // writer appends new blobs to `idx0`, periodically compacts them into
+        // the `idx1`/`idx2` block index, then keeps appending fresh blobs back
+        // into `idx0`. A finalized archive can therefore have BOTH tiers
+        // populated at once: `idx1`/`idx2` holds the bulk of the rows and
+        // `idx0` holds a recent tail. We must resolve both into one logical
+        // column, or large accessions are silently truncated to the `idx0`
+        // tail (issue #87).
+        let idx0_blobs = parse_idx0(idx0_bytes, meta.idx0_count)?;
 
-        // For v2+ columns with idx2 data, parse block locators from idx1 and
-        // decode idx2 to get individual blob locations.
-        if blobs.is_empty() && meta.version >= 2 && !idx2_bytes.is_empty() {
+        // Parse the `idx1`/`idx2` block index unconditionally — it is the base
+        // tier that `idx0` overlays, not a fallback.
+        let mut idx12_blobs: Vec<BlobLoc> = Vec::new();
+        if meta.version >= 2 && !idx2_bytes.is_empty() {
             let header_end = 8usize; // KDBHdr size
             let block_locs = parse_block_locs_v2(idx1_bytes, header_end, meta.num_blocks as usize)?;
 
@@ -799,21 +808,26 @@ impl ColumnReader {
 
                 let idx2_slice = &idx2_bytes[start..slice_end];
                 let block_blobs = parse_idx2_block(idx2_slice, bloc)?;
-                blobs.extend(block_blobs);
+                idx12_blobs.extend(block_blobs);
             }
 
-            blobs.sort_by_key(|b| b.start_id);
+            idx12_blobs.sort_by_key(|b| b.start_id);
         }
 
-        // For v1 columns with idx0, the blobs from parse_idx0 are correct.
-        // For v1 columns without idx0, use the idx1 block_locs directly.
-        if blobs.is_empty() && meta.version <= 1 && !meta.block_locs.is_empty() {
+        // For v1 columns the block locators in `idx1` ARE the base tier (there
+        // is no idx2). Use them the same way we use idx12_blobs for v2+.
+        if idx12_blobs.is_empty() && meta.version <= 1 && !meta.block_locs.is_empty() {
             tracing::debug!(
-                "idx0 empty (v1); using {} block locators from idx1",
+                "v1: using {} block locators from idx1 as the base tier",
                 meta.block_locs.len()
             );
-            blobs = meta.block_locs.clone();
+            idx12_blobs = meta.block_locs.clone();
         }
+
+        // Merge the base (idx1/idx2) and overlay (idx0) tiers into one sorted
+        // view. `idx0` wins on any overlapping row range; the base tier fills
+        // in every row `idx0` does not cover.
+        let mut blobs = merge_index_tiers(idx12_blobs, idx0_blobs);
 
         // When no blob locators are available at all, create a single
         // synthetic blob covering all data.
@@ -1112,6 +1126,56 @@ fn blob_overlaps(blob: &BlobLoc, lo: i64, hi: i64) -> bool {
     }
     let end = blob.start_id + i64::from(blob.id_range) - 1;
     blob.start_id <= hi && end >= lo
+}
+
+/// Merge the `idx1`/`idx2` base tier with the `idx0` overlay into one column
+/// view sorted by `start_id`.
+///
+/// `idx0` is a write-ahead overlay: its blobs are the newest and take
+/// precedence, mirroring ncbi-vdb's `KColumnIdxLocateBlob` (check idx0 first,
+/// fall back to idx1/idx2). Any `base` blob whose row range intersects an
+/// `overlay` blob is dropped in favor of the overlay; every other `base` blob
+/// is retained. For finalized append-only archives the two tiers are disjoint
+/// (base = head rows, overlay = tail rows), so this is just a sorted union.
+fn merge_index_tiers(base: Vec<BlobLoc>, overlay: Vec<BlobLoc>) -> Vec<BlobLoc> {
+    // Fast paths: nothing to merge. Preserves prior single-tier behavior,
+    // including an idx0 that parsed to empty (e.g. only remove-flagged
+    // entries) → the base tier is returned unchanged.
+    if overlay.is_empty() {
+        return base;
+    }
+    if base.is_empty() {
+        return overlay;
+    }
+
+    // The span the overlay actually covers. Base blobs entirely outside it
+    // cannot be superseded, so we skip the per-blob scan for them — that keeps
+    // the common append-only case (base = head, overlay = tail, disjoint) O(n).
+    let overlay_min = overlay.iter().map(|o| o.start_id).min().unwrap_or(i64::MAX);
+    let overlay_max = overlay
+        .iter()
+        .map(|o| o.start_id + i64::from(o.id_range.max(1)) - 1)
+        .max()
+        .unwrap_or(i64::MIN);
+
+    // Overlay blobs always win.
+    let mut merged = base;
+    merged.retain(|b| {
+        // Synthetic all-covering base blobs (id_range == 0) are meaningless
+        // once we have real overlay locators; drop them.
+        if b.id_range == 0 {
+            return false;
+        }
+        let lo = b.start_id;
+        let hi = b.start_id + i64::from(b.id_range) - 1;
+        if hi < overlay_min || lo > overlay_max {
+            return true; // no possible overlap — keep it
+        }
+        !overlay.iter().any(|o| blob_overlaps(o, lo, hi))
+    });
+    merged.extend(overlay);
+    merged.sort_by_key(|b| b.start_id);
+    merged
 }
 
 // ---------------------------------------------------------------------------
@@ -1451,6 +1515,128 @@ mod tests {
             data: DataSource::InMemory(Vec::new()),
         };
         assert!(reader.find_blob(1).is_none());
+    }
+
+    // -----------------------------------------------------------------------
+    // merge_index_tiers (idx0 overlay + idx1/idx2 base) — issue #87
+    // -----------------------------------------------------------------------
+
+    fn loc(start_id: i64, id_range: u32) -> BlobLoc {
+        BlobLoc {
+            pg: start_id as u64, // arbitrary but distinct; unused by the merge
+            size: id_range,
+            id_range,
+            start_id,
+        }
+    }
+
+    #[test]
+    fn merge_tiers_empty_overlay_returns_base() {
+        // idx0 absent (or only remove-flagged) → base tier is used verbatim.
+        let base = vec![loc(1, 10), loc(11, 10)];
+        let merged = merge_index_tiers(base.clone(), Vec::new());
+        assert_eq!(merged.len(), 2);
+        assert_eq!(merged.iter().map(|b| b.id_range as u64).sum::<u64>(), 20);
+        assert_eq!(merged[0].start_id, 1);
+        assert_eq!(merged[1].start_id, 11);
+    }
+
+    #[test]
+    fn merge_tiers_empty_base_returns_overlay() {
+        // Legacy path: only idx0 populated.
+        let overlay = vec![loc(1, 5)];
+        let merged = merge_index_tiers(Vec::new(), overlay);
+        assert_eq!(merged.len(), 1);
+        assert_eq!(merged[0].start_id, 1);
+    }
+
+    #[test]
+    fn merge_tiers_disjoint_tail_unions() {
+        // The real regression: idx1/idx2 holds rows 1..=20, idx0 holds the
+        // appended tail 21..=30. Both tiers must survive.
+        let base = vec![loc(1, 10), loc(11, 10)];
+        let overlay = vec![loc(21, 10)];
+        let merged = merge_index_tiers(base, overlay);
+        assert_eq!(merged.len(), 3);
+        // Monotonic by start_id and total row count is the union.
+        let starts: Vec<i64> = merged.iter().map(|b| b.start_id).collect();
+        assert_eq!(starts, vec![1, 11, 21]);
+        assert_eq!(merged.iter().map(|b| b.id_range as u64).sum::<u64>(), 30);
+    }
+
+    #[test]
+    fn merge_tiers_overlay_wins_on_overlap() {
+        // idx0 rewrites the last blob (rows 6..=10). The stale base blob for
+        // that range is dropped; the earlier base blob and the overlay remain,
+        // so every row is covered exactly once with idx0's copy winning.
+        let base = vec![loc(1, 5), loc(6, 5)];
+        let overlay = vec![loc(6, 5)];
+        let merged = merge_index_tiers(base, overlay);
+        assert_eq!(merged.len(), 2);
+        assert_eq!(merged.iter().map(|b| b.id_range as u64).sum::<u64>(), 10);
+        // The blob covering row 6 is the overlay entry (pg mirrors start_id in
+        // the base loc() but the overlay's is the one retained — both share
+        // start_id 6, so assert the count/coverage instead).
+        assert_eq!(merged[0].start_id, 1);
+        assert_eq!(merged[1].start_id, 6);
+    }
+
+    #[test]
+    fn merge_tiers_drops_synthetic_base_when_overlay_present() {
+        // A synthetic all-covering base blob (id_range == 0) must not mask real
+        // overlay locators.
+        let base = vec![loc(1, 0)];
+        let overlay = vec![loc(1, 5), loc(6, 5)];
+        let merged = merge_index_tiers(base, overlay);
+        assert_eq!(merged.len(), 2);
+        assert!(merged.iter().all(|b| b.id_range != 0));
+    }
+
+    /// Build a v1 `idx1` buffer: full KColumnHdr followed by `num_blocks`
+    /// 24-byte block locators (used here as the base tier, no idx2).
+    fn build_idx1_v1_with_locs(
+        data_eof: u64,
+        page_size: u32,
+        locs: &[(u64, u32, u32, i64)],
+    ) -> Vec<u8> {
+        let mut buf = vec![0u8; 40];
+        LittleEndian::write_u32(&mut buf[0..4], KDB_ENDIAN_MAGIC);
+        LittleEndian::write_u32(&mut buf[4..8], 1); // version
+        LittleEndian::write_u64(&mut buf[8..16], data_eof);
+        LittleEndian::write_u64(&mut buf[16..24], 0); // idx2_eof
+        LittleEndian::write_u32(&mut buf[24..28], locs.len() as u32); // num_blocks
+        LittleEndian::write_u32(&mut buf[28..32], page_size);
+        buf[32] = 0; // checksum
+        for &(pg, size, id_range, start_id) in locs {
+            buf.extend_from_slice(&build_blob_loc(pg, size, id_range, start_id));
+        }
+        buf
+    }
+
+    #[test]
+    fn from_parts_merges_v1_base_with_idx0_overlay() {
+        // Base (idx1 block locs): rows 1..=16 as two blobs of 8.
+        // Overlay (idx0): appended tail rows 17..=24.
+        // Before the fix, the non-empty idx0 masked the idx1 base entirely,
+        // yielding row_count == 8 instead of 24.
+        let idx1 = build_idx1_v1_with_locs(1000, 1, &[(0, 8, 8, 1), (8, 8, 8, 9)]);
+        let idx0 = build_blob_loc(16, 8, 8, 17);
+
+        let reader = ColumnReader::from_parts(&idx1, &idx0, &[], &[], Vec::new()).unwrap();
+
+        assert_eq!(reader.blob_count(), 3, "all three blobs must be present");
+        assert_eq!(
+            reader.row_count(),
+            24,
+            "base + overlay rows must both count"
+        );
+        assert_eq!(reader.first_row_id(), Some(1));
+
+        // A row from the base tier resolves to a base blob…
+        assert_eq!(reader.find_blob(4).unwrap().start_id, 1);
+        assert_eq!(reader.find_blob(12).unwrap().start_id, 9);
+        // …and a row from the idx0 overlay resolves to the overlay blob.
+        assert_eq!(reader.find_blob(20).unwrap().start_id, 17);
     }
 
     // -----------------------------------------------------------------------
