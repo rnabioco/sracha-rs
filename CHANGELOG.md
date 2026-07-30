@@ -4,6 +4,13 @@
 
 ### Fixes
 
+- Stop the download progress bar from overstating progress when chunks retry
+  (#89). Bytes were credited as they arrived, but a retried chunk re-fetches
+  from byte zero, so every retry counted its bytes again — a stalled 37 GiB
+  ENA transfer displayed `30.99 GiB/30.99 GiB  eta 0s` while chunks were
+  still outstanding, reading as a near-miss when it was nowhere close. A
+  failed attempt's bytes are now rolled back, so the bar reflects only data
+  actually on disk.
 - Retry an interrupted `--prefer-ena` transfer instead of aborting the run
   (#89). The per-chunk retry budget spans roughly a minute; ENA outages last
   longer, so a single chunk exhausting its attempts would abort a transfer
