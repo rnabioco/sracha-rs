@@ -42,6 +42,7 @@ fn backoff_base_ms(attempt: u32) -> u64 {
 const MEDIUM_FILE_CONNECTIONS: usize = 24;
 
 /// Configuration for parallel chunked downloads.
+#[derive(Clone)]
 pub struct DownloadConfig {
     /// Number of parallel connections (default 8).
     pub connections: usize,
@@ -72,6 +73,151 @@ pub struct DownloadConfig {
     /// archive magic (`NCBI.sra`) so a corrupt `.sracha-tmp-*.sra` cannot
     /// silently feed garbage to the VDB decoder.
     pub expected_prefix: Option<Vec<u8>>,
+}
+
+/// How many times to re-enter a resumable transfer, and how long to wait
+/// between attempts.
+///
+/// The per-chunk retry loop in [`download_chunk`] rides out a host that is
+/// briefly unhappy — a few seconds of backoff across [`MAX_RETRIES`]
+/// attempts. It cannot ride out an outage measured in minutes, which is what
+/// ENA produces during an instability window: one chunk burns its attempts,
+/// its error aborts the whole file, and a multi-hour transfer that was nearly
+/// finished exits with the user left to re-run it by hand.
+///
+/// This policy governs the outer loop, which waits far longer and then
+/// resumes from the `.sracha-progress` sidecar. Completed chunks are not
+/// re-fetched, so a retry costs only the bytes still missing.
+#[derive(Debug, Clone)]
+pub struct TransferRetryPolicy {
+    /// Total whole-file attempts, including the first. `1` disables retrying.
+    pub attempts: u32,
+    /// Delay before the first resume; doubles on each subsequent attempt.
+    pub base_delay: std::time::Duration,
+    /// Upper bound on any single delay, before jitter.
+    pub cap_delay: std::time::Duration,
+}
+
+impl Default for TransferRetryPolicy {
+    fn default() -> Self {
+        Self {
+            attempts: 4,
+            base_delay: std::time::Duration::from_secs(30),
+            cap_delay: std::time::Duration::from_secs(300),
+        }
+    }
+}
+
+impl TransferRetryPolicy {
+    /// Disable outer retries entirely.
+    pub fn none() -> Self {
+        Self {
+            attempts: 1,
+            ..Self::default()
+        }
+    }
+
+    /// Deterministic exponential delay before `attempt` (1-based), capped.
+    /// Jitter is added by the caller so this stays pure and testable.
+    fn base_delay_for(&self, attempt: u32) -> std::time::Duration {
+        let shift = attempt.saturating_sub(1).min(31);
+        self.base_delay
+            .saturating_mul(1u32 << shift)
+            .min(self.cap_delay)
+    }
+}
+
+/// Is `e` worth another whole-file attempt?
+///
+/// Only transport failures are, because those leave the partial file and its
+/// sidecar intact for a resume. The others would either waste the wait or do
+/// the wrong thing: a cancellation is the user's decision; a checksum
+/// mismatch has already deleted the output, so "resuming" would silently
+/// become a full re-download of a file we have no reason to think will hash
+/// differently; and an I/O error is usually a full disk or bad permissions,
+/// which waiting does not fix.
+fn is_resumable_transfer_error(e: &Error) -> bool {
+    matches!(e, Error::Http(_) | Error::Download { .. })
+}
+
+/// [`download_file`], re-entered on transport failure so a resumable transfer
+/// survives an outage longer than the per-chunk retry budget.
+///
+/// Each retry resumes via the progress sidecar rather than starting over.
+/// Retrying is skipped when `config.resume` is off, since every attempt would
+/// then re-fetch the file from byte zero.
+pub async fn download_file_with_retries(
+    urls: &[String],
+    expected_size: u64,
+    expected_md5: Option<&str>,
+    output_path: &Path,
+    config: &DownloadConfig,
+    policy: &TransferRetryPolicy,
+) -> Result<DownloadResult> {
+    let attempts = if config.resume {
+        policy.attempts.max(1)
+    } else {
+        1
+    };
+
+    // `force` means "start fresh". That is right for the first attempt and
+    // wrong for every later one: left set, it would delete the partial file
+    // and sidecar each time, so each "resume" would restart from zero.
+    let resume_config = if config.force {
+        let mut c = config.clone();
+        c.force = false;
+        Some(c)
+    } else {
+        None
+    };
+
+    let mut last_error: Option<Error> = None;
+
+    for attempt in 0..attempts {
+        if attempt > 0 {
+            let base = policy.base_delay_for(attempt);
+            let delay = base
+                + std::time::Duration::from_millis(crate::util::jitter_ms(
+                    base.as_millis().min(u128::from(u64::MAX)) as u64,
+                ));
+            tracing::warn!(
+                "transfer failed ({}); resuming {} in {:?} (attempt {}/{attempts})",
+                last_error
+                    .as_ref()
+                    .map(|e| e.to_string())
+                    .unwrap_or_default(),
+                output_path.display(),
+                delay,
+                attempt + 1,
+            );
+            // The pause can run to minutes; say so rather than leaving a
+            // stalled progress bar as the only sign of life.
+            eprintln!(
+                "warning: transfer interrupted — resuming in {}s (attempt {}/{attempts})",
+                delay.as_secs(),
+                attempt + 1,
+            );
+            tokio::time::sleep(delay).await;
+        }
+
+        let cfg = if attempt == 0 {
+            config
+        } else {
+            resume_config.as_ref().unwrap_or(config)
+        };
+
+        match download_file(urls, expected_size, expected_md5, output_path, cfg).await {
+            Ok(result) => return Ok(result),
+            Err(e) if is_resumable_transfer_error(&e) => last_error = Some(e),
+            // Not worth another attempt — surface it now.
+            Err(e) => return Err(e),
+        }
+    }
+
+    Err(last_error.unwrap_or_else(|| Error::Download {
+        accession: String::new(),
+        message: "transfer failed with no error captured".into(),
+    }))
 }
 
 impl Default for DownloadConfig {
@@ -1176,6 +1322,53 @@ mod tests {
         assert_eq!(backoff_base_ms(3), 2000);
         assert_eq!(backoff_base_ms(4), 4000);
         assert_eq!(backoff_base_ms(5), 8000);
+    }
+
+    #[test]
+    fn test_transfer_retry_policy_defaults() {
+        let p = TransferRetryPolicy::default();
+        assert_eq!(p.attempts, 4);
+        assert_eq!(p.base_delay, std::time::Duration::from_secs(30));
+        assert_eq!(p.cap_delay, std::time::Duration::from_secs(300));
+        assert_eq!(TransferRetryPolicy::none().attempts, 1);
+    }
+
+    #[test]
+    fn test_transfer_retry_delay_exponential_and_capped() {
+        let p = TransferRetryPolicy::default();
+        assert_eq!(p.base_delay_for(1), std::time::Duration::from_secs(30));
+        assert_eq!(p.base_delay_for(2), std::time::Duration::from_secs(60));
+        assert_eq!(p.base_delay_for(3), std::time::Duration::from_secs(120));
+        assert_eq!(p.base_delay_for(4), std::time::Duration::from_secs(240));
+        // Capped from here on, with no overflow from the shift.
+        assert_eq!(p.base_delay_for(5), std::time::Duration::from_secs(300));
+        assert_eq!(p.base_delay_for(64), std::time::Duration::from_secs(300));
+        assert_eq!(
+            p.base_delay_for(u32::MAX),
+            std::time::Duration::from_secs(300)
+        );
+    }
+
+    #[test]
+    fn test_only_transport_errors_are_resumable() {
+        assert!(is_resumable_transfer_error(&Error::Download {
+            accession: String::new(),
+            message: "connection reset".into(),
+        }));
+
+        // A cancellation is the user's call, a checksum mismatch already
+        // deleted the output, and I/O errors (e.g. a full disk) don't heal
+        // by waiting — none should burn a retry.
+        assert!(!is_resumable_transfer_error(&Error::Cancelled {
+            output_files: vec![],
+        }));
+        assert!(!is_resumable_transfer_error(&Error::ChecksumMismatch {
+            expected: "a".into(),
+            actual: "b".into(),
+        }));
+        assert!(!is_resumable_transfer_error(&Error::Io(
+            std::io::Error::other("no space left on device"),
+        )));
     }
 
     #[test]

@@ -9,7 +9,9 @@ use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
-use sracha_core::download::{DownloadConfig, download_file};
+use sracha_core::download::{
+    DownloadConfig, TransferRetryPolicy, download_file, download_file_with_retries,
+};
 use wiremock::matchers::{method, path};
 use wiremock::{Mock, MockServer, Request, Respond, ResponseTemplate};
 
@@ -432,5 +434,235 @@ async fn download_file_resumes_missing_chunk_via_sidecar() {
     assert!(
         !sidecar.exists(),
         "sidecar is cleaned up after a successful completion"
+    );
+}
+
+/// A `Range`-aware responder that fails one chunk hard enough to exhaust the
+/// per-chunk retry budget, then relents. Models an outage that outlives the
+/// inner retries but not the outer resume loop.
+struct OutageResponder {
+    body: Vec<u8>,
+    fail_start: u64,
+    /// How many requests for `fail_start` to reject before serving it.
+    fail_times: u64,
+    failures: Arc<AtomicU64>,
+    requested_starts: Arc<Mutex<Vec<u64>>>,
+}
+
+impl Respond for OutageResponder {
+    fn respond(&self, request: &Request) -> ResponseTemplate {
+        let raw = request
+            .headers
+            .get("range")
+            .and_then(|v| v.to_str().ok())
+            .and_then(|v| v.strip_prefix("bytes="))
+            .unwrap_or("");
+        let (start, end) = raw
+            .split_once('-')
+            .and_then(|(a, b)| Some((a.parse::<u64>().ok()?, b.parse::<u64>().ok()?)))
+            .expect("test always sends a well-formed byte range");
+
+        self.requested_starts.lock().unwrap().push(start);
+
+        if start == self.fail_start && self.failures.load(Ordering::SeqCst) < self.fail_times {
+            self.failures.fetch_add(1, Ordering::SeqCst);
+            return ResponseTemplate::new(503);
+        }
+        ResponseTemplate::new(206).set_body_bytes(self.body[start as usize..=end as usize].to_vec())
+    }
+}
+
+#[tokio::test]
+async fn download_file_with_retries_resumes_after_exhausting_chunk_retries() {
+    // One chunk fails 5 times — the full per-chunk budget (MAX_RETRIES) — so
+    // the first whole-file attempt errors out. The outer loop must then
+    // resume from the sidecar and finish, re-fetching ONLY the failed chunk.
+    const CHUNK: u64 = 8 * 1024 * 1024;
+    const CHUNK_RETRY_BUDGET: u64 = 5;
+    let size = (5 * CHUNK) as usize; // 40 MiB => chunks at 0,8,16,24,32 MiB
+    let fail_offset = 3 * CHUNK;
+
+    let payload: Vec<u8> = (0..size).map(|i| (i * 13 + 5) as u8).collect();
+    let expected_md5 = md5_hex(&payload);
+    let requested = Arc::new(Mutex::new(Vec::<u64>::new()));
+
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/outage"))
+        .respond_with(OutageResponder {
+            body: payload.clone(),
+            fail_start: fail_offset,
+            fail_times: CHUNK_RETRY_BUDGET,
+            failures: Arc::new(AtomicU64::new(0)),
+            requested_starts: requested.clone(),
+        })
+        .mount(&server)
+        .await;
+
+    let url = format!("{}/outage", server.uri());
+    let (_dir, out) = tmp_out("outage.sra");
+
+    let cfg = DownloadConfig {
+        connections: 4,
+        chunk_size: CHUNK,
+        resume: true,
+        ..test_config()
+    };
+    // Near-zero delays: the timing policy is unit-tested separately, this
+    // test is about the loop re-entering and resuming.
+    let policy = TransferRetryPolicy {
+        attempts: 3,
+        base_delay: std::time::Duration::from_millis(10),
+        cap_delay: std::time::Duration::from_millis(10),
+    };
+
+    let res = download_file_with_retries(
+        std::slice::from_ref(&url),
+        size as u64,
+        Some(&expected_md5),
+        &out,
+        &cfg,
+        &policy,
+    )
+    .await
+    .expect("outer retry must resume and complete the transfer");
+
+    assert_eq!(res.md5.as_deref(), Some(expected_md5.as_str()));
+    assert_eq!(std::fs::read(&out).unwrap(), payload);
+
+    // The decisive assertion: chunks that succeeded on the first attempt were
+    // NOT re-fetched by the retry. Only the failed chunk was requested again,
+    // which is what makes an outer retry cheap rather than a full restart.
+    let starts = requested.lock().unwrap().clone();
+    for offset in [0, CHUNK, 2 * CHUNK, 4 * CHUNK] {
+        assert_eq!(
+            starts.iter().filter(|&&s| s == offset).count(),
+            1,
+            "chunk at {offset} must be fetched exactly once across both attempts"
+        );
+    }
+    assert_eq!(
+        starts.iter().filter(|&&s| s == fail_offset).count() as u64,
+        CHUNK_RETRY_BUDGET + 1,
+        "failed chunk: 5 rejected attempts, then one success on the resume"
+    );
+}
+
+#[tokio::test]
+async fn download_file_with_retries_does_not_retry_checksum_mismatch() {
+    // A corrupt body is not a transport failure: download_file deletes the
+    // output, so a "resume" would silently become a full re-download. The
+    // outer loop must surface it on the first attempt instead of burning
+    // every retry re-fetching a file that will hash the same way again.
+    let server = MockServer::start().await;
+    let size = 33 * 1024 * 1024usize;
+    let payload: Vec<u8> = (0..size).map(|i| (i * 7 + 1) as u8).collect();
+    let requested = Arc::new(Mutex::new(Vec::<u64>::new()));
+
+    Mock::given(method("GET"))
+        .and(path("/corrupt"))
+        .respond_with(OutageResponder {
+            body: payload.clone(),
+            fail_start: u64::MAX, // never inject a transport failure
+            fail_times: 0,
+            failures: Arc::new(AtomicU64::new(0)),
+            requested_starts: requested.clone(),
+        })
+        .mount(&server)
+        .await;
+
+    let url = format!("{}/corrupt", server.uri());
+    let (_dir, out) = tmp_out("corrupt.sra");
+
+    let cfg = DownloadConfig {
+        connections: 1,
+        chunk_size: 64 * 1024 * 1024, // one chunk covering the whole file
+        resume: true,
+        ..test_config()
+    };
+    let policy = TransferRetryPolicy {
+        attempts: 3,
+        base_delay: std::time::Duration::from_millis(10),
+        cap_delay: std::time::Duration::from_millis(10),
+    };
+
+    let wrong_md5 = md5_hex(b"not the payload");
+    let err = download_file_with_retries(
+        std::slice::from_ref(&url),
+        size as u64,
+        Some(&wrong_md5),
+        &out,
+        &cfg,
+        &policy,
+    )
+    .await
+    .err()
+    .expect("checksum mismatch must fail");
+    assert!(
+        matches!(err, sracha_core::error::Error::ChecksumMismatch { .. }),
+        "expected ChecksumMismatch, got {err:?}"
+    );
+    assert_eq!(
+        requested.lock().unwrap().len(),
+        1,
+        "must not re-download after a checksum mismatch"
+    );
+}
+
+#[tokio::test]
+async fn download_file_with_retries_skips_retrying_when_resume_disabled() {
+    // With resume off there is no sidecar, so every attempt would restart
+    // from byte zero — retrying a 40 GiB transfer that way is worse than
+    // failing fast. One attempt only.
+    let server = MockServer::start().await;
+    let size = 33 * 1024 * 1024usize;
+    let payload: Vec<u8> = (0..size).map(|i| (i * 3 + 2) as u8).collect();
+    let requested = Arc::new(Mutex::new(Vec::<u64>::new()));
+
+    Mock::given(method("GET"))
+        .and(path("/always-fails"))
+        .respond_with(OutageResponder {
+            body: payload.clone(),
+            fail_start: 0,
+            fail_times: u64::MAX, // never recovers
+            failures: Arc::new(AtomicU64::new(0)),
+            requested_starts: requested.clone(),
+        })
+        .mount(&server)
+        .await;
+
+    let url = format!("{}/always-fails", server.uri());
+    let (_dir, out) = tmp_out("noresume.sra");
+
+    let cfg = DownloadConfig {
+        connections: 1,
+        chunk_size: 64 * 1024 * 1024,
+        resume: false,
+        ..test_config()
+    };
+    let policy = TransferRetryPolicy {
+        attempts: 4,
+        base_delay: std::time::Duration::from_millis(10),
+        cap_delay: std::time::Duration::from_millis(10),
+    };
+
+    let expected_md5 = md5_hex(&payload);
+    let _ = download_file_with_retries(
+        std::slice::from_ref(&url),
+        size as u64,
+        Some(&expected_md5),
+        &out,
+        &cfg,
+        &policy,
+    )
+    .await
+    .err()
+    .expect("transfer must fail");
+
+    // Exactly one whole-file attempt: the chunk's own 5 retries, no more.
+    assert_eq!(
+        requested.lock().unwrap().len(),
+        5,
+        "resume disabled => a single whole-file attempt (5 chunk retries)"
     );
 }

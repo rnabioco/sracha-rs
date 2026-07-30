@@ -135,20 +135,25 @@ async fn main() -> Result<()> {
                         format_size(file.size),
                         out.display(),
                     );
-                    if let Err(e) = sracha_core::download::download_file(
+                    // ENA outages outlast the per-chunk retry budget, so
+                    // re-enter the transfer (resuming from the sidecar)
+                    // rather than losing a near-complete download.
+                    if let Err(e) = sracha_core::download::download_file_with_retries(
                         std::slice::from_ref(&file.url),
                         file.size,
                         Some(&file.md5),
                         &out,
                         &dl_config,
+                        &sracha_core::download::TransferRetryPolicy::default(),
                     )
                     .await
                     {
                         // Partial file + sidecar are preserved by download_file;
                         // re-running resumes rather than starting over.
                         eprintln!(
-                            "{}: ENA transfer failed ({e}); partial download and resume \
-                             state kept at {} — re-run with --prefer-ena to resume",
+                            "{}: ENA transfer failed after all resume attempts ({e}); \
+                             partial download and resume state kept at {} — re-run with \
+                             --prefer-ena to pick up where it left off",
                             style::header(acc),
                             style::path(out.display()),
                         );
