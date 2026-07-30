@@ -377,6 +377,55 @@ async fn download_chunk(
     }))
 }
 
+/// Progress-bar credit for one chunk attempt, rolled back unless the attempt
+/// completes.
+///
+/// A retried chunk re-fetches from byte zero, so bytes credited by a failed
+/// attempt must not stay on the bar — otherwise a transfer that retries a lot
+/// displays progress it has not made. That is what made a stalled 37 GiB ENA
+/// download report `30.99 GiB/30.99 GiB  eta 0s` while chunks were still
+/// outstanding, reading as a near-miss when it was nowhere close.
+///
+/// Rolling back in `Drop` covers every early return, including the `?` inside
+/// the streaming loop.
+struct ChunkTicks<'a> {
+    pb: Option<&'a indicatif::ProgressBar>,
+    credited: u64,
+    committed: bool,
+}
+
+impl<'a> ChunkTicks<'a> {
+    fn new(pb: Option<&'a indicatif::ProgressBar>) -> Self {
+        Self {
+            pb,
+            credited: 0,
+            committed: false,
+        }
+    }
+
+    fn credit(&mut self, n: u64) {
+        if let Some(pb) = self.pb {
+            pb.inc(n);
+            self.credited += n;
+        }
+    }
+
+    /// The chunk landed — its bytes stay on the bar.
+    fn commit(&mut self) {
+        self.committed = true;
+    }
+}
+
+impl Drop for ChunkTicks<'_> {
+    fn drop(&mut self) {
+        if !self.committed
+            && let Some(pb) = self.pb
+        {
+            pb.dec(self.credited);
+        }
+    }
+}
+
 /// Single attempt to download a chunk.
 ///
 /// Streams hyper's response pieces through a bounded mpsc into a
@@ -444,6 +493,9 @@ async fn try_download_chunk(
     const PB_TICK_THRESHOLD: u64 = 256 * 1024;
     let mut feed_error: Option<Error> = None;
     let mut pending_ticks = 0u64;
+    // Credited through a guard so a failed attempt's bytes are rolled back
+    // rather than left on the bar for the retry to double-count.
+    let mut ticks = ChunkTicks::new(progress);
     while let Some(piece) = response.chunk().await? {
         let n = piece.len() as u64;
         if tx.send(piece).await.is_err() {
@@ -456,19 +508,15 @@ async fn try_download_chunk(
             });
             break;
         }
-        if let Some(pb) = progress {
-            pending_ticks += n;
-            if pending_ticks >= PB_TICK_THRESHOLD {
-                pb.inc(pending_ticks);
-                pending_ticks = 0;
-            }
+        pending_ticks += n;
+        if pending_ticks >= PB_TICK_THRESHOLD {
+            ticks.credit(pending_ticks);
+            pending_ticks = 0;
         }
     }
     drop(tx);
-    if let Some(pb) = progress
-        && pending_ticks > 0
-    {
-        pb.inc(pending_ticks);
+    if pending_ticks > 0 {
+        ticks.credit(pending_ticks);
     }
 
     let bytes_written = writer
@@ -495,6 +543,8 @@ async fn try_download_chunk(
         });
     }
 
+    // The chunk is on disk in full — its bytes stay counted.
+    ticks.commit();
     Ok(())
 }
 
@@ -1322,6 +1372,53 @@ mod tests {
         assert_eq!(backoff_base_ms(3), 2000);
         assert_eq!(backoff_base_ms(4), 4000);
         assert_eq!(backoff_base_ms(5), 8000);
+    }
+
+    #[test]
+    fn test_chunk_ticks_rolled_back_when_attempt_fails() {
+        // A failed attempt must leave the bar where it started: the retry
+        // re-fetches the chunk from byte zero and credits it again, so
+        // keeping the first attempt's bytes would double-count them.
+        let pb = indicatif::ProgressBar::hidden();
+        pb.set_length(1000);
+        pb.set_position(100); // an earlier, completed chunk
+
+        {
+            let mut ticks = ChunkTicks::new(Some(&pb));
+            ticks.credit(250);
+            ticks.credit(150);
+            assert_eq!(pb.position(), 500, "credits show while the attempt runs");
+            // Dropped without commit — the attempt failed.
+        }
+
+        assert_eq!(
+            pb.position(),
+            100,
+            "a failed attempt must not leave bytes on the bar"
+        );
+    }
+
+    #[test]
+    fn test_chunk_ticks_kept_when_attempt_commits() {
+        let pb = indicatif::ProgressBar::hidden();
+        pb.set_length(1000);
+
+        {
+            let mut ticks = ChunkTicks::new(Some(&pb));
+            ticks.credit(400);
+            ticks.commit();
+        }
+
+        assert_eq!(pb.position(), 400, "a completed chunk keeps its bytes");
+    }
+
+    #[test]
+    fn test_chunk_ticks_without_progress_bar_is_inert() {
+        // `--no-progress` passes None; crediting and rolling back must be
+        // no-ops rather than panicking.
+        let mut ticks = ChunkTicks::new(None);
+        ticks.credit(1024);
+        drop(ticks);
     }
 
     #[test]
