@@ -117,9 +117,7 @@ async fn main() -> Result<()> {
                     // ENA serves from a single Apache host; cap concurrency and
                     // skip the S3-tuned auto-scale floor to avoid connection
                     // limits. --connections may still lower it further.
-                    connections: args
-                        .connections
-                        .min(sracha_core::ena::ENA_MAX_CONNECTIONS),
+                    connections: args.connections.min(sracha_core::ena::ENA_MAX_CONNECTIONS),
                     auto_scale_connections: false,
                     force: args.force,
                     validate: !args.no_validate,

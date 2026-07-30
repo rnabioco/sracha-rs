@@ -345,7 +345,9 @@ mod tests {
     #[test]
     fn ftp_to_https_rewrites_scheme() {
         assert_eq!(
-            ftp_to_https("ftp://ftp.sra.ebi.ac.uk/vol1/fastq/SRR000/SRR000001/SRR000001_1.fastq.gz"),
+            ftp_to_https(
+                "ftp://ftp.sra.ebi.ac.uk/vol1/fastq/SRR000/SRR000001/SRR000001_1.fastq.gz"
+            ),
             "https://ftp.sra.ebi.ac.uk/vol1/fastq/SRR000/SRR000001/SRR000001_1.fastq.gz"
         );
     }

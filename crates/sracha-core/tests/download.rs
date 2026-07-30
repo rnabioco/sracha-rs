@@ -394,10 +394,10 @@ async fn download_file_resumes_missing_chunk_via_sidecar() {
         .expect("first run must fail on the injected bad chunk");
     let _ = err;
 
-    let sidecar = out
-        .parent()
-        .unwrap()
-        .join(format!(".{}.sracha-progress", out.file_name().unwrap().to_str().unwrap()));
+    let sidecar = out.parent().unwrap().join(format!(
+        ".{}.sracha-progress",
+        out.file_name().unwrap().to_str().unwrap()
+    ));
     assert!(sidecar.exists(), "sidecar must persist partial progress");
     assert_eq!(
         std::fs::metadata(&out).unwrap().len(),
