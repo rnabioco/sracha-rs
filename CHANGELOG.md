@@ -4,6 +4,16 @@
 
 ### Fixes
 
+- Account for FASTQ output and ENA sizes in the download confirmation and
+  disk preflight (#91 follow-up). The >100 GiB confirmation prompt summed
+  `.sra` sizes, so under `--prefer-ena` it could be evaluated against
+  archives that are never downloaded — it now uses the same per-run sizes as
+  the disk check, and the table shown alongside it reports them too. The
+  `get` preflight also counted only the archive, but the decoder writes FASTQ
+  beside the temp `.sra` before it is removed, so peak usage is both; output
+  size is now estimated from RunInfo spot counts and read lengths (and left
+  out entirely when RunInfo is unavailable, rather than guessed).
+
 - Size the disk-space preflight by what will actually be downloaded (#91).
   The check summed the NCBI `.sra` object size even under `--prefer-ena`,
   where that object is never fetched — so it measured a file that would not
