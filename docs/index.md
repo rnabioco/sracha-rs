@@ -92,11 +92,11 @@ local build required.
 
 ```bash
 # Docker / Podman
-docker run --rm quay.io/biocontainers/sracha:0.4.1--h54198d6_0 sracha --help
+docker run --rm quay.io/biocontainers/sracha:0.4.2--h54198d6_0 sracha --help
 
 # Singularity / Apptainer
 singularity run \
-  https://depot.galaxyproject.org/singularity/sracha:0.4.1--h54198d6_0 sracha --help
+  https://depot.galaxyproject.org/singularity/sracha:0.4.2--h54198d6_0 sracha --help
 ```
 
 These tags track the current Bioconda release and are refreshed weekly by a
@@ -112,8 +112,8 @@ or let the `conda` directive resolve it:
 
 ```groovy
 process SRACHA_GET {
-    container 'quay.io/biocontainers/sracha:0.4.1--h54198d6_0'
-    // or: conda 'bioconda::sracha=0.4.1'
+    container 'quay.io/biocontainers/sracha:0.4.2--h54198d6_0'
+    // or: conda 'bioconda::sracha=0.4.2'
     // ...
 }
 ```
