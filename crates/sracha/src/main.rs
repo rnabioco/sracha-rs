@@ -209,11 +209,13 @@ async fn main() -> Result<()> {
                 "Resolved {} accession(s)",
                 style::count(resolved_all.len()),
             ));
-            check_download_confirmation(&resolved_all, args.yes, has_projects)?;
             // Only NCBI-served runs reach here; the ENA set was checked and
             // downloaded above, so `available_space` already reflects it.
-            let sra_bytes: u64 = resolved_all.iter().map(|r| r.sra_file.size).sum();
-            check_disk_space(sra_bytes, &args.output_dir)?;
+            // `fetch` keeps the archive and decodes nothing, so the archive
+            // size is the whole requirement.
+            let sizes = expected_bytes_each(&resolved_all, &[], SraDisposition::KeepArchive);
+            check_download_confirmation(&resolved_all, &sizes, args.yes, has_projects)?;
+            check_disk_space(sizes.iter().sum(), &args.output_dir)?;
 
             for resolved in &resolved_all {
                 let acc = &resolved.accession;
@@ -520,11 +522,17 @@ async fn main() -> Result<()> {
                 vec![None; resolved_all.len()]
             };
 
-            check_download_confirmation(&resolved_all, args.yes, has_projects)?;
-            check_disk_space(
-                expected_download_bytes(&resolved_all, &ena_results),
-                &args.output_dir,
-            )?;
+            // `get` decodes each NCBI archive to FASTQ written beside it, so
+            // peak disk is archive + output. ENA-served runs skip both.
+            let sizes = expected_bytes_each(
+                &resolved_all,
+                &ena_results,
+                SraDisposition::DecodeToFastq {
+                    compressed: !matches!(compression, sracha_core::fastq::CompressionMode::None),
+                },
+            );
+            check_download_confirmation(&resolved_all, &sizes, args.yes, has_projects)?;
+            check_disk_space(sizes.iter().sum(), &args.output_dir)?;
 
             let format_label = if args.fasta { "FASTA" } else { "FASTQ" };
             tracing::info!(
@@ -956,7 +964,7 @@ async fn main() -> Result<()> {
                 InfoFormat::Table => {
                     if entries.len() > 1 {
                         // Project/multi-accession: summary table.
-                        print_info_table(&entries);
+                        print_info_table(&entries, None);
                     } else if let Some(InfoEntry::Ok(r)) = entries.first() {
                         print_resolved(r);
                     }
@@ -1609,7 +1617,11 @@ fn print_ena_section(accession: &str, resolved: Option<&sracha_core::ena::EnaRes
 /// Print a compact table for multiple accessions. Errored entries appear
 /// as rows with an `error` status (other columns dashed) and the error
 /// message is printed beneath the table.
-fn print_info_table(entries: &[InfoEntry<'_>]) {
+/// `size_overrides`, when given, is positionally aligned with `entries` and
+/// replaces the `.sra` size in the Size column and the total. Used so the
+/// confirmation table reflects ENA FASTQ sizes on the `--prefer-ena` path
+/// instead of archives that will never be downloaded.
+fn print_info_table(entries: &[InfoEntry<'_>], size_overrides: Option<&[u64]>) {
     use tabled::builder::Builder;
     use tabled::settings::object::{Columns, Rows};
     use tabled::settings::style::HorizontalLine;
@@ -1631,9 +1643,12 @@ fn print_info_table(entries: &[InfoEntry<'_>]) {
         "Source",
     ]);
 
-    for entry in entries {
+    for (idx, entry) in entries.iter().enumerate() {
         match entry {
             InfoEntry::Ok(r) => {
+                let row_size = size_overrides
+                    .and_then(|s| s.get(idx).copied())
+                    .unwrap_or(r.sra_file.size);
                 let layout = r
                     .run_info
                     .as_ref()
@@ -1691,12 +1706,12 @@ fn print_info_table(entries: &[InfoEntry<'_>]) {
                 } else {
                     "SRA"
                 };
-                total_size += r.sra_file.size;
+                total_size += row_size;
                 ok_count += 1;
 
                 builder.push_record([
                     r.accession.clone(),
-                    format_size(r.sra_file.size),
+                    format_size(row_size),
                     layout,
                     reads,
                     platform,
@@ -1910,17 +1925,23 @@ async fn resolve_accessions(
 ///
 /// Project downloads (SRP/PRJNA/etc.) always require `--yes` confirmation.
 /// Non-project downloads require `--yes` only when the total exceeds 500 GiB.
+/// `sizes` is what each run will actually put on disk (see
+/// [`expected_bytes_each`]), positionally aligned with `resolved`. Passing it
+/// rather than re-summing `sra_file.size` keeps the 100 GiB threshold — and
+/// the table the user is shown — describing the transfer that will really
+/// happen, which under `--prefer-ena` is not the `.sra` objects.
 fn check_download_confirmation(
     resolved: &[ResolvedAccession],
+    sizes: &[u64],
     yes: bool,
     has_projects: bool,
 ) -> Result<()> {
-    let total_size: u64 = resolved.iter().map(|r| r.sra_file.size).sum();
+    let total_size: u64 = sizes.iter().sum();
     let entries: Vec<InfoEntry> = resolved.iter().map(InfoEntry::Ok).collect();
 
     if has_projects && !yes {
         eprintln!();
-        print_info_table(&entries);
+        print_info_table(&entries, Some(sizes));
         eprintln!();
         anyhow::bail!(
             "project downloads require confirmation -- rerun with --yes / -y to proceed ({})",
@@ -1930,7 +1951,7 @@ fn check_download_confirmation(
 
     if total_size > LARGE_DOWNLOAD_THRESHOLD && !yes {
         eprintln!();
-        print_info_table(&entries);
+        print_info_table(&entries, Some(sizes));
         eprintln!();
         anyhow::bail!(
             "total download size {} exceeds 100 GiB -- rerun with --yes / -y to confirm",
@@ -1941,36 +1962,93 @@ fn check_download_confirmation(
     // For confirmed project downloads, still show the table for visibility.
     if has_projects {
         eprintln!();
-        print_info_table(&entries);
+        print_info_table(&entries, Some(sizes));
         eprintln!();
     }
 
     Ok(())
 }
 
-/// Total bytes the run set will actually write into the output directory.
+/// What a command does with a downloaded `.sra`, which determines how much
+/// disk the run needs at peak.
+#[derive(Clone, Copy, Debug)]
+enum SraDisposition {
+    /// `fetch`: the archive is the deliverable, nothing else is written.
+    KeepArchive,
+    /// `get`: the archive is decoded to FASTQ, which is written *alongside*
+    /// it — the temp `.sracha-tmp-<acc>.sra` is not removed until decode
+    /// finishes, so both exist at once.
+    DecodeToFastq { compressed: bool },
+}
+
+/// Assumed gzip/zstd ratio for FASTQ output.
 ///
-/// Sizing by `sra_file.size` alone is wrong under `--prefer-ena`: those runs
-/// are served as ENA FASTQ files and the NCBI `.sra` object is never fetched,
-/// so the check would measure a file that will not exist. That misses in both
-/// directions — refusing a transfer that would have fit, and passing one that
-/// runs out of disk partway (for SRR37428186 the `.sra` is 58.2 GiB while the
-/// ENA FASTQs total 72.9 GiB).
+/// Measured 6.0x on NovaSeq X data with binned quality scores (SRR37428186:
+/// ~441 GiB of FASTQ text for 72.9 GiB of `.gz`); older full-resolution
+/// quality strings compress closer to 3.5x. 5 sits between them and biases
+/// toward admitting a borderline transfer rather than refusing it — a false
+/// refusal blocks work outright, whereas a mild under-count is no worse than
+/// the behaviour this replaces.
+const FASTQ_COMPRESSION_RATIO: u64 = 5;
+
+/// Rough size of the FASTQ `get` will write for one run.
 ///
-/// `ena_results` is positionally aligned with `resolved`; `None` means ENA
-/// can't serve that run and the NCBI path will be used.
-fn expected_download_bytes(
+/// Returns 0 when RunInfo is missing (e.g. `--no-runinfo`): the preflight
+/// would rather under-count, as it always has, than refuse a download on a
+/// number it has no basis for.
+fn estimate_fastq_bytes(run_info: Option<&sracha_core::sdl::RunInfo>, compressed: bool) -> u64 {
+    let Some(ri) = run_info else { return 0 };
+    let Some(spots) = ri.spots else { return 0 };
+
+    // Per read within a spot: a header line, the bases, a `+` line, and an
+    // equal-length run of quality characters, plus the newlines.
+    const PER_READ_OVERHEAD: u64 = 40;
+    let per_spot: u64 = ri
+        .avg_read_len
+        .iter()
+        .map(|&len| PER_READ_OVERHEAD + 2 * u64::from(len) + 2)
+        .sum();
+
+    let uncompressed = spots.saturating_mul(per_spot);
+    if compressed {
+        uncompressed / FASTQ_COMPRESSION_RATIO
+    } else {
+        uncompressed
+    }
+}
+
+/// Bytes each run needs on disk at peak, positionally aligned with `resolved`.
+///
+/// Sizing by `sra_file.size` alone is wrong twice over. Under `--prefer-ena`
+/// the run is served as ENA FASTQ files and the `.sra` is never fetched, so
+/// the check would measure a file that will not exist — missing in both
+/// directions (for SRR37428186 the `.sra` is 58.2 GiB while the ENA FASTQs
+/// total 72.9 GiB). And on the NCBI `get` path the decoder writes FASTQ while
+/// the temp archive is still on disk, so peak is archive + output, not
+/// archive alone.
+///
+/// `ena_results` is positionally aligned with `resolved`; `None` (or a short
+/// slice) means ENA can't serve that run and the NCBI path will be used.
+fn expected_bytes_each(
     resolved: &[ResolvedAccession],
     ena_results: &[Option<sracha_core::ena::EnaResolved>],
-) -> u64 {
+    disposition: SraDisposition,
+) -> Vec<u64> {
     resolved
         .iter()
         .enumerate()
         .map(|(i, r)| match ena_results.get(i).and_then(|e| e.as_ref()) {
+            // ENA files land directly as the deliverable — no archive, no decode.
             Some(ena) => ena.total_size,
-            None => r.sra_file.size,
+            None => match disposition {
+                SraDisposition::KeepArchive => r.sra_file.size,
+                SraDisposition::DecodeToFastq { compressed } => r
+                    .sra_file
+                    .size
+                    .saturating_add(estimate_fastq_bytes(r.run_info.as_ref(), compressed)),
+            },
         })
-        .sum()
+        .collect()
 }
 
 /// Check that the target directory has enough free disk space for
@@ -2144,28 +2222,46 @@ mod tests {
     // check_download_confirmation
     // -----------------------------------------------------------------------
 
+    const HUGE: u64 = 200 * 1024 * 1024 * 1024;
+
     #[test]
     fn confirmation_ok_with_yes_flag() {
-        let resolved = vec![make_resolved_acc("SRR1", 200 * 1024 * 1024 * 1024)];
-        assert!(check_download_confirmation(&resolved, true, true).is_ok());
+        let resolved = vec![make_resolved_acc("SRR1", HUGE)];
+        assert!(check_download_confirmation(&resolved, &[HUGE], true, true).is_ok());
     }
 
     #[test]
     fn confirmation_required_for_projects() {
         let resolved = vec![make_resolved_acc("SRR1", 1000)];
-        assert!(check_download_confirmation(&resolved, false, true).is_err());
+        assert!(check_download_confirmation(&resolved, &[1000], false, true).is_err());
     }
 
     #[test]
     fn confirmation_required_for_large_downloads() {
-        let resolved = vec![make_resolved_acc("SRR1", 200 * 1024 * 1024 * 1024)];
-        assert!(check_download_confirmation(&resolved, false, false).is_err());
+        let resolved = vec![make_resolved_acc("SRR1", HUGE)];
+        assert!(check_download_confirmation(&resolved, &[HUGE], false, false).is_err());
     }
 
     #[test]
     fn confirmation_ok_for_small_non_project() {
         let resolved = vec![make_resolved_acc("SRR1", 1000)];
-        assert!(check_download_confirmation(&resolved, false, false).is_ok());
+        assert!(check_download_confirmation(&resolved, &[1000], false, false).is_ok());
+    }
+
+    #[test]
+    fn confirmation_threshold_follows_ena_size_not_archive_size() {
+        // A small .sra served by ENA as >100 GiB of FASTQ must still prompt;
+        // previously the threshold saw only the archive and waved it through.
+        let resolved = vec![make_resolved_acc("SRR1", 1000)];
+        assert!(check_download_confirmation(&resolved, &[HUGE], false, false).is_err());
+    }
+
+    #[test]
+    fn confirmation_not_triggered_by_archive_the_ena_path_skips() {
+        // Inverse: a huge .sra that ENA serves as a small FASTQ set must not
+        // demand confirmation for bytes that will never be downloaded.
+        let resolved = vec![make_resolved_acc("SRR1", HUGE)];
+        assert!(check_download_confirmation(&resolved, &[1000], false, false).is_ok());
     }
 
     // -----------------------------------------------------------------------
@@ -2194,7 +2290,7 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
-    // expected_download_bytes (regression: issue #91)
+    // expected_bytes_each (regression: issue #91)
     // -----------------------------------------------------------------------
 
     fn make_ena_resolved(accession: &str, total_size: u64) -> sracha_core::ena::EnaResolved {
@@ -2205,13 +2301,36 @@ mod tests {
         }
     }
 
+    /// A ResolvedAccession carrying enough RunInfo to size FASTQ output.
+    fn make_resolved_with_runinfo(
+        accession: &str,
+        size: u64,
+        spots: u64,
+        read_lens: &[u32],
+    ) -> ResolvedAccession {
+        let mut r = make_resolved_acc(accession, size);
+        r.run_info = Some(sracha_core::sdl::RunInfo {
+            nreads: read_lens.len(),
+            avg_read_len: read_lens.to_vec(),
+            spot_len: read_lens.iter().sum(),
+            spots: Some(spots),
+            ..Default::default()
+        });
+        r
+    }
+
+    fn total(v: Vec<u64>) -> u64 {
+        v.iter().sum()
+    }
+
     #[test]
     fn expected_bytes_uses_sra_size_without_ena() {
         let resolved = vec![
             make_resolved_acc("SRR1", 1024),
             make_resolved_acc("SRR2", 512),
         ];
-        assert_eq!(expected_download_bytes(&resolved, &[None, None]), 1536);
+        let sizes = expected_bytes_each(&resolved, &[None, None], SraDisposition::KeepArchive);
+        assert_eq!(total(sizes), 1536);
     }
 
     #[test]
@@ -2220,7 +2339,14 @@ mod tests {
         // FASTQs that will be written, not the .sra that never will be.
         let resolved = vec![make_resolved_acc("SRR1", 1024)];
         let ena = vec![Some(make_ena_resolved("SRR1", 4096))];
-        assert_eq!(expected_download_bytes(&resolved, &ena), 4096);
+        assert_eq!(
+            total(expected_bytes_each(
+                &resolved,
+                &ena,
+                SraDisposition::KeepArchive
+            )),
+            4096
+        );
     }
 
     #[test]
@@ -2236,7 +2362,14 @@ mod tests {
             None,
             Some(make_ena_resolved("SRR3", 20)),
         ];
-        assert_eq!(expected_download_bytes(&resolved, &ena), 10 + 2048 + 20);
+        assert_eq!(
+            total(expected_bytes_each(
+                &resolved,
+                &ena,
+                SraDisposition::KeepArchive
+            )),
+            10 + 2048 + 20
+        );
     }
 
     #[test]
@@ -2247,7 +2380,70 @@ mod tests {
             make_resolved_acc("SRR1", 1024),
             make_resolved_acc("SRR2", 512),
         ];
-        assert_eq!(expected_download_bytes(&resolved, &[]), 1536);
+        assert_eq!(
+            total(expected_bytes_each(
+                &resolved,
+                &[],
+                SraDisposition::KeepArchive
+            )),
+            1536
+        );
+    }
+
+    #[test]
+    fn expected_bytes_adds_fastq_output_when_decoding() {
+        // `get` writes FASTQ beside the temp archive, so peak is both. One
+        // spot of 2x100bp uncompressed: 2 * (40 + 200 + 2) = 484 bytes.
+        let resolved = vec![make_resolved_with_runinfo("SRR1", 1000, 1, &[100, 100])];
+        let sizes = expected_bytes_each(
+            &resolved,
+            &[],
+            SraDisposition::DecodeToFastq { compressed: false },
+        );
+        assert_eq!(total(sizes), 1000 + 484);
+    }
+
+    #[test]
+    fn expected_bytes_discounts_compressed_fastq_output() {
+        let resolved = vec![make_resolved_with_runinfo("SRR1", 1000, 1, &[100, 100])];
+        let sizes = expected_bytes_each(
+            &resolved,
+            &[],
+            SraDisposition::DecodeToFastq { compressed: true },
+        );
+        assert_eq!(total(sizes), 1000 + 484 / FASTQ_COMPRESSION_RATIO);
+    }
+
+    #[test]
+    fn expected_bytes_skips_fastq_estimate_without_runinfo() {
+        // No RunInfo (e.g. --no-runinfo) => no basis for an estimate, so the
+        // check under-counts as before rather than refusing on a guess.
+        let resolved = vec![make_resolved_acc("SRR1", 1000)];
+        let sizes = expected_bytes_each(
+            &resolved,
+            &[],
+            SraDisposition::DecodeToFastq { compressed: true },
+        );
+        assert_eq!(total(sizes), 1000);
+    }
+
+    #[test]
+    fn expected_bytes_ena_run_skips_archive_and_decode() {
+        // An ENA hit is served as FASTQ directly: no archive, no decode, so
+        // the decode disposition must not inflate it.
+        let resolved = vec![make_resolved_with_runinfo(
+            "SRR1",
+            999_999,
+            1000,
+            &[150, 150],
+        )];
+        let ena = vec![Some(make_ena_resolved("SRR1", 4096))];
+        let sizes = expected_bytes_each(
+            &resolved,
+            &ena,
+            SraDisposition::DecodeToFastq { compressed: true },
+        );
+        assert_eq!(total(sizes), 4096);
     }
 
     // -----------------------------------------------------------------------
