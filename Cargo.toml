@@ -3,7 +3,7 @@ resolver = "2"
 members = ["crates/sracha", "crates/sracha-core", "crates/sracha-vdb"]
 
 [workspace.package]
-version = "0.4.1"
+version = "0.4.2"
 edition = "2024"
 rust-version = "1.95"
 repository = "https://github.com/rnabioco/sracha-rs"
