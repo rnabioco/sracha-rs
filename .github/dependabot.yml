@@ -1,0 +1,38 @@
+version: 2
+
+updates:
+  # Rust dependencies. The root manifest is a workspace, so this covers
+  # sracha, sracha-core, and sracha-vdb.
+  - package-ecosystem: cargo
+    directory: /
+    schedule:
+      interval: weekly
+      day: monday
+      time: "06:00"
+      timezone: America/Denver
+    open-pull-requests-limit: 5
+    commit-message:
+      prefix: "deps"
+      include: scope
+    groups:
+      # Patch/minor bumps land as one PR so CI runs once for the batch.
+      cargo-minor-patch:
+        update-types: [minor, patch]
+    ignore:
+      # Rolling a major requires a code audit; do those by hand.
+      - dependency-name: "*"
+        update-types: [version-update:semver-major]
+
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: weekly
+      day: monday
+      time: "06:00"
+      timezone: America/Denver
+    open-pull-requests-limit: 5
+    commit-message:
+      prefix: "ci"
+    groups:
+      github-actions:
+        patterns: ["*"]
