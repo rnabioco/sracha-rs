@@ -36,3 +36,9 @@ updates:
     groups:
       github-actions:
         patterns: ["*"]
+    ignore:
+      # The ref on dtolnay/rust-toolchain is a Rust toolchain selector, not an
+      # action version. Bumping the MSRV job's `@1.95.0` pin defeats the check,
+      # and the repo carries branches for unreleased Rust versions, so
+      # Dependabot picks one rustup cannot install. Keep this pin manual.
+      - dependency-name: dtolnay/rust-toolchain
