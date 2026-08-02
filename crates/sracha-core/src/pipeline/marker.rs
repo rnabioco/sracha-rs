@@ -111,6 +111,9 @@ pub(crate) fn write_stats_file(entry: StatsEntry<'_>) -> Result<()> {
             "quality_length_mismatches": diag.quality_length_mismatches.load(Ordering::Relaxed),
             "quality_invalid_bytes": diag.quality_invalid_bytes.load(Ordering::Relaxed),
             "quality_overruns": diag.quality_overruns.load(Ordering::Relaxed),
+            "quality_blob_length_mismatch": diag
+                .quality_blob_length_mismatch
+                .load(Ordering::Relaxed),
             "all_zero_quality_blobs": diag.all_zero_quality_blobs.load(Ordering::Relaxed),
             "paired_spot_violations": diag.paired_spot_violations.load(Ordering::Relaxed),
             "truncated_spots": diag.truncated_spots.load(Ordering::Relaxed),

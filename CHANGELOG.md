@@ -4,6 +4,15 @@
 
 ### Fixes
 
+- Refuse to emit records whose quality does not correspond to their sequence
+  (#115). Strict mode checked quality per spot, but the per-spot slice is
+  correctly sized by construction, so a wrong-sized quality buffer produced
+  correctly-sized slices of the wrong bytes and no counter moved — how three
+  quality bugs (#101, #111, #113) shipped with correct sequences, correct
+  counts and a zero exit code. A blob-level check now compares the decoded
+  quality stream against the decoded sequence stream; both are one byte per
+  base, so any difference is fatal under the default strict mode.
+
 - Decode 4-channel log-odds QUALITY on the `q4` Illumina schema (#113). Those
   archives store `NCBI:qual4` — four log-odds channels per base behind a
   two-stage `zip`/`qual4_encode` chain — and sracha stopped after the inflate,
