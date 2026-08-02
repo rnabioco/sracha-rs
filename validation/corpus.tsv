@@ -9,6 +9,12 @@
 # shape  table    = flat KAR table   db = database with a SEQUENCE table
 #        csra     = reference-compressed, has PRIMARY_ALIGNMENT + REFERENCE
 #
+# Not every row exercises the FASTQ decoder. `sracha fastq` refuses cSRA and
+# 454 outright, so those rows check that both binaries refuse identically
+# (verdict REJECT_CSRA / REJECT_PLATFORM in ab_corpus.sh); reach their decode
+# paths with `sracha vdb dump` instead. Treating a REJECT as decode coverage
+# is the mistake this note exists to prevent.
+#
 # Usage:
 #   awk -F'\t' '$2=="core" && !/^#/ {print $1}' validation/corpus.tsv > core.txt
 #   bash validation/ab_corpus.sh --sbatch --baseline OLD --candidate NEW -a core.txt
@@ -37,8 +43,8 @@ DRR019046	core	table	ILLUMINA	Illumina HiSeq 2000	SINGLE	miRNA-Seq	17171857	51	5
 DRR023226	core	db	ILLUMINA	Illumina Genome Analyzer IIx	SINGLE	RNA-Seq	8563991	86	414662256	READ and QUALITY columns with mismatched blob counts
 DRR004435	core	table	ILLUMINA	Illumina Genome Analyzer IIx	SINGLE	OTHER	36805747	34	728056928	2 bp adapter ahead of a 34 bp read; routing to _2 with no _1
 DRR050206	core	table	ILLUMINA	Illumina HiSeq 2000	SINGLE	RNA-Seq	3043495	49	102425783	content-equal but md5-divergent output
-SRR341578	core	csra	ILLUMINA	Illumina HiSeq 2000	PAIRED	WGS	7549706	202	932308473	aligned cSRA: PRIMARY_ALIGNMENT + REFERENCE + SEQUENCE
-SRR000001	core	table	LS454	454 GS FLX	PAIRED	WGS	470985	248	312527083	454 pyrosequencing, flat table
+SRR341578	core	csra	ILLUMINA	Illumina HiSeq 2000	PAIRED	WGS	7549706	202	932308473	aligned cSRA: PRIMARY_ALIGNMENT + REFERENCE + SEQUENCE; fastq refuses it, use vdb dump
+SRR000001	core	table	LS454	454 GS FLX	PAIRED	WGS	470985	248	312527083	454 pyrosequencing, flat table; fastq refuses the platform, use vdb dump
 SRR2584863	core	table	ILLUMINA	Illumina HiSeq 2500	PAIRED	WGS	1553259	300	302057279	HiSeq paired flat table
 SRR28588231	core	db	ILLUMINA	Illumina MiSeq	PAIRED	AMPLICON	66220	602	23395841	MiSeq 2x301 amplicon
 SRR10358300	core	db	ILLUMINA	Illumina MiSeq	PAIRED	AMPLICON	62983	600	24227855	align schema, unmapped; MiSeq amplicon
