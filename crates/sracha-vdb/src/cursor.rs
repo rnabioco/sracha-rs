@@ -104,7 +104,7 @@ impl VdbCursor {
         // Parse table metadata (md/cur) to extract reads_per_spot and
         // platform for SRA-lite files that lack physical READ_LEN/NREADS columns.
         let (metadata_read_descs, platform) = Self::detect_metadata(archive, table);
-        let bio_base_count = read_stats_u64_from_archive(archive, "BIO_BASE_COUNT");
+        let bio_base_count = read_stats_u64_from_archive(archive, table, "BIO_BASE_COUNT");
         let is_sra_lite = Self::detect_sra_lite(archive);
 
         // READ is required.
@@ -1054,15 +1054,24 @@ fn reject_if_csra<R: Read + Seek>(archive: &mut KarArchive<R>, seq_col_base: &st
 /// Scan table and database-level `md/cur` trees for `STATS/TABLE/CMP_BASE_COUNT`
 /// and return the first non-`None` value found.
 fn read_cmp_base_count_from_archive<R: Read + Seek>(archive: &mut KarArchive<R>) -> Option<u64> {
-    read_stats_u64_from_archive(archive, "CMP_BASE_COUNT")
+    read_stats_u64_from_archive(archive, "SEQUENCE", "CMP_BASE_COUNT")
 }
 
-/// Read a `STATS/TABLE/<name>` counter from either md/cur tree.
+/// Read a `STATS/TABLE/<name>` counter from the given table's md/cur tree.
+///
+/// The table matters. A PacBio archive carries CONSENSUS, PASSES, SEQUENCE and
+/// ZMW_METRICS, and their stats describe different things: on DRR032988,
+/// SEQUENCE records 1,368,491,160 raw subread bases while the CCS reads the
+/// converter actually emits total 6,880,774. Reading SEQUENCE's stats while
+/// decoding CONSENSUS compares two unrelated numbers and refuses a correct
+/// conversion.
 fn read_stats_u64_from_archive<R: Read + Seek>(
     archive: &mut KarArchive<R>,
+    table: &str,
     name: &str,
 ) -> Option<u64> {
-    for path in ["tbl/SEQUENCE/md/cur", "md/cur"] {
+    for path in [format!("tbl/{table}/md/cur"), "md/cur".to_string()] {
+        let path = path.as_str();
         if let Ok(md_bytes) = archive.read_file(path)
             && md_bytes.len() >= 8
             && let Some(n) = crate::metadata::read_stats_table_u64(&md_bytes[8..], name)
@@ -1743,5 +1752,29 @@ mod tests {
         let (templates, starts) = VdbCursor::load_name_templates(&mut archive);
         assert!(templates.is_empty());
         assert!(starts.is_empty());
+    }
+
+    /// Stats must come from the table being decoded. A PacBio archive carries
+    /// CONSENSUS alongside SEQUENCE and their counters describe different
+    /// data, so reading SEQUENCE's while decoding CONSENSUS compares unrelated
+    /// numbers.
+    #[test]
+    fn stats_lookup_is_scoped_to_its_table() {
+        let md = build_md_cur_with_csra_stats("NCBI:align:tbl:seq#1", 4242, false);
+        let archive_bytes = build_sra_archive_with_metadata(Some(&md));
+        let sra_path = write_temp_sra(&archive_bytes);
+        let mut archive = KarArchive::open(Cursor::new(archive_bytes)).unwrap();
+
+        // The fixture writes its stats under the SEQUENCE table.
+        assert_eq!(
+            read_stats_u64_from_archive(&mut archive, "SEQUENCE", "CMP_BASE_COUNT"),
+            Some(4242),
+        );
+        // A table with no md/cur of its own must not silently inherit them.
+        assert_eq!(
+            read_stats_u64_from_archive(&mut archive, "CONSENSUS", "NOT_A_REAL_NODE"),
+            None,
+        );
+        let _ = std::fs::remove_file(&sra_path);
     }
 }
