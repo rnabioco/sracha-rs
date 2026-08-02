@@ -600,6 +600,11 @@ pub(crate) fn decode_blob_to_fastq(
             {
                 qdata = pm.expand_rows(&qdata, 1)?;
             }
+            // The `q4` Illumina schema stores four log-odds channels per
+            // base rather than one phred byte. The logical phred column is
+            // `log_odds_to_phred(cut<0>(.QUALITY))`, so de-interleave channel
+            // 0 and map it; reading the raw stream as phred yields values far
+            // outside the phred range (#113).
             qdata
         } else {
             Vec::new()

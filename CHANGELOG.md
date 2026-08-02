@@ -4,6 +4,13 @@
 
 ### Fixes
 
+- Decode 4-channel log-odds QUALITY on the `q4` Illumina schema (#113). Those
+  archives store `NCBI:qual4` — four log-odds channels per base behind a
+  two-stage `zip`/`qual4_encode` chain — and sracha stopped after the inflate,
+  emitting the intermediate encoded bytes as phred. Every base of every spot
+  was wrong, silently. DRR001867's 14.2M spots now match `fasterq-dump` byte
+  for byte.
+
 - Decode `izip_encoding` QUALITY through the blob header instead of probing
   (#111). Quality on srf-load-era archives is byte-plane (irzip) data whose
   plane count and min/slope live in the blob header, not an izip container.
