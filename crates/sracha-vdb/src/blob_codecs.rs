@@ -196,6 +196,28 @@ pub fn decode_quality_encoding(decoded: &blob::DecodedBlob<'_>) -> Result<Vec<u8
     if decoded.data.first() == Some(&0x78) {
         return decode_zip_encoding(decoded);
     }
+    // Header-driven irzip. `izip_encoding` quality (srf-load-era Illumina)
+    // arrives with a v1+ compression header carrying the plane count in `ops`
+    // and min/slope in `args`, exactly like the integer columns — the payload
+    // is bit-plane encoded, not an izip container and not deflate. Probing it
+    // as either yields plausible-looking garbage rather than an error, so the
+    // header has to be consulted before the probes run. See
+    // `decode_irzip_column`, which has always done this for X/Y/READ_LEN;
+    // quality never did (#111).
+    if let Some(hdr) = decoded.headers.first().filter(|h| h.version >= 1)
+        && !(hdr.ops.is_empty() && hdr.args.is_empty())
+    {
+        let planes = hdr.ops.first().copied().unwrap_or(0xFF);
+        let min = hdr.args.first().copied().unwrap_or(0);
+        let slope = hdr.args.get(1).copied().unwrap_or(0);
+        // Quality is one byte per element, so osize is the element count.
+        let num_elems = hdr.osize as u32;
+        if let Ok(q) = blob::irzip_decode(&decoded.data, 8, num_elems, min, slope, planes, None)
+            && q.len() == hdr.osize as usize
+        {
+            return Ok(q);
+        }
+    }
     if let Ok(qdata) = blob::izip_decode(&decoded.data, 8)
         && !qdata.is_empty()
     {

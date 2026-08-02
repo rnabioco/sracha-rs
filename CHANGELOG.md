@@ -4,6 +4,15 @@
 
 ### Fixes
 
+- Decode `izip_encoding` QUALITY through the blob header instead of probing
+  (#111). Quality on srf-load-era archives is byte-plane (irzip) data whose
+  plane count and min/slope live in the blob header, not an izip container.
+  Probing it as an izip container fails, and the fallback decoded it as
+  deflate, yielding plausible-but-wrong scores for every base of every spot
+  with no error — DRR001816's 35.9M spots now match `fasterq-dump` byte for
+  byte. Sequences, names and counts were always correct, so nothing failed
+  loudly.
+
 - Apply the ALTREAD ambiguity mask in `vdb dump -C READ` (#104). The dump
   rendered the physical READ column while `vdb-dump` renders the logical one
   the schema defines, so the two disagreed wherever a submitter recorded an
