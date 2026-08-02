@@ -4,16 +4,20 @@
 
 ### Fixes
 
+- Apply the ALTREAD ambiguity mask in `vdb dump -C READ` (#104). The dump
+  rendered the physical READ column while `vdb-dump` renders the logical one
+  the schema defines, so the two disagreed wherever a submitter recorded an
+  ambiguity — sracha printed a confident basecall where `vdb-dump` printed
+  `N`. ALTREAD is stored `trim<0,0>` and its page maps deduplicate rows, so
+  each row's stored nibbles right-align against READ's width; the FASTQ path
+  was already correct.
+
 - Name the `--split-files` output `ACC.fastq` for single-read archives (#103).
   fasterq-dump suffixes by mate index there, except when the archive stores
   one read per spot, where it writes a bare filename; sracha always wrote
   `ACC_1.fastq`. The decision keys off the stored read count rather than how
   many reads survive filtering, so DRR004435 — where a 2 bp adapter is dropped
   and only mate 2 remains — still writes `DRR004435_2.fastq`.
-
-## Unreleased
-
-### Fixes
 
 - Decode version-2 (random-access) page maps as per-row element offsets
   instead of repeat counts (#101). A page map's `data_offset[]` and

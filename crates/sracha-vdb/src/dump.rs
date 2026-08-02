@@ -58,6 +58,10 @@ pub enum CellKind {
     U32Scalar,
     /// One i32/u32 per row (X, Y coordinates).
     I32Scalar,
+    /// Raw 4na nibbles, one per base, low nibble significant. Internal only:
+    /// never inferred for a user-selected column, and used solely for the
+    /// auxiliary ALTREAD reader that supplies READ's ambiguity mask.
+    Raw4na,
     /// Fallback — render raw blob bytes as hex.
     HexRaw,
 }
@@ -72,6 +76,7 @@ impl CellKind {
             | Self::AsciiBytes
             | Self::U8Array
             | Self::U8Scalar
+            | Self::Raw4na
             | Self::HexRaw => 1,
             Self::U32Array | Self::U32Scalar | Self::I32Scalar => 4,
         }
@@ -161,6 +166,13 @@ struct BlobCache {
 /// Top-level entry point.
 pub struct DumpRunner<R: Read + Seek> {
     cols: Vec<OpenedColumn>,
+    /// ALTREAD opened alongside a requested READ column, so the dump can show
+    /// the *logical* READ the schema defines (2na basecalls `bit_or`ed with
+    /// this 4na ambiguity mask) rather than the physical column. `vdb-dump`
+    /// shows the logical one, and without this the two disagree wherever the
+    /// submitter recorded an ambiguity (#104). `None` when READ was not
+    /// selected or the archive has no ALTREAD.
+    altread: Option<OpenedColumn>,
     first_row: i64,
     row_count: u64,
     format: DumpFormat,
@@ -220,6 +232,27 @@ impl<R: Read + Seek> DumpRunner<R> {
             ));
         }
 
+        // Open ALTREAD as an auxiliary reader when a READ column is on show.
+        let altread = if cols.iter().any(|c| c.name == "READ")
+            && available.iter().any(|n| n == "ALTREAD")
+        {
+            let full = format!("{col_base}/ALTREAD");
+            match ColumnReader::open_windowed(archive, &full, data, &window) {
+                Ok(reader) => Some(OpenedColumn {
+                    name: "ALTREAD".to_string(),
+                    kind: CellKind::Raw4na,
+                    reader,
+                    cache: None,
+                }),
+                Err(e) => {
+                    tracing::debug!("dump: READ N-mask unavailable, ALTREAD failed to open: {e}");
+                    None
+                }
+            }
+        } else {
+            None
+        };
+
         let first_row = cols
             .iter()
             .filter_map(|c| c.reader.first_row_id())
@@ -229,6 +262,7 @@ impl<R: Read + Seek> DumpRunner<R> {
 
         Ok(Self {
             cols,
+            altread,
             first_row,
             row_count,
             format: spec.format,
@@ -267,12 +301,47 @@ impl<R: Read + Seek> DumpRunner<R> {
         for col in &mut self.cols {
             ensure_blob(col, row_id)?;
         }
+        self.apply_read_n_mask(row_id)?;
 
         match self.format {
             DumpFormat::Default => write_default(w, row_id, &self.cols)?,
             DumpFormat::Csv => write_delimited(w, row_id, &self.cols, b',')?,
             DumpFormat::Tab => write_delimited(w, row_id, &self.cols, b'\t')?,
             DumpFormat::Json => write_json(w, row_id, &self.cols)?,
+        }
+        Ok(())
+    }
+
+    /// Fold ALTREAD's ambiguity codes into this row's READ bases, in place.
+    ///
+    /// The merge is idempotent — a base that already carries the nibble maps
+    /// to itself — so a row emitted twice by overlapping `-R` ranges is safe.
+    fn apply_read_n_mask(&mut self, row_id: i64) -> Result<()> {
+        let Some(alt) = self.altread.as_mut() else {
+            return Ok(());
+        };
+        if ensure_blob(alt, row_id).is_err() {
+            // A blob we cannot decode means no mask for these rows; showing
+            // the unmasked basecalls beats failing the whole dump.
+            return Ok(());
+        }
+        let mask = cell_bytes(alt, row_id);
+        if mask.is_empty() {
+            return Ok(());
+        }
+        for col in &mut self.cols {
+            if col.name != "READ" || col.kind != CellKind::Dna2na {
+                continue;
+            }
+            let Some(cache) = col.cache.as_mut() else {
+                continue;
+            };
+            let i = (row_id - cache.start_id) as usize;
+            if i + 1 >= cache.offsets.len() {
+                continue;
+            }
+            let (lo, hi) = (cache.offsets[i], cache.offsets[i + 1]);
+            merge_trimmed_mask(&mut cache.bytes[lo..hi], mask);
         }
         Ok(())
     }
@@ -347,6 +416,7 @@ fn materialize_blob(
             materialize_u32(decoded, row_count)
         }
         CellKind::U8Array | CellKind::U8Scalar => materialize_u8_array(decoded, row_count),
+        CellKind::Raw4na => materialize_raw4na(decoded, row_count),
         CellKind::HexRaw => materialize_hex_fallback(decoded, row_count),
     }
 }
@@ -423,6 +493,61 @@ fn materialize_dna4na_bin(
         expected,
         expected / 2,
     )))
+}
+
+/// Per-row raw 4na nibbles (no ASCII mapping), for merging into READ.
+///
+/// `materialize_dna4na_bin` renders letters, which loses the bits the merge
+/// needs — the schema `bit_or`s ALTREAD's nibble with READ's 2na code.
+fn materialize_raw4na(decoded: &DecodedBlob<'_>, row_count: u64) -> Result<(Vec<u8>, Vec<usize>)> {
+    let raw = decode_zip_encoding(decoded)?;
+    let offsets = split_offsets(decoded, row_count, 1)?;
+    let expected = offsets.last().copied().unwrap_or(0);
+
+    if !mapping_is_identity(decoded) {
+        let expanded = expand_rows_if_needed(decoded, raw, 1)?;
+        if expanded.len() == expected {
+            let out: Vec<u8> = expanded.iter().map(|b| b & 0x0F).collect();
+            return Ok((out, offsets));
+        }
+        return Err(Error::Format(format!(
+            "dump: ALTREAD payload expands to {} bytes, expected {expected}",
+            expanded.len(),
+        )));
+    }
+    if raw.len() == expected {
+        let out: Vec<u8> = raw.iter().map(|b| b & 0x0F).collect();
+        return Ok((out, offsets));
+    }
+    if raw.len() * 2 == expected {
+        // 4na:packed — two nibbles per byte, high nibble first.
+        let mut out = Vec::with_capacity(expected);
+        for &b in &raw {
+            out.push((b >> 4) & 0x0F);
+            out.push(b & 0x0F);
+        }
+        out.truncate(expected);
+        return Ok((out, offsets));
+    }
+    Err(Error::Format(format!(
+        "dump: ALTREAD payload size {} matches neither {expected} (4na:bin) nor {} (4na:packed)",
+        raw.len(),
+        expected / 2,
+    )))
+}
+
+/// Fold a row's stored ALTREAD nibbles into its bases.
+///
+/// ALTREAD is written `trim<0,0>`, so the leading zero nibbles are stripped
+/// and what remains right-aligns against the row's full width. Merging from
+/// index 0 would smear the mask across the wrong bases. A mask wider than the
+/// row is inconsistent and is ignored rather than truncated to the wrong end.
+fn merge_trimmed_mask(bases: &mut [u8], mask: &[u8]) {
+    if mask.is_empty() || mask.len() > bases.len() {
+        return;
+    }
+    let start = bases.len() - mask.len();
+    crate::encoding::merge_altread_bin(&mut bases[start..], mask, mask.len());
 }
 
 fn decode_4na_nibble(n: u8) -> u8 {
@@ -708,7 +833,7 @@ fn write_cell_default<W: Write>(w: &mut W, kind: CellKind, bytes: &[u8]) -> Resu
         CellKind::I32Scalar => {
             write_i32_scalar(w, bytes)?;
         }
-        CellKind::HexRaw => {
+        CellKind::Raw4na | CellKind::HexRaw => {
             write_hex(w, bytes)?;
         }
     }
@@ -743,7 +868,7 @@ fn write_cell_delimited<W: Write>(
         CellKind::I32Scalar => {
             write_i32_scalar(w, bytes)?;
         }
-        CellKind::HexRaw => {
+        CellKind::Raw4na | CellKind::HexRaw => {
             write_hex(w, bytes)?;
         }
     }
@@ -786,7 +911,7 @@ fn cell_to_json(kind: CellKind, bytes: &[u8]) -> Value {
                 Value::Null
             }
         }
-        CellKind::HexRaw => {
+        CellKind::Raw4na | CellKind::HexRaw => {
             let mut s = String::with_capacity(bytes.len() * 2);
             for b in bytes {
                 s.push_str(&format!("{b:02x}"));
@@ -1109,5 +1234,40 @@ mod tests {
         let mut buf = Vec::new();
         write_u8_scalar(&mut buf, &[42]).unwrap();
         assert_eq!(buf, b"42");
+    }
+
+    #[test]
+    fn trimmed_mask_right_aligns_against_the_row() {
+        // trim<0,0> strips leading zeros, so a 3-nibble mask belongs to the
+        // last three bases — here "TAC". The set nibble is the middle one, so
+        // it lands on the `A`: A(1) | G(4) = 5, which is `R`.
+        let mut bases = *b"ACGTAC";
+        merge_trimmed_mask(&mut bases, &[0x0, 0x4, 0x0]);
+        assert_eq!(&bases, b"ACGTRC", "mask lands on the tail, not the head");
+    }
+
+    #[test]
+    fn trimmed_mask_is_idempotent() {
+        // Overlapping -R ranges can emit a row twice; merging again must be a
+        // no-op, since the merged base already carries the nibble.
+        let mut once = *b"ACGTAC";
+        merge_trimmed_mask(&mut once, &[0xF, 0x0, 0x0]);
+        let mut twice = once;
+        merge_trimmed_mask(&mut twice, &[0xF, 0x0, 0x0]);
+        assert_eq!(once, twice);
+    }
+
+    #[test]
+    fn trimmed_mask_wider_than_row_is_ignored() {
+        let mut bases = *b"ACGT";
+        merge_trimmed_mask(&mut bases, &[0xF; 8]);
+        assert_eq!(&bases, b"ACGT", "an oversized mask must not be applied");
+    }
+
+    #[test]
+    fn empty_trimmed_mask_leaves_bases_alone() {
+        let mut bases = *b"ACGT";
+        merge_trimmed_mask(&mut bases, &[]);
+        assert_eq!(&bases, b"ACGT");
     }
 }
