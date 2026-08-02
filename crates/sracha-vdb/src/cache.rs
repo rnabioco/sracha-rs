@@ -10,7 +10,7 @@
 
 use std::cell::RefCell;
 
-use crate::blob::{self, DecodedBlob, PageMap};
+use crate::blob::{self, DecodedBlob, PageMap, RowExtent};
 use crate::error::{Error, Result};
 use crate::kdb::ColumnReader;
 
@@ -42,34 +42,31 @@ pub(crate) struct DecodedColumnBlob {
     pub bytes: Vec<u8>,
     /// Present when the blob has a page map.
     pub page_map: Option<PageMap>,
-    /// `page_map.data_record_lengths()` cached once (empty if no page map).
-    /// Unit matches what the column's encoding stores: bits for
-    /// bit-packed rows, bytes for byte rows, elements for integer rows,
+    /// `page_map.row_extents()` cached once (empty if no page map): one
+    /// `(offset, len)` per logical row, resolved from whichever mapping the
+    /// page map carries. Units match what the column's encoding stores: bits
+    /// for bit-packed rows, bytes for byte rows, elements for integer rows,
     /// bases for 2na rows.
-    pub record_lens: Vec<u32>,
-    /// `record_prefix[i] = sum(record_lens[0..i]) as u64`, length = `record_lens.len() + 1`.
-    /// Lets row slicing be O(1) instead of the previous O(n²) `take(i).sum()`.
-    pub record_prefix: Vec<u64>,
-    /// Per-logical-row rec_idx (honouring `page_map.data_runs`). Empty
-    /// when the mapping is identity (no `data_runs`).
-    pub logical_to_rec: Vec<u32>,
+    pub extents: Vec<RowExtent>,
 }
 
 impl DecodedColumnBlob {
-    /// Map a blob-relative row offset to the rec_idx of its unique value.
-    pub fn rec_idx(&self, logical_offset: usize) -> Result<usize> {
-        if self.logical_to_rec.is_empty() {
-            return Ok(logical_offset);
+    /// Where a blob-relative row's data sits in the decoded payload.
+    ///
+    /// With no page map every row is one element wide at its own index.
+    pub fn extent(&self, logical_offset: usize) -> Result<RowExtent> {
+        if self.extents.is_empty() {
+            return Ok(RowExtent {
+                offset: logical_offset as u32,
+                len: 1,
+            });
         }
-        self.logical_to_rec
-            .get(logical_offset)
-            .map(|&v| v as usize)
-            .ok_or_else(|| {
-                Error::Format(format!(
-                    "logical offset {logical_offset} out of bounds ({} rows)",
-                    self.logical_to_rec.len()
-                ))
-            })
+        self.extents.get(logical_offset).copied().ok_or_else(|| {
+            Error::Format(format!(
+                "logical offset {logical_offset} out of bounds ({} rows)",
+                self.extents.len()
+            ))
+        })
     }
 }
 
@@ -130,14 +127,9 @@ impl CachedColumn {
             ColumnKind::TwoNa => decoded.data.to_vec(),
         };
         let page_map = decoded.page_map;
-        let record_lens: Vec<u32> = page_map
+        let extents = page_map
             .as_ref()
-            .map(|pm| pm.data_record_lengths())
-            .unwrap_or_default();
-        let record_prefix = compute_prefix(&record_lens);
-        let logical_to_rec = page_map
-            .as_ref()
-            .map(compute_logical_to_rec)
+            .map(|pm| pm.row_extents())
             .transpose()?
             .unwrap_or_default();
 
@@ -145,9 +137,7 @@ impl CachedColumn {
             start_id,
             bytes,
             page_map,
-            record_lens,
-            record_prefix,
-            logical_to_rec,
+            extents,
         });
 
         let borrow = self.cache.borrow();
@@ -166,9 +156,9 @@ impl CachedColumn {
     pub fn read_bool_row(&self, row_id: i64) -> Result<Vec<u8>> {
         debug_assert!(matches!(self.kind, ColumnKind::Zip));
         self.with_blob(row_id, |blob, logical_offset| {
-            let rec_idx = blob.rec_idx(logical_offset)?;
-            let start_bits = blob.record_prefix[rec_idx] as usize;
-            let len_bits = blob.record_lens[rec_idx] as usize;
+            let extent = blob.extent(logical_offset)?;
+            let start_bits = extent.offset as usize;
+            let len_bits = extent.len as usize;
             let mut out = Vec::with_capacity(len_bits);
             for i in 0..len_bits {
                 let bit_idx = start_bits + i;
@@ -187,9 +177,9 @@ impl CachedColumn {
     pub fn read_byte_row(&self, row_id: i64) -> Result<Vec<u8>> {
         debug_assert!(matches!(self.kind, ColumnKind::Zip));
         self.with_blob(row_id, |blob, logical_offset| {
-            let rec_idx = blob.rec_idx(logical_offset)?;
-            let start = blob.record_prefix[rec_idx] as usize;
-            let len = blob.record_lens[rec_idx] as usize;
+            let extent = blob.extent(logical_offset)?;
+            let start = extent.offset as usize;
+            let len = extent.len as usize;
             let end = start + len;
             if end > blob.bytes.len() {
                 return Err(Error::Format(format!(
@@ -205,9 +195,9 @@ impl CachedColumn {
     pub fn read_i32_row(&self, row_id: i64) -> Result<Vec<i32>> {
         debug_assert!(matches!(self.kind, ColumnKind::Irzip { elem_bits: 32 }));
         self.with_blob(row_id, |blob, logical_offset| {
-            let rec_idx = blob.rec_idx(logical_offset)?;
-            let start = (blob.record_prefix[rec_idx] as usize) * 4;
-            let len_elems = blob.record_lens[rec_idx] as usize;
+            let extent = blob.extent(logical_offset)?;
+            let start = (extent.offset as usize) * 4;
+            let len_elems = extent.len as usize;
             let end = start + len_elems * 4;
             if end > blob.bytes.len() {
                 return Err(Error::Format(format!(
@@ -226,9 +216,9 @@ impl CachedColumn {
     pub fn read_u32_row(&self, row_id: i64) -> Result<Vec<u32>> {
         debug_assert!(matches!(self.kind, ColumnKind::Irzip { elem_bits: 32 }));
         self.with_blob(row_id, |blob, logical_offset| {
-            let rec_idx = blob.rec_idx(logical_offset)?;
-            let start = (blob.record_prefix[rec_idx] as usize) * 4;
-            let len_elems = blob.record_lens[rec_idx] as usize;
+            let extent = blob.extent(logical_offset)?;
+            let start = (extent.offset as usize) * 4;
+            let len_elems = extent.len as usize;
             let end = start + len_elems * 4;
             if end > blob.bytes.len() {
                 return Err(Error::Format(format!(
@@ -247,9 +237,9 @@ impl CachedColumn {
     pub fn read_i64_row(&self, row_id: i64) -> Result<Vec<i64>> {
         debug_assert!(matches!(self.kind, ColumnKind::Irzip { elem_bits: 64 }));
         self.with_blob(row_id, |blob, logical_offset| {
-            let rec_idx = blob.rec_idx(logical_offset)?;
-            let start = (blob.record_prefix[rec_idx] as usize) * 8;
-            let len_elems = blob.record_lens[rec_idx] as usize;
+            let extent = blob.extent(logical_offset)?;
+            let start = (extent.offset as usize) * 8;
+            let len_elems = extent.len as usize;
             let end = start + len_elems * 8;
             if end > blob.bytes.len() {
                 return Err(Error::Format(format!(
@@ -266,7 +256,7 @@ impl CachedColumn {
 
     /// Scalar fixed-width integer with optional `data_runs` RLE (used by
     /// `GLOBAL_REF_START`, `REF_LEN`, `REFERENCE.SEQ_LEN`). The blob
-    /// payload holds only the unique values; `rec_idx(offset)` resolves
+    /// payload holds only the unique values; the row's extent resolves
     /// which one this row maps to.
     pub fn read_scalar_i64(&self, row_id: i64) -> Result<i64> {
         self.read_scalar_int(row_id, 64)
@@ -282,9 +272,9 @@ impl CachedColumn {
             ColumnKind::Irzip { elem_bits: eb } if eb == elem_bits
         ));
         self.with_blob(row_id, |blob, logical_offset| {
-            let rec_idx = blob.rec_idx(logical_offset)?;
+            let extent = blob.extent(logical_offset)?;
             let bytes_per = (elem_bits / 8) as usize;
-            let byte_off = rec_idx * bytes_per;
+            let byte_off = extent.offset as usize * bytes_per;
             if byte_off + bytes_per > blob.bytes.len() {
                 return Err(Error::Format(format!(
                     "scalar row {row_id}: byte offset {byte_off} past decoded {}",
@@ -323,13 +313,13 @@ impl CachedColumn {
             let pm = blob.page_map.as_ref().ok_or_else(|| {
                 Error::Format("2na column: page_map required for record boundaries".into())
             })?;
-            let _ = pm; // presence-only check; record_lens already cached.
-            let rec_idx = blob.rec_idx(logical_offset)?;
-            let len_bases = blob.record_lens[rec_idx] as usize;
+            let _ = pm; // presence-only check; extents already cached.
+            let extent = blob.extent(logical_offset)?;
+            let len_bases = extent.len as usize;
             if len_bases == 0 {
                 return Ok(Vec::new());
             }
-            let start_bits = (blob.record_prefix[rec_idx] as usize) * 2;
+            let start_bits = (extent.offset as usize) * 2;
 
             // 2na → 4na nibble lookup. Bases are MSB-first within each
             // byte (verified by cross-check against vdb-dump on
@@ -362,50 +352,6 @@ impl ColumnKind {
             ColumnKind::TwoNa => 2,
         }
     }
-}
-
-fn compute_prefix(record_lens: &[u32]) -> Vec<u64> {
-    let mut prefix = Vec::with_capacity(record_lens.len() + 1);
-    let mut acc: u64 = 0;
-    prefix.push(0);
-    for &l in record_lens {
-        acc += u64::from(l);
-        prefix.push(acc);
-    }
-    prefix
-}
-
-/// Maximum logical rows per blob — reject crafted page maps whose
-/// `leng_runs` sum to more than this. Real SRA blobs hold well under this
-/// (a few million rows is typical, hundreds of millions is the high end).
-const MAX_LOGICAL_ROWS_PER_BLOB: u64 = 1_000_000_000;
-
-fn compute_logical_to_rec(pm: &PageMap) -> Result<Vec<u32>> {
-    if pm.data_runs.is_empty() {
-        return Ok(Vec::new());
-    }
-    let total = pm.total_rows();
-    // Random-access variant: data_runs[i] is the rec_idx for logical row i.
-    if (pm.data_runs.len() as u64) >= total {
-        return Ok(pm.data_runs.clone());
-    }
-    // Run-length variant: data_runs[i] is the repeat count for rec_idx i.
-    //
-    // `total` is the sum of `pm.leng_runs` (parsed from idx2/page-map bytes).
-    // A crafted page map can make this arbitrarily large; reject before
-    // allocating.
-    if total > MAX_LOGICAL_ROWS_PER_BLOB {
-        return Err(Error::Format(format!(
-            "page map: logical row count {total} exceeds {MAX_LOGICAL_ROWS_PER_BLOB} cap"
-        )));
-    }
-    let mut out = Vec::with_capacity(total as usize);
-    for (i, &repeat) in pm.data_runs.iter().enumerate() {
-        for _ in 0..repeat {
-            out.push(i as u32);
-        }
-    }
-    Ok(out)
 }
 
 fn decode_bytes_payload(decoded: &DecodedBlob<'_>) -> Result<Vec<u8>> {
@@ -473,81 +419,109 @@ fn decode_integer_bytes(decoded: &DecodedBlob<'_>, elem_bits: u32) -> Result<Vec
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::blob::PageMap;
+    use crate::blob::{PageMap, RowMapping};
 
-    fn pm(data_runs: Vec<u32>, lengths: Vec<u32>, leng_runs: Vec<u32>) -> PageMap {
+    fn pm(mapping: RowMapping, lengths: Vec<u32>, leng_runs: Vec<u32>) -> PageMap {
+        let data_recs = match &mapping {
+            RowMapping::RepeatCounts(v) => v.len() as u64,
+            _ => leng_runs.iter().map(|&r| u64::from(r)).sum(),
+        };
         PageMap {
-            data_recs: data_runs.len() as u64,
+            data_recs,
             lengths,
             leng_runs,
-            data_runs,
+            mapping,
         }
     }
 
+    /// Identity: rows sit back to back, each one element wide.
     #[test]
-    fn prefix_sum_empty() {
-        let p = compute_prefix(&[]);
-        assert_eq!(p, vec![0]);
+    fn extents_identity_are_contiguous() {
+        let extents = pm(RowMapping::Identity, vec![1], vec![4])
+            .row_extents()
+            .unwrap();
+        let offsets: Vec<u32> = extents.iter().map(|e| e.offset).collect();
+        assert_eq!(offsets, vec![0, 1, 2, 3]);
+        assert!(extents.iter().all(|e| e.len == 1));
     }
 
+    /// Repeat counts: [3, 2, 4] means rows 0..3 share record 0, rows 3..5
+    /// share record 1, rows 5..9 share record 2 — so the data cursor advances
+    /// once per record, not once per row.
     #[test]
-    fn prefix_sum_basic() {
-        let p = compute_prefix(&[3, 5, 2]);
-        assert_eq!(p, vec![0, 3, 8, 10]);
+    fn extents_repeat_counts_share_offsets() {
+        let extents = pm(RowMapping::RepeatCounts(vec![3, 2, 4]), vec![1], vec![9])
+            .row_extents()
+            .unwrap();
+        let offsets: Vec<u32> = extents.iter().map(|e| e.offset).collect();
+        assert_eq!(offsets, vec![0, 0, 0, 1, 1, 2, 2, 2, 2]);
     }
 
+    /// Random access: the stored value IS the row's element offset. These are
+    /// not record indices — they may repeat and may decrease.
     #[test]
-    fn logical_to_rec_empty_is_identity() {
-        let map = compute_logical_to_rec(&pm(vec![], vec![1], vec![1])).unwrap();
-        assert!(
-            map.is_empty(),
-            "no data_runs → identity mapping (empty vec)"
+    fn extents_random_access_use_offsets_verbatim() {
+        let offs = vec![2, 0, 1, 3];
+        let extents = pm(
+            RowMapping::RandomAccessOffsets(offs.clone()),
+            vec![1],
+            vec![4],
+        )
+        .row_extents()
+        .unwrap();
+        assert_eq!(
+            extents.iter().map(|e| e.offset).collect::<Vec<_>>(),
+            offs,
+            "random-access offsets must pass through untouched"
+        );
+    }
+
+    /// A row wider than one element scales the offset by the row length only
+    /// through `lengths`, never by multiplying the stored offset.
+    #[test]
+    fn extents_random_access_multi_element_rows() {
+        let extents = pm(
+            RowMapping::RandomAccessOffsets(vec![0, 4, 0]),
+            vec![2],
+            vec![3],
+        )
+        .row_extents()
+        .unwrap();
+        assert_eq!(
+            extents
+                .iter()
+                .map(|e| (e.offset, e.len))
+                .collect::<Vec<_>>(),
+            vec![(0, 2), (4, 2), (0, 2)]
         );
     }
 
     #[test]
-    fn logical_to_rec_run_length() {
-        // data_runs = [3, 2, 4] → rows 0..3 → rec 0, 3..5 → rec 1, 5..9 → rec 2.
-        let map = compute_logical_to_rec(&pm(vec![3, 2, 4], vec![1], vec![9])).unwrap();
-        assert_eq!(map, vec![0, 0, 0, 1, 1, 2, 2, 2, 2]);
-    }
-
-    #[test]
-    fn logical_to_rec_random_access() {
-        // data_runs has one entry per logical row → treat as rec_idx lookup.
-        // total_rows (leng_runs sum) = 4; data_runs.len()=4 → random-access.
-        let dr = vec![2, 0, 1, 3];
-        let map = compute_logical_to_rec(&pm(dr.clone(), vec![1], vec![4])).unwrap();
-        assert_eq!(map, dr);
-    }
-
-    #[test]
-    fn decoded_rec_idx_identity() {
+    fn decoded_extent_without_page_map_is_identity() {
         let blob = DecodedColumnBlob {
             start_id: 0,
             bytes: Vec::new(),
             page_map: None,
-            record_lens: Vec::new(),
-            record_prefix: vec![0],
-            logical_to_rec: Vec::new(),
+            extents: Vec::new(),
         };
-        assert_eq!(blob.rec_idx(0).unwrap(), 0);
-        assert_eq!(blob.rec_idx(42).unwrap(), 42);
+        assert_eq!(blob.extent(0).unwrap(), RowExtent { offset: 0, len: 1 });
+        assert_eq!(blob.extent(42).unwrap(), RowExtent { offset: 42, len: 1 });
     }
 
     #[test]
-    fn decoded_rec_idx_lookup() {
+    fn decoded_extent_lookup_and_bounds() {
         let blob = DecodedColumnBlob {
             start_id: 0,
             bytes: Vec::new(),
             page_map: None,
-            record_lens: Vec::new(),
-            record_prefix: vec![0],
-            logical_to_rec: vec![0, 0, 1, 1, 2],
+            extents: vec![
+                RowExtent { offset: 0, len: 3 },
+                RowExtent { offset: 0, len: 3 },
+                RowExtent { offset: 3, len: 3 },
+            ],
         };
-        assert_eq!(blob.rec_idx(0).unwrap(), 0);
-        assert_eq!(blob.rec_idx(2).unwrap(), 1);
-        assert_eq!(blob.rec_idx(4).unwrap(), 2);
-        assert!(blob.rec_idx(5).is_err());
+        assert_eq!(blob.extent(0).unwrap(), RowExtent { offset: 0, len: 3 });
+        assert_eq!(blob.extent(2).unwrap(), RowExtent { offset: 3, len: 3 });
+        assert!(blob.extent(3).is_err());
     }
 }

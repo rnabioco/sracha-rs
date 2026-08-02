@@ -183,18 +183,134 @@ pub enum TrimSide {
     Trailing,
 }
 
+/// How a page map maps logical rows onto the blob's element stream.
+///
+/// ncbi-vdb's `PageMap` carries a `random_access` flag plus two arrays that
+/// share one allocation — `data_run` (repeat counts) and `data_offset`
+/// (per-row offsets) — with the flag deciding which one is live
+/// (`libs/kdb/page-map.c`, `PageMapDeserialize_v0`). Modelling that as one
+/// untyped `Vec<u32>` is what produced issue #101: a version-2 blob's
+/// `data_offset[]` was walked as though the entries were repeat counts.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RowMapping {
+    /// Every data record covers exactly one logical row — the `data_run[..]
+    /// == 1` case (variants 0 and 2 without random access). Row data is laid
+    /// out contiguously in row order.
+    Identity,
+    /// `repeats[i]` consecutive logical rows all share data record `i`
+    /// (variants 1 and 3). The read cursor advances by one record's element
+    /// count per *record*, not per row, so a record covering many rows is
+    /// stored once.
+    RepeatCounts(Vec<u32>),
+    /// `offsets[r]` is the element offset of logical row `r`'s data within
+    /// the blob's element stream — ncbi-vdb's `data_offset[row_count]`,
+    /// written only by version 2 (`random_access`) and only for variants 0
+    /// and 2.
+    ///
+    /// The values are element offsets (`elem_count_t`), not byte offsets and
+    /// not record indices. They may repeat and may decrease: the writer runs
+    /// a vocabulary encoder (`libs/vdb/blob.c`, `VBlobPageMapOptimize`), so
+    /// distinct rows with identical content point at the same offset and the
+    /// data buffer is usually far smaller than `sum(row lengths)`.
+    RandomAccessOffsets(Vec<u32>),
+}
+
+impl RowMapping {
+    /// Repeat counts, when this map stores them.
+    pub fn repeat_counts(&self) -> Option<&[u32]> {
+        match self {
+            RowMapping::RepeatCounts(v) => Some(v),
+            _ => None,
+        }
+    }
+
+    /// Per-row element offsets, when this map stores them.
+    pub fn row_offsets(&self) -> Option<&[u32]> {
+        match self {
+            RowMapping::RandomAccessOffsets(v) => Some(v),
+            _ => None,
+        }
+    }
+
+    pub fn is_identity(&self) -> bool {
+        matches!(self, RowMapping::Identity)
+    }
+}
+
+/// Maximum logical rows per blob — reject page maps whose `leng_runs` sum to
+/// more than this. Real SRA blobs hold well under it (a few million rows is
+/// typical, hundreds of millions is the high end).
+pub const MAX_LOGICAL_ROWS_PER_BLOB: u64 = 1_000_000_000;
+
+/// Yields one element count per logical row by walking `lengths` / `leng_runs`
+/// without expanding them.
+struct LengthRunCursor<'a> {
+    lengths: &'a [u32],
+    leng_runs: &'a [u32],
+    idx: usize,
+    left_in_run: u32,
+}
+
+impl<'a> LengthRunCursor<'a> {
+    fn new(pm: &'a PageMap) -> Self {
+        Self {
+            lengths: &pm.lengths,
+            leng_runs: &pm.leng_runs,
+            idx: 0,
+            left_in_run: pm.leng_runs.first().copied().unwrap_or(0),
+        }
+    }
+
+    /// Element count of the row at the cursor, without advancing.
+    fn peek(&mut self) -> Option<u32> {
+        while self.left_in_run == 0 {
+            self.idx += 1;
+            self.left_in_run = *self.leng_runs.get(self.idx)?;
+        }
+        self.lengths.get(self.idx).copied()
+    }
+
+    /// Advance past `n` rows and return the elements they span.
+    ///
+    /// Whole runs are consumed at a time, so skipping a record that covers
+    /// millions of rows costs one iteration per run crossed, not one per row.
+    fn skip_rows(&mut self, n: u64) -> u64 {
+        let mut remaining = n;
+        let mut span = 0u64;
+        while remaining > 0 {
+            let Some(len) = self.peek() else { break };
+            let take = remaining.min(u64::from(self.left_in_run));
+            span += take * u64::from(len);
+            self.left_in_run -= take as u32;
+            remaining -= take;
+        }
+        span
+    }
+}
+
+/// Where one logical row's data sits in the blob's element stream.
+///
+/// Units are *elements*, matching ncbi-vdb's `PageMapIteratorDataOffset` /
+/// `PageMapIteratorDataLength`: multiply by the column's element size to get
+/// bytes. Two rows may share an offset when the writer deduplicated them.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RowExtent {
+    pub offset: u32,
+    pub len: u32,
+}
+
 /// Deserialized page map describing row boundaries within a blob.
 #[derive(Debug, Clone)]
 pub struct PageMap {
-    /// Number of data records (rows) in the blob.
+    /// Number of data records in the blob. Equals the row count for the
+    /// identity and random-access mappings.
     pub data_recs: u64,
     /// Row lengths (one per unique length run).
     pub lengths: Vec<u32>,
     /// Length runs (how many consecutive rows share the same length).
     pub leng_runs: Vec<u32>,
-    /// Data runs (how many rows share the same physical data position).
-    /// Empty for variants where data_run is always 1.
-    pub data_runs: Vec<u32>,
+    /// How logical rows map onto stored data.
+    pub mapping: RowMapping,
 }
 
 impl PageMap {
@@ -206,162 +322,284 @@ impl PageMap {
         self.leng_runs.iter().map(|&r| u64::from(r)).sum()
     }
 
-    /// Expand run-length-encoded data to full row data.
-    ///
-    /// Takes decoded values (one per `data_rec`) and returns expanded values
-    /// (one per logical row). Each data entry `i` covers `data_runs[i]`
-    /// consecutive rows. If `data_runs` is empty, each data entry covers
-    /// exactly one row (no expansion needed).
-    ///
-    /// This is used for columns like READ_LEN where `irzip_decode` produces
-    /// `data_recs` unique values, but the actual row count is larger because
-    /// some values repeat via `data_runs`.
-    pub fn expand_data_runs<T: Clone>(&self, data: &[T]) -> Vec<T> {
-        if self.data_runs.is_empty() {
-            // No run-length encoding — each data entry = one row.
-            return data.to_vec();
-        }
-
-        let total = self.total_rows() as usize;
-        let mut expanded = Vec::with_capacity(total);
-
-        for (i, item) in data.iter().enumerate() {
-            let repeat = self.data_runs.get(i).copied().unwrap_or(1) as usize;
-            for _ in 0..repeat {
-                expanded.push(item.clone());
-            }
-        }
-
-        expanded
+    /// Repeat counts, when the mapping stores them.
+    pub fn repeat_counts(&self) -> Option<&[u32]> {
+        self.mapping.repeat_counts()
     }
 
-    /// Compute per-data-record byte lengths from the page map.
+    /// One element count per logical row, expanded from `lengths` /
+    /// `leng_runs`.
     ///
-    /// The page map stores `lengths` (unique length values) and `leng_runs`
-    /// (how many consecutive rows share each length). This function expands
-    /// to one length per data record (not per logical row — data_runs are
-    /// NOT applied here).
-    pub fn data_record_lengths(&self) -> Vec<u32> {
-        if self.data_runs.is_empty() {
-            // No data_runs: data_recs == total_rows, expand leng_runs directly
-            let mut row_lens = Vec::with_capacity(self.data_recs as usize);
-            for (length, &run) in self.lengths.iter().zip(self.leng_runs.iter()) {
-                for _ in 0..run {
-                    row_lens.push(*length);
+    /// Independent of the mapping: ncbi-vdb keeps the length runs unchanged
+    /// when it converts a page map to random access
+    /// (`PageMapToRandomAccess`), so row lengths always come from here.
+    pub fn logical_row_lengths(&self) -> Vec<u32> {
+        let mut out = Vec::with_capacity(self.total_rows() as usize);
+        for (&len, &run) in self.lengths.iter().zip(self.leng_runs.iter()) {
+            for _ in 0..run {
+                out.push(len);
+            }
+        }
+        out
+    }
+
+    /// Resolve every logical row to its `(offset, len)` in the blob's element
+    /// stream.
+    ///
+    /// This is the single place the three mappings are interpreted; it mirrors
+    /// the reference walk in ncbi-vdb's `PageMapFindRow` (page-map.c:431-461)
+    /// and the `data_offset[row]` lookup in `PageMapIteratorDataOffset`.
+    ///
+    /// Returns fewer than `total_rows()` entries when the map is internally
+    /// inconsistent (runs that don't cover every row); callers that care check
+    /// the length.
+    ///
+    /// Errors when `leng_runs` sums past [`MAX_LOGICAL_ROWS_PER_BLOB`], which
+    /// a crafted page map could otherwise use to force a huge allocation.
+    pub fn row_extents(&self) -> Result<Vec<RowExtent>> {
+        self.row_extents_range(0, self.total_rows() as usize)
+    }
+
+    /// [`row_extents`](Self::row_extents) for the window `[skip, skip + take)`.
+    pub fn row_extents_range(&self, skip: usize, take: usize) -> Result<Vec<RowExtent>> {
+        let mut out = Vec::with_capacity(take.min(self.total_rows() as usize));
+        self.for_each_row_extent(skip, take, |_, e| {
+            out.push(e);
+            Ok(())
+        })?;
+        Ok(out)
+    }
+
+    /// Total elements across every logical row, without allocating.
+    fn total_elems(&self) -> u64 {
+        self.lengths
+            .iter()
+            .zip(self.leng_runs.iter())
+            .map(|(&l, &r)| u64::from(l) * u64::from(r))
+            .sum()
+    }
+
+    /// Visit each logical row's extent in `[skip, skip + take)`, in row order.
+    ///
+    /// Costs one step per length run and data record crossed — proportional to
+    /// the *encoded* size, not the row count — plus one call per row visited.
+    /// The decode paths use this rather than [`row_extents`] so a blob costs no
+    /// per-row allocation; materializing one `RowExtent` per row for every blob
+    /// of every column was worth about 2x the decode CPU on archives whose page
+    /// maps are not identity. Blobs where a single record covers millions of
+    /// rows (SRR18959644's first READ_TYPE record spans 22,227,968 spots) are
+    /// read once per READ blob, so a per-row walk here would be quadratic.
+    fn for_each_row_extent(
+        &self,
+        skip: usize,
+        take: usize,
+        mut f: impl FnMut(usize, RowExtent) -> Result<()>,
+    ) -> Result<()> {
+        let total_rows = self.total_rows();
+        if total_rows > MAX_LOGICAL_ROWS_PER_BLOB {
+            return Err(Error::Format(format!(
+                "page_map: logical row count {total_rows} exceeds {MAX_LOGICAL_ROWS_PER_BLOB} cap"
+            )));
+        }
+        let total = total_rows as usize;
+        let end = skip.saturating_add(take).min(total);
+        if skip >= end {
+            return Ok(());
+        }
+
+        let mut lens = LengthRunCursor::new(self);
+
+        match &self.mapping {
+            RowMapping::Identity => {
+                // Rows sit back to back, so the first requested row starts at
+                // however many elements every earlier row spans.
+                let mut offset = lens.skip_rows(skip as u64).min(u64::from(u32::MAX)) as u32;
+                for row in skip..end {
+                    let Some(len) = lens.peek() else { break };
+                    lens.skip_rows(1);
+                    f(row, RowExtent { offset, len })?;
+                    offset = offset.saturating_add(len);
                 }
             }
-            return row_lens;
-        }
-
-        // With data_runs: expand leng_runs to get per-logical-row lengths,
-        // then collapse back to per-data-record lengths by skipping repeated rows.
-        let mut logical_lens = Vec::with_capacity(self.total_rows() as usize);
-        for (length, &run) in self.lengths.iter().zip(self.leng_runs.iter()) {
-            for _ in 0..run {
-                logical_lens.push(*length);
+            RowMapping::RepeatCounts(repeats) => {
+                // Each record covers `repeat` rows sharing one stored copy; the
+                // cursor advances one row length per *record*.
+                let mut offset = 0u32;
+                let mut row = 0usize;
+                for &repeat in repeats {
+                    if row >= end {
+                        break;
+                    }
+                    let Some(len) = lens.peek() else { break };
+                    let rows_here = repeat as usize;
+                    lens.skip_rows(u64::from(repeat));
+                    // Only the part of this record's span inside the window is
+                    // visited; a record covering millions of rows outside it
+                    // costs nothing.
+                    let lo = row.max(skip);
+                    let hi = (row + rows_here).min(end);
+                    for r in lo..hi {
+                        f(r, RowExtent { offset, len })?;
+                    }
+                    offset = offset.saturating_add(len);
+                    row += rows_here;
+                }
+            }
+            RowMapping::RandomAccessOffsets(offsets) => {
+                lens.skip_rows(skip as u64);
+                for row in skip..end {
+                    let Some(len) = lens.peek() else { break };
+                    lens.skip_rows(1);
+                    // A zero-length row can point anywhere; the writer emits 0
+                    // for those (libs/vdb/blob.c:800-806).
+                    let offset = offsets.get(row).copied().unwrap_or(0);
+                    f(row, RowExtent { offset, len })?;
+                }
             }
         }
 
-        let mut record_lens = Vec::with_capacity(self.data_recs as usize);
-        let mut row = 0usize;
-        for i in 0..self.data_recs as usize {
-            let repeat = self.data_runs.get(i).copied().unwrap_or(1) as usize;
-            if row < logical_lens.len() {
-                record_lens.push(logical_lens[row]);
-            }
-            row += repeat;
-        }
-        record_lens
+        Ok(())
     }
 
-    /// Expand a per-row-trimmed column (e.g. ALTREAD `trim<0,0>`) to a
-    /// flat `total_rows * row_bytes` buffer, zero-padding the removed
-    /// positions that were trimmed at write time.
+    /// Gather every logical row's data into one flat, row-ordered buffer.
     ///
-    /// `data` is the decompressed payload with one contiguous byte run
-    /// per data record. Records 0..N are then replicated `data_runs[i]`
-    /// times to produce the full row sequence. For every emitted row we
-    /// copy `min(stored, row_bytes)` bytes into the appropriate end of
-    /// the padded row (right-aligned for `TrimSide::Leading`,
-    /// left-aligned for `TrimSide::Trailing`) and leave the other end
-    /// zero.
+    /// `data` is the decompressed payload; `elem_bytes` is the column's true
+    /// element size (1 for byte columns, 4 for u32). Under
+    /// [`RowMapping::RepeatCounts`] a record stored once is emitted once per
+    /// row it covers; under [`RowMapping::RandomAccessOffsets`] each row is
+    /// pulled from its own offset, so deduplicated rows are materialized
+    /// again. The result always holds `sum(logical_row_lengths) * elem_bytes`
+    /// bytes.
     ///
-    /// Fails if a per-record stored length exceeds `row_bytes` (would
-    /// silently drop data) or if data runs short.
+    /// Errors when a row's slice would run past the end of `data`.
+    pub fn expand_rows(&self, data: &[u8], elem_bytes: usize) -> Result<Vec<u8>> {
+        if elem_bytes == 0 {
+            return Err(Error::Format(
+                "page_map: elem_bytes must be non-zero".into(),
+            ));
+        }
+
+        let total_rows = self.total_rows() as usize;
+        if total_rows > MAX_LOGICAL_ROWS_PER_BLOB as usize {
+            return Err(Error::Format(format!(
+                "page_map: logical row count {total_rows} exceeds {MAX_LOGICAL_ROWS_PER_BLOB} cap"
+            )));
+        }
+        let out_bytes = (self.total_elems() as usize)
+            .checked_mul(elem_bytes)
+            .ok_or_else(|| Error::Format("page_map: expanded size overflows".into()))?;
+
+        match &self.mapping {
+            // Rows are already contiguous and in row order.
+            RowMapping::Identity => Ok(data.to_vec()),
+
+            // The hot path: one stored copy backs `repeat` consecutive rows.
+            // Per-record rather than per-row so the slice arithmetic is hoisted
+            // out of the repeat loop — this function is ~two thirds of decode
+            // CPU on archives that use it, and doing the bounds math once per
+            // row instead of once per record costs about 2x.
+            RowMapping::RepeatCounts(repeats) => {
+                let mut out = Vec::with_capacity(out_bytes);
+                let mut lens = LengthRunCursor::new(self);
+                let mut cursor = 0usize;
+                let mut rows_seen = 0usize;
+                for &repeat in repeats {
+                    let Some(len) = lens.peek() else { break };
+                    lens.skip_rows(u64::from(repeat));
+                    let nbytes = (len as usize)
+                        .checked_mul(elem_bytes)
+                        .ok_or_else(|| Error::Format("page_map: row length overflows".into()))?;
+                    let end = cursor
+                        .checked_add(nbytes)
+                        .ok_or_else(|| Error::Format("page_map: record extent overflows".into()))?;
+                    if end > data.len() {
+                        return Err(Error::Format(format!(
+                            "page_map: record wants data[{cursor}..{end}] but data has {} bytes",
+                            data.len(),
+                        )));
+                    }
+                    let chunk = &data[cursor..end];
+                    for _ in 0..repeat {
+                        out.extend_from_slice(chunk);
+                    }
+                    cursor = end;
+                    rows_seen += repeat as usize;
+                }
+                if rows_seen != total_rows {
+                    return Err(Error::Format(format!(
+                        "page_map: mapping covers {rows_seen} of {total_rows} rows \
+                         (inconsistent runs)",
+                    )));
+                }
+                Ok(out)
+            }
+
+            // Every row indexes its own slice out of a deduplicated pool, so
+            // there is nothing to hoist.
+            RowMapping::RandomAccessOffsets(offsets) => {
+                let mut out = Vec::with_capacity(out_bytes);
+                let mut lens = LengthRunCursor::new(self);
+                for row in 0..total_rows {
+                    let Some(len) = lens.peek() else { break };
+                    lens.skip_rows(1);
+                    let start = (offsets.get(row).copied().unwrap_or(0) as usize)
+                        .checked_mul(elem_bytes)
+                        .ok_or_else(|| Error::Format("page_map: row offset overflows".into()))?;
+                    let nbytes = (len as usize)
+                        .checked_mul(elem_bytes)
+                        .ok_or_else(|| Error::Format("page_map: row length overflows".into()))?;
+                    let end = start
+                        .checked_add(nbytes)
+                        .ok_or_else(|| Error::Format("page_map: row extent overflows".into()))?;
+                    if end > data.len() {
+                        return Err(Error::Format(format!(
+                            "page_map: row {row} wants data[{start}..{end}] but data has {} bytes",
+                            data.len(),
+                        )));
+                    }
+                    out.extend_from_slice(&data[start..end]);
+                }
+                if out.len() != out_bytes {
+                    return Err(Error::Format(format!(
+                        "page_map: expanded {} bytes, expected {out_bytes} (inconsistent runs)",
+                        out.len(),
+                    )));
+                }
+                Ok(out)
+            }
+        }
+    }
+
+    /// Expand a per-row-trimmed column (e.g. ALTREAD `trim<0,0>`) to a flat
+    /// `total_rows * row_bytes` buffer, zero-padding the positions the trim
+    /// removed at write time.
+    ///
+    /// Each row's stored bytes are copied into the appropriate end of its
+    /// slot — right-aligned for [`TrimSide::Leading`], left-aligned for
+    /// [`TrimSide::Trailing`] — and the rest is left zero.
+    ///
+    /// Fails if a stored row is wider than `row_bytes` (which would silently
+    /// drop data) or if a row's bytes run past the end of `data`.
     pub fn pad_trimmed_rows_fixed(
         &self,
         data: &[u8],
         row_bytes: usize,
         side: TrimSide,
     ) -> Result<Vec<u8>> {
-        let total_rows = self.total_rows() as usize;
-        let mut out = vec![0u8; total_rows * row_bytes];
-        let record_lens = self.data_record_lengths();
-
-        let mut in_off = 0usize;
-        let mut out_row = 0usize;
-        for (rec_idx, &rec_len_u32) in record_lens.iter().enumerate() {
-            let rec_len = rec_len_u32 as usize;
-            if rec_len > row_bytes {
-                return Err(Error::Format(format!(
-                    "page_map: record {rec_idx} stored {rec_len} bytes exceeds \
-                     row_bytes={row_bytes}"
-                )));
-            }
-            if in_off + rec_len > data.len() {
-                return Err(Error::Format(format!(
-                    "page_map: record {rec_idx} wants {rec_len} bytes at offset \
-                     {in_off} but data has only {}",
-                    data.len()
-                )));
-            }
-            let rec_data = &data[in_off..in_off + rec_len];
-            let repeat = if self.data_runs.is_empty() {
-                1
-            } else {
-                self.data_runs.get(rec_idx).copied().unwrap_or(1) as usize
-            };
-            for _ in 0..repeat {
-                if out_row >= total_rows {
-                    return Ok(out);
-                }
-                let out_start = out_row * row_bytes;
-                match side {
-                    TrimSide::Leading => {
-                        // stored bytes right-align; leading zeros fill the gap.
-                        let offset = row_bytes - rec_len;
-                        out[out_start + offset..out_start + row_bytes].copy_from_slice(rec_data);
-                    }
-                    TrimSide::Trailing => {
-                        out[out_start..out_start + rec_len].copy_from_slice(rec_data);
-                    }
-                }
-                out_row += 1;
-            }
-            in_off += rec_len;
-        }
-        Ok(out)
+        self.pad_trimmed_rows(data, |_| row_bytes, side)
     }
 
     /// Variable-target version of [`pad_trimmed_rows_fixed`].
     ///
-    /// Used for columns whose logical rows have non-uniform true widths —
-    /// e.g. ALTREAD on Illumina runs after adapter trimming, where each
-    /// spot's base count matches that spot's `READ_LEN` sum. The stored
-    /// bytes are still left- or right-aligned inside each row depending
-    /// on `side`; the difference from the fixed variant is that every
-    /// logical row pads to its own `row_lens[logical_row]` target instead
-    /// of a single shared `row_bytes`.
+    /// Used for columns whose logical rows have non-uniform true widths — e.g.
+    /// ALTREAD on Illumina runs after adapter trimming, where each spot's base
+    /// count matches that spot's `READ_LEN` sum. `row_lens` must have
+    /// `self.total_rows()` entries and gives each row's full pre-trim width;
+    /// the page map's own `lengths` give the trimmed width actually stored.
     ///
-    /// `row_lens` must have `self.total_rows()` entries (one per logical
-    /// row, after `data_runs` replication). Returns a buffer of size
-    /// `sum(row_lens)` — a flat concatenation of every logical row's
-    /// padded bytes — so callers merging against another variable-row
-    /// column can just iterate byte-for-byte.
-    ///
-    /// Fails if `row_lens` has the wrong length, if a stored record's
-    /// bytes exceed the target for any of its replicated rows, or if
-    /// `data` is shorter than the sum of per-record stored lengths.
+    /// Returns `sum(row_lens)` bytes — every logical row's padded bytes
+    /// concatenated — so callers merging against another variable-row column
+    /// can iterate byte for byte.
     pub fn pad_trimmed_rows_variable(
         &self,
         data: &[u8],
@@ -371,367 +609,74 @@ impl PageMap {
         let total_rows = self.total_rows() as usize;
         if row_lens.len() != total_rows {
             return Err(Error::Format(format!(
-                "page_map: row_lens has {} entries, expected {} (total_rows)",
+                "page_map: row_lens has {} entries, expected {total_rows} (total_rows)",
                 row_lens.len(),
-                total_rows,
             )));
         }
-        let total_bytes: usize = row_lens.iter().map(|&l| l as usize).sum();
-        let mut out = vec![0u8; total_bytes];
-        let record_lens = self.data_record_lengths();
-
-        let mut in_off = 0usize;
-        let mut out_off = 0usize;
-        let mut logical_row = 0usize;
-        for (rec_idx, &rec_len_u32) in record_lens.iter().enumerate() {
-            let rec_len = rec_len_u32 as usize;
-            if in_off + rec_len > data.len() {
-                return Err(Error::Format(format!(
-                    "page_map: record {rec_idx} wants {rec_len} bytes at offset \
-                     {in_off} but data has only {}",
-                    data.len()
-                )));
-            }
-            let rec_data = &data[in_off..in_off + rec_len];
-            let repeat = if self.data_runs.is_empty() {
-                1
-            } else {
-                self.data_runs.get(rec_idx).copied().unwrap_or(1) as usize
-            };
-            for _ in 0..repeat {
-                if logical_row >= total_rows {
-                    return Ok(out);
-                }
-                let row_bytes = row_lens[logical_row] as usize;
-                if rec_len > row_bytes {
-                    return Err(Error::Format(format!(
-                        "page_map: record {rec_idx} stored {rec_len} bytes \
-                         exceeds row {logical_row} target {row_bytes}"
-                    )));
-                }
-                match side {
-                    TrimSide::Leading => {
-                        let offset = row_bytes - rec_len;
-                        out[out_off + offset..out_off + row_bytes].copy_from_slice(rec_data);
-                    }
-                    TrimSide::Trailing => {
-                        out[out_off..out_off + rec_len].copy_from_slice(rec_data);
-                    }
-                }
-                out_off += row_bytes;
-                logical_row += 1;
-            }
-            in_off += rec_len;
-        }
-        Ok(out)
+        self.pad_trimmed_rows(data, |row| row_lens[row] as usize, side)
     }
 
-    /// Reconstruct per-row bytes from a variant-2 random-access page map
-    /// (variable row lengths + per-row `data_offset[]`) used by trim-then-zip
-    /// physical columns like `.ALTREAD`.
+    /// Shared streaming implementation behind both `pad_trimmed_rows_*` entry
+    /// points. `target` gives each logical row's full pre-trim width; the
+    /// stored bytes are right-aligned inside it for [`TrimSide::Leading`] and
+    /// left-aligned for [`TrimSide::Trailing`], leaving the trimmed end zero.
     ///
-    /// The on-disk layout in this variant: `lengths[]/leng_runs[]` describes
-    /// each row's *trimmed* byte count (after `trim<0,0>` stripped leading
-    /// zeros at write time), and the field this code calls `data_runs` is
-    /// actually `data_offset[row_count]` — the byte offset of each row's
-    /// trimmed bytes inside the decompressed `data` buffer. Multiple rows
-    /// may share the same offset (write-time deduplication), so the data
-    /// buffer can be much smaller than `sum(lengths × leng_runs)`.
-    ///
-    /// `row_logical_lens[r]` is the row's full pre-trim width (e.g. the
-    /// READ column's per-row base count for ALTREAD). The trimmed bytes are
-    /// placed inside a `row_logical_lens[r]` slot, right-aligned for
-    /// `TrimSide::Leading` (the trim<0,0> case) so the leading zeros that
-    /// were stripped are restored as zero bytes. Returns
-    /// `sum(row_logical_lens)` bytes — one row after another in a single
-    /// flat buffer, ready to merge byte-for-byte against another column.
-    ///
-    /// Errors when `row_logical_lens` length doesn't match `total_rows()`,
-    /// when `data_runs` (= `data_offset[]`) length doesn't match
-    /// `total_rows()` (i.e. this isn't a variant-2 RA page map), when a
-    /// trimmed length exceeds the corresponding logical width (would mean
-    /// the trim wrote more bytes than its input held), or when a row's
-    /// `(offset, trimmed_len)` slice would read past the end of `data`.
-    pub fn pad_random_access_rows(
+    /// Handles all three mappings, including the random-access one where
+    /// several rows share one stored copy.
+    fn pad_trimmed_rows(
         &self,
         data: &[u8],
-        row_logical_lens: &[u32],
+        target: impl Fn(usize) -> usize,
         side: TrimSide,
     ) -> Result<Vec<u8>> {
         let total_rows = self.total_rows() as usize;
-        if row_logical_lens.len() != total_rows {
-            return Err(Error::Format(format!(
-                "page_map: row_logical_lens has {} entries, expected {} (total_rows)",
-                row_logical_lens.len(),
-                total_rows,
-            )));
-        }
-        if self.data_runs.len() != total_rows {
-            return Err(Error::Format(format!(
-                "page_map: pad_random_access_rows requires data_offset[] of length \
-                 {total_rows}, got {} entries",
-                self.data_runs.len(),
-            )));
-        }
-
-        // Expand `lengths`/`leng_runs` to per-row trimmed lengths.
-        let mut row_trimmed_lens = Vec::with_capacity(total_rows);
-        for (length, &run) in self.lengths.iter().zip(self.leng_runs.iter()) {
-            for _ in 0..run {
-                row_trimmed_lens.push(*length);
-            }
-        }
-        if row_trimmed_lens.len() != total_rows {
-            return Err(Error::Format(format!(
-                "page_map: leng_runs sum to {} but total_rows() = {total_rows}",
-                row_trimmed_lens.len(),
-            )));
-        }
-
-        let total_bytes: usize = row_logical_lens.iter().map(|&l| l as usize).sum();
+        let total_bytes: usize = (0..total_rows).map(&target).sum();
         let mut out = vec![0u8; total_bytes];
 
         let mut out_off = 0usize;
-        for r in 0..total_rows {
-            let logical = row_logical_lens[r] as usize;
-            let trimmed = row_trimmed_lens[r] as usize;
-            let offset = self.data_runs[r] as usize;
-
-            if trimmed > logical {
+        let mut rows_seen = 0usize;
+        self.for_each_row_extent(0, total_rows, |row, extent| {
+            let target = target(row);
+            let stored = extent.len as usize;
+            if stored > target {
                 return Err(Error::Format(format!(
-                    "page_map: row {r} trimmed_len {trimmed} > logical {logical}"
+                    "page_map: row {row} stored {stored} bytes exceeds target {target}"
                 )));
             }
-            if trimmed > 0 {
-                let end = offset.checked_add(trimmed).ok_or_else(|| {
-                    Error::Format(format!(
-                        "page_map: row {r} offset {offset} + trimmed {trimmed} overflows usize"
-                    ))
+            if stored > 0 {
+                let start = extent.offset as usize;
+                let end = start.checked_add(stored).ok_or_else(|| {
+                    Error::Format(format!("page_map: row {row} extent overflows"))
                 })?;
                 if end > data.len() {
                     return Err(Error::Format(format!(
-                        "page_map: row {r} wants data[{offset}..{end}] but data has only {} bytes",
+                        "page_map: row {row} wants data[{start}..{end}] but data has {} bytes",
                         data.len(),
                     )));
                 }
-                let bytes = &data[offset..end];
+                let bytes = &data[start..end];
                 match side {
                     TrimSide::Leading => {
-                        let pad = logical - trimmed;
-                        out[out_off + pad..out_off + logical].copy_from_slice(bytes);
+                        let pad = target - stored;
+                        out[out_off + pad..out_off + target].copy_from_slice(bytes);
                     }
                     TrimSide::Trailing => {
-                        out[out_off..out_off + trimmed].copy_from_slice(bytes);
+                        out[out_off..out_off + stored].copy_from_slice(bytes);
                     }
                 }
             }
-            out_off += logical;
+            out_off += target;
+            rows_seen += 1;
+            Ok(())
+        })?;
+
+        if rows_seen != total_rows {
+            return Err(Error::Format(format!(
+                "page_map: mapping covers {rows_seen} of {total_rows} rows (inconsistent runs)",
+            )));
         }
 
         Ok(out)
-    }
-
-    /// Expand variable-length data via data_runs.
-    ///
-    /// Unlike [`expand_data_runs_bytes`](Self::expand_data_runs_bytes) which
-    /// handles fixed-size elements, this handles variable-length rows (e.g.,
-    /// quality data where each row has a different number of bytes).
-    ///
-    /// Fails if `data` is shorter than the sum of record lengths or if
-    /// `data_runs` has fewer entries than there are records — either signals
-    /// a truncated blob or a corrupt page map that would otherwise drop rows
-    /// silently.
-    pub fn expand_variable_data_runs(&self, data: &[u8]) -> Result<Vec<u8>> {
-        if self.data_runs.is_empty() {
-            return Ok(data.to_vec());
-        }
-
-        let record_lens = self.data_record_lengths();
-
-        if self.data_runs.len() < record_lens.len() {
-            return Err(Error::Format(format!(
-                "page_map: data_runs has {} entries, expected at least {}",
-                self.data_runs.len(),
-                record_lens.len(),
-            )));
-        }
-
-        let total_data: usize = record_lens.iter().map(|&l| l as usize).sum();
-        if data.len() < total_data {
-            return Err(Error::Format(format!(
-                "page_map: variable data truncated — have {} bytes, need {}",
-                data.len(),
-                total_data,
-            )));
-        }
-
-        let expected_out: usize = record_lens
-            .iter()
-            .zip(self.data_runs.iter())
-            .map(|(&len, &rep)| len as usize * rep as usize)
-            .sum();
-        let mut expanded = Vec::with_capacity(expected_out);
-        let mut cursor = 0usize;
-        for (i, &len) in record_lens.iter().enumerate() {
-            let repeat = self.data_runs[i] as usize;
-            let chunk = &data[cursor..cursor + len as usize];
-            for _ in 0..repeat {
-                expanded.extend_from_slice(chunk);
-            }
-            cursor += len as usize;
-        }
-
-        if expanded.len() != expected_out {
-            return Err(Error::Format(format!(
-                "page_map: expanded length {} != expected {}",
-                expanded.len(),
-                expected_out,
-            )));
-        }
-
-        Ok(expanded)
-    }
-
-    /// Expand run-length-encoded byte data to full row data.
-    ///
-    /// Like [`expand_data_runs`](Self::expand_data_runs), but operates on
-    /// fixed-size elements packed into a byte slice. Each element is
-    /// `elem_bytes` wide.
-    ///
-    /// Fails if `data_runs` has fewer entries than the number of elements in
-    /// `data` — missing entries used to default to repeat=1, silently losing
-    /// the intended per-record repeat counts.
-    pub fn expand_data_runs_bytes(&self, data: &[u8], elem_bytes: usize) -> Result<Vec<u8>> {
-        if self.data_runs.is_empty() || elem_bytes == 0 {
-            return Ok(data.to_vec());
-        }
-
-        let n = data.len() / elem_bytes;
-        if self.data_runs.len() < n {
-            return Err(Error::Format(format!(
-                "page_map: data_runs has {} entries, expected at least {} for {} bytes at {} bytes/elem",
-                self.data_runs.len(),
-                n,
-                data.len(),
-                elem_bytes,
-            )));
-        }
-
-        let expected_out: usize = self
-            .data_runs
-            .iter()
-            .take(n)
-            .map(|&r| r as usize * elem_bytes)
-            .sum();
-        let mut expanded = Vec::with_capacity(expected_out);
-
-        for i in 0..n {
-            let repeat = self.data_runs[i] as usize;
-            let start = i * elem_bytes;
-            let end = start + elem_bytes;
-            let chunk = &data[start..end];
-            for _ in 0..repeat {
-                expanded.extend_from_slice(chunk);
-            }
-        }
-
-        Ok(expanded)
-    }
-
-    /// Expand variable-length physical records into per-logical-row data,
-    /// honouring both `data_runs` (record → row replication) and the per-row
-    /// element counts carried by `lengths` / `leng_runs`.
-    ///
-    /// Each physical record occupies a contiguous run of elements in `data`
-    /// whose length is the element count of the first logical row the record
-    /// covers (all rows sharing a physical record have the same length). The
-    /// record is emitted `data_runs[i]` times.
-    ///
-    /// This generalises [`expand_data_runs_bytes`](Self::expand_data_runs_bytes),
-    /// which assumes every record is the same width. Variable-length array
-    /// columns — e.g. READ_START / READ_TYPE / LABEL_LEN / RD_FILTER on PacBio
-    /// SMRT runs, where each spot stores an NREADS-sized array — pack records
-    /// of differing lengths, so the fixed-width walk reads the wrong record
-    /// boundaries (and trips the length check when the record count and the
-    /// data-run count disagree).
-    ///
-    /// `elem_bytes` is the true element size (1 for byte columns, 4 for u32),
-    /// NOT a per-row stride — record widths come from the page map. Falls back
-    /// to passthrough when there are no `data_runs`.
-    pub fn expand_records_to_rows(&self, data: &[u8], elem_bytes: usize) -> Result<Vec<u8>> {
-        if self.data_runs.is_empty() || elem_bytes == 0 {
-            return Ok(data.to_vec());
-        }
-        // Without a length structure we can't recover per-record widths; defer
-        // to the fixed-width walk (each record is one element wide).
-        if self.lengths.is_empty() || self.leng_runs.is_empty() {
-            return self.expand_data_runs_bytes(data, elem_bytes);
-        }
-
-        let mut expanded = Vec::with_capacity(data.len());
-        let mut byte_off = 0usize; // consumed bytes of `data`
-        let mut li = 0usize; // index into lengths/leng_runs
-        let mut rem = self.leng_runs[0] as u64; // rows left in the current leng run
-
-        // Advance the leng-run cursor to the next run that still has rows.
-        let advance = |li: &mut usize, rem: &mut u64| -> Result<()> {
-            while *rem == 0 {
-                *li += 1;
-                match self.leng_runs.get(*li) {
-                    Some(&r) => *rem = r as u64,
-                    None => {
-                        return Err(Error::Format(
-                            "page_map: leng_runs exhausted before data_runs (inconsistent map)"
-                                .into(),
-                        ));
-                    }
-                }
-            }
-            Ok(())
-        };
-
-        for &run in &self.data_runs {
-            advance(&mut li, &mut rem)?;
-            let rec_len =
-                *self.lengths.get(li).ok_or_else(|| {
-                    Error::Format("page_map: lengths shorter than leng_runs".into())
-                })? as usize;
-            let rec_bytes = rec_len.checked_mul(elem_bytes).ok_or_else(|| {
-                Error::Format("page_map: record length × elem_bytes overflows".into())
-            })?;
-            let end = byte_off
-                .checked_add(rec_bytes)
-                .ok_or_else(|| Error::Format("page_map: record offset overflows".into()))?;
-            if end > data.len() {
-                return Err(Error::Format(format!(
-                    "page_map: variable record wants bytes {byte_off}..{end} but data has {}",
-                    data.len(),
-                )));
-            }
-            let chunk = &data[byte_off..end];
-            for _ in 0..run {
-                expanded.extend_from_slice(chunk);
-            }
-            byte_off = end;
-
-            // Consume `run` logical rows from the leng-run stream.
-            let mut to_consume = run as u64;
-            while to_consume > 0 {
-                advance(&mut li, &mut rem)?;
-                let step = to_consume.min(rem);
-                rem -= step;
-                to_consume -= step;
-            }
-        }
-
-        if byte_off != data.len() {
-            return Err(Error::Format(format!(
-                "page_map: variable records consumed {byte_off} of {} data bytes",
-                data.len(),
-            )));
-        }
-
-        Ok(expanded)
     }
 }
 
@@ -778,33 +723,41 @@ fn page_map_deserialize_v0(data: &[u8], row_count: u64) -> Result<PageMap> {
 
     let random_access = (data[0] >> 2) == 2;
 
+    // Random access is only ever written for variants 0 and 2: the encoder
+    // derives variant bit 0 from `data_recs != row_count`, and
+    // `PageMapToRandomAccess` always sets `data_recs = row_count`
+    // (ncbi-vdb page-map.c:729, :1098). Variants 1 and 3 reserve no space for
+    // `data_offset[]`, so a version-2 header on one of them is malformed —
+    // ncbi-vdb would leave `data_offset` NULL and dereference it later.
+    if random_access && (variant == 1 || variant == 3) {
+        return Err(Error::Format(format!(
+            "page_map: version 2 (random access) is not valid with variant {variant} — \
+             only variants 0 and 2 carry data_offset[]"
+        )));
+    }
+
     match variant {
         0 => {
             // Fixed row length.
             let (row_len, sz) = vlen_decode_u64(&data[cur..])?;
             cur += sz;
 
-            if random_access {
-                // Random access: data_offset array maps each row to a data position.
-                // The array has row_count entries, each indicating which data_rec
-                // that row uses. This allows compacting N rows into fewer unique entries.
+            let mapping = if random_access {
+                // `data_offset[row_count]`: one element offset per logical row.
                 let (data_offsets, _) = deserialize_lengths(&data[cur..], row_count as usize)?;
-                // data_recs = max(data_offsets) + 1
-                let max_off = data_offsets.iter().copied().max().unwrap_or(0);
-                Ok(PageMap {
-                    data_recs: (max_off + 1) as u64,
-                    lengths: vec![row_len as u32],
-                    leng_runs: vec![row_count as u32],
-                    data_runs: data_offsets, // repurpose data_runs as data_offsets
-                })
+                RowMapping::RandomAccessOffsets(data_offsets)
             } else {
-                Ok(PageMap {
-                    data_recs: row_count,
-                    lengths: vec![row_len as u32],
-                    leng_runs: vec![row_count as u32],
-                    data_runs: vec![],
-                })
-            }
+                RowMapping::Identity
+            };
+
+            Ok(PageMap {
+                // ncbi-vdb sets data_recs = row_count for this variant whether
+                // or not random access is on (page-map.c:1288).
+                data_recs: row_count,
+                lengths: vec![row_len as u32],
+                leng_runs: vec![row_count as u32],
+                mapping,
+            })
         }
         1 => {
             // Fixed row length, variable data_run.
@@ -820,23 +773,17 @@ fn page_map_deserialize_v0(data: &[u8], row_count: u64) -> Result<PageMap> {
                 data_recs,
                 lengths: vec![row_len as u32],
                 leng_runs: vec![row_count as u32],
-                data_runs,
+                mapping: RowMapping::RepeatCounts(data_runs),
             })
         }
         2 => {
             // Variable row length, data_run = 1.
             //
-            // When random_access is set (page_map version=2), this
-            // variant additionally stores `data_offset[row_count]`
-            // after the lengths/leng_runs pair — a per-row byte offset
-            // into the column's data buffer. ncbi-vdb repurposes the
-            // `data_run` slot to carry these offsets for the random-
-            // access variant. We follow the same convention so
-            // downstream code can detect "data_runs.len() ==
-            // total_rows" and dispatch into the offset-lookup branch
-            // already present in `expand_via_page_map`. Without this,
-            // NAME_FMT blobs on Illumina HiSeq archives (DRR040793
-            // blob 2 et al) lose their per-row template overrides and
+            // When random_access is set (page_map version 2), this variant
+            // additionally stores `data_offset[row_count]` after the
+            // lengths/leng_runs pair — one element offset per logical row.
+            // NAME_FMT blobs on Illumina HiSeq archives (DRR040793 blob 2 et
+            // al) rely on it for their per-row template overrides; without it
             // sracha falls back to the skey range mapping, which can't
             // reproduce the fine-grained tile interleave.
             let (leng_recs, sz) = vlen_decode_u64(&data[cur..])?;
@@ -850,18 +797,18 @@ fn page_map_deserialize_v0(data: &[u8], row_count: u64) -> Result<PageMap> {
             let lengths = combined[..leng_recs as usize].to_vec();
             let leng_runs = combined[leng_recs as usize..].to_vec();
 
-            let data_runs = if random_access {
+            let mapping = if random_access {
                 let (offsets, _) = deserialize_lengths(&data[cur..], row_count as usize)?;
-                offsets
+                RowMapping::RandomAccessOffsets(offsets)
             } else {
-                Vec::new()
+                RowMapping::Identity
             };
 
             Ok(PageMap {
                 data_recs: row_count,
                 lengths,
                 leng_runs,
-                data_runs,
+                mapping,
             })
         }
         3 => {
@@ -883,7 +830,7 @@ fn page_map_deserialize_v0(data: &[u8], row_count: u64) -> Result<PageMap> {
                 data_recs,
                 lengths,
                 leng_runs,
-                data_runs,
+                mapping: RowMapping::RepeatCounts(data_runs),
             })
         }
         _ => Err(Error::Format(format!(
@@ -2601,7 +2548,7 @@ mod tests {
         assert_eq!(pm.data_recs, 100);
         assert_eq!(pm.lengths, vec![10]);
         assert_eq!(pm.leng_runs, vec![100]);
-        assert!(pm.data_runs.is_empty());
+        assert_eq!(pm.mapping, RowMapping::Identity);
     }
 
     #[test]
@@ -2613,7 +2560,7 @@ mod tests {
         assert_eq!(pm.data_recs, 3);
         assert_eq!(pm.lengths, vec![5]);
         assert_eq!(pm.leng_runs, vec![6]);
-        assert_eq!(pm.data_runs, vec![2, 3, 1]);
+        assert_eq!(pm.mapping, RowMapping::RepeatCounts(vec![2, 3, 1]));
     }
 
     #[test]
@@ -2626,7 +2573,107 @@ mod tests {
         assert_eq!(pm.data_recs, 8);
         assert_eq!(pm.lengths, vec![10, 20]);
         assert_eq!(pm.leng_runs, vec![5, 3]);
-        assert!(pm.data_runs.is_empty());
+        assert_eq!(pm.mapping, RowMapping::Identity);
+    }
+
+    /// Raw deflate (no zlib wrapper), matching the `deflateInit2(..., -15,
+    /// ...)` the page map serializer uses for versions 1 and 2.
+    fn deflate_raw(data: &[u8]) -> Vec<u8> {
+        use flate2::{Compression, write::DeflateEncoder};
+        use std::io::Write;
+        let mut enc = DeflateEncoder::new(Vec::new(), Compression::fast());
+        enc.write_all(data).unwrap();
+        enc.finish().unwrap()
+    }
+
+    /// Version 2 is the random-access encoding: the array after the header is
+    /// `data_offset[row_count]`, one element offset per logical row, NOT
+    /// repeat counts. Misreading this is issue #101.
+    #[test]
+    fn page_map_version2_variant0_is_random_access() {
+        // byte0 = (version 2 << 2) | variant 0 = 0x08, row_length = 3.
+        // Six rows drawn from a three-row vocabulary: offsets repeat and are
+        // not monotonic, both of which the format allows.
+        let mut data = vec![0x08, 3];
+        data.extend_from_slice(&deflate_raw(&[0, 0, 3, 3, 0, 6]));
+        let pm = page_map_deserialize(&data, 6).unwrap();
+
+        assert_eq!(pm.lengths, vec![3]);
+        assert_eq!(pm.leng_runs, vec![6]);
+        assert_eq!(
+            pm.mapping,
+            RowMapping::RandomAccessOffsets(vec![0, 0, 3, 3, 0, 6])
+        );
+        // ncbi-vdb sets data_recs = row_count here (page-map.c:1288). Deriving
+        // it from the offsets instead (e.g. max + 1 = 7) is meaningless: the
+        // offsets are neither sorted nor unique.
+        assert_eq!(pm.data_recs, 6);
+
+        // Nine stored bytes back six rows of three.
+        let expanded = pm.expand_rows(b"AAABBBCCC", 1).unwrap();
+        assert_eq!(expanded, b"AAAAAABBBBBBAAACCC");
+    }
+
+    #[test]
+    fn page_map_version2_variant2_is_random_access() {
+        // byte0 = (2 << 2) | 2 = 0x0A, leng_recs = 2.
+        // lengths=[2,3], leng_runs=[2,2], then data_offset[4].
+        let mut data = vec![0x0A, 2];
+        data.extend_from_slice(&deflate_raw(&[2, 3, 2, 2, 0, 0, 2, 2]));
+        let pm = page_map_deserialize(&data, 4).unwrap();
+
+        assert_eq!(pm.lengths, vec![2, 3]);
+        assert_eq!(pm.leng_runs, vec![2, 2]);
+        assert_eq!(
+            pm.mapping,
+            RowMapping::RandomAccessOffsets(vec![0, 0, 2, 2])
+        );
+        assert_eq!(pm.data_recs, 4);
+
+        // Rows 0-1 are two bytes at offset 0; rows 2-3 are three at offset 2.
+        let expanded = pm.expand_rows(b"ABCDE", 1).unwrap();
+        assert_eq!(expanded, b"ABABCDECDE");
+    }
+
+    /// Version 1 keeps the run-length reading, so the same trailing array
+    /// means something entirely different from the version-2 case above.
+    #[test]
+    fn page_map_version1_variant1_is_repeat_counts() {
+        // byte0 = (1 << 2) | 1 = 0x05, row_length = 3, data_recs = 2.
+        let mut data = vec![0x05, 3, 2];
+        data.extend_from_slice(&deflate_raw(&[2, 4]));
+        let pm = page_map_deserialize(&data, 6).unwrap();
+
+        assert_eq!(pm.mapping, RowMapping::RepeatCounts(vec![2, 4]));
+        // Record 0 backs rows 0-1, record 1 backs rows 2-5: 2x"AAA" + 4x"BBB".
+        let expanded = pm.expand_rows(b"AAABBB", 1).unwrap();
+        assert_eq!(expanded, b"AAAAAABBBBBBBBBBBB".to_vec());
+    }
+
+    /// Random access is only ever emitted for variants 0 and 2 — the encoder
+    /// derives variant bit 0 from `data_recs != row_count` and
+    /// `PageMapToRandomAccess` always sets them equal. Variants 1 and 3
+    /// reserve no space for `data_offset[]`, so ncbi-vdb would read a NULL
+    /// pointer; we refuse instead.
+    #[test]
+    fn page_map_version2_rejects_variants_with_data_runs() {
+        for (byte0, variant) in [(0x09u8, 1), (0x0Bu8, 3)] {
+            let mut data = vec![byte0, 3, 2];
+            data.extend_from_slice(&deflate_raw(&[2, 4, 1, 1]));
+            let err = page_map_deserialize(&data, 6)
+                .expect_err("version 2 on variant {variant} must be rejected");
+            assert!(
+                matches!(err, Error::Format(ref m) if m.contains("random access")),
+                "variant {variant}: got {err:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn page_map_rejects_unsupported_version() {
+        // Version 3 is past everything ncbi-vdb will deserialize.
+        let err = page_map_deserialize(&[0x0C, 1], 1).expect_err("version 3 must be rejected");
+        assert!(matches!(err, Error::Format(_)), "got {err:?}");
     }
 
     #[test]
@@ -2640,7 +2687,7 @@ mod tests {
         assert_eq!(pm.data_recs, 3);
         assert_eq!(pm.lengths, vec![10, 20]);
         assert_eq!(pm.leng_runs, vec![5, 3]);
-        assert_eq!(pm.data_runs, vec![1, 1, 1]);
+        assert_eq!(pm.mapping, RowMapping::RepeatCounts(vec![1, 1, 1]));
     }
 
     // -----------------------------------------------------------------------
@@ -2996,7 +3043,7 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
-    // PageMap expand_data_runs tests
+    // PageMap expand_rows tests
     // -----------------------------------------------------------------------
 
     #[test]
@@ -3005,7 +3052,7 @@ mod tests {
             data_recs: 100,
             lengths: vec![10],
             leng_runs: vec![100],
-            data_runs: vec![],
+            mapping: RowMapping::Identity,
         };
         assert_eq!(pm.total_rows(), 100);
     }
@@ -3016,54 +3063,52 @@ mod tests {
             data_recs: 3,
             lengths: vec![5],
             leng_runs: vec![2048],
-            data_runs: vec![1000, 500, 548],
+            mapping: RowMapping::RepeatCounts(vec![1000, 500, 548]),
         };
         assert_eq!(pm.total_rows(), 2048);
     }
 
-    #[test]
-    fn page_map_expand_data_runs_empty_runs() {
-        // No data_runs means each entry covers 1 row (no expansion).
-        let pm = PageMap {
-            data_recs: 3,
-            lengths: vec![10],
-            leng_runs: vec![3],
-            data_runs: vec![],
-        };
-        let data = vec![10u32, 20, 30];
-        let expanded = pm.expand_data_runs(&data);
-        assert_eq!(expanded, vec![10, 20, 30]);
-    }
+    // The old `page_map_expand_data_runs_empty_runs` test (generic
+    // `expand_data_runs` over `&[u32]`, empty runs) is folded into
+    // `page_map_expand_rows_identity_is_passthrough` below: with the typed
+    // mapping, "no data runs" is exactly `RowMapping::Identity`.
 
     #[test]
-    fn page_map_expand_data_runs_with_repeats() {
-        // data_runs = [2, 3, 1] means:
-        //   entry 0 covers 2 rows, entry 1 covers 3 rows, entry 2 covers 1 row
+    fn page_map_expand_rows_repeat_counts_u32() {
+        // RepeatCounts [2, 3, 1]: record 0 covers 2 rows, record 1 covers 3
+        // rows, record 2 covers 1 row. One u32 element per row.
         let pm = PageMap {
             data_recs: 3,
-            lengths: vec![5],
+            lengths: vec![1],
             leng_runs: vec![6],
-            data_runs: vec![2, 3, 1],
+            mapping: RowMapping::RepeatCounts(vec![2, 3, 1]),
         };
-        let data = vec![100u32, 200, 300];
-        let expanded = pm.expand_data_runs(&data);
-        assert_eq!(expanded, vec![100, 100, 200, 200, 200, 300]);
+        let mut data = Vec::new();
+        for v in [100u32, 200, 300] {
+            data.extend_from_slice(&v.to_le_bytes());
+        }
+        let expanded = pm.expand_rows(&data, 4).unwrap();
+        let vals: Vec<u32> = expanded
+            .chunks_exact(4)
+            .map(|c| u32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+            .collect();
+        assert_eq!(vals, vec![100, 100, 200, 200, 200, 300]);
     }
 
     #[test]
-    fn page_map_expand_data_runs_bytes_u32() {
+    fn page_map_expand_rows_repeat_counts_bytes_u32() {
         let pm = PageMap {
             data_recs: 2,
-            lengths: vec![4],
+            lengths: vec![1], // one u32 element per row
             leng_runs: vec![5],
-            data_runs: vec![3, 2],
+            mapping: RowMapping::RepeatCounts(vec![3, 2]),
         };
         // Two u32 LE values: 42 and 99
         let mut data = Vec::new();
         data.extend_from_slice(&42u32.to_le_bytes());
         data.extend_from_slice(&99u32.to_le_bytes());
 
-        let expanded = pm.expand_data_runs_bytes(&data, 4).unwrap();
+        let expanded = pm.expand_rows(&data, 4).unwrap();
         assert_eq!(expanded.len(), 5 * 4); // 5 rows * 4 bytes each
 
         let vals: Vec<u32> = expanded
@@ -3074,51 +3119,55 @@ mod tests {
     }
 
     #[test]
-    fn page_map_expand_data_runs_bytes_empty_runs() {
+    fn page_map_expand_rows_identity_is_passthrough() {
+        // Identity: every record is one row and rows are already contiguous
+        // and in order, so expansion is a copy.
         let pm = PageMap {
             data_recs: 2,
-            lengths: vec![4],
+            lengths: vec![1],
             leng_runs: vec![2],
-            data_runs: vec![],
+            mapping: RowMapping::Identity,
         };
         let data = vec![1, 2, 3, 4, 5, 6, 7, 8];
-        let expanded = pm.expand_data_runs_bytes(&data, 4).unwrap();
+        let expanded = pm.expand_rows(&data, 4).unwrap();
         assert_eq!(expanded, data);
     }
 
     #[test]
-    fn page_map_expand_records_to_rows_uniform_matches_fixed() {
-        // For uniform-length records, expand_records_to_rows must reproduce the
-        // fixed-width expand_data_runs_bytes result exactly.
+    fn page_map_expand_rows_random_access_offsets() {
+        // RandomAccessOffsets: offsets are ELEMENT offsets, may repeat, and
+        // need not increase. Rows 0 and 2 share record 0's copy; row 1 points
+        // past it. This is the shape a version-2 page map writes after
+        // VBlobPageMapOptimize dedups identical rows.
         let pm = PageMap {
-            data_recs: 2,
-            lengths: vec![1], // one u32 per row, constant
-            leng_runs: vec![5],
-            data_runs: vec![3, 2],
+            data_recs: 3,
+            lengths: vec![1],
+            leng_runs: vec![3],
+            mapping: RowMapping::RandomAccessOffsets(vec![0, 1, 0]),
         };
         let mut data = Vec::new();
-        data.extend_from_slice(&42u32.to_le_bytes());
-        data.extend_from_slice(&99u32.to_le_bytes());
-
-        let variable = pm.expand_records_to_rows(&data, 4).unwrap();
-        let fixed = pm.expand_data_runs_bytes(&data, 4).unwrap();
-        assert_eq!(variable, fixed);
-
-        let vals: Vec<u32> = variable
+        for v in [42u32, 99] {
+            data.extend_from_slice(&v.to_le_bytes());
+        }
+        let expanded = pm.expand_rows(&data, 4).unwrap();
+        let vals: Vec<u32> = expanded
             .chunks_exact(4)
             .map(|c| u32::from_le_bytes([c[0], c[1], c[2], c[3]]))
             .collect();
-        assert_eq!(vals, vec![42, 42, 42, 99, 99]);
+        assert_eq!(vals, vec![42, 99, 42]);
     }
 
+    // `page_map_expand_records_to_rows_uniform_matches_fixed` compared the
+    // fixed-width and variable-width walks against each other; both are now
+    // the single `expand_rows` path, so the uniform-record case is covered by
+    // `page_map_expand_rows_repeat_counts_bytes_u32` above.
+
     #[test]
-    fn page_map_expand_records_to_rows_variable_lengths() {
+    fn page_map_expand_rows_variable_lengths() {
         // Variable-length array column (e.g. READ_START on PacBio SMRT): records
         // have differing element counts, given by the lengths/leng_runs runs,
-        // and each record is replicated data_runs[i] times. The fixed-width walk
-        // mis-reads record boundaries and rejects this shape — the variable walk
-        // must reconstruct it. Mirrors the real DRR032988 first-blob layout where
-        // data runs align with leng runs.
+        // and each record is replicated repeat_counts[i] times. Mirrors the real
+        // DRR032988 first-blob layout where data runs align with leng runs.
         //
         //   3 records: lengths 1, 3, 1 (sum = 5 u32s of source data)
         //   record 0 (len 1) -> repeated 2 rows
@@ -3128,7 +3177,7 @@ mod tests {
             data_recs: 3,
             lengths: vec![1, 3, 1],
             leng_runs: vec![2, 1, 2],
-            data_runs: vec![2, 1, 2],
+            mapping: RowMapping::RepeatCounts(vec![2, 1, 2]),
         };
         // Source u32 stream: rec0=[10], rec1=[20,21,22], rec2=[30]  (5 u32s)
         let src: Vec<u32> = vec![10, 20, 21, 22, 30];
@@ -3137,10 +3186,7 @@ mod tests {
             data.extend_from_slice(&v.to_le_bytes());
         }
 
-        // The fixed-width walk can't handle this (would want >= 5 data_runs).
-        assert!(pm.expand_data_runs_bytes(&data, 4).is_err());
-
-        let expanded = pm.expand_records_to_rows(&data, 4).unwrap();
+        let expanded = pm.expand_rows(&data, 4).unwrap();
         let vals: Vec<u32> = expanded
             .chunks_exact(4)
             .map(|c| u32::from_le_bytes([c[0], c[1], c[2], c[3]]))
@@ -3150,68 +3196,67 @@ mod tests {
     }
 
     #[test]
-    fn page_map_expand_records_to_rows_byte_column() {
+    fn page_map_expand_rows_byte_column() {
         // Same shape, 1-byte elements (e.g. READ_TYPE).
         let pm = PageMap {
             data_recs: 3,
             lengths: vec![1, 3, 1],
             leng_runs: vec![2, 1, 2],
-            data_runs: vec![2, 1, 2],
+            mapping: RowMapping::RepeatCounts(vec![2, 1, 2]),
         };
         let data = vec![1u8, 0, 1, 0, 1]; // rec0=[1] rec1=[0,1,0] rec2=[1]
-        let expanded = pm.expand_records_to_rows(&data, 1).unwrap();
+        let expanded = pm.expand_rows(&data, 1).unwrap();
         assert_eq!(expanded, vec![1, 1, 0, 1, 0, 1, 1]);
     }
 
     #[test]
-    fn page_map_expand_records_to_rows_rejects_truncated() {
-        // Source shorter than the records demand -> error, not silent garbage.
+    fn page_map_expand_rows_rejects_truncated() {
+        // Source shorter than the rows demand -> error, not silent garbage.
         let pm = PageMap {
             data_recs: 2,
             lengths: vec![1, 3],
             leng_runs: vec![1, 1],
-            data_runs: vec![1, 1],
+            mapping: RowMapping::RepeatCounts(vec![1, 1]),
         };
         let data = vec![0u8; 4]; // only 1 u32, needs 1 + 3 = 4 u32s
-        assert!(pm.expand_records_to_rows(&data, 4).is_err());
+        assert!(pm.expand_rows(&data, 4).is_err());
     }
 
     #[test]
-    fn page_map_expand_data_runs_bytes_rejects_short_data_runs() {
-        // data has 3 elements (12 bytes / 4), but data_runs only has 2.
+    fn page_map_expand_rows_rejects_incomplete_mapping() {
+        // The repeat counts cover 2 + 3 = 5 rows but leng_runs claims 6, so the
+        // map is internally inconsistent — refuse rather than emit a short
+        // buffer that callers would silently mis-slice.
         let pm = PageMap {
             data_recs: 2,
-            lengths: vec![4],
-            leng_runs: vec![5],
-            data_runs: vec![2, 3],
+            lengths: vec![1],
+            leng_runs: vec![6],
+            mapping: RowMapping::RepeatCounts(vec![2, 3]),
         };
-        let data = vec![1u8, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12];
-        assert!(pm.expand_data_runs_bytes(&data, 4).is_err());
+        let data = vec![1u8, 2, 3, 4, 5, 6, 7, 8];
+        assert!(pm.expand_rows(&data, 4).is_err());
     }
 
     #[test]
-    fn page_map_expand_data_runs_bytes_row_length_gt_1() {
+    fn page_map_expand_rows_row_length_gt_1() {
         // Regression for iter-1 validation: columns with row_length > 1 crashed
-        // sracha with `data_runs has N entries, expected at least 2N for 4N
-        // bytes at 4 bytes/elem`. Callers must pass entry_bytes
-        // (= row_length × elem_bytes), not elem_bytes, so the "number of rows"
-        // check matches the per-row data_runs count.
+        // sracha with `data runs has N entries, expected at least 2N for 4N
+        // bytes at 4 bytes/elem`. Row width now comes from the page map's own
+        // `lengths`, so callers pass elem_bytes and the walk derives the rest.
         let pm = PageMap {
             data_recs: 3,
             lengths: vec![2], // two u32s per row
             leng_runs: vec![6],
-            data_runs: vec![2, 1, 3],
+            mapping: RowMapping::RepeatCounts(vec![2, 1, 3]),
         };
-        // Three rows, two u32 LE each = 24 bytes.
+        // Three records, two u32 LE each = 24 bytes.
         let mut data = Vec::new();
         for v in [10u32, 11, 20, 21, 30, 31] {
             data.extend_from_slice(&v.to_le_bytes());
         }
-        let row_length = pm.lengths[0] as usize;
-        let entry_bytes = row_length * 4;
 
-        let expanded = pm.expand_data_runs_bytes(&data, entry_bytes).unwrap();
-        // 2 + 1 + 3 = 6 logical rows, each 8 bytes.
+        let expanded = pm.expand_rows(&data, 4).unwrap();
+        // 2 + 1 + 3 = 6 logical rows, each 2 u32s.
         assert_eq!(expanded.len(), 6 * 8);
         let vals: Vec<u32> = expanded
             .chunks_exact(4)
@@ -3219,22 +3264,36 @@ mod tests {
             .collect();
         assert_eq!(vals, vec![10, 11, 10, 11, 20, 21, 30, 31, 30, 31, 30, 31]);
 
-        // And confirm the old mis-invocation (passing elem_bytes=4) still
-        // fails, so we don't silently regress.
-        assert!(pm.expand_data_runs_bytes(&data, 4).is_err());
+        // The units flipped relative to the old API: passing entry_bytes
+        // (row_length × elem_bytes) now double-counts the row width and runs
+        // off the end of the data. Kept so a caller can't regress to it
+        // silently.
+        let entry_bytes = pm.lengths[0] as usize * 4;
+        assert!(pm.expand_rows(&data, entry_bytes).is_err());
     }
 
     #[test]
-    fn page_map_expand_variable_data_runs_rejects_truncated_data() {
-        // record_lens will be [4], needs 4 bytes; give it only 2.
+    fn page_map_expand_rows_rejects_truncated_data() {
+        // Row length is 4 elements, so row 0 needs 4 bytes; give it only 2.
         let pm = PageMap {
             data_recs: 1,
             lengths: vec![4],
             leng_runs: vec![3],
-            data_runs: vec![3],
+            mapping: RowMapping::RepeatCounts(vec![3]),
         };
         let data = vec![1u8, 2];
-        assert!(pm.expand_variable_data_runs(&data).is_err());
+        assert!(pm.expand_rows(&data, 1).is_err());
+    }
+
+    #[test]
+    fn page_map_expand_rows_rejects_zero_elem_bytes() {
+        let pm = PageMap {
+            data_recs: 1,
+            lengths: vec![1],
+            leng_runs: vec![1],
+            mapping: RowMapping::RepeatCounts(vec![1]),
+        };
+        assert!(pm.expand_rows(&[0u8; 4], 0).is_err());
     }
 
     // -----------------------------------------------------------------------
@@ -3244,13 +3303,13 @@ mod tests {
     #[test]
     fn pad_trimmed_rows_leading_right_aligns_and_replicates() {
         // Mirrors ALTREAD `trim<0,0>`: each record's stored bytes land at
-        // the END of a fixed-width row, and `data_runs` copies those bytes
-        // into multiple consecutive rows.
+        // the END of a fixed-width row, and the repeat counts copy those
+        // bytes into multiple consecutive rows.
         let pm = PageMap {
             data_recs: 2,
             lengths: vec![3, 0],
             leng_runs: vec![2, 3],
-            data_runs: vec![2, 3],
+            mapping: RowMapping::RepeatCounts(vec![2, 3]),
         };
         // Record 0 = 3 bytes, record 1 = 0 bytes. Data = record 0 only.
         let data = vec![0xAA, 0xBB, 0xCC];
@@ -3277,7 +3336,7 @@ mod tests {
             data_recs: 1,
             lengths: vec![2],
             leng_runs: vec![3],
-            data_runs: vec![3],
+            mapping: RowMapping::RepeatCounts(vec![3]),
         };
         let data = vec![0x01, 0x02];
         let padded = pm
@@ -3299,7 +3358,7 @@ mod tests {
             data_recs: 1,
             lengths: vec![5],
             leng_runs: vec![1],
-            data_runs: vec![1],
+            mapping: RowMapping::RepeatCounts(vec![1]),
         };
         let data = vec![1u8, 2, 3, 4, 5];
         // row_bytes=3 is shorter than the 5-byte record — must error.
@@ -3323,7 +3382,7 @@ mod tests {
             data_recs: 3,
             lengths: vec![2],
             leng_runs: vec![3],
-            data_runs: vec![],
+            mapping: RowMapping::Identity,
         };
         let data = vec![0x0A, 0x0B, 0x0C, 0x0D, 0x0E, 0x0F];
         let row_lens = vec![4u32, 6, 3];
@@ -3341,9 +3400,9 @@ mod tests {
     }
 
     #[test]
-    fn pad_trimmed_rows_variable_replicates_via_data_runs() {
-        // Two data records (3-byte, 2-byte). data_runs replicate record 0
-        // across two logical rows and record 1 across three. Each
+    fn pad_trimmed_rows_variable_replicates_via_repeat_counts() {
+        // Two data records (3-byte, 2-byte). The repeat counts replicate
+        // record 0 across two logical rows and record 1 across three. Each
         // replicated logical row gets its own target width — mimics the
         // ALTREAD case where deduplicated records expand into rows of
         // differing true lengths.
@@ -3351,7 +3410,7 @@ mod tests {
             data_recs: 2,
             lengths: vec![3, 2],
             leng_runs: vec![2, 3],
-            data_runs: vec![2, 3],
+            mapping: RowMapping::RepeatCounts(vec![2, 3]),
         };
         let data = vec![0xAA, 0xBB, 0xCC, 0xDD, 0xEE];
         let row_lens = vec![5u32, 4, 3, 2, 4];
@@ -3376,7 +3435,7 @@ mod tests {
             data_recs: 1,
             lengths: vec![5],
             leng_runs: vec![1],
-            data_runs: vec![],
+            mapping: RowMapping::Identity,
         };
         let data = vec![1u8, 2, 3, 4, 5];
         // Target row width 3 < stored record length 5.
@@ -3392,7 +3451,7 @@ mod tests {
             data_recs: 2,
             lengths: vec![1],
             leng_runs: vec![2],
-            data_runs: vec![],
+            mapping: RowMapping::Identity,
         };
         let data = vec![0x01, 0x02];
         // total_rows is 2 but caller supplied only one length.
@@ -3403,7 +3462,7 @@ mod tests {
     }
 
     #[test]
-    fn pad_random_access_rows_dedups_offset_zero_across_rows() {
+    fn pad_trimmed_rows_random_access_dedups_offset_zero_across_rows() {
         // Variant-2 RA shape: 4 rows, two length runs (3 rows of length 2,
         // 1 row of length 3). Rows 0-2 share offset=0; row 3 sits at
         // offset 2. Logical width 5 — leading-trim restoration leaves
@@ -3412,14 +3471,14 @@ mod tests {
             data_recs: 4,
             lengths: vec![2, 3],
             leng_runs: vec![3, 1],
-            data_runs: vec![0, 0, 0, 2], // repurposed as data_offset[]
+            mapping: RowMapping::RandomAccessOffsets(vec![0, 0, 0, 2]),
         };
         // data: bytes 0..2 = the dedup'd 2-byte payload for the first
         // run; bytes 2..5 = the unique 3-byte payload for the last row.
         let data = vec![0x0a, 0x0b, 0xcc, 0xdd, 0xee];
         let widths = [5u32; 4];
         let out = pm
-            .pad_random_access_rows(&data, &widths, TrimSide::Leading)
+            .pad_trimmed_rows_variable(&data, &widths, TrimSide::Leading)
             .unwrap();
         // Each output row is 5 bytes; trimmed bytes right-aligned with
         // leading zeros padding the gap.
@@ -3435,24 +3494,24 @@ mod tests {
     }
 
     #[test]
-    fn pad_random_access_rows_zero_trim_emits_all_zeros() {
+    fn pad_trimmed_rows_random_access_zero_trim_emits_all_zeros() {
         // A zero-trim run means "no overlay for these rows" — the output
         // width should still be respected; bytes stay zero.
         let pm = PageMap {
             data_recs: 2,
             lengths: vec![0],
             leng_runs: vec![2],
-            data_runs: vec![0, 0],
+            mapping: RowMapping::RandomAccessOffsets(vec![0, 0]),
         };
         let data = vec![];
         let out = pm
-            .pad_random_access_rows(&data, &[4, 4], TrimSide::Leading)
+            .pad_trimmed_rows_variable(&data, &[4, 4], TrimSide::Leading)
             .unwrap();
         assert_eq!(out, vec![0u8; 8]);
     }
 
     #[test]
-    fn pad_random_access_rows_trailing_side_left_aligns() {
+    fn pad_trimmed_rows_random_access_trailing_side_left_aligns() {
         // TrimSide::Trailing: trim<0,0> with side=1 strips trailing
         // zeros, so restoration places stored bytes at the start of
         // each row.
@@ -3460,11 +3519,11 @@ mod tests {
             data_recs: 2,
             lengths: vec![2],
             leng_runs: vec![2],
-            data_runs: vec![0, 0],
+            mapping: RowMapping::RandomAccessOffsets(vec![0, 0]),
         };
         let data = vec![0x11, 0x22];
         let out = pm
-            .pad_random_access_rows(&data, &[5, 5], TrimSide::Trailing)
+            .pad_trimmed_rows_variable(&data, &[5, 5], TrimSide::Trailing)
             .unwrap();
         assert_eq!(
             out,
@@ -3476,7 +3535,7 @@ mod tests {
     }
 
     #[test]
-    fn pad_random_access_rows_rejects_trim_greater_than_logical() {
+    fn pad_trimmed_rows_random_access_rejects_trim_greater_than_logical() {
         // A trimmed length wider than the row's logical width would mean
         // trim<0,0> output more bytes than its input held — corrupt
         // page_map. Refuse.
@@ -3484,43 +3543,44 @@ mod tests {
             data_recs: 1,
             lengths: vec![10],
             leng_runs: vec![1],
-            data_runs: vec![0],
+            mapping: RowMapping::RandomAccessOffsets(vec![0]),
         };
         let data = vec![0u8; 10];
         assert!(
-            pm.pad_random_access_rows(&data, &[5], TrimSide::Leading)
+            pm.pad_trimmed_rows_variable(&data, &[5], TrimSide::Leading)
                 .is_err()
         );
     }
 
     #[test]
-    fn pad_random_access_rows_rejects_offset_past_data_end() {
+    fn pad_trimmed_rows_random_access_rejects_offset_past_data_end() {
         // Offset+length out of bounds. Loud failure beats silent bad
         // FASTQ; the caller logs the error and skips the merge.
         let pm = PageMap {
             data_recs: 1,
             lengths: vec![3],
             leng_runs: vec![1],
-            data_runs: vec![5], // 5 + 3 = 8 > data.len() = 6
+            // 5 + 3 = 8 > data.len() = 6
+            mapping: RowMapping::RandomAccessOffsets(vec![5]),
         };
         let data = vec![0u8; 6];
         assert!(
-            pm.pad_random_access_rows(&data, &[5], TrimSide::Leading)
+            pm.pad_trimmed_rows_variable(&data, &[5], TrimSide::Leading)
                 .is_err()
         );
     }
 
     #[test]
-    fn pad_random_access_rows_rejects_wrong_logical_lens_count() {
+    fn pad_trimmed_rows_random_access_rejects_wrong_logical_lens_count() {
         let pm = PageMap {
             data_recs: 2,
             lengths: vec![1],
             leng_runs: vec![2],
-            data_runs: vec![0, 0],
+            mapping: RowMapping::RandomAccessOffsets(vec![0, 0]),
         };
         let data = vec![0x01];
         assert!(
-            pm.pad_random_access_rows(&data, &[4], TrimSide::Leading)
+            pm.pad_trimmed_rows_variable(&data, &[4], TrimSide::Leading)
                 .is_err()
         );
     }
@@ -3630,14 +3690,14 @@ mod tests {
     // PageMap property tests — regression fence for issue-#22 class bugs
     //
     // Every `expand_*` method had silent-wrong-output failure modes when
-    // variable `data_runs` interacted with heterogeneous row lengths. These
+    // variable repeat counts interacted with heterogeneous row lengths. These
     // tests compare against a naive "obvious" reference expansion over
     // randomly-shaped page maps to catch any such divergence.
     // -----------------------------------------------------------------------
 
     use proptest::prelude::*;
 
-    /// Build a PageMap from `(data_run, length)` pairs — one per data record.
+    /// Build a PageMap from `(repeat_count, length)` pairs — one per data record.
     /// The on-disk format assumes rows within the same data-run share a
     /// length, so we expand + RLE to produce canonical `lengths`/`leng_runs`.
     fn page_map_from_pairs(pairs: &[(u32, u32)]) -> PageMap {
@@ -3662,13 +3722,13 @@ mod tests {
             data_recs: pairs.len() as u64,
             lengths,
             leng_runs,
-            data_runs: pairs.iter().map(|&(r, _)| r).collect(),
+            mapping: RowMapping::RepeatCounts(pairs.iter().map(|&(r, _)| r).collect()),
         }
     }
 
     proptest! {
-        /// expand_variable_data_runs matches the naive "emit record i's
-        /// bytes data_runs[i] times" expansion for every well-formed page
+        /// expand_rows matches the naive "emit record i's bytes
+        /// repeat_counts[i] times" expansion for every well-formed page
         /// map. Direct fence against issue #22: the original bug silently
         /// skipped expansion whenever `lengths` wasn't all-equal, and a
         /// property test like this one would have caught it before landing.
@@ -3681,7 +3741,7 @@ mod tests {
         ) {
             let pm = page_map_from_pairs(&pairs);
             let record_lens: Vec<u32> = pairs.iter().map(|&(_, l)| l).collect();
-            let data_runs: Vec<u32> = pairs.iter().map(|&(r, _)| r).collect();
+            let repeats: Vec<u32> = pairs.iter().map(|&(r, _)| r).collect();
 
             // data: record i is `length` bytes of value `i as u8`. Picking
             // per-record distinct bytes lets a mis-stitched output be
@@ -3693,13 +3753,13 @@ mod tests {
                 }
             }
 
-            let got = pm.expand_variable_data_runs(&data).unwrap();
+            let got = pm.expand_rows(&data, 1).unwrap();
 
             let mut expected = Vec::new();
             let mut cursor = 0usize;
             for (i, &len) in record_lens.iter().enumerate() {
                 let chunk = &data[cursor..cursor + len as usize];
-                for _ in 0..data_runs[i] as usize {
+                for _ in 0..repeats[i] as usize {
                     expected.extend_from_slice(chunk);
                 }
                 cursor += len as usize;
@@ -3707,24 +3767,31 @@ mod tests {
             prop_assert_eq!(got, expected);
         }
 
-        /// expand_data_runs (fixed-element) matches a flat_map expansion
-        /// for every well-formed `data_runs`.
+        /// expand_rows over fixed-width (one element per row) records
+        /// matches a flat_map expansion for every well-formed repeat-count
+        /// vector.
         #[test]
-        fn prop_expand_data_runs_fixed_matches_reference(
+        fn prop_expand_rows_fixed_matches_reference(
             runs in proptest::collection::vec(1u32..=4u32, 1..15),
         ) {
-            let data: Vec<u32> = (0..runs.len() as u32).collect();
+            let values: Vec<u32> = (0..runs.len() as u32).collect();
+            let mut data = Vec::new();
+            for v in &values {
+                data.extend_from_slice(&v.to_le_bytes());
+            }
             let total_rows: u32 = runs.iter().sum();
-            // expand_data_runs doesn't consult `lengths`, so the trivial
-            // (lengths=[1], leng_runs=[total]) parametrisation suffices.
+            // One u32 element per row: lengths=[1], leng_runs=[total].
             let pm = PageMap {
-                data_recs: data.len() as u64,
+                data_recs: values.len() as u64,
                 lengths: vec![1],
                 leng_runs: vec![total_rows],
-                data_runs: runs.clone(),
+                mapping: RowMapping::RepeatCounts(runs.clone()),
             };
-            let got = pm.expand_data_runs(&data);
-            let expected: Vec<u32> = data
+            let got: Vec<u32> = pm.expand_rows(&data, 4).unwrap()
+                .chunks_exact(4)
+                .map(|c| u32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+                .collect();
+            let expected: Vec<u32> = values
                 .iter()
                 .zip(runs.iter())
                 .flat_map(|(&v, &r)| std::iter::repeat_n(v, r as usize))
@@ -3732,22 +3799,26 @@ mod tests {
             prop_assert_eq!(got, expected);
         }
 
-        /// data_record_lengths reproduces the per-record `length` input.
-        /// Round-trip over the RLE (`lengths`/`leng_runs`) + `data_runs`.
+        /// logical_row_lengths reproduces one length per logical row: record
+        /// i's `length` repeated `repeat_count` times. Round-trip over the
+        /// RLE (`lengths`/`leng_runs`) encoding built by page_map_from_pairs.
         #[test]
-        fn prop_data_record_lengths_round_trip(
+        fn prop_logical_row_lengths_round_trip(
             pairs in proptest::collection::vec(
                 (1u32..=4u32, 0u32..=8u32),
                 1..12,
             ),
         ) {
             let pm = page_map_from_pairs(&pairs);
-            let got = pm.data_record_lengths();
-            let expected: Vec<u32> = pairs.iter().map(|&(_, l)| l).collect();
+            let got = pm.logical_row_lengths();
+            let expected: Vec<u32> = pairs
+                .iter()
+                .flat_map(|&(r, l)| std::iter::repeat_n(l, r as usize))
+                .collect();
             prop_assert_eq!(got, expected);
         }
 
-        /// total_rows always equals both sum(leng_runs) and sum(data_runs)
+        /// total_rows always equals both sum(leng_runs) and sum(repeat counts)
         /// for well-formed page maps. Cross-checks the two RLE encodings.
         #[test]
         fn prop_total_rows_consistent(
@@ -3759,9 +3830,38 @@ mod tests {
             let pm = page_map_from_pairs(&pairs);
             let total = pm.total_rows();
             let sum_leng: u64 = pm.leng_runs.iter().map(|&r| u64::from(r)).sum();
-            let sum_data: u64 = pm.data_runs.iter().map(|&r| u64::from(r)).sum();
+            let sum_data: u64 = pm
+                .repeat_counts()
+                .expect("page_map_from_pairs builds RepeatCounts")
+                .iter()
+                .map(|&r| u64::from(r))
+                .sum();
             prop_assert_eq!(total, sum_leng);
             prop_assert_eq!(total, sum_data);
+        }
+
+        /// row_extents_range(skip, take) returns exactly the window it was
+        /// asked for out of the full row_extents() walk — the windowed walk
+        /// must not drift from the full one.
+        #[test]
+        fn prop_row_extents_range_matches_full(
+            pairs in proptest::collection::vec(
+                (1u32..=4u32, 0u32..=8u32),
+                1..12,
+            ),
+            skip in 0usize..12,
+            take in 0usize..12,
+        ) {
+            let pm = page_map_from_pairs(&pairs);
+            let full = pm.row_extents().unwrap();
+            let window = pm.row_extents_range(skip, take).unwrap();
+            let expected: Vec<RowExtent> = full
+                .iter()
+                .skip(skip)
+                .take(take)
+                .copied()
+                .collect();
+            prop_assert_eq!(window, expected);
         }
     }
 }

@@ -87,15 +87,6 @@ impl FlatBytes {
         self.offsets.push(self.bytes.len() as u32);
     }
 
-    /// Append the same chunk `repeat` times — used by NAME_FMT's run-length
-    /// variant where identical templates back many consecutive rows.
-    fn push_repeated(&mut self, row: &[u8], repeat: usize) {
-        for _ in 0..repeat {
-            self.bytes.extend_from_slice(row);
-            self.offsets.push(self.bytes.len() as u32);
-        }
-    }
-
     #[inline]
     fn get(&self, i: usize) -> Option<&[u8]> {
         if i + 1 < self.offsets.len() {
@@ -120,8 +111,8 @@ pub(crate) use crate::vdb::blob_codecs::{
 
 /// Materialize the READ_TYPE rows covering one READ blob, one row per spot.
 ///
-/// VDB stores only the distinct READ_TYPE rows; the page map's `data_runs[i]`
-/// says how many consecutive spots share record `i`. A run whose read types
+/// VDB stores only the distinct READ_TYPE rows; the page map says how many
+/// consecutive spots share each record. A run whose read types
 /// never change collapses to a single record — SRR18959644's first record
 /// covers 22,227,968 spots — and a blob straddling a change in read types
 /// holds two. Indexing the unexpanded buffer per spot therefore reads the
@@ -132,7 +123,7 @@ pub(crate) use crate::vdb::blob_codecs::{
 /// those long runs, so only the `[skip_rows, skip_rows + take_rows)` window
 /// this blob needs is built. The result is indexed from row 0.
 ///
-/// Blobs with no page map (or no `data_runs`) already carry one row per spot
+/// Blobs with no page map (or an identity mapping) already carry one row per spot
 /// and are sliced directly.
 fn read_type_rows_for_blob(
     data: &[u8],
@@ -153,8 +144,7 @@ fn read_type_rows_for_blob(
         return Vec::new();
     }
 
-    let runs = page_map.map(|pm| pm.data_runs.as_slice()).unwrap_or(&[]);
-    if runs.is_empty() {
+    let Some(pm) = page_map.filter(|pm| !pm.mapping.is_identity()) else {
         // One row per spot already. A blob holding a single row against many
         // spots is a constant column stored without runs; repeat it.
         if data.len() == row_len {
@@ -163,23 +153,22 @@ fn read_type_rows_for_blob(
         let start = (skip_rows * row_len).min(data.len());
         let end = (start + take_rows * row_len).min(data.len());
         return data[start..end].to_vec();
-    }
+    };
 
+    // Only the requested window is materialized: one READ_TYPE record can
+    // cover millions of spots, so expanding the whole blob would cost tens of
+    // MiB per READ blob.
+    let Ok(extents) = pm.row_extents_range(skip_rows, take_rows) else {
+        return Vec::new();
+    };
     let mut out = Vec::with_capacity(take_rows * row_len);
-    let mut row = 0usize; // first logical row of the current record
-    for (i, record) in data.chunks_exact(row_len).enumerate() {
-        let repeat = runs.get(i).copied().unwrap_or(1) as usize;
-        let end = row + repeat;
-        // Overlap of this record's row span with the requested window.
-        let from = row.max(skip_rows);
-        let to = end.min(skip_rows + take_rows);
-        for _ in from..to {
-            out.extend_from_slice(record);
-        }
-        row = end;
-        if row >= skip_rows + take_rows {
+    for extent in &extents {
+        let start = extent.offset as usize;
+        let end = start + extent.len as usize;
+        if end > data.len() {
             break;
         }
+        out.extend_from_slice(&data[start..end]);
     }
     out
 }
@@ -416,7 +405,7 @@ fn apply_altread_merge(
     // emit potentially-wrong FASTQ.
     if let Some(pm) = alt_page_map.as_ref()
         && pm.lengths.len() > 1
-        && pm.data_runs.is_empty()
+        && pm.mapping.is_identity()
         && altread_data.iter().any(|&b| b != 0)
     {
         return Err(sracha_vdb::Error::UnsupportedFormat {
@@ -450,69 +439,26 @@ fn apply_altread_merge(
     let row_bases = actual_bases / raw.read_id_range.max(1) as usize;
     let per_row_lens = alt_page_map.as_ref().and_then(|alt_pm| {
         let read_pm = read_page_map?;
-        (alt_pm.total_rows() == read_pm.total_rows()).then(|| {
-            // Expand READ's per-data-record lengths via READ's own
-            // data_runs to get one entry per logical row — matches
-            // the row-by-row layout of `read_data` after the
-            // `expand_variable_data_runs` step above.
-            let rec_lens = read_pm.data_record_lengths();
-            let mut lens = Vec::with_capacity(read_pm.total_rows() as usize);
-            if read_pm.data_runs.is_empty() {
-                lens.extend_from_slice(&rec_lens);
-            } else {
-                for (i, &len) in rec_lens.iter().enumerate() {
-                    let repeat = read_pm.data_runs.get(i).copied().unwrap_or(1) as usize;
-                    for _ in 0..repeat {
-                        lens.push(len);
-                    }
-                }
-            }
-            lens
-        })
+        // `leng_runs` already carries one length per logical row, matching the
+        // row-by-row layout of `read_data` after the expansion above.
+        (alt_pm.total_rows() == read_pm.total_rows()).then(|| read_pm.logical_row_lengths())
     });
-    // Variant-2 random-access page maps repurpose `data_runs` as
-    // `data_offset[row_count]`: each row's trimmed bytes are sliced
-    // out of `altread_data` at `data_offsets[row]` for `lengths[run]`
-    // bytes (multiple rows can share the same offset → write-time
-    // dedup, so the data buffer can be far smaller than
-    // `sum(lengths × leng_runs)`). DRR024182 blob 162 hits this:
-    // 8192 rows / 77 unique lengths / 1981 stored bytes / only 17
-    // unique offsets (6481 rows share offset=0). Detect by the data
-    // shape (`data_runs.len() == total_rows && lengths.len() > 1`)
-    // and route to the offset-aware reconstruction; everything else
-    // continues through the run-length variable padder.
-    let is_variant2_ra = alt_page_map
-        .as_ref()
-        .is_some_and(|pm| pm.lengths.len() > 1 && pm.data_runs.len() as u64 == pm.total_rows());
+    // Random-access page maps (version 2) give each row its own element
+    // offset into `altread_data`, and several rows can share one offset —
+    // write-time dedup, so the stored buffer is far smaller than
+    // `sum(lengths × leng_runs)`. DRR024182 blob 162 hits this: 8192 rows /
+    // 77 unique lengths / 1981 stored bytes / only 17 unique offsets (6481
+    // rows share offset 0). `pad_trimmed_rows_*` resolve every mapping
+    // through `PageMap::row_extents`, so no special case is needed here.
     let padded_ok = alt_page_map.as_ref().and_then(|pm| {
         if altread_data.is_empty() {
             return None;
         }
-        // Variant-2 RA needs to walk every row by `data_offset[row]`
-        // and copy `lengths[run]` bytes; neither `pad_trimmed_rows_*`
-        // can do that. When the READ blob aligns 1:1 with ALTREAD,
-        // pad each row to its READ-derived logical width; otherwise
-        // (e.g. DRR035866-style 2:1 ALTREAD blob) pad to the uniform
-        // `row_bases` width across every ALTREAD row, then the merge
-        // step slices the relevant `row_offset * row_bases` portion.
-        if is_variant2_ra && row_bases > 0 {
-            let alt_total_rows = pm.total_rows() as usize;
-            let row_logical_lens: Vec<u32> = match per_row_lens.as_ref() {
-                Some(lens) => lens.clone(),
-                None => vec![row_bases as u32; alt_total_rows],
-            };
-            match pm.pad_random_access_rows(
-                &altread_data,
-                &row_logical_lens,
-                crate::vdb::blob::TrimSide::Leading,
-            ) {
-                Ok(v) => return Some(v),
-                Err(e) => {
-                    tracing::debug!("blob {blob_idx}: ALTREAD pad_random_access_rows err: {e}");
-                    return None;
-                }
-            }
-        }
+        // When the READ blob aligns 1:1 with ALTREAD, pad each row to its
+        // READ-derived logical width; otherwise (e.g. DRR035866-style 2:1
+        // ALTREAD blob) pad to the uniform `row_bases` width across every
+        // ALTREAD row, and the merge step slices the relevant
+        // `row_offset * row_bases` portion.
         if let Some(lens) = per_row_lens.as_ref() {
             match pm.pad_trimmed_rows_variable(
                 &altread_data,
@@ -613,22 +559,20 @@ pub(crate) fn decode_blob_to_fastq(
     let mut read_data = crate::vdb::encoding::unpack_2na(&read_decoded.data, actual_bases);
     let read_page_map = read_decoded.page_map;
 
-    // V2 blobs may deduplicate identical rows via the page map's
-    // `data_runs` — e.g., two spots with identical base calls get
-    // written once and replicated on read. Without expansion the
-    // trailing duplicate rows drop out at blob boundaries and every
-    // subsequent spot drifts. Variable per-row lengths (Illumina reads
-    // vary after adapter trim) are the common case, so delegate to
-    // `expand_variable_data_runs` — same approach as the QUALITY path
-    // below. On the unpacked 2na buffer, page_map `lengths` are in
-    // bases per row, matching one byte per base in `read_data`.
+    // Blobs may deduplicate identical rows — two spots with identical base
+    // calls get written once and materialized again on read, either via
+    // repeat counts or via per-row offsets into a vocabulary. Without
+    // expansion the duplicate rows drop out at blob boundaries and every
+    // subsequent spot drifts. On the unpacked 2na buffer the page map's
+    // `lengths` are bases per row, matching one byte per base in `read_data`,
+    // so the element size is 1.
     if let Some(ref pm) = read_page_map
-        && !pm.data_runs.is_empty()
+        && !pm.mapping.is_identity()
     {
-        match pm.expand_variable_data_runs(&read_data) {
+        match pm.expand_rows(&read_data, 1) {
             Ok(expanded) => read_data = expanded,
             Err(e) => {
-                tracing::debug!("blob {blob_idx}: READ expand_variable_data_runs skipped: {e}");
+                tracing::debug!("blob {blob_idx}: READ row expansion skipped: {e}");
             }
         }
     }
@@ -652,9 +596,9 @@ pub(crate) fn decode_blob_to_fastq(
             // data_runs > 1; the decompressed data only contains unique
             // rows and must be expanded to match the total base count.
             if let Some(ref pm) = qpage_map
-                && !pm.data_runs.is_empty()
+                && !pm.mapping.is_identity()
             {
-                qdata = pm.expand_variable_data_runs(&qdata)?;
+                qdata = pm.expand_rows(&qdata, 1)?;
             }
             qdata
         } else {
@@ -1023,84 +967,47 @@ pub(crate) fn decode_blob_to_fastq(
         // two tiles alternate at fine granularity along the spot axis
         // (DRR040793: tile 1101/1102 interleave starting at spot 7637).
         //
-        // Two page_map shapes show up in real archives:
-        //   - data_runs holds run-length REPEAT counts (one per data
-        //     record). data_record_lengths × repeats expands directly
-        //     to per-row strings.
-        //   - data_runs holds per-row BYTE OFFSETS into the data buffer
-        //     (the random_access variant 2 case where ncbi-vdb's serial
-        //     format stores `data_offset[row_count]` after lengths /
-        //     leng_runs and overlays it on the data_run slot). Each row
-        //     pulls its own slice from a deduplicated pool of unique
-        //     templates.
-        let name_fmt_per_row: Option<FlatBytes> = if raw.has_name_fmt
-            && !raw.name_fmt_raw.is_empty()
-        {
-            decode_raw(raw.name_fmt_raw, raw.name_fmt_cs, raw.name_fmt_id_range)
-                .ok()
-                .and_then(|nfd| {
-                    let pm = nfd.page_map.as_ref()?;
-                    let total_rows = pm.total_rows() as usize;
-                    let random_access = pm.data_runs.len() == total_rows && total_rows > 0;
-                    let bytes = decode_zip_encoding(&nfd).ok()?;
-                    let mut rows = FlatBytes::with_capacity(total_rows, bytes.len());
-                    if random_access {
-                        // Per-row byte offsets: each row pulls its own
-                        // slice from `bytes` at offset data_runs[i] of
-                        // length determined by leng_runs expansion.
-                        let mut row_idx = 0usize;
-                        for (length, &run) in pm.lengths.iter().zip(pm.leng_runs.iter()) {
-                            let len = *length as usize;
-                            for _ in 0..run {
-                                if len == 0 {
-                                    rows.push(&[]);
-                                    row_idx += 1;
-                                    continue;
-                                }
-                                let off = pm.data_runs.get(row_idx).copied().unwrap_or(0) as usize;
-                                if off + len > bytes.len() {
-                                    return None;
-                                }
-                                rows.push(&bytes[off..off + len]);
-                                row_idx += 1;
-                            }
+        // Rows are pulled straight from their extents: under repeat counts a
+        // record stored once is emitted for each row it covers, and under a
+        // random-access map each row indexes its own template out of a
+        // deduplicated pool. Both shapes appear in real archives.
+        let name_fmt_per_row: Option<FlatBytes> =
+            if raw.has_name_fmt && !raw.name_fmt_raw.is_empty() {
+                decode_raw(raw.name_fmt_raw, raw.name_fmt_cs, raw.name_fmt_id_range)
+                    .ok()
+                    .and_then(|nfd| {
+                        let pm = nfd.page_map.as_ref()?;
+                        let total_rows = pm.total_rows() as usize;
+                        let bytes = decode_zip_encoding(&nfd).ok()?;
+                        let extents = pm.row_extents().ok()?;
+                        if extents.len() != total_rows {
+                            return None;
                         }
-                    } else {
-                        // Run-length variant: one chunk per data record,
-                        // replicated `data_runs[i]` times (defaults to 1
-                        // when data_runs is empty).
-                        let rec_lens = pm.data_record_lengths();
-                        let mut cursor = 0usize;
-                        for (i, &len) in rec_lens.iter().enumerate() {
-                            let len = len as usize;
-                            let repeat = pm.data_runs.get(i).copied().unwrap_or(1) as usize;
-                            if cursor + len > bytes.len() {
+                        let mut rows = FlatBytes::with_capacity(total_rows, bytes.len());
+                        for extent in &extents {
+                            let start = extent.offset as usize;
+                            let end = start.checked_add(extent.len as usize)?;
+                            if end > bytes.len() {
                                 return None;
                             }
-                            rows.push_repeated(&bytes[cursor..cursor + len], repeat);
-                            cursor += len;
+                            rows.push(&bytes[start..end]);
                         }
-                    }
-                    if blob_idx == 0 {
-                        let nonempty = (0..rows.len())
-                            .filter(|&i| rows.get(i).is_some_and(|r| !r.is_empty()))
-                            .count();
-                        tracing::debug!(
-                            "NAME_FMT blob 0: {} rows ({}), {} non-empty overrides",
-                            rows.len(),
-                            if random_access {
-                                "random-access"
-                            } else {
-                                "run-length"
-                            },
-                            nonempty,
-                        );
-                    }
-                    Some(rows)
-                })
-        } else {
-            None
-        };
+                        if blob_idx == 0 {
+                            let nonempty = (0..rows.len())
+                                .filter(|&i| rows.get(i).is_some_and(|r| !r.is_empty()))
+                                .count();
+                            tracing::debug!(
+                                "NAME_FMT blob 0: {} rows ({:?}), {} non-empty overrides",
+                                rows.len(),
+                                std::mem::discriminant(&pm.mapping),
+                                nonempty,
+                            );
+                        }
+                        Some(rows)
+                    })
+            } else {
+                None
+            };
 
         if has_templates && !x_vals.is_empty() && !y_vals.is_empty() {
             // Average template length ~30 chars + ~20 chars of expanded
@@ -1568,12 +1475,18 @@ mod tests {
     // `[technical, biological]`, leaving nothing to emit.
     // -----------------------------------------------------------------------
 
-    fn page_map(lengths: Vec<u32>, leng_runs: Vec<u32>, data_runs: Vec<u32>) -> PageMap {
+    fn page_map(lengths: Vec<u32>, leng_runs: Vec<u32>, repeats: Vec<u32>) -> PageMap {
+        let data_recs = repeats.len() as u64;
+        let mapping = if repeats.is_empty() {
+            crate::vdb::blob::RowMapping::Identity
+        } else {
+            crate::vdb::blob::RowMapping::RepeatCounts(repeats)
+        };
         PageMap {
-            data_recs: data_runs.len() as u64,
+            data_recs,
             lengths,
             leng_runs,
-            data_runs,
+            mapping,
         }
     }
 
@@ -1617,7 +1530,7 @@ mod tests {
         assert_eq!(read_type_rows_for_blob(&data, None, 2, 0, 2), data.to_vec());
         assert_eq!(read_type_rows_for_blob(&data, None, 2, 1, 1), vec![0, 1]);
 
-        // A page map with no data_runs already holds one row per spot.
+        // An identity page map already holds one row per spot.
         let pm = page_map(vec![2], vec![2], vec![]);
         assert_eq!(
             read_type_rows_for_blob(&data, Some(&pm), 2, 0, 2),

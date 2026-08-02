@@ -59,10 +59,17 @@ pub fn decode_irzip_column(decoded: &blob::DecodedBlob<'_>) -> Result<Vec<u8>> {
     expand_via_page_map(decoded_ints, &decoded.page_map)
 }
 
-/// Expand decoded integer data via a page map's data_runs, if present.
+/// Expand decoded integer data to one entry per logical row via the page map.
 ///
 /// For columns like X, Y, and READ_LEN, the irzip/izip decoder produces
-/// unique data entries and the page map maps each row to its data entry.
+/// unique data entries and the page map says which entry each row uses.
+///
+/// Offsets in a random-access page map are *element* offsets: ncbi-vdb's
+/// `data_offset` is an `elem_count_t` indexed into the blob's element stream
+/// (`interfaces/kdb/page-map.h:77`), consumed by `PageMapIteratorDataOffset`
+/// and `KDataBufferSub`, both of which take element counts. Earlier revisions
+/// guessed between that and an "entry index" reading by testing which one fit
+/// the decoded buffer, which silently picked wrong whenever both fit.
 pub fn expand_via_page_map(
     decoded_ints: Vec<u8>,
     page_map: &Option<blob::PageMap>,
@@ -70,66 +77,10 @@ pub fn expand_via_page_map(
     let Some(pm) = page_map else {
         return Ok(decoded_ints);
     };
-    let elem_bytes = 4usize; // u32
-    let row_length = pm.lengths.first().copied().unwrap_or(1) as usize;
-    let entry_bytes = row_length * elem_bytes;
-
-    if !pm.data_runs.is_empty() && pm.data_runs.len() as u64 >= pm.total_rows() {
-        // Random-access variant: data_runs[i] picks the source for logical
-        // row i. Two offset-unit conventions coexist in practice:
-        //
-        // - entry-index (default): offset is the index of a row_length-wide
-        //   entry in the decoded buffer, so `start = offset * entry_bytes`.
-        // - u32-index (rare; e.g. DRR045255's READ_LEN blob with 1032 rows
-        //   where the decoded buffer holds a flat u32 stream): offset is
-        //   the index of a single u32, so `start = offset * elem_bytes` and
-        //   row_length consecutive u32s are consumed per row.
-        //
-        // We can't statically tell them apart — the page_map serialisation
-        // uses the same on-disk shape for both. Dispatch adaptively: if
-        // the max data_run fits the entry-index interpretation, use it;
-        // otherwise fall back to u32-index. Either way a dispatch that
-        // can't reconstruct row_count * entry_bytes of output is an error.
-        let max_offset = pm.data_runs.iter().max().copied().unwrap_or(0) as usize;
-        let entry_index_fits = max_offset * entry_bytes + entry_bytes <= decoded_ints.len();
-        let u32_index_fits =
-            row_length >= 2 && max_offset * elem_bytes + entry_bytes <= decoded_ints.len();
-        let stride = if entry_index_fits {
-            entry_bytes
-        } else if u32_index_fits {
-            elem_bytes
-        } else {
-            return Err(Error::Format(format!(
-                "page_map: max offset {max_offset} overflows decoded buffer \
-                 ({} bytes) under both entry-index (×{entry_bytes}) and u32-index \
-                 (×{elem_bytes}) interpretations",
-                decoded_ints.len(),
-            )));
-        };
-
-        let mut expanded = Vec::with_capacity(pm.data_runs.len() * entry_bytes);
-        for &offset in &pm.data_runs {
-            let start = offset as usize * stride;
-            let end = start + entry_bytes;
-            if end > decoded_ints.len() {
-                return Err(Error::Format(format!(
-                    "page_map: offset {offset} × {stride} + {entry_bytes} out of {} decoded bytes",
-                    decoded_ints.len(),
-                )));
-            }
-            expanded.extend_from_slice(&decoded_ints[start..end]);
-        }
-        Ok(expanded)
-    } else if !pm.data_runs.is_empty() {
-        // data_runs replicates physical records across rows. Records may be
-        // variable-length (array columns like READ_START on PacBio SMRT pack
-        // one NREADS-sized array per spot), so widths come from the page map's
-        // lengths/leng_runs rather than a single row_length. For uniform-length
-        // columns this reduces to the old fixed-width walk.
-        Ok(pm.expand_records_to_rows(&decoded_ints, elem_bytes)?)
-    } else {
-        Ok(decoded_ints)
+    if pm.mapping.is_identity() {
+        return Ok(decoded_ints);
     }
+    pm.expand_rows(&decoded_ints, 4)
 }
 
 /// Decode a zip_encoding data section.
@@ -256,7 +207,7 @@ pub fn decode_quality_encoding(decoded: &blob::DecodedBlob<'_>) -> Result<Vec<u8
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::blob::{DecodedBlob, PageMap};
+    use crate::blob::{DecodedBlob, PageMap, RowMapping};
     use std::borrow::Cow;
 
     /// Build a minimal v1 blob: header byte with rls=3 (implicit row_length=1),
@@ -331,12 +282,12 @@ mod tests {
     }
 
     #[test]
-    fn expand_via_page_map_empty_data_runs_passthrough() {
+    fn expand_via_page_map_identity_passthrough() {
         let pm = PageMap {
             data_recs: 1,
             lengths: vec![1],
             leng_runs: vec![1],
-            data_runs: vec![],
+            mapping: RowMapping::Identity,
         };
         let out = expand_via_page_map(vec![0xAA; 4], &Some(pm)).unwrap();
         assert_eq!(out, vec![0xAA; 4]);
@@ -344,13 +295,13 @@ mod tests {
 
     #[test]
     fn expand_via_page_map_per_row_expansion_uses_repeat_counts() {
-        // 2 records, each of row_length=1 u32. data_runs=[1,3] means the
+        // 2 records, each of row_length=1 u32. repeats=[1,3] means the
         // second record is replicated 3 times → 4 rows total × 4 bytes.
         let pm = PageMap {
             data_recs: 2,
             lengths: vec![1],
             leng_runs: vec![4],
-            data_runs: vec![1, 3],
+            mapping: RowMapping::RepeatCounts(vec![1, 3]),
         };
         let mut data = Vec::new();
         data.extend_from_slice(&1u32.to_le_bytes());
@@ -364,14 +315,14 @@ mod tests {
     }
 
     #[test]
-    fn expand_via_page_map_random_access_entry_index() {
-        // data_runs length >= total_rows triggers the random-access branch.
-        // row_length=1, entry_bytes=4. Offsets index into full entries.
+    fn expand_via_page_map_random_access_single_element_rows() {
+        // One u32 per row, so an element offset and an entry index coincide.
+        // Offsets are used verbatim and may reorder rows.
         let pm = PageMap {
             data_recs: 3,
             lengths: vec![1],
             leng_runs: vec![3],
-            data_runs: vec![0, 2, 1],
+            mapping: RowMapping::RandomAccessOffsets(vec![0, 2, 1]),
         };
         let mut data = Vec::new();
         data.extend_from_slice(&10u32.to_le_bytes());
@@ -384,21 +335,17 @@ mod tests {
     }
 
     #[test]
-    fn expand_via_page_map_random_access_u32_index_dispatch() {
-        // row_length=2: entry_bytes=8. If data_runs holds u32 indices (not
-        // entry indices), max_offset * 8 would overflow a small buffer — but
-        // max_offset * 4 fits. We verify the u32-index branch is picked and
-        // that row_length consecutive u32s flow out per logical row.
-        //
-        // Decoded buffer has 4 u32s; row_length=2 means each row consumes 2
-        // consecutive u32s. data_runs=[0, 2] means row 0 = u32s[0..2],
-        // row 1 = u32s[2..4]. With entry-index dispatch, offset 2 * 8 + 8 =
-        // 24 > 16 (overflow) → falls back to u32-index.
+    fn expand_via_page_map_random_access_multi_element_rows() {
+        // Two u32s per row. ncbi-vdb stores `data_offset` in elements, so
+        // offset 2 means "start at the third u32" — NOT "start at the third
+        // two-u32 entry". Earlier revisions guessed between those readings by
+        // testing which one fit the buffer; this shape is where the entry
+        // reading is wrong (it would run off the end at 2 * 8 + 8 = 24 > 16).
         let pm = PageMap {
             data_recs: 2,
             lengths: vec![2],
             leng_runs: vec![2],
-            data_runs: vec![0, 2],
+            mapping: RowMapping::RandomAccessOffsets(vec![0, 2]),
         };
         let mut data = Vec::new();
         for v in [100u32, 200, 300, 400] {
@@ -414,13 +361,12 @@ mod tests {
 
     #[test]
     fn expand_via_page_map_random_access_offset_overflow_errors() {
-        // row_length=1 so entry_bytes=4. Buffer has 2 u32s (8 bytes). Offset
-        // 5 overflows both dispatch modes.
+        // Buffer has 2 u32s (8 bytes); element offset 5 runs past the end.
         let pm = PageMap {
             data_recs: 3,
             lengths: vec![1],
             leng_runs: vec![3],
-            data_runs: vec![0, 1, 5],
+            mapping: RowMapping::RandomAccessOffsets(vec![0, 1, 5]),
         };
         let data = vec![0u8; 8];
         let err =
@@ -567,12 +513,9 @@ mod tests {
             prop_assert_eq!(out, data);
         }
 
-        /// In the per-row expansion branch (`data_runs.len() < total_rows`)
-        /// the output byte count is exactly `sum(data_runs) * elem_bytes`
-        /// for row_length=1 — the invariant `expand_data_runs_bytes`
-        /// enforces, exposed via `expand_via_page_map`. Values start at 2
-        /// so `sum(runs) > runs.len()` and we always hit the per-row branch
-        /// rather than the equal-length random-access branch.
+        /// Under repeat counts the output byte count is exactly
+        /// `sum(repeats) * elem_bytes` for row_length=1, and each record's
+        /// bytes appear once per row it covers.
         #[test]
         fn prop_expand_via_page_map_per_row_length_is_sum_of_runs(
             runs in proptest::collection::vec(2u32..4, 1..16)
@@ -583,7 +526,7 @@ mod tests {
                 data_recs: n as u64,
                 lengths: vec![1],
                 leng_runs: vec![total],
-                data_runs: runs.clone(),
+                mapping: RowMapping::RepeatCounts(runs.clone()),
             };
             // row_length=1 → each record is one u32 (4 bytes).
             let mut data = Vec::with_capacity(n * 4);
@@ -602,22 +545,21 @@ mod tests {
             }
         }
 
-        /// Random-access (entry-index) branch: for row_length=1, every
-        /// `data_runs[i]` picks one u32 entry, so output length always
-        /// equals `data_runs.len() * 4`.
+        /// Random access: for row_length=1 every offset picks one u32, so
+        /// the output length always equals `offsets.len() * 4` regardless of
+        /// how the offsets repeat or reorder.
         #[test]
-        fn prop_expand_via_page_map_random_access_entry_index_length(
+        fn prop_expand_via_page_map_random_access_length(
             entries in 1usize..16,
             refs in proptest::collection::vec(0u32..16, 1..32),
         ) {
             let max_ref = (entries - 1) as u32;
             let refs: Vec<u32> = refs.into_iter().map(|r| r % max_ref.max(1)).collect();
-            // For random-access dispatch, data_runs.len() must be >= total_rows.
             let pm = PageMap {
                 data_recs: refs.len() as u64,
                 lengths: vec![1],
                 leng_runs: vec![refs.len() as u32],
-                data_runs: refs.clone(),
+                mapping: RowMapping::RandomAccessOffsets(refs.clone()),
             };
             let mut data = Vec::with_capacity(entries * 4);
             for i in 0..entries {
