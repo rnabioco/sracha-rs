@@ -1221,6 +1221,7 @@ pub(crate) fn decode_blob_to_fastq(
         biological: bool,
     }
     let mut segments: Vec<ReadSeg> = Vec::with_capacity(rps);
+    let mut bio_bases_in_blob: u64 = 0;
 
     while rl_cursor + rps <= read_lengths.len() {
         let spot_read_lengths = &read_lengths[rl_cursor..rl_cursor + rps];
@@ -1342,6 +1343,13 @@ pub(crate) fn decode_blob_to_fastq(
             }
 
             let biological = crate::fastq::read_is_biological(spot_read_types, i);
+            if biological {
+                // Tallied before the technical and min-length filters so the
+                // total is a property of the archive, not of the user's flags.
+                // Accumulated locally and published once per blob — an atomic
+                // per read would be contended across every rayon worker.
+                bio_bases_in_blob += rlen_usize as u64;
+            }
 
             // Filter: skip technical reads if configured.
             if config.skip_technical && !biological {
@@ -1501,6 +1509,11 @@ pub(crate) fn decode_blob_to_fastq(
              sequence stream",
             read_data.len(),
         );
+    }
+
+    if bio_bases_in_blob != 0 {
+        diag.bio_bases_seen
+            .fetch_add(bio_bases_in_blob, Ordering::Relaxed);
     }
 
     // Collect populated LUT entries in slot-index order, then overflow.

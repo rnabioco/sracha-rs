@@ -192,17 +192,26 @@ pub fn is_aligned_database_schema(schema_name: &str) -> bool {
 /// - `None` — the node is absent (most non-cSRA runs), no signal either
 ///   way.
 pub fn read_cmp_base_count(tree_data: &[u8]) -> Option<u64> {
+    read_stats_table_u64(tree_data, "CMP_BASE_COUNT")
+}
+
+/// Read a `STATS/TABLE/<name>` u64 counter from a metadata tree.
+///
+/// The loader writes these when it builds the archive, so they are an
+/// independent record of what the run contains rather than something derived
+/// from the same decode being checked. `BASE_COUNT`, `BIO_BASE_COUNT` and
+/// `SPOT_COUNT` all live here.
+pub fn read_stats_table_u64(tree_data: &[u8], name: &str) -> Option<u64> {
     let nodes = parse_meta_nodes(tree_data).ok()?;
-    // STATS is a top-level node with nested children; we want STATS/TABLE/CMP_BASE_COUNT.
     fn find_child<'a>(parent: &'a [MetaNode], name: &str) -> Option<&'a MetaNode> {
         parent.iter().find(|n| n.name == name)
     }
     let stats = find_child(&nodes, "STATS")?;
     let table = find_child(&stats.children, "TABLE")?;
-    let cmp = find_child(&table.children, "CMP_BASE_COUNT")?;
-    if cmp.value.len() >= 8 {
+    let node = find_child(&table.children, name)?;
+    if node.value.len() >= 8 {
         let mut b = [0u8; 8];
-        b.copy_from_slice(&cmp.value[..8]);
+        b.copy_from_slice(&node.value[..8]);
         Some(u64::from_le_bytes(b))
     } else {
         None

@@ -588,6 +588,9 @@ fn decode_and_write(
     // Fallback per-read lengths (from VDB metadata or the NCBI EUtils API).
     // Only used when READ_LEN column is absent. Cloned once here so rayon
     // closures can borrow it without moving the config.
+    // Captured before the cursor is consumed; compared once the run ends.
+    let expected_bio_bases: Option<u64> = cursor.bio_base_count();
+
     let fallback_read_lengths: Option<Vec<u32>> = if !has_read_len {
         let picked = resolve_fallback_read_lengths(
             cursor.metadata_read_lengths(),
@@ -1068,6 +1071,23 @@ fn decode_and_write(
     if !config.stdout {
         for (final_path, tmp_path) in &output_paths {
             std::fs::rename(tmp_path, final_path).map_err(Error::Io)?;
+        }
+    }
+
+    // The one check anchored outside the decode. The loader recorded how many
+    // biological bases this run holds, so a conversion that quietly emits a
+    // fraction of them is visible even when every internal stream agrees with
+    // every other — #118 lost exactly half of five runs that way, with static
+    // READ_LEN and the decoded buffer in perfect agreement at 50 of 100 bases
+    // per spot.
+    if let Some(expected) = expected_bio_bases.filter(|&n| n > 0) {
+        let seen = diag.bio_bases_seen.load(Ordering::Relaxed);
+        if seen != expected {
+            diag.base_count_mismatch.fetch_add(1, Ordering::Relaxed);
+            tracing::warn!(
+                "{accession}: decoded {seen} biological bases but the archive \
+                 records {expected} (STATS/TABLE/BIO_BASE_COUNT)",
+            );
         }
     }
 

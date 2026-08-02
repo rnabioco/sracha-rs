@@ -64,6 +64,8 @@ pub struct VdbCursor {
     /// Read descriptors inferred from table metadata (used when READ_LEN
     /// column is absent, e.g. SRA-lite files).
     metadata_read_descs: Option<Vec<ReadDescriptor>>,
+    /// `STATS/TABLE/BIO_BASE_COUNT`, when the loader recorded one.
+    bio_base_count: Option<u64>,
     /// Sequencing platform detected from VDB schema metadata.
     platform: Option<String>,
     /// `true` when the metadata shows a `SOFTWARE/delite` node — the tell-tale
@@ -102,6 +104,7 @@ impl VdbCursor {
         // Parse table metadata (md/cur) to extract reads_per_spot and
         // platform for SRA-lite files that lack physical READ_LEN/NREADS columns.
         let (metadata_read_descs, platform) = Self::detect_metadata(archive, table);
+        let bio_base_count = read_stats_u64_from_archive(archive, "BIO_BASE_COUNT");
         let is_sra_lite = Self::detect_sra_lite(archive);
 
         // READ is required.
@@ -192,9 +195,20 @@ impl VdbCursor {
             first_row,
             row_count,
             metadata_read_descs,
+            bio_base_count,
             platform,
             is_sra_lite,
         })
+    }
+
+    /// Biological bases the loader recorded for this run
+    /// (`STATS/TABLE/BIO_BASE_COUNT`).
+    ///
+    /// Independent of anything the decoder computes, so it can be used to
+    /// confirm a conversion emitted the run it was given rather than a
+    /// self-consistent fraction of it.
+    pub fn bio_base_count(&self) -> Option<u64> {
+        self.bio_base_count
     }
 
     /// Total number of spots (rows) in the SEQUENCE table.
@@ -1040,10 +1054,18 @@ fn reject_if_csra<R: Read + Seek>(archive: &mut KarArchive<R>, seq_col_base: &st
 /// Scan table and database-level `md/cur` trees for `STATS/TABLE/CMP_BASE_COUNT`
 /// and return the first non-`None` value found.
 fn read_cmp_base_count_from_archive<R: Read + Seek>(archive: &mut KarArchive<R>) -> Option<u64> {
+    read_stats_u64_from_archive(archive, "CMP_BASE_COUNT")
+}
+
+/// Read a `STATS/TABLE/<name>` counter from either md/cur tree.
+fn read_stats_u64_from_archive<R: Read + Seek>(
+    archive: &mut KarArchive<R>,
+    name: &str,
+) -> Option<u64> {
     for path in ["tbl/SEQUENCE/md/cur", "md/cur"] {
         if let Ok(md_bytes) = archive.read_file(path)
             && md_bytes.len() >= 8
-            && let Some(n) = crate::metadata::read_cmp_base_count(&md_bytes[8..])
+            && let Some(n) = crate::metadata::read_stats_table_u64(&md_bytes[8..], name)
         {
             return Some(n);
         }
