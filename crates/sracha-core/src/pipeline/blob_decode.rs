@@ -1483,6 +1483,26 @@ pub(crate) fn decode_blob_to_fastq(
         spot_idx_in_blob += 1;
     }
 
+    // Invariant: the spots consumed exactly the bases this blob decoded.
+    //
+    // The loop above catches per-spot *overrun* — READ_LEN claiming more bases
+    // than remain — but nothing notices the other direction, where the spot
+    // boundaries stop short and the tail of `read_data` is silently dropped.
+    // Either way the two streams disagree about where spots begin, so every
+    // record after the first divergence carries bases from the wrong offsets.
+    // This is the sequence-side analogue of the quality check above (#115,
+    // #117).
+    if seq_offset != read_data.len() {
+        diag.sequence_blob_length_mismatch
+            .fetch_add(1, Ordering::Relaxed);
+        tracing::warn!(
+            "blob {blob_idx}: READ_LEN accounts for {seq_offset} of {} decoded bases \
+             after {spot_idx_in_blob} spots — the spot boundaries do not match the \
+             sequence stream",
+            read_data.len(),
+        );
+    }
+
     // Collect populated LUT entries in slot-index order, then overflow.
     let mut records: Vec<BlobSlotOutput> = Vec::with_capacity(4);
     for entry in slot_lut.into_iter().flatten() {

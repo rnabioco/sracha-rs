@@ -114,6 +114,9 @@ pub(crate) fn write_stats_file(entry: StatsEntry<'_>) -> Result<()> {
             "quality_blob_length_mismatch": diag
                 .quality_blob_length_mismatch
                 .load(Ordering::Relaxed),
+            "sequence_blob_length_mismatch": diag
+                .sequence_blob_length_mismatch
+                .load(Ordering::Relaxed),
             "all_zero_quality_blobs": diag.all_zero_quality_blobs.load(Ordering::Relaxed),
             "paired_spot_violations": diag.paired_spot_violations.load(Ordering::Relaxed),
             "truncated_spots": diag.truncated_spots.load(Ordering::Relaxed),
