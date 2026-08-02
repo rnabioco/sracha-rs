@@ -1,5 +1,19 @@
 # Changelog
 
+## Unreleased
+
+### Fixes
+
+- Decode version-2 (random-access) page maps as per-row element offsets
+  instead of repeat counts (#101). A page map's `data_offset[]` and
+  `data_run[]` share one slot in the on-disk format, and sracha kept both in
+  an untyped `Vec<u32>`, so a version-2 blob's offsets were walked as run
+  lengths — `sracha fastq` failed on SRR35917722 with "variable data
+  truncated", and `sracha vdb dump` failed on any archive with deduplicated
+  rows because it never expanded them at all. `PageMap` now carries a typed
+  `RowMapping`, and every consumer resolves rows through a single
+  offset-and-length walk that mirrors ncbi-vdb's `PageMapFindRow`.
+
 ## 0.4.2 (2026-07-31)
 
 ### Fixes

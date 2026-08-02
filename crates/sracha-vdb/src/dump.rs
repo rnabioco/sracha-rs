@@ -357,7 +357,11 @@ fn materialize_dna2na(decoded: &DecodedBlob<'_>, row_count: u64) -> Result<(Vec<
     let packed = decode_2na_payload(decoded, expected_bases)?;
     let actual_bases = elem_count(decoded, &packed, 2);
     let bases = unpack_2na(&packed, actual_bases);
-    split_by_rows(decoded, bases, row_count, 1)
+    // Deduplicated blobs store one copy per data record, so the unpacked
+    // bases have to be expanded to one run per logical row before they can be
+    // sliced against the (per-row) split plan.
+    let bases = expand_rows_if_needed(decoded, bases, 1)?;
+    split_by_rows_already_expanded(decoded, bases, row_count, 1)
 }
 
 /// Obtain the packed 2na bytes for a READ blob.
@@ -389,6 +393,22 @@ fn materialize_dna4na_bin(
     let raw = decode_zip_encoding(decoded)?;
     let offsets = split_offsets(decoded, row_count, 1)?;
     let expected = offsets.last().copied().unwrap_or(0);
+    // 4na:packed can't be expanded before unpacking, so a deduplicated blob
+    // is only handled in its (far more common) one-byte-per-base form.
+    if !mapping_is_identity(decoded) {
+        let expanded = expand_rows_if_needed(decoded, raw, 1)?;
+        if expanded.len() == expected {
+            let out: Vec<u8> = expanded
+                .iter()
+                .map(|b| decode_4na_nibble(b & 0x0F))
+                .collect();
+            return Ok((out, offsets));
+        }
+        return Err(Error::Format(format!(
+            "dump: ALTREAD payload expands to {} bytes, expected {expected} (4na:bin)",
+            expanded.len(),
+        )));
+    }
     if raw.len() == expected {
         let out: Vec<u8> = raw.iter().map(|b| decode_4na_nibble(b & 0x0F)).collect();
         return Ok((out, offsets));
@@ -413,26 +433,20 @@ fn decode_4na_nibble(n: u8) -> u8 {
 fn materialize_quality(decoded: &DecodedBlob<'_>, row_count: u64) -> Result<(Vec<u8>, Vec<usize>)> {
     let raw = decode_quality_encoding(decoded)?;
     let ascii = phred_to_ascii(&raw);
-    split_by_rows(decoded, ascii, row_count, 1)
+    // Rows deduplicated at write time are stored once; expand before slicing.
+    let ascii = expand_rows_if_needed(decoded, ascii, 1)?;
+    split_by_rows_already_expanded(decoded, ascii, row_count, 1)
 }
 
 fn materialize_ascii(decoded: &DecodedBlob<'_>, row_count: u64) -> Result<(Vec<u8>, Vec<usize>)> {
     let raw = decode_zip_encoding(decoded)?;
-    let raw = if let Some(pm) = decoded.page_map.as_ref() {
-        if pm.data_runs.is_empty() {
-            raw
-        } else {
-            pm.expand_variable_data_runs(&raw)?
-        }
-    } else {
-        raw
-    };
+    let raw = expand_rows_if_needed(decoded, raw, 1)?;
     split_by_rows_already_expanded(decoded, raw, row_count, 1)
 }
 
 fn materialize_u32(decoded: &DecodedBlob<'_>, row_count: u64) -> Result<(Vec<u8>, Vec<usize>)> {
     let raw = decode_irzip_column(decoded)?;
-    // `decode_irzip_column` already runs the page_map data_runs expansion,
+    // `decode_irzip_column` already runs the page_map row expansion,
     // so `raw` is flat row bytes at `entry_bytes = row_length * 4`.
     split_by_rows_already_expanded(decoded, raw, row_count, 4)
 }
@@ -553,19 +567,36 @@ fn expand_leng_runs(pm: &PageMap) -> Vec<u32> {
 }
 
 /// For fixed-size element columns (u32, u8), replicate physical records to
-/// per-row data via the page map's data_runs (honouring variable per-record
+/// per-row data via the page map's mapping (honouring variable per-record
 /// lengths) — otherwise return as-is.
 fn expand_runs_if_any(
     decoded: &DecodedBlob<'_>,
     data: Vec<u8>,
     elem_bytes: usize,
 ) -> Result<Vec<u8>> {
-    if let Some(pm) = decoded.page_map.as_ref()
-        && !pm.data_runs.is_empty()
-    {
-        return pm.expand_records_to_rows(&data, elem_bytes);
+    expand_rows_if_needed(decoded, data, elem_bytes)
+}
+
+/// True when every data record covers exactly one logical row, so the decoded
+/// payload is already in row order.
+fn mapping_is_identity(decoded: &DecodedBlob<'_>) -> bool {
+    decoded
+        .page_map
+        .as_ref()
+        .is_none_or(|pm| pm.mapping.is_identity())
+}
+
+/// Expand a decoded payload from one entry per data record to one per logical
+/// row, honouring whichever mapping the page map carries.
+fn expand_rows_if_needed(
+    decoded: &DecodedBlob<'_>,
+    data: Vec<u8>,
+    elem_bytes: usize,
+) -> Result<Vec<u8>> {
+    match decoded.page_map.as_ref() {
+        Some(pm) if !pm.mapping.is_identity() => pm.expand_rows(&data, elem_bytes),
+        _ => Ok(data),
     }
-    Ok(data)
 }
 
 /// After elements have been unpacked/expanded to one ASCII byte per elem
@@ -589,7 +620,7 @@ fn split_by_rows(
 }
 
 /// Like [`split_by_rows`] but for byte streams that already include
-/// data_runs expansion (e.g. `decode_irzip_column` result).
+/// row expansion (e.g. `decode_irzip_column` result).
 fn split_by_rows_already_expanded(
     decoded: &DecodedBlob<'_>,
     data: Vec<u8>,
@@ -916,7 +947,7 @@ mod tests {
             data_recs: 5,
             lengths: vec![0, 8, 0],
             leng_runs: vec![2, 1, 2],
-            data_runs: vec![],
+            mapping: crate::blob::RowMapping::Identity,
         };
         let data = vec![0x1b, 0xe4];
         let blob = DecodedBlob {

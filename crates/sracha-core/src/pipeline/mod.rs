@@ -2426,32 +2426,32 @@ mod tests {
     }
 
     #[test]
-    fn expand_empty_data_runs_returns_input() {
+    fn expand_identity_mapping_returns_input() {
         let data = vec![1, 0, 0, 0, 2, 0, 0, 0];
         let pm = blob::PageMap {
             data_recs: 2,
             lengths: vec![1],
             leng_runs: vec![2],
-            data_runs: vec![],
+            mapping: blob::RowMapping::Identity,
         };
         let result = expand_via_page_map(data.clone(), &Some(pm)).unwrap();
         assert_eq!(result, data);
     }
 
     #[test]
-    fn expand_data_runs_direct_offset() {
+    fn expand_random_access_offsets() {
         // 3 unique u32 values: [10, 20, 30]
         let data = vec![
             10, 0, 0, 0, // entry 0
             20, 0, 0, 0, // entry 1
             30, 0, 0, 0, // entry 2
         ];
-        // 4 rows, each referencing an entry by offset index
+        // 4 rows, each naming the element its data starts at
         let pm = blob::PageMap {
-            data_recs: 3,
+            data_recs: 4,
             lengths: vec![1],
             leng_runs: vec![4],
-            data_runs: vec![0, 2, 1, 0], // rows → entries: 0,2,1,0
+            mapping: blob::RowMapping::RandomAccessOffsets(vec![0, 2, 1, 0]),
         };
         let result = expand_via_page_map(data, &Some(pm)).unwrap();
         assert_eq!(
@@ -2466,14 +2466,14 @@ mod tests {
     }
 
     #[test]
-    fn expand_data_runs_direct_offset_rejects_oob() {
+    fn expand_random_access_offsets_reject_oob() {
         // Only 2 entries in data (8 bytes = 2 u32s), but offset 5 points past.
         let data = vec![10, 0, 0, 0, 20, 0, 0, 0];
         let pm = blob::PageMap {
-            data_recs: 2,
+            data_recs: 3,
             lengths: vec![1],
             leng_runs: vec![3],
-            data_runs: vec![0, 5, 1],
+            mapping: blob::RowMapping::RandomAccessOffsets(vec![0, 5, 1]),
         };
         assert!(expand_via_page_map(data, &Some(pm)).is_err());
     }
