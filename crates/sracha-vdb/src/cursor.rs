@@ -296,8 +296,16 @@ impl VdbCursor {
     /// non-zero length. Returns `None` if any length is 0 (variable/unknown).
     pub fn metadata_read_lengths(&self) -> Option<Vec<u32>> {
         let descs = self.metadata_read_descs.as_ref()?;
-        if descs.iter().all(|d| d.read_len > 0) {
-            Some(descs.iter().map(|d| d.read_len).collect())
+        let lens: Vec<u32> = descs.iter().map(|d| d.read_len).collect();
+        // A zero-length slot is legitimate: it marks a read the run does not
+        // use, and the decoder drops it like any other empty read. Rejecting
+        // the whole descriptor over one zero sent `latf-load` archives — whose
+        // static READ_LEN is `[100, 0]` — down the even-split heuristic, which
+        // cut every 100 bp spot into 50/50 and silently emitted half the run
+        // (#118). Only an all-zero descriptor is unusable, since it yields no
+        // spot length to divide by.
+        if lens.iter().any(|&l| l > 0) {
+            Some(lens)
         } else {
             None
         }
@@ -1376,6 +1384,41 @@ mod tests {
 
         assert_eq!(cursor.metadata_reads_per_spot(), Some(2));
         assert_eq!(cursor.metadata_read_lengths(), Some(vec![151, 151]));
+        let _ = std::fs::remove_file(&sra_path);
+    }
+
+    /// A zero-length read slot is legitimate — it marks a read the run does
+    /// not use, and the decoder drops it like any other empty read.
+    /// Discarding the whole descriptor over one zero sent `latf-load`
+    /// archives down the even-split heuristic, cutting every 100 bp spot into
+    /// 50/50 and silently emitting half the run (#118).
+    #[test]
+    fn metadata_read_lengths_keeps_a_zero_length_slot() {
+        let md = build_metadata_bytes(&[("READ_0", b"B|100|"), ("READ_1", b"B|0|")], None);
+        let archive_bytes = build_sra_archive_with_metadata(Some(&md));
+        let sra_path = write_temp_sra(&archive_bytes);
+        let mut archive = KarArchive::open(Cursor::new(archive_bytes)).unwrap();
+        let cursor = VdbCursor::open(&mut archive, &sra_path).unwrap();
+
+        assert_eq!(
+            cursor.metadata_read_lengths(),
+            Some(vec![100, 0]),
+            "the 100 bp read must survive its empty sibling"
+        );
+        let _ = std::fs::remove_file(&sra_path);
+    }
+
+    /// An all-zero descriptor still yields nothing: it gives no spot length
+    /// to divide by, so the caller has to fall back.
+    #[test]
+    fn metadata_read_lengths_rejects_an_all_zero_descriptor() {
+        let md = build_metadata_bytes(&[("READ_0", b"B|0|"), ("READ_1", b"B|0|")], None);
+        let archive_bytes = build_sra_archive_with_metadata(Some(&md));
+        let sra_path = write_temp_sra(&archive_bytes);
+        let mut archive = KarArchive::open(Cursor::new(archive_bytes)).unwrap();
+        let cursor = VdbCursor::open(&mut archive, &sra_path).unwrap();
+
+        assert_eq!(cursor.metadata_read_lengths(), None);
         let _ = std::fs::remove_file(&sra_path);
     }
 
