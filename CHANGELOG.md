@@ -4,6 +4,17 @@
 
 ### Fixes
 
+- Name the `--split-files` output `ACC.fastq` for single-read archives (#103).
+  fasterq-dump suffixes by mate index there, except when the archive stores
+  one read per spot, where it writes a bare filename; sracha always wrote
+  `ACC_1.fastq`. The decision keys off the stored read count rather than how
+  many reads survive filtering, so DRR004435 — where a 2 bp adapter is dropped
+  and only mate 2 remains — still writes `DRR004435_2.fastq`.
+
+## Unreleased
+
+### Fixes
+
 - Decode version-2 (random-access) page maps as per-row element offsets
   instead of repeat counts (#101). A page map's `data_offset[]` and
   `data_run[]` share one slot in the on-disk format, and sracha kept both in
