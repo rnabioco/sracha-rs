@@ -1,0 +1,52 @@
+# Distilled validation corpus for sracha.
+#
+# One row per archive worth re-checking after any decoder change. Every entry
+# is here because it broke something or because it is the only cover for a
+# platform, layout, read length, or archive shape.
+#
+# tier   core     = run by default; the whole tier is a few hundred GB of decode
+#        extended = large archives, run when the change touches their path
+# shape  table    = flat KAR table   db = database with a SEQUENCE table
+#        csra     = reference-compressed, has PRIMARY_ALIGNMENT + REFERENCE
+#
+# Usage:
+#   awk -F'\t' '$2=="core" && !/^#/ {print $1}' validation/corpus.tsv > core.txt
+#   bash validation/ab_corpus.sh --sbatch --baseline OLD --candidate NEW -a core.txt
+#
+accession	tier	shape	platform	model	layout	strategy	reads	avg_read_len	size_bytes	covers
+SRR35917722	extended	db	ILLUMINA	Illumina NovaSeq X	PAIRED	RNA-Seq	695578709	302	32160632119	version-2 random-access page map; rows share a deduplicated vocabulary (#101)
+DRR028486	core	table	ILLUMINA	Illumina HiSeq 2500	PAIRED	RNA-Seq	1759140	302	372039045	ALTREAD N-mask dropped when the random-access shape was guessed (#101)
+SRR33907345	core	db	ILLUMINA	Illumina MiSeq	PAIRED	WGS	305571	488	77521894	variable-length data_runs in a READ blob; dropped a spot when unexpanded (#22)
+DRR045255	core	db	ILLUMINA	Illumina MiSeq	PAIRED	RNA-Seq	3745800	147	245875647	random-access READ_LEN offsets; cross-batch spot numbering past 1,048,576
+DRR040793	core	table	ILLUMINA	Illumina HiSeq 2000	PAIRED	OTHER	870924	200	122476723	NAME_FMT per-row template overrides; fine-grained tile interleave
+DRR024182	core	table	ILLUMINA	Illumina HiSeq 2500	PAIRED	WGS	4806031	200	567683965	variant-2 random-access ALTREAD; 6481 rows share offset 0
+DRR035866	core	table	ILLUMINA	Illumina MiSeq	PAIRED	OTHER	208643	502	66338519	ALTREAD blobs twice the size of READ blobs (2:1 row pairing)
+DRR006688	core	table	ILLUMINA	Illumina Genome Analyzer IIx	SINGLE	RNA-Seq	8843478	76	430438287	ALTREAD N-mask vs quality-based masking (FAIL_SEQ divergence)
+SRR18959644	core	db	BGISEQ	BGISEQ-500	PAIRED	RNA-Seq	44457242	150	4168694011	one READ_TYPE record spans 22,227,968 spots; windowed expansion only
+DRR001816	core	table	ILLUMINA	Illumina Genome Analyzer IIx	SINGLE	RNA-Seq	35949084	36	734255205	izip-encoded quality from the srf-load era, not deflate
+ERR15141550	core	db	OXFORD_NANOPORE	PromethION	SINGLE	WGS	553585	2847	1428803617	v2 iunzip blob with osize == data.len(); raw passthrough (#20)
+SRR14724462	core	db	ILLUMINA	Illumina NovaSeq 6000	PAIRED	WXS	41135235	302	4057553143	bam-loaded but fully unmapped: align schema with no PRIMARY_ALIGNMENT
+DRR035195	core	db	ILLUMINA	Illumina MiSeq	PAIRED	WGS	598383	486	0	delite-processed SRA-Lite; synthesized quality must match fasterq-dump
+DRR032988	core	db	PACBIO_SMRT	PacBio RS	SINGLE	WGS	326964	4185	5306051249	PacBio blob whose data runs align exactly with its length runs
+DRR035183	core	db	ILLUMINA	Illumina MiSeq	PAIRED	WGS	644410	428	172248773	md5 parity case that regressed twice
+SRR36401016	core	db	ILLUMINA	Illumina NovaSeq 6000	PAIRED	WGS	48639849	300	8510845882	compressor drained only 19 of N blocks before the writer ran
+SRR15000000	core	db	ILLUMINA	Illumina NovaSeq 6000	PAIRED	AMPLICON	4006555	96	126844353	newer-writer archive layout
+SRR9827735	core	db	ILLUMINA	NextSeq 500	PAIRED	RNA-Seq	23039135	55	1275408432	10x 26/55/8 read layout mis-split into 44/45
+SRR38107137	core	db	PACBIO_SMRT	Sequel	SINGLE	FL-cDNA	50511	2479	42332890	PacBio sequence and quality mismatches vs fasterq-dump
+DRR019046	core	table	ILLUMINA	Illumina HiSeq 2000	SINGLE	miRNA-Seq	17171857	51	579182626	skey name reconstruction on a flat table; adjacent-template prefix bytes
+DRR023226	core	db	ILLUMINA	Illumina Genome Analyzer IIx	SINGLE	RNA-Seq	8563991	86	414662256	READ and QUALITY columns with mismatched blob counts
+DRR004435	core	table	ILLUMINA	Illumina Genome Analyzer IIx	SINGLE	OTHER	36805747	34	728056928	2 bp adapter ahead of a 34 bp read; routing to _2 with no _1
+DRR050206	core	table	ILLUMINA	Illumina HiSeq 2000	SINGLE	RNA-Seq	3043495	49	102425783	content-equal but md5-divergent output
+SRR341578	core	csra	ILLUMINA	Illumina HiSeq 2000	PAIRED	WGS	7549706	202	932308473	aligned cSRA: PRIMARY_ALIGNMENT + REFERENCE + SEQUENCE
+SRR000001	core	table	LS454	454 GS FLX	PAIRED	WGS	470985	248	312527083	454 pyrosequencing, flat table
+SRR2584863	core	table	ILLUMINA	Illumina HiSeq 2500	PAIRED	WGS	1553259	300	302057279	HiSeq paired flat table
+SRR28588231	core	db	ILLUMINA	Illumina MiSeq	PAIRED	AMPLICON	66220	602	23395841	MiSeq 2x301 amplicon
+SRR10358300	core	db	ILLUMINA	Illumina MiSeq	PAIRED	AMPLICON	62983	600	24227855	align schema, unmapped; MiSeq amplicon
+SRR38889541	core	db	PACBIO_SMRT	Revio	SINGLE	AMPLICON	25000	1473	11366482	PacBio Revio HiFi long reads
+SRR38892122	core	db	OXFORD_NANOPORE	PromethION	SINGLE	WGS	1828	4766	6985886	Oxford Nanopore PromethION long reads
+DRR002770	core	table	ION_TORRENT	Ion Torrent PGM	SINGLE	WGS	908553	281	675763350	Ion Torrent PGM, variable read length
+DRR010063	core	table	ABI_SOLID	AB 5500xl Genetic Analyzer	SINGLE	WGS	631524	75	27458459	ABI SOLiD colorspace decode path
+DRR171344	core	db	CAPILLARY	AB 3730xL Genetic Analyzer	SINGLE	WGS	30801	1088	24820152	Sanger capillary reads
+DRR1001272	core	db	DNBSEQ	unspecified	PAIRED	AMPLICON	102234	444	19559696	DNBSEQ paired amplicon
+ERR13764617	core	db	ELEMENT	Element AVITI	SINGLE	RNA-Seq	1352371	75	69961841	Element AVITI
+SRR32909377	core	db	ULTIMA	UG 100	PAIRED	OTHER	33004	484	5860358	Ultima UG 100
