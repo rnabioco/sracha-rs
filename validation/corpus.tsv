@@ -9,11 +9,14 @@
 # shape  table    = flat KAR table   db = database with a SEQUENCE table
 #        csra     = reference-compressed, has PRIMARY_ALIGNMENT + REFERENCE
 #
-# Not every row exercises the FASTQ decoder. `sracha fastq` refuses cSRA and
-# 454 outright, so those rows check that both binaries refuse identically
-# (verdict REJECT_CSRA / REJECT_PLATFORM in ab_corpus.sh); reach their decode
-# paths with `sracha vdb dump` instead. Treating a REJECT as decode coverage
-# is the mistake this note exists to prevent.
+# Not every row exercises the FASTQ decoder. `sracha fastq` declines cSRA and
+# the legacy platforms — 454, Ion Torrent, capillary — and cannot read ABI
+# SOLiD colorspace at all (#109). Those five rows check that both binaries
+# decline identically (verdict REJECT_CSRA / REJECT_PLATFORM / REJECTED_BOTH
+# in ab_corpus.sh); reach their decode paths with `sracha vdb dump` instead.
+# Treating a REJECT as decode coverage is the mistake this note exists to
+# prevent, and the `covers` column says so per row rather than leaving it to
+# be inferred from the platform.
 #
 # Usage:
 #   awk -F'\t' '$2=="core" && !/^#/ {print $1}' validation/corpus.tsv > core.txt
@@ -50,9 +53,9 @@ SRR28588231	core	db	ILLUMINA	Illumina MiSeq	PAIRED	AMPLICON	66220	602	23395841	M
 SRR10358300	core	db	ILLUMINA	Illumina MiSeq	PAIRED	AMPLICON	62983	600	24227855	align schema, unmapped; MiSeq amplicon
 SRR38889541	core	db	PACBIO_SMRT	Revio	SINGLE	AMPLICON	25000	1473	11366482	PacBio Revio HiFi long reads
 SRR38892122	core	db	OXFORD_NANOPORE	PromethION	SINGLE	WGS	1828	4766	6985886	Oxford Nanopore PromethION long reads
-DRR002770	core	table	ION_TORRENT	Ion Torrent PGM	SINGLE	WGS	908553	281	675763350	Ion Torrent PGM, variable read length
-DRR010063	core	table	ABI_SOLID	AB 5500xl Genetic Analyzer	SINGLE	WGS	631524	75	27458459	ABI SOLiD colorspace decode path
-DRR171344	core	db	CAPILLARY	AB 3730xL Genetic Analyzer	SINGLE	WGS	30801	1088	24820152	Sanger capillary reads
+DRR002770	core	table	ION_TORRENT	Ion Torrent PGM	SINGLE	WGS	908553	281	675763350	Ion Torrent PGM, variable read length; fastq declines the platform, use vdb dump
+DRR010063	core	table	ABI_SOLID	AB 5500xl Genetic Analyzer	SINGLE	WGS	631524	75	27458459	ABI SOLiD: colorspace CSREAD/ALTCSREAD, no READ column; fastq cannot convert it (#109)
+DRR171344	core	db	CAPILLARY	AB 3730xL Genetic Analyzer	SINGLE	WGS	30801	1088	24820152	Sanger capillary reads; fastq declines the platform, use vdb dump
 DRR1001272	core	db	DNBSEQ	unspecified	PAIRED	AMPLICON	102234	444	19559696	DNBSEQ paired amplicon
 ERR13764617	core	db	ELEMENT	Element AVITI	SINGLE	RNA-Seq	1352371	75	69961841	Element AVITI
 SRR32909377	core	db	ULTIMA	UG 100	PAIRED	OTHER	33004	484	5860358	Ultima UG 100
