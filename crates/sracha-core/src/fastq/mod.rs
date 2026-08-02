@@ -53,6 +53,13 @@ pub struct IntegrityDiag {
     /// A tally rather than a violation count: compared at end of run against
     /// the loader's `STATS/TABLE/BIO_BASE_COUNT`.
     pub bio_bases_seen: AtomicU64,
+    /// Set when the decoded spot count disagrees with the SEQUENCE table's
+    /// row count.
+    ///
+    /// `BIO_BASE_COUNT` alone cannot see this: a run emitting the right total
+    /// bases spread across the wrong number of spots passes it cleanly. Issue
+    /// #22 was exactly that shape — a spot undercount with plausible output.
+    pub spot_count_mismatch: AtomicU64,
     /// Set when that comparison disagrees.
     ///
     /// The only check anchored to something outside the decode. Everything
@@ -79,6 +86,7 @@ impl IntegrityDiag {
             || self.quality_blob_length_mismatch.load(Ordering::Relaxed) != 0
             || self.sequence_blob_length_mismatch.load(Ordering::Relaxed) != 0
             || self.base_count_mismatch.load(Ordering::Relaxed) != 0
+            || self.spot_count_mismatch.load(Ordering::Relaxed) != 0
             || self.all_zero_quality_blobs.load(Ordering::Relaxed) != 0
             || self.paired_spot_violations.load(Ordering::Relaxed) != 0
             || self.truncated_spots.load(Ordering::Relaxed) != 0
@@ -96,6 +104,7 @@ impl IntegrityDiag {
             || self.quality_blob_length_mismatch.load(Ordering::Relaxed) != 0
             || self.sequence_blob_length_mismatch.load(Ordering::Relaxed) != 0
             || self.base_count_mismatch.load(Ordering::Relaxed) != 0
+            || self.spot_count_mismatch.load(Ordering::Relaxed) != 0
             || self.paired_spot_violations.load(Ordering::Relaxed) != 0
     }
 
@@ -104,14 +113,16 @@ impl IntegrityDiag {
         format!(
             "quality_length_mismatches={}, quality_invalid_bytes={}, quality_overruns={}, \
              quality_blob_length_mismatch={}, sequence_blob_length_mismatch={}, \
-             base_count_mismatch={}, all_zero_quality_blobs={}, \
-             paired_spot_violations={}, truncated_spots={}",
+             base_count_mismatch={}, spot_count_mismatch={}, \
+             all_zero_quality_blobs={}, paired_spot_violations={}, \
+             truncated_spots={}",
             self.quality_length_mismatches.load(Ordering::Relaxed),
             self.quality_invalid_bytes.load(Ordering::Relaxed),
             self.quality_overruns.load(Ordering::Relaxed),
             self.quality_blob_length_mismatch.load(Ordering::Relaxed),
             self.sequence_blob_length_mismatch.load(Ordering::Relaxed),
             self.base_count_mismatch.load(Ordering::Relaxed),
+            self.spot_count_mismatch.load(Ordering::Relaxed),
             self.all_zero_quality_blobs.load(Ordering::Relaxed),
             self.paired_spot_violations.load(Ordering::Relaxed),
             self.truncated_spots.load(Ordering::Relaxed),
@@ -2128,5 +2139,37 @@ mod tests {
         assert!(!d.any(), "a tally alone is not an integrity problem");
         assert!(!d.any_strict_fatal());
         assert!(d.summary().contains("base_count_mismatch=0"));
+    }
+
+    /// A spot undercount is invisible to the base-count check when the bases
+    /// happen to total correctly, so it needs its own counter — issue #22 was
+    /// exactly that shape.
+    #[test]
+    fn spot_count_mismatch_is_strict_fatal() {
+        let d = IntegrityDiag::default();
+        assert!(!d.any_strict_fatal());
+        d.spot_count_mismatch.fetch_add(1, Ordering::Relaxed);
+        assert!(d.any(), "must be reported");
+        assert!(d.any_strict_fatal(), "and must fail a strict run");
+        assert!(d.summary().contains("spot_count_mismatch=1"));
+    }
+
+    /// The two external anchors are independent: bases can total correctly
+    /// while the spot count is wrong, and vice versa.
+    #[test]
+    fn base_and_spot_anchors_are_independent() {
+        let bases_only = IntegrityDiag::default();
+        bases_only
+            .base_count_mismatch
+            .fetch_add(1, Ordering::Relaxed);
+        assert!(bases_only.any_strict_fatal());
+        assert_eq!(bases_only.spot_count_mismatch.load(Ordering::Relaxed), 0);
+
+        let spots_only = IntegrityDiag::default();
+        spots_only
+            .spot_count_mismatch
+            .fetch_add(1, Ordering::Relaxed);
+        assert!(spots_only.any_strict_fatal());
+        assert_eq!(spots_only.base_count_mismatch.load(Ordering::Relaxed), 0);
     }
 }

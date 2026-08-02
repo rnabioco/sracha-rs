@@ -4,6 +4,12 @@
 
 ### Fixes
 
+- Verify the decoded spot count against the SEQUENCE table's row count
+  (#117). `BIO_BASE_COUNT` cannot see a run that emits the right total bases
+  across the wrong number of spots — issue #22 was exactly that shape.
+  `sracha validate` has always made this comparison; the conversion path never
+  did. Strict-fatal.
+
 - Verify decoded bases against the archive's recorded `BIO_BASE_COUNT` (#117).
   Every other integrity check compares the decoder against itself, which
   cannot see a decode where all streams agree on the wrong answer — #118

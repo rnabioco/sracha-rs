@@ -590,6 +590,7 @@ fn decode_and_write(
     // closures can borrow it without moving the config.
     // Captured before the cursor is consumed; compared once the run ends.
     let expected_bio_bases: Option<u64> = cursor.bio_base_count();
+    let expected_spots: u64 = cursor.spot_count();
 
     let fallback_read_lengths: Option<Vec<u32>> = if !has_read_len {
         let picked = resolve_fallback_read_lengths(
@@ -1089,6 +1090,18 @@ fn decode_and_write(
                  records {expected} (STATS/TABLE/BIO_BASE_COUNT)",
             );
         }
+    }
+
+    // Spot count is the other half of the external anchor. `BIO_BASE_COUNT`
+    // cannot see a run that emits the right total bases across the wrong
+    // number of spots — issue #22 was exactly that. `sracha validate` has
+    // always compared these; the conversion path never did.
+    if expected_spots > 0 && total_spots != expected_spots {
+        diag.spot_count_mismatch.fetch_add(1, Ordering::Relaxed);
+        tracing::warn!(
+            "{accession}: decoded {total_spots} spots but the SEQUENCE table \
+             holds {expected_spots} rows",
+        );
     }
 
     Ok((total_spots, reads_written, final_paths))
