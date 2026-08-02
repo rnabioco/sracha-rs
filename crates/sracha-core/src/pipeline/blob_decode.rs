@@ -622,6 +622,26 @@ pub(crate) fn decode_blob_to_fastq(
         (all, is_empty)
     };
 
+    // Invariant: the decoded quality stream covers exactly the bases this
+    // blob decoded. Both are one byte per base.
+    //
+    // The per-spot slicing below cannot check this. It takes
+    // `spot_total_bases` from wherever the cursor points, so a quality buffer
+    // of the wrong total size still yields a correctly *sized* slice for every
+    // spot — of the wrong bytes. #111 (0.75x) and #113 (3.13x) both shipped
+    // through that blind spot with sequences, names and counts all correct.
+    if !quality_is_empty && quality_all.len() != read_data.len() {
+        diag.quality_blob_length_mismatch
+            .fetch_add(1, Ordering::Relaxed);
+        tracing::warn!(
+            "blob {blob_idx}: decoded quality is {} bytes for {} bases — the quality \
+             stream does not correspond to the sequence stream, so records from this \
+             blob would carry quality read from the wrong offsets",
+            quality_all.len(),
+            read_data.len(),
+        );
+    }
+
     // ------------------------------------------------------------------
     // N-masking: ALTREAD (4na) ambiguity merge.
     //
@@ -1246,14 +1266,21 @@ pub(crate) fn decode_blob_to_fastq(
             }
         };
 
-        // Invariant: quality must be exactly as long as sequence.
-        debug_assert_eq!(
-            quality.len(),
-            sequence.len(),
-            "blob {blob_idx}, spot {spot_idx_in_blob}: quality length {} != sequence length {}",
-            quality.len(),
-            sequence.len(),
-        );
+        // Invariant: quality must be exactly as long as sequence. The
+        // slicing above satisfies this by construction today, so the branch
+        // costs a length compare and never taken — but it is the last gate
+        // before bytes reach the writer, and a `debug_assert!` here would be
+        // compiled out of exactly the builds users run.
+        if quality.len() != sequence.len() {
+            diag.quality_length_mismatches
+                .fetch_add(1, Ordering::Relaxed);
+            tracing::warn!(
+                "blob {blob_idx}, spot {spot_idx_in_blob}: quality length {} != \
+                 sequence length {}",
+                quality.len(),
+                sequence.len(),
+            );
+        }
 
         // Spot number: always numeric 1-based index.
         let spot_number_str = itoa_buf.format(spots_before as usize + spot_idx_in_blob + 1);

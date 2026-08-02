@@ -31,6 +31,16 @@ pub struct IntegrityDiag {
     /// Blobs where the decoded quality stream ran short of the sequence
     /// stream, forcing per-spot synthesized quality fallback.
     pub quality_overruns: AtomicU64,
+    /// Blobs whose decoded quality stream was not the same length as the
+    /// decoded sequence stream.
+    ///
+    /// Both are one byte per base, so any difference means the quality being
+    /// written does not correspond to the bases it is written against. The
+    /// per-spot slicing cannot see this — it takes `spot_total_bases` from
+    /// wherever the cursor points, so every spot gets a correctly *sized*
+    /// slice of the wrong bytes. Three quality-decode bugs (#101, #111, #113)
+    /// shipped through that blind spot; this is the counter that closes it.
+    pub quality_blob_length_mismatch: AtomicU64,
     /// Blobs whose full quality payload was all-zero (SRA-lite style) and
     /// was replaced with a uniform Phred fallback.
     pub all_zero_quality_blobs: AtomicU64,
@@ -47,6 +57,7 @@ impl IntegrityDiag {
         self.quality_length_mismatches.load(Ordering::Relaxed) != 0
             || self.quality_invalid_bytes.load(Ordering::Relaxed) != 0
             || self.quality_overruns.load(Ordering::Relaxed) != 0
+            || self.quality_blob_length_mismatch.load(Ordering::Relaxed) != 0
             || self.all_zero_quality_blobs.load(Ordering::Relaxed) != 0
             || self.paired_spot_violations.load(Ordering::Relaxed) != 0
             || self.truncated_spots.load(Ordering::Relaxed) != 0
@@ -61,6 +72,7 @@ impl IntegrityDiag {
         self.quality_length_mismatches.load(Ordering::Relaxed) != 0
             || self.quality_invalid_bytes.load(Ordering::Relaxed) != 0
             || self.quality_overruns.load(Ordering::Relaxed) != 0
+            || self.quality_blob_length_mismatch.load(Ordering::Relaxed) != 0
             || self.paired_spot_violations.load(Ordering::Relaxed) != 0
     }
 
@@ -68,10 +80,12 @@ impl IntegrityDiag {
     pub fn summary(&self) -> String {
         format!(
             "quality_length_mismatches={}, quality_invalid_bytes={}, quality_overruns={}, \
-             all_zero_quality_blobs={}, paired_spot_violations={}, truncated_spots={}",
+             quality_blob_length_mismatch={}, all_zero_quality_blobs={}, \
+             paired_spot_violations={}, truncated_spots={}",
             self.quality_length_mismatches.load(Ordering::Relaxed),
             self.quality_invalid_bytes.load(Ordering::Relaxed),
             self.quality_overruns.load(Ordering::Relaxed),
+            self.quality_blob_length_mismatch.load(Ordering::Relaxed),
             self.all_zero_quality_blobs.load(Ordering::Relaxed),
             self.paired_spot_violations.load(Ordering::Relaxed),
             self.truncated_spots.load(Ordering::Relaxed),
@@ -2020,5 +2034,50 @@ mod tests {
         let lines: Vec<&str> = text.lines().collect();
         assert_eq!(lines[1].len(), lines[3].len());
         assert_eq!(lines[1], "ACGT");
+    }
+
+    // -----------------------------------------------------------------
+    // Blob-level quality/sequence correspondence (#115)
+    // -----------------------------------------------------------------
+
+    /// The counter that closes the blind spot behind #101/#111/#113 must be
+    /// strict-fatal, or a run producing wrong quality still exits zero.
+    #[test]
+    fn quality_blob_length_mismatch_is_strict_fatal() {
+        let d = IntegrityDiag::default();
+        assert!(!d.any(), "a clean run reports nothing");
+        assert!(!d.any_strict_fatal());
+
+        d.quality_blob_length_mismatch
+            .fetch_add(1, Ordering::Relaxed);
+
+        assert!(d.any(), "a mismatched blob must be visible");
+        assert!(
+            d.any_strict_fatal(),
+            "strict mode must refuse a run whose quality does not correspond \
+             to its sequence"
+        );
+    }
+
+    #[test]
+    fn quality_blob_length_mismatch_appears_in_the_summary() {
+        let d = IntegrityDiag::default();
+        d.quality_blob_length_mismatch
+            .fetch_add(7, Ordering::Relaxed);
+        let s = d.summary();
+        assert!(
+            s.contains("quality_blob_length_mismatch=7"),
+            "summary was: {s}"
+        );
+    }
+
+    /// `all_zero_quality_blobs` stays non-fatal: SRA-Lite ships synthesized
+    /// quality by design, so it is expected rather than a defect.
+    #[test]
+    fn sra_lite_synthesized_quality_stays_non_fatal() {
+        let d = IntegrityDiag::default();
+        d.all_zero_quality_blobs.fetch_add(1, Ordering::Relaxed);
+        assert!(d.any(), "still reported");
+        assert!(!d.any_strict_fatal(), "but must not fail a strict run");
     }
 }
