@@ -4,6 +4,14 @@
 
 ### Fixes
 
+- Keep zero-length read slots in the archive's static READ_LEN (#118).
+  `latf-load` archives declare `READ_LEN = [100, 0]` and carry no READ_LEN
+  column, but the metadata accessor discarded any descriptor containing a
+  zero. That sent them down the even-split heuristic, which cut every 100 bp
+  spot into 50/50 — emitting **half the run's bases** with no error and a zero
+  exit code. Five corpus accessions were affected; all now match
+  `fasterq-dump` byte for byte.
+
 - Check that a blob's spot boundaries consume exactly its decoded bases
   (#117). `READ_LEN` defines where each spot starts inside the sequence
   stream; the per-spot check saw only overrun, so a short accounting silently
