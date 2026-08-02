@@ -493,16 +493,31 @@ struct ReadSegment<'a> {
 ///   to 0, sending everything to the unpaired file.
 ///
 /// `mate_idx` is the 1-based original slot, `emit_idx` the 0-based position
-/// among surviving segments, and `bio_reads` the number of biological reads
-/// that passed the zero-length and min-length filters.
+/// among surviving segments, `bio_reads` the number of biological reads that
+/// passed the zero-length and min-length filters, and `spot_reads` the number
+/// of reads the spot holds *before* any filtering.
+///
+/// `spot_reads` is what decides the `--split-files` filename. fasterq-dump
+/// suffixes by mate index there, except when the archive stores a single read
+/// per spot, where it writes a bare `ACC.fastq`. It is the stored read count
+/// that matters, not how many survive filtering: on DRR004435 a 2 bp adapter
+/// is dropped and only mate 2 survives, and fasterq-dump still writes
+/// `DRR004435_2.fastq` — so keying this off `bio_reads` would rename that file.
 pub(crate) fn slot_for_segment(
     split_mode: SplitMode,
     mate_idx: u32,
     emit_idx: usize,
     bio_reads: usize,
+    spot_reads: usize,
 ) -> OutputSlot {
     match split_mode {
-        SplitMode::SplitFiles => OutputSlot::ReadN(mate_idx.saturating_sub(1)),
+        SplitMode::SplitFiles => {
+            if spot_reads < 2 {
+                OutputSlot::Unpaired
+            } else {
+                OutputSlot::ReadN(mate_idx.saturating_sub(1))
+            }
+        }
         SplitMode::Split3 => {
             if bio_reads < 2 {
                 OutputSlot::Unpaired
@@ -539,7 +554,13 @@ pub fn format_spot(
     if segments.is_empty() {
         return Vec::new();
     }
-    route_segments_to_slots(&segments, &spot.name, run_name, config)
+    route_segments_to_slots(
+        &segments,
+        &spot.name,
+        run_name,
+        config,
+        spot.read_lengths.len(),
+    )
 }
 
 /// Split a spot's concatenated sequence/quality into per-read segments,
@@ -604,6 +625,7 @@ fn route_segments_to_slots(
     spot_name: &[u8],
     run_name: &str,
     config: &FastqConfig,
+    spot_reads: usize,
 ) -> Vec<(OutputSlot, FastqRecord)> {
     let mut results = Vec::with_capacity(segments.len());
     let format = |seg: &ReadSegment<'_>| {
@@ -630,7 +652,13 @@ fn route_segments_to_slots(
 
     let bio_reads = segments.iter().filter(|s| s.biological).count();
     for (emit_idx, seg) in segments.iter().enumerate() {
-        let slot = slot_for_segment(config.split_mode, seg.mate_idx, emit_idx, bio_reads);
+        let slot = slot_for_segment(
+            config.split_mode,
+            seg.mate_idx,
+            emit_idx,
+            bio_reads,
+            spot_reads,
+        );
         results.push((slot, format(seg)));
     }
 
@@ -858,7 +886,9 @@ mod tests {
     }
 
     #[test]
-    fn single_read_routes_to_read_n0_in_split_files() {
+    fn single_read_routes_to_unsuffixed_file_in_split_files() {
+        // An archive storing one read per spot gets a bare `ACC.fastq` from
+        // fasterq-dump's --split-files, not `ACC_1.fastq` (issue #103).
         let spot = single_read_spot(b"1", b"ACGT", b"????");
         let config = FastqConfig {
             split_mode: SplitMode::SplitFiles,
@@ -867,7 +897,38 @@ mod tests {
         let results = format_spot(&spot, "SRR1", &config);
 
         assert_eq!(results.len(), 1);
-        assert_eq!(results[0].0, OutputSlot::ReadN(0));
+        assert_eq!(results[0].0, OutputSlot::Unpaired);
+    }
+
+    #[test]
+    fn lone_surviving_mate_keeps_its_suffix_in_split_files() {
+        // DRR004435's shape: the spot stores two reads, a 2 bp adapter ahead
+        // of a biological read. The adapter is filtered out, leaving one
+        // segment — but the file is still `_2`, because the archive stores
+        // two reads per spot. Routing on the surviving count instead of the
+        // stored count would rename this to `ACC.fastq`.
+        let spot = SpotRecord {
+            name: b"1".to_vec(),
+            sequence: b"ACACGTACGT".to_vec(),
+            quality: b"??????????".to_vec(),
+            read_lengths: vec![2, 8],
+            read_types: vec![BIO, BIO],
+            read_filter: vec![0, 0],
+            spot_group: Vec::new(),
+        };
+        let config = FastqConfig {
+            split_mode: SplitMode::SplitFiles,
+            min_read_len: Some(4),
+            ..default_config()
+        };
+        let results = format_spot(&spot, "SRR1", &config);
+
+        assert_eq!(results.len(), 1, "the 2 bp adapter is filtered out");
+        assert_eq!(
+            results[0].0,
+            OutputSlot::ReadN(1),
+            "surviving mate 2 still writes _2"
+        );
     }
 
     #[test]

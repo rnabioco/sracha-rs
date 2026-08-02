@@ -1416,6 +1416,7 @@ pub(crate) fn decode_blob_to_fastq(
                             seg.mate_idx,
                             emit_idx,
                             bio_reads,
+                            spot_read_lengths.len(),
                         );
                         emit(slot, seg, spot_number, description);
                     }
