@@ -41,6 +41,13 @@ pub struct IntegrityDiag {
     /// slice of the wrong bytes. Three quality-decode bugs (#101, #111, #113)
     /// shipped through that blind spot; this is the counter that closes it.
     pub quality_blob_length_mismatch: AtomicU64,
+    /// Blobs whose spot boundaries did not consume exactly the decoded bases.
+    ///
+    /// `READ_LEN` defines where each spot starts inside the decoded sequence
+    /// stream. If the two disagree in total, the boundaries are wrong and
+    /// every record past the divergence carries bases from the wrong offsets.
+    /// The per-spot check sees only overrun, never a short accounting.
+    pub sequence_blob_length_mismatch: AtomicU64,
     /// Blobs whose full quality payload was all-zero (SRA-lite style) and
     /// was replaced with a uniform Phred fallback.
     pub all_zero_quality_blobs: AtomicU64,
@@ -58,6 +65,7 @@ impl IntegrityDiag {
             || self.quality_invalid_bytes.load(Ordering::Relaxed) != 0
             || self.quality_overruns.load(Ordering::Relaxed) != 0
             || self.quality_blob_length_mismatch.load(Ordering::Relaxed) != 0
+            || self.sequence_blob_length_mismatch.load(Ordering::Relaxed) != 0
             || self.all_zero_quality_blobs.load(Ordering::Relaxed) != 0
             || self.paired_spot_violations.load(Ordering::Relaxed) != 0
             || self.truncated_spots.load(Ordering::Relaxed) != 0
@@ -73,6 +81,7 @@ impl IntegrityDiag {
             || self.quality_invalid_bytes.load(Ordering::Relaxed) != 0
             || self.quality_overruns.load(Ordering::Relaxed) != 0
             || self.quality_blob_length_mismatch.load(Ordering::Relaxed) != 0
+            || self.sequence_blob_length_mismatch.load(Ordering::Relaxed) != 0
             || self.paired_spot_violations.load(Ordering::Relaxed) != 0
     }
 
@@ -80,12 +89,13 @@ impl IntegrityDiag {
     pub fn summary(&self) -> String {
         format!(
             "quality_length_mismatches={}, quality_invalid_bytes={}, quality_overruns={}, \
-             quality_blob_length_mismatch={}, all_zero_quality_blobs={}, \
-             paired_spot_violations={}, truncated_spots={}",
+             quality_blob_length_mismatch={}, sequence_blob_length_mismatch={}, \
+             all_zero_quality_blobs={}, paired_spot_violations={}, truncated_spots={}",
             self.quality_length_mismatches.load(Ordering::Relaxed),
             self.quality_invalid_bytes.load(Ordering::Relaxed),
             self.quality_overruns.load(Ordering::Relaxed),
             self.quality_blob_length_mismatch.load(Ordering::Relaxed),
+            self.sequence_blob_length_mismatch.load(Ordering::Relaxed),
             self.all_zero_quality_blobs.load(Ordering::Relaxed),
             self.paired_spot_violations.load(Ordering::Relaxed),
             self.truncated_spots.load(Ordering::Relaxed),

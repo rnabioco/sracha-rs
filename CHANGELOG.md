@@ -4,6 +4,13 @@
 
 ### Fixes
 
+- Check that a blob's spot boundaries consume exactly its decoded bases
+  (#117). `READ_LEN` defines where each spot starts inside the sequence
+  stream; the per-spot check saw only overrun, so a short accounting silently
+  dropped the tail and shifted every later record. Strict-fatal, mirroring the
+  quality check in #115. Note this does not catch #118, where `READ_LEN` and
+  the decoded buffer agree with each other but both hold half the spot.
+
 - Refuse to emit records whose quality does not correspond to their sequence
   (#115). Strict mode checked quality per spot, but the per-spot slice is
   correctly sized by construction, so a wrong-sized quality buffer produced
