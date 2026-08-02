@@ -48,6 +48,18 @@ pub struct IntegrityDiag {
     /// every record past the divergence carries bases from the wrong offsets.
     /// The per-spot check sees only overrun, never a short accounting.
     pub sequence_blob_length_mismatch: AtomicU64,
+    /// Biological bases seen by the decoder, before any user-facing filter.
+    ///
+    /// A tally rather than a violation count: compared at end of run against
+    /// the loader's `STATS/TABLE/BIO_BASE_COUNT`.
+    pub bio_bases_seen: AtomicU64,
+    /// Set when that comparison disagrees.
+    ///
+    /// The only check anchored to something outside the decode. Everything
+    /// else here verifies the decoder against itself, which cannot catch a
+    /// decode where every stream agrees on the wrong answer — #118 emitted
+    /// exactly half of five runs that way.
+    pub base_count_mismatch: AtomicU64,
     /// Blobs whose full quality payload was all-zero (SRA-lite style) and
     /// was replaced with a uniform Phred fallback.
     pub all_zero_quality_blobs: AtomicU64,
@@ -66,6 +78,7 @@ impl IntegrityDiag {
             || self.quality_overruns.load(Ordering::Relaxed) != 0
             || self.quality_blob_length_mismatch.load(Ordering::Relaxed) != 0
             || self.sequence_blob_length_mismatch.load(Ordering::Relaxed) != 0
+            || self.base_count_mismatch.load(Ordering::Relaxed) != 0
             || self.all_zero_quality_blobs.load(Ordering::Relaxed) != 0
             || self.paired_spot_violations.load(Ordering::Relaxed) != 0
             || self.truncated_spots.load(Ordering::Relaxed) != 0
@@ -82,6 +95,7 @@ impl IntegrityDiag {
             || self.quality_overruns.load(Ordering::Relaxed) != 0
             || self.quality_blob_length_mismatch.load(Ordering::Relaxed) != 0
             || self.sequence_blob_length_mismatch.load(Ordering::Relaxed) != 0
+            || self.base_count_mismatch.load(Ordering::Relaxed) != 0
             || self.paired_spot_violations.load(Ordering::Relaxed) != 0
     }
 
@@ -90,12 +104,14 @@ impl IntegrityDiag {
         format!(
             "quality_length_mismatches={}, quality_invalid_bytes={}, quality_overruns={}, \
              quality_blob_length_mismatch={}, sequence_blob_length_mismatch={}, \
-             all_zero_quality_blobs={}, paired_spot_violations={}, truncated_spots={}",
+             base_count_mismatch={}, all_zero_quality_blobs={}, \
+             paired_spot_violations={}, truncated_spots={}",
             self.quality_length_mismatches.load(Ordering::Relaxed),
             self.quality_invalid_bytes.load(Ordering::Relaxed),
             self.quality_overruns.load(Ordering::Relaxed),
             self.quality_blob_length_mismatch.load(Ordering::Relaxed),
             self.sequence_blob_length_mismatch.load(Ordering::Relaxed),
+            self.base_count_mismatch.load(Ordering::Relaxed),
             self.all_zero_quality_blobs.load(Ordering::Relaxed),
             self.paired_spot_violations.load(Ordering::Relaxed),
             self.truncated_spots.load(Ordering::Relaxed),
@@ -2089,5 +2105,28 @@ mod tests {
         d.all_zero_quality_blobs.fetch_add(1, Ordering::Relaxed);
         assert!(d.any(), "still reported");
         assert!(!d.any_strict_fatal(), "but must not fail a strict run");
+    }
+
+    /// The only counter anchored to something outside the decode. Every other
+    /// check verifies the decoder against itself, which cannot see a decode
+    /// where all streams agree on the wrong answer.
+    #[test]
+    fn base_count_mismatch_is_strict_fatal() {
+        let d = IntegrityDiag::default();
+        assert!(!d.any_strict_fatal());
+        d.base_count_mismatch.fetch_add(1, Ordering::Relaxed);
+        assert!(d.any(), "must be reported");
+        assert!(d.any_strict_fatal(), "and must fail a strict run");
+    }
+
+    /// `bio_bases_seen` is a tally, not a violation: a healthy run has a large
+    /// non-zero value and must still pass.
+    #[test]
+    fn bio_bases_seen_is_a_tally_not_a_violation() {
+        let d = IntegrityDiag::default();
+        d.bio_bases_seen.fetch_add(149_883_600, Ordering::Relaxed);
+        assert!(!d.any(), "a tally alone is not an integrity problem");
+        assert!(!d.any_strict_fatal());
+        assert!(d.summary().contains("base_count_mismatch=0"));
     }
 }

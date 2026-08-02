@@ -4,6 +4,14 @@
 
 ### Fixes
 
+- Verify decoded bases against the archive's recorded `BIO_BASE_COUNT` (#117).
+  Every other integrity check compares the decoder against itself, which
+  cannot see a decode where all streams agree on the wrong answer — #118
+  emitted half of five runs with static READ_LEN and the decoded buffer in
+  perfect agreement. The loader records how many biological bases a run holds;
+  comparing against it is the one check anchored outside the decode.
+  Strict-fatal.
+
 - Keep zero-length read slots in the archive's static READ_LEN (#118).
   `latf-load` archives declare `READ_LEN = [100, 0]` and carry no READ_LEN
   column, but the metadata accessor discarded any descriptor containing a
