@@ -235,7 +235,6 @@ impl RowMapping {
     pub fn is_identity(&self) -> bool {
         matches!(self, RowMapping::Identity)
     }
-
 }
 
 /// Maximum logical rows per blob — reject page maps whose `leng_runs` sum to
@@ -2476,6 +2475,106 @@ mod tests {
         assert_eq!(pm.lengths, vec![10, 20]);
         assert_eq!(pm.leng_runs, vec![5, 3]);
         assert_eq!(pm.mapping, RowMapping::Identity);
+    }
+
+    /// Raw deflate (no zlib wrapper), matching the `deflateInit2(..., -15,
+    /// ...)` the page map serializer uses for versions 1 and 2.
+    fn deflate_raw(data: &[u8]) -> Vec<u8> {
+        use flate2::{Compression, write::DeflateEncoder};
+        use std::io::Write;
+        let mut enc = DeflateEncoder::new(Vec::new(), Compression::fast());
+        enc.write_all(data).unwrap();
+        enc.finish().unwrap()
+    }
+
+    /// Version 2 is the random-access encoding: the array after the header is
+    /// `data_offset[row_count]`, one element offset per logical row, NOT
+    /// repeat counts. Misreading this is issue #101.
+    #[test]
+    fn page_map_version2_variant0_is_random_access() {
+        // byte0 = (version 2 << 2) | variant 0 = 0x08, row_length = 3.
+        // Six rows drawn from a three-row vocabulary: offsets repeat and are
+        // not monotonic, both of which the format allows.
+        let mut data = vec![0x08, 3];
+        data.extend_from_slice(&deflate_raw(&[0, 0, 3, 3, 0, 6]));
+        let pm = page_map_deserialize(&data, 6).unwrap();
+
+        assert_eq!(pm.lengths, vec![3]);
+        assert_eq!(pm.leng_runs, vec![6]);
+        assert_eq!(
+            pm.mapping,
+            RowMapping::RandomAccessOffsets(vec![0, 0, 3, 3, 0, 6])
+        );
+        // ncbi-vdb sets data_recs = row_count here (page-map.c:1288). Deriving
+        // it from the offsets instead (e.g. max + 1 = 7) is meaningless: the
+        // offsets are neither sorted nor unique.
+        assert_eq!(pm.data_recs, 6);
+
+        // Nine stored bytes back six rows of three.
+        let expanded = pm.expand_rows(b"AAABBBCCC", 1).unwrap();
+        assert_eq!(expanded, b"AAAAAABBBBBBAAACCC");
+    }
+
+    #[test]
+    fn page_map_version2_variant2_is_random_access() {
+        // byte0 = (2 << 2) | 2 = 0x0A, leng_recs = 2.
+        // lengths=[2,3], leng_runs=[2,2], then data_offset[4].
+        let mut data = vec![0x0A, 2];
+        data.extend_from_slice(&deflate_raw(&[2, 3, 2, 2, 0, 0, 2, 2]));
+        let pm = page_map_deserialize(&data, 4).unwrap();
+
+        assert_eq!(pm.lengths, vec![2, 3]);
+        assert_eq!(pm.leng_runs, vec![2, 2]);
+        assert_eq!(
+            pm.mapping,
+            RowMapping::RandomAccessOffsets(vec![0, 0, 2, 2])
+        );
+        assert_eq!(pm.data_recs, 4);
+
+        // Rows 0-1 are two bytes at offset 0; rows 2-3 are three at offset 2.
+        let expanded = pm.expand_rows(b"ABCDE", 1).unwrap();
+        assert_eq!(expanded, b"ABABCDECDE");
+    }
+
+    /// Version 1 keeps the run-length reading, so the same trailing array
+    /// means something entirely different from the version-2 case above.
+    #[test]
+    fn page_map_version1_variant1_is_repeat_counts() {
+        // byte0 = (1 << 2) | 1 = 0x05, row_length = 3, data_recs = 2.
+        let mut data = vec![0x05, 3, 2];
+        data.extend_from_slice(&deflate_raw(&[2, 4]));
+        let pm = page_map_deserialize(&data, 6).unwrap();
+
+        assert_eq!(pm.mapping, RowMapping::RepeatCounts(vec![2, 4]));
+        // Record 0 backs rows 0-1, record 1 backs rows 2-5: 2x"AAA" + 4x"BBB".
+        let expanded = pm.expand_rows(b"AAABBB", 1).unwrap();
+        assert_eq!(expanded, b"AAAAAABBBBBBBBBBBB".to_vec());
+    }
+
+    /// Random access is only ever emitted for variants 0 and 2 — the encoder
+    /// derives variant bit 0 from `data_recs != row_count` and
+    /// `PageMapToRandomAccess` always sets them equal. Variants 1 and 3
+    /// reserve no space for `data_offset[]`, so ncbi-vdb would read a NULL
+    /// pointer; we refuse instead.
+    #[test]
+    fn page_map_version2_rejects_variants_with_data_runs() {
+        for (byte0, variant) in [(0x09u8, 1), (0x0Bu8, 3)] {
+            let mut data = vec![byte0, 3, 2];
+            data.extend_from_slice(&deflate_raw(&[2, 4, 1, 1]));
+            let err = page_map_deserialize(&data, 6)
+                .expect_err("version 2 on variant {variant} must be rejected");
+            assert!(
+                matches!(err, Error::Format(ref m) if m.contains("random access")),
+                "variant {variant}: got {err:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn page_map_rejects_unsupported_version() {
+        // Version 3 is past everything ncbi-vdb will deserialize.
+        let err = page_map_deserialize(&[0x0C, 1], 1).expect_err("version 3 must be rejected");
+        assert!(matches!(err, Error::Format(_)), "got {err:?}");
     }
 
     #[test]
