@@ -178,20 +178,165 @@ pub fn decode_zip_encoding(decoded: &blob::DecodedBlob<'_>) -> Result<Vec<u8>> {
     Ok(decoded.data.to_vec())
 }
 
-/// Decode the QUALITY blob payload, handling both `zip_encoding` (deflate/
-/// zlib — modern Illumina) and `izip_encoding` (NCBI integer compression —
-/// older srf-load-era Illumina such as DRR001816).
+/// Decode `NCBI:SRA:qual4_encode` output to four log-odds channels per base.
 ///
-/// The encoding isn't tagged in the blob header, so we probe. zlib streams
-/// always start with a `0x78` CMF byte for the deflate window sizes NCBI
-/// uses, so when we see one we go straight to [`decode_zip_encoding`] and
-/// skip the iZip probe entirely — that closes the path that drove issue
-/// #30, where SRA-Lite quality blobs were being interpreted as iZip with
-/// arbitrary `data_count` values. Otherwise try `izip_decode` (now bounded
-/// against the input size) and fall back to deflate on failure.
+/// A byte-oriented codebook over whole 4-tuples, emitted one variable-length
+/// code per base (`libs/sraxf/qual4_decode.c`, codebook in `qual4_codec.h`):
+///
+/// | leading byte | bytes | quad |
+/// |---|---|---|
+/// | `0..=80` | 4 | literal `[b0-40, b1-40, b2-40, b3-40]` |
+/// | `81` | 1 | `[-5, -5, -5, -5]` — the `N` marker |
+/// | `82` | 1 | `[qmax, qmin, qmin, qmin]` |
+/// | `83..=91` | 2 | `[v, ..]` with one slot set from `v`, rest `qmin` |
+/// | `92..=255` | — | malformed |
+///
+/// For the pattern codes `v = b1 - 40`, and the non-`qmin` slot holds `-v`
+/// (83-85), `-v + 1` (86-88) or `-v - 1` (89-91); which slot is 1, 2 or 3 as
+/// the code cycles.
+///
+/// Channel 0 is the *called* base's quality — the stored order is "swapped",
+/// with index 0 exchanged with the called base's 2na code. Recovering A/C/G/T
+/// order would need the basecalls, but the phred column is `cut<0>`, so this
+/// decoder needs no READ input.
+///
+/// Value bytes are not range-checked by the reference; arithmetic wraps at
+/// `i8`. Mirrored here so corrupt input decodes bit-identically rather than
+/// saturating or panicking.
+pub fn qual4_decode(src: &[u8], dcount: usize, qmin: i8, qmax: i8) -> Result<Vec<u8>> {
+    const KNOWN_BAD: u8 = 81;
+    const KNOWN_GOOD: u8 = 82;
+    const PATTERN_FIRST: u8 = 83;
+    const PATTERN_LAST: u8 = 91;
+
+    let out_len = dcount
+        .checked_mul(4)
+        .ok_or_else(|| Error::Format("qual4: output size overflows".into()))?;
+    let mut out = vec![0u8; out_len];
+    let mut j = 0usize;
+    let mut st = 0u8;
+    let mut pending = 0u8;
+
+    for &b in src {
+        if j >= dcount {
+            break;
+        }
+        let val = b.wrapping_sub(40) as i8;
+        let q = j * 4;
+        match st {
+            0 => {
+                if b < KNOWN_BAD {
+                    out[q] = val as u8;
+                    st = 1;
+                } else if b == KNOWN_BAD {
+                    out[q..q + 4].copy_from_slice(&[(-5i8) as u8; 4]);
+                } else if b == KNOWN_GOOD {
+                    out[q] = qmax as u8;
+                    out[q + 1] = qmin as u8;
+                    out[q + 2] = qmin as u8;
+                    out[q + 3] = qmin as u8;
+                } else {
+                    pending = b;
+                    st = 4;
+                }
+            }
+            1 => {
+                out[q + 1] = val as u8;
+                st = 2;
+            }
+            2 => {
+                out[q + 2] = val as u8;
+                st = 3;
+            }
+            3 => {
+                out[q + 3] = val as u8;
+                st = 0;
+            }
+            _ => {
+                if !(PATTERN_FIRST..=PATTERN_LAST).contains(&pending) {
+                    return Err(Error::Format(format!(
+                        "qual4: unknown codebook byte {pending}"
+                    )));
+                }
+                let idx = (pending - PATTERN_FIRST) as usize;
+                let v = val as i32;
+                let other = match idx / 3 {
+                    0 => -v,
+                    1 => -v + 1,
+                    _ => -v - 1,
+                };
+                let slot = idx % 3 + 1;
+                out[q] = val as u8;
+                out[q + 1] = qmin as u8;
+                out[q + 2] = qmin as u8;
+                out[q + 3] = qmin as u8;
+                out[q + slot] = (other as i8) as u8;
+                st = 0;
+            }
+        }
+        if st == 0 {
+            j += 1;
+        }
+    }
+
+    // The reference rejects the blob unless every requested quad was produced;
+    // trailing input past `dcount` is ignored, an incomplete quad is not.
+    if j != dcount {
+        return Err(Error::Format(format!(
+            "qual4: decoded {j} of {dcount} quads"
+        )));
+    }
+    Ok(out)
+}
+
+/// Decode the QUALITY blob payload.
+///
+/// Three encodings appear in the wild and the blob does not name which one it
+/// is, so the header is consulted first and the payload probed only after:
+///
+/// - `qual4_encoding` (`q4` Illumina schema) — a two-frame chain, `zip`
+///   outside and the qual4 codebook inside. Recognised by the second header
+///   frame's two ops, and collapsed to one phred byte per base here (#113).
+/// - `izip_encoding` (srf-load-era Illumina) — byte-plane data whose plane
+///   count and min/slope live in the blob header (#111).
+/// - `zip_encoding` (modern Illumina) — deflate/zlib.
+///
+/// zlib streams always start with a `0x78` CMF byte for the window sizes NCBI
+/// uses, so seeing one routes straight to [`decode_zip_encoding`] and skips
+/// the iZip probe — that closes the path behind issue #30, where SRA-Lite
+/// quality blobs were read as iZip with arbitrary `data_count` values.
 pub fn decode_quality_encoding(decoded: &blob::DecodedBlob<'_>) -> Result<Vec<u8>> {
     if decoded.data.is_empty() {
         return decode_zip_encoding(decoded);
+    }
+    // `NCBI:SRA:qual4_encoding#1` is a two-stage chain — `zip` outside, the
+    // qual4 codebook inside — so the blob carries two header frames:
+    //
+    //   frame0  version 1, no ops,      osize = inflated size
+    //   frame1  version 0, ops=[a, b],  osize = 4 bytes per base
+    //
+    // Every other codec here reads `headers.first()` and assumes a single
+    // transform, which left this column stopping after the inflate and
+    // handing the intermediate `encoded_qual4` bytes out as phred (#113).
+    // The ops are `qmin + 40` and `qmax + 40` (qual4_decode.c:176-188).
+    if decoded.headers.len() >= 2
+        && let inner = &decoded.headers[1]
+        && inner.ops.len() == 2
+        && inner.osize > 0
+        && inner.osize % 4 == 0
+    {
+        let inflated = decode_zip_encoding(decoded)?;
+        let qmin = (i32::from(inner.ops[0]) - 40) as i8;
+        let qmax = (i32::from(inner.ops[1]) - 40) as i8;
+        let dcount = (inner.osize / 4) as usize;
+        if let Ok(q4) = qual4_decode(&inflated, dcount, qmin, qmax) {
+            // Collapse to one phred byte per base here rather than handing
+            // four channels upward. The page map counts *elements*, and every
+            // caller expands it at one byte per element — a 4-byte element
+            // silently mis-expands on any blob whose map is not identity
+            // (which is most of them on this archive's blob 200).
+            return Ok(crate::encoding::qual4_log_odds_to_phred(&q4));
+        }
     }
     if decoded.data.first() == Some(&0x78) {
         return decode_zip_encoding(decoded);
@@ -590,5 +735,101 @@ mod tests {
             let out = expand_via_page_map(data, &Some(pm)).unwrap();
             prop_assert_eq!(out.len(), refs.len() * 4);
         }
+    }
+
+    // -----------------------------------------------------------------
+    // qual4 codebook (#113)
+    // -----------------------------------------------------------------
+
+    /// Literal quad: leading byte < 81 means four value bytes, each biased +40.
+    #[test]
+    fn qual4_literal_quad() {
+        let src = [40u8, 30, 20, 10]; // -> 0, -10, -20, -30
+        let out = qual4_decode(&src, 1, -40, 40).unwrap();
+        assert_eq!(
+            out.iter().map(|&b| b as i8).collect::<Vec<_>>(),
+            vec![0, -10, -20, -30]
+        );
+    }
+
+    /// Code 81 is the `N` marker and expands to (-5, -5, -5, -5) — the
+    /// 0xFBFBFBFB the schema maps to log-odds -6.
+    #[test]
+    fn qual4_known_bad_is_the_n_quad() {
+        let out = qual4_decode(&[81], 1, -40, 40).unwrap();
+        assert_eq!(
+            out.iter().map(|&b| b as i8).collect::<Vec<_>>(),
+            vec![-5, -5, -5, -5]
+        );
+    }
+
+    /// Code 82 expands to (qmax, qmin, qmin, qmin) using the header's bounds.
+    #[test]
+    fn qual4_known_good_uses_header_bounds() {
+        let out = qual4_decode(&[82], 1, -40, 40).unwrap();
+        assert_eq!(
+            out.iter().map(|&b| b as i8).collect::<Vec<_>>(),
+            vec![40, -40, -40, -40]
+        );
+    }
+
+    /// The nine pattern codes place one derived value and fill the rest with
+    /// qmin. 83-85 use -v, 86-88 use -v+1, 89-91 use -v-1; the slot cycles
+    /// 1, 2, 3 within each group.
+    #[test]
+    fn qual4_pattern_codes_place_value_and_fill_qmin() {
+        let cases: [(u8, [i8; 4]); 9] = [
+            (83, [10, -10, -40, -40]),
+            (84, [10, -40, -10, -40]),
+            (85, [10, -40, -40, -10]),
+            (86, [10, -9, -40, -40]),
+            (87, [10, -40, -9, -40]),
+            (88, [10, -40, -40, -9]),
+            (89, [10, -11, -40, -40]),
+            (90, [10, -40, -11, -40]),
+            (91, [10, -40, -40, -11]),
+        ];
+        for (code, want) in cases {
+            let out = qual4_decode(&[code, 50], 1, -40, 40).unwrap();
+            let got: Vec<i8> = out.iter().map(|&b| b as i8).collect();
+            assert_eq!(got, want.to_vec(), "code {code}");
+        }
+    }
+
+    /// The reference rejects a blob that does not yield exactly `dcount`
+    /// quads, so a truncated trailing code must error rather than pad.
+    #[test]
+    fn qual4_incomplete_trailing_quad_errors() {
+        assert!(qual4_decode(&[40, 30], 1, -40, 40).is_err());
+        assert!(qual4_decode(&[81], 2, -40, 40).is_err());
+    }
+
+    /// Codes past the table are malformed. The reference notices on the
+    /// *following* byte, because state 0 defers an unknown code.
+    #[test]
+    fn qual4_unknown_code_errors() {
+        assert!(qual4_decode(&[92, 40], 1, -40, 40).is_err());
+    }
+
+    /// Trailing input past `dcount` is ignored, not an error.
+    #[test]
+    fn qual4_extra_trailing_input_is_ignored() {
+        let out = qual4_decode(&[81, 81, 81], 2, -40, 40).unwrap();
+        assert_eq!(out.len(), 8);
+    }
+
+    /// Mixed stream: every code shape back to back stays in sync.
+    #[test]
+    fn qual4_mixed_stream_stays_aligned() {
+        // literal, known_good, pattern, known_bad
+        let src = [40u8, 30, 20, 10, 82, 84, 50, 81];
+        let out = qual4_decode(&src, 4, -40, 40).unwrap();
+        let got: Vec<i8> = out.iter().map(|&b| b as i8).collect();
+        assert_eq!(
+            got,
+            vec![
+                0, -10, -20, -30, 40, -40, -40, -40, 10, -40, -10, -40, -5, -5, -5, -5
+            ]
+        );
     }
 }

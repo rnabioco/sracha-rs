@@ -225,6 +225,43 @@ pub fn merge_altread_bin(bases: &mut [u8], altread_bytes: &[u8], num_bases: usiz
 // Public API — Quality scores
 // ---------------------------------------------------------------------------
 
+/// Convert a 4-channel log-odds quality stream to one Phred score per base.
+///
+/// The `q4` Illumina schema stores `NCBI:qual4` — four
+/// `INSDC:quality:log_odds` values per base — and derives the logical phred
+/// column as `log_odds_to_phred(cut<0>(.QUALITY))`, i.e. channel 0 of each
+/// 4-tuple mapped through a lookup table.
+///
+/// The mapping is the 47-entry table in ncbi-vdb's
+/// `interfaces/ncbi/seq.vschema:809-838`, clipped to `[-6, 40]`. It is NOT
+/// the `10*log10(1 + 10^(x/10)) + 0.499` formula quoted in the comment above
+/// that table — the two disagree at the low end (the formula gives 1 for
+/// x = -6 where the table gives 0), and the table is what the reference
+/// implementation actually evaluates.
+///
+/// Returns one phred byte per base. Input length must be a multiple of 4.
+pub fn qual4_log_odds_to_phred(qual4: &[u8]) -> Vec<u8> {
+    qual4
+        .chunks_exact(4)
+        .map(|c| log_odds_to_phred(c[0] as i8))
+        .collect()
+}
+
+/// Single log-odds value to Phred, per ncbi-vdb's lookup table.
+#[inline]
+pub fn log_odds_to_phred(log_odds: i8) -> u8 {
+    // Table index is `clip(log_odds, -6, 40) + 6`.
+    const TO_PHRED: [u8; 47] = [
+        0, 1, 1, 2, 2, 3, 3, // -6 ..= 0
+        4, 4, 5, 5, 6, 7, 8, 9, 10, 10, // 1 ..= 10
+        11, 12, 13, 14, 15, 16, 17, 18, 19, 20, // 11 ..= 20
+        21, 22, 23, 24, 25, 26, 27, 28, 29, 30, // 21 ..= 30
+        31, 32, 33, 34, 35, 36, 37, 38, 39, 40, // 31 ..= 40
+    ];
+    let clipped = log_odds.clamp(-6, 40);
+    TO_PHRED[(clipped as i32 + 6) as usize]
+}
+
 /// Convert binary Phred quality scores to Phred+33 ASCII encoding.
 ///
 /// Each input byte is treated as a numeric Phred score; the output byte is
@@ -687,5 +724,40 @@ mod tests {
             let expected = if pass { b'?' } else { b'$' };
             prop_assert!(q.iter().all(|&b| b == expected));
         }
+    }
+
+    /// The log-odds -> phred map is the 47-entry table in ncbi-vdb's
+    /// seq.vschema, not the formula quoted in the comment above it. They
+    /// disagree at the low end: the formula gives 1 for -6, the table 0.
+    #[test]
+    fn log_odds_to_phred_matches_the_reference_table() {
+        assert_eq!(log_odds_to_phred(-6), 0);
+        assert_eq!(log_odds_to_phred(-5), 1);
+        assert_eq!(log_odds_to_phred(-1), 3);
+        assert_eq!(log_odds_to_phred(0), 3);
+        assert_eq!(log_odds_to_phred(1), 4);
+        assert_eq!(log_odds_to_phred(10), 10);
+        // 11 and up are identity.
+        for q in 11..=40i8 {
+            assert_eq!(log_odds_to_phred(q), q as u8, "log-odds {q}");
+        }
+    }
+
+    #[test]
+    fn log_odds_to_phred_clips_out_of_range() {
+        assert_eq!(log_odds_to_phred(-128), log_odds_to_phred(-6));
+        assert_eq!(log_odds_to_phred(127), log_odds_to_phred(40));
+    }
+
+    /// Only channel 0 survives: it is the called base's quality, which is
+    /// what the schema's `cut<0>` selects.
+    #[test]
+    fn qual4_conversion_takes_channel_zero() {
+        // two bases: (0, -10, -20, -30) and (40, -40, -40, -40)
+        let q4: Vec<u8> = [0i8, -10, -20, -30, 40, -40, -40, -40]
+            .iter()
+            .map(|&v| v as u8)
+            .collect();
+        assert_eq!(qual4_log_odds_to_phred(&q4), vec![3, 40]);
     }
 }
