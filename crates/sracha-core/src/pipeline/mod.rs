@@ -23,7 +23,8 @@ use crate::download::{
 };
 use crate::error::{Error, Result};
 use crate::fastq::{
-    CompressionMode, FastqConfig, IntegrityDiag, OutputSlot, SplitMode, output_filename,
+    CompressionMode, FastqConfig, IntegrityDiag, OutputSlot, QUALITY_HISTOGRAM_BINS, SplitMode,
+    output_filename,
 };
 use crate::sdl::ResolvedAccession;
 use crate::vdb::cursor::VdbCursor;
@@ -599,6 +600,14 @@ fn decode_and_write(
     // Captured before the cursor is consumed; compared once the run ends.
     let expected_bio_bases: Option<u64> = cursor.bio_base_count();
     let expected_spots: u64 = cursor.spot_count();
+    // Scoped to `table`, not always SEQUENCE — see #123. A PacBio archive's
+    // SEQUENCE histogram describes raw subreads while the converter emits
+    // CONSENSUS.
+    let expected_quality_hist: Option<Vec<u64>> = if config.verify {
+        cursor.quality_histogram().map(|h| h.to_vec())
+    } else {
+        None
+    };
 
     let fallback_read_lengths: Option<Vec<u32>> = if !has_read_len {
         let picked = resolve_fallback_read_lengths(
@@ -769,6 +778,7 @@ fn decode_and_write(
             read_cs,
             has_name_column: table != "CONSENSUS",
             skey_spot_names: skey_spot_names.as_deref(),
+            verify_quality: expected_quality_hist.is_some(),
         };
 
         // ---- Decode loop (main thread) ----
@@ -1097,6 +1107,61 @@ fn decode_and_write(
                 "{accession}: decoded {seen} biological bases but the archive \
                  records {expected} (STATS/TABLE/BIO_BASE_COUNT)",
             );
+        }
+    }
+
+    // Quality *values*, under `--verify`. Everything above — and every check
+    // added in #115, #117, #119, #121, #122 — compares lengths or totals: a
+    // decode producing the right number of plausible quality bytes at the
+    // wrong values passes all of them. `STATS/QUALITY` is the loader's own
+    // per-value tally, so comparing against it exercises the whole quality
+    // path rather than its size.
+    //
+    // Skipped when the decoder synthesized quality instead of reading it
+    // (`--fasta`, SRA-Lite, all-zero blobs) or when it already fell back
+    // per spot (`quality_overruns`). In those cases the emitted bytes are
+    // deliberately not the stored ones, so the histogram would disagree by
+    // design — and a check that fires when nothing is wrong teaches people to
+    // pass `--no-strict`.
+    if let Some(expected_hist) = expected_quality_hist.as_deref() {
+        let synthesized = diag.all_zero_quality_blobs.load(Ordering::Relaxed) != 0
+            || diag.quality_overruns.load(Ordering::Relaxed) != 0;
+        if config.fasta || is_lite || synthesized {
+            tracing::debug!(
+                "{accession}: STATS/QUALITY comparison skipped (quality synthesized rather \
+                 than decoded)",
+            );
+        } else if diag.quality_histogram.total() == 0 {
+            tracing::debug!("{accession}: no quality decoded; STATS/QUALITY comparison skipped");
+        } else {
+            let seen_hist = diag.quality_histogram.snapshot();
+            let differing = seen_hist
+                .iter()
+                .zip(expected_hist.iter())
+                .filter(|(a, b)| a != b)
+                .count() as u64;
+            if differing != 0 {
+                diag.quality_histogram_mismatch
+                    .fetch_add(differing, Ordering::Relaxed);
+                let worst: Vec<String> = seen_hist
+                    .iter()
+                    .zip(expected_hist.iter())
+                    .enumerate()
+                    .filter(|(_, (a, b))| a != b)
+                    .take(8)
+                    .map(|(q, (a, b))| format!("Q{q}: decoded {a}, recorded {b}"))
+                    .collect();
+                tracing::warn!(
+                    "{accession}: decoded quality values disagree with the archive's \
+                     STATS/QUALITY histogram in {differing} of {} bins ({} bytes decoded, \
+                     {} recorded) — the quality written does not match what the loader \
+                     stored. First differences: {}",
+                    QUALITY_HISTOGRAM_BINS,
+                    diag.quality_histogram.total(),
+                    expected_hist.iter().sum::<u64>(),
+                    worst.join("; "),
+                );
+            }
         }
     }
 
@@ -2291,6 +2356,7 @@ mod tests {
             stdout: false,
             cancelled: None,
             strict: false,
+            verify: false,
             http_client: None,
             keep_sra: false,
             paired_suffix: crate::fastq::PairedSuffix::Numeric,

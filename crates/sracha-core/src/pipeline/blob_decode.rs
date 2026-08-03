@@ -19,7 +19,8 @@ use itoa;
 
 use crate::error::Result;
 use crate::fastq::{
-    FastqConfig, IntegrityDiag, OutputSlot, SplitMode, append_fasta_record, append_fastq_record,
+    FastqConfig, IntegrityDiag, OutputSlot, QUALITY_HISTOGRAM_BINS, SplitMode, append_fasta_record,
+    append_fastq_record,
 };
 
 use super::BlobSlotOutput;
@@ -340,6 +341,10 @@ pub(crate) struct BlobDecodeCtx<'a> {
     /// physical NAME column and no X/Y coordinates. `None` for every other
     /// run. Each blob slices its own spot range out of this.
     pub(crate) skey_spot_names: Option<&'a [Vec<u8>]>,
+    /// Tally each decoded quality byte into `diag.quality_histogram` so the
+    /// run can be checked against the loader's `STATS/QUALITY`. Off unless
+    /// `--verify` is passed: it costs one increment per base.
+    pub(crate) verify_quality: bool,
 }
 
 /// Decode the ALTREAD blob (when present) and merge its per-base 4na
@@ -548,6 +553,7 @@ pub(crate) fn decode_blob_to_fastq(
         read_cs,
         has_name_column,
         skey_spot_names,
+        verify_quality,
     } = *ctx;
     // ------------------------------------------------------------------
     // Decode READ blob -> 2na -> ASCII bases.
@@ -609,6 +615,24 @@ pub(crate) fn decode_blob_to_fastq(
         } else {
             Vec::new()
         };
+
+        // Tally the raw Phred values for the end-of-run comparison against
+        // `STATS/QUALITY`. Done here, on the whole decoded blob, for two
+        // reasons: these are the exact bytes the loader's `qual_stats`
+        // trigger saw (whole QUALITY rows, before the +33 FASTQ offset), and
+        // counting the blob rather than the emitted records keeps the total a
+        // property of the archive rather than of `--skip-technical` /
+        // `--min-read-len`.
+        //
+        // Accumulated in a stack-local and published once per blob; an atomic
+        // per base would be contended across every rayon worker.
+        if verify_quality && !quality_data.is_empty() {
+            let mut local = [0u64; QUALITY_HISTOGRAM_BINS];
+            for &q in &quality_data {
+                local[q as usize] += 1;
+            }
+            diag.quality_histogram.publish(&local);
+        }
 
         let (all, is_empty) = encode_raw_quality_for_fastq(&quality_data);
         if is_empty && !quality_data.is_empty() {

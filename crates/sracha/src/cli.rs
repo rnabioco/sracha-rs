@@ -353,6 +353,14 @@ pub struct FastqArgs {
     /// truncated-spot recovery) stay informational either way.
     #[arg(long, help_heading = "Advanced")]
     pub no_strict: bool,
+
+    /// Verify decoded quality values against the archive's STATS/QUALITY
+    /// histogram. Every other quality check compares lengths, so this is the
+    /// only one that notices a decode emitting the right number of plausible
+    /// quality bytes at the wrong values. Costs one increment per base and
+    /// is skipped for archives that synthesize quality (SRA-Lite, --fasta).
+    #[arg(long, help_heading = "Advanced")]
+    pub verify: bool,
 }
 
 #[derive(Args)]
@@ -505,6 +513,14 @@ pub struct GetArgs {
     /// truncated-spot recovery) stay informational either way.
     #[arg(long, help_heading = "Advanced")]
     pub no_strict: bool,
+
+    /// Verify decoded quality values against the archive's STATS/QUALITY
+    /// histogram. Every other quality check compares lengths, so this is the
+    /// only one that notices a decode emitting the right number of plausible
+    /// quality bytes at the wrong values. Costs one increment per base and
+    /// is skipped for archives that synthesize quality (SRA-Lite, --fasta).
+    #[arg(long, help_heading = "Advanced")]
+    pub verify: bool,
 
     /// Keep the downloaded SRA file in the output directory instead of
     /// deleting it after decode. Useful for validation runs that want

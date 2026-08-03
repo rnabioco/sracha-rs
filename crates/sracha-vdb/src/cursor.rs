@@ -66,6 +66,10 @@ pub struct VdbCursor {
     metadata_read_descs: Option<Vec<ReadDescriptor>>,
     /// `STATS/TABLE/BIO_BASE_COUNT`, when the loader recorded one.
     bio_base_count: Option<u64>,
+    /// `STATS/QUALITY/PHRED_<n>`, when the loader recorded one — a 256-bin
+    /// histogram of the raw Phred values written to this table's QUALITY
+    /// column.
+    quality_histogram: Option<Vec<u64>>,
     /// Sequencing platform detected from VDB schema metadata.
     platform: Option<String>,
     /// `true` when the metadata shows a `SOFTWARE/delite` node — the tell-tale
@@ -105,6 +109,7 @@ impl VdbCursor {
         // platform for SRA-lite files that lack physical READ_LEN/NREADS columns.
         let (metadata_read_descs, platform) = Self::detect_metadata(archive, table);
         let bio_base_count = read_stats_u64_from_archive(archive, table, "BIO_BASE_COUNT");
+        let quality_histogram = read_stats_quality_from_archive(archive, table);
         let is_sra_lite = Self::detect_sra_lite(archive);
 
         // READ is required.
@@ -196,6 +201,7 @@ impl VdbCursor {
             row_count,
             metadata_read_descs,
             bio_base_count,
+            quality_histogram,
             platform,
             is_sra_lite,
         })
@@ -209,6 +215,18 @@ impl VdbCursor {
     /// self-consistent fraction of it.
     pub fn bio_base_count(&self) -> Option<u64> {
         self.bio_base_count
+    }
+
+    /// The loader's per-value histogram of this table's raw Phred quality
+    /// bytes (`STATS/QUALITY/PHRED_<n>`), indexed by Phred value.
+    ///
+    /// Every other quality check sracha has compares *lengths*: a decode that
+    /// emits the right number of plausible bytes passes all of them. This is
+    /// the only anchor that says what the bytes should be, and like
+    /// [`bio_base_count`](Self::bio_base_count) it comes from the loader
+    /// rather than from the decode being checked.
+    pub fn quality_histogram(&self) -> Option<&[u64]> {
+        self.quality_histogram.as_deref()
     }
 
     /// Total number of spots (rows) in the SEQUENCE table.
@@ -1116,6 +1134,30 @@ fn read_stats_u64_from_archive<R: Read + Seek>(
     None
 }
 
+/// Read `STATS/QUALITY` from the given table's md/cur tree.
+///
+/// Scoped to the table being decoded for the same reason as
+/// [`read_stats_u64_from_archive`]: on DRR032988 the SEQUENCE histogram
+/// spans Phred 0..15 and totals 1,372,620,430 raw subread bases, while the
+/// CONSENSUS histogram the converter actually emits spans 0..73 and totals
+/// 6,880,774. Reading the wrong one refuses a correct conversion, which is
+/// exactly what #123 had to undo.
+fn read_stats_quality_from_archive<R: Read + Seek>(
+    archive: &mut KarArchive<R>,
+    table: &str,
+) -> Option<Vec<u64>> {
+    for path in [format!("tbl/{table}/md/cur"), "md/cur".to_string()] {
+        let path = path.as_str();
+        if let Ok(md_bytes) = archive.read_file(path)
+            && md_bytes.len() >= 8
+            && let Some(hist) = crate::metadata::read_stats_quality_histogram(&md_bytes[8..])
+        {
+            return Some(hist);
+        }
+    }
+    None
+}
+
 /// Scan table and database-level `md/cur` trees for the top-level
 /// `unaligned` marker that `ConvertDatabaseToUnmapped` stamps.
 fn read_unaligned_marker_from_archive<R: Read + Seek>(archive: &mut KarArchive<R>) -> bool {
@@ -1867,6 +1909,41 @@ mod tests {
         // A table with no md/cur of its own must not silently inherit them.
         assert_eq!(
             read_stats_u64_from_archive(&mut archive, "CONSENSUS", "NOT_A_REAL_NODE"),
+            None,
+        );
+        let _ = std::fs::remove_file(&sra_path);
+    }
+
+    /// The quality histogram is scoped the same way, and for the same reason:
+    /// on DRR032988 SEQUENCE records 1,372,620,430 raw subread bases across
+    /// Phred 0..15 while CONSENSUS — the table the converter reads — records
+    /// 6,880,774 across 0..73.
+    #[test]
+    fn quality_histogram_lookup_is_scoped_to_its_table() {
+        use crate::metadata::tests::{
+            build_meta_node, build_meta_node_with_children, build_pbstree,
+        };
+
+        let bin30 = build_meta_node("PHRED_30", &1234u64.to_le_bytes(), None);
+        let bin2 = build_meta_node("PHRED_2", &7u64.to_le_bytes(), None);
+        let quality = build_meta_node_with_children("QUALITY", b"", &[&bin2, &bin30], None);
+        let stats = build_meta_node_with_children("STATS", b"", &[&quality], None);
+        let tree = build_pbstree(&[&stats]);
+        let mut md = vec![0u8; 8]; // KDBHdr prefix
+        md.extend_from_slice(&tree);
+
+        let archive_bytes = build_sra_archive_with_metadata(Some(&md));
+        let sra_path = write_temp_sra(&archive_bytes);
+        let mut archive = KarArchive::open(Cursor::new(archive_bytes)).unwrap();
+
+        let hist = read_stats_quality_from_archive(&mut archive, "SEQUENCE").unwrap();
+        assert_eq!(hist[2], 7);
+        assert_eq!(hist[30], 1234);
+        assert_eq!(hist.iter().sum::<u64>(), 1241);
+
+        // No md/cur of its own means no anchor — better than the wrong one.
+        assert_eq!(
+            read_stats_quality_from_archive(&mut archive, "CONSENSUS"),
             None,
         );
         let _ = std::fs::remove_file(&sra_path);
