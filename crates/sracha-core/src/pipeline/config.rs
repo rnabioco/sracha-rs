@@ -46,6 +46,14 @@ pub struct PipelineConfig {
     /// if any quality-length / mate-pair / blob-truncation counter is non-zero
     /// at the end of decode, instead of merely reporting the counts.
     pub strict: bool,
+    /// Verify decoded quality *values* against the archive's `STATS/QUALITY`
+    /// histogram (`--verify`).
+    ///
+    /// Off by default because it costs one increment per base. Every other
+    /// quality check compares lengths, so this is the only one that would
+    /// notice a decode emitting the right number of plausible bytes at the
+    /// wrong values.
+    pub verify: bool,
     /// Shared HTTP client. When `Some`, `download_sra` threads it into
     /// [`crate::download::DownloadConfig`] so TLS sessions and connection
     /// pools are reused across accessions.
@@ -135,6 +143,7 @@ mod tests {
             stdout: false,
             cancelled: None,
             strict: false,
+            verify: false,
             http_client: None,
             keep_sra: false,
             paired_suffix: crate::fastq::PairedSuffix::Numeric,

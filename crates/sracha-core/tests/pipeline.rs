@@ -366,6 +366,7 @@ fn test_config(
         stdout: false,
         cancelled: None,
         strict: false,
+        verify: false,
         http_client: None,
         keep_sra: false,
         paired_suffix: sracha_core::fastq::PairedSuffix::Numeric,

@@ -110,6 +110,7 @@ sracha get [OPTIONS] [ACCESSION]...
 | `--keep-sra` | | Keep the downloaded SRA file in the output directory instead of deleting it after decode |
 | `--no-progress` | | Disable progress bar |
 | `--no-strict` | | Downgrade strict-fatal data-integrity anomalies (quality length mismatch, invalid quality bytes, quality overruns, paired-spot violations) from hard failures to warnings. Strict is the default. Benign-fallback counters (SRA-lite all-zero quality blobs, truncated-spot recovery) stay informational either way |
+| `--verify` | | Also check decoded quality *values* against the archive's `STATS/QUALITY` histogram. Every other quality check compares lengths, so this is the only one that notices a decode emitting the right number of plausible quality bytes at the wrong values. Costs one increment per base; skipped where quality is synthesized rather than decoded (SRA-Lite, `--fasta`) |
 
 ---
 
@@ -192,6 +193,7 @@ sracha fastq [OPTIONS] <INPUT>...
 | `-f, --force` | | Overwrite existing files |
 | `--no-progress` | | Disable progress bar |
 | `--no-strict` | | Downgrade strict-fatal data-integrity anomalies (quality length mismatch, invalid quality bytes, quality overruns, paired-spot violations) from hard failures to warnings. Strict is the default. Benign-fallback counters (SRA-lite all-zero quality blobs, truncated-spot recovery) stay informational either way |
+| `--verify` | | Also check decoded quality *values* against the archive's `STATS/QUALITY` histogram. Every other quality check compares lengths, so this is the only one that notices a decode emitting the right number of plausible quality bytes at the wrong values. Costs one increment per base; skipped where quality is synthesized rather than decoded (SRA-Lite, `--fasta`) |
 
 ---
 

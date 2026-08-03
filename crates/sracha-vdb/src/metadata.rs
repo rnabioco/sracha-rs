@@ -218,6 +218,52 @@ pub fn read_stats_table_u64(tree_data: &[u8], name: &str) -> Option<u64> {
     }
 }
 
+/// Number of bins in a Phred quality histogram — one per possible byte
+/// value, matching ncbi-vdb's `MAX_QUALITY` in `libs/sraxf/stats_quality.c`.
+pub const QUALITY_HISTOGRAM_BINS: usize = 256;
+
+/// Read the `STATS/QUALITY/PHRED_<n>` histogram from a metadata tree.
+///
+/// The loader's `qual_stats` trigger
+/// (`NCBI:SRA:phred_stats_trigger`, `libs/sraxf/stats_quality.c`) increments
+/// `count[q]` for every element of every `QUALITY` row it writes and flushes
+/// the non-zero bins as `PHRED_<n>` nodes when the table closes. Bins are
+/// indexed by the *raw* Phred value stored in the column, before the +33
+/// FASTQ offset.
+///
+/// Because the trigger sees whole rows, the histogram covers every base in
+/// the table — technical reads included — and its total equals
+/// `STATS/TABLE/BASE_COUNT`, not `BIO_BASE_COUNT`. Verified on 15 archives
+/// spanning Illumina, PacBio, Nanopore, cSRA and two srf-load-era schemas:
+/// `sum(PHRED_*) - BASE_COUNT == 0` on every one, including DRR004435
+/// (73,611,494 technical bases) and SRR000001 (12,324,876).
+///
+/// Returns `None` when the tree has no `STATS/QUALITY` node or it holds no
+/// `PHRED_<n>` children — no anchor is better than a partial one.
+pub fn read_stats_quality_histogram(tree_data: &[u8]) -> Option<Vec<u64>> {
+    let nodes = parse_meta_nodes(tree_data).ok()?;
+    let quality = find_meta_node(&nodes, "STATS/QUALITY")?;
+
+    let mut hist = vec![0u64; QUALITY_HISTOGRAM_BINS];
+    let mut found = false;
+    for child in &quality.children {
+        let Some(idx) = child.name.strip_prefix("PHRED_") else {
+            continue;
+        };
+        let Ok(idx) = idx.parse::<usize>() else {
+            continue;
+        };
+        if idx >= QUALITY_HISTOGRAM_BINS || child.value.len() < 8 {
+            continue;
+        }
+        let mut b = [0u8; 8];
+        b.copy_from_slice(&child.value[..8]);
+        hist[idx] = u64::from_le_bytes(b);
+        found = true;
+    }
+    found.then_some(hist)
+}
+
 /// Whether the metadata has a top-level `unaligned` node.
 ///
 /// bam-load's `ConvertDatabaseToUnmapped` stamps this marker when it
@@ -1303,6 +1349,65 @@ pub(crate) mod tests {
         let stats = build_meta_node_with_children("STATS", b"", &[&table], None);
         let tree = build_pbstree(&[&stats]);
         assert_eq!(read_cmp_base_count(&tree), Some(0));
+    }
+
+    // -----------------------------------------------------------------------
+    // read_stats_quality_histogram
+    // -----------------------------------------------------------------------
+
+    fn quality_tree(bins: &[(u32, u64)]) -> Vec<u8> {
+        let vals: Vec<(String, [u8; 8])> = bins
+            .iter()
+            .map(|&(q, n)| (format!("PHRED_{q}"), n.to_le_bytes()))
+            .collect();
+        let nodes: Vec<Vec<u8>> = vals
+            .iter()
+            .map(|(name, val)| build_meta_node(name, val, None))
+            .collect();
+        let refs: Vec<&[u8]> = nodes.iter().map(|n| n.as_slice()).collect();
+        let quality = build_meta_node_with_children("QUALITY", b"", &refs, None);
+        let stats = build_meta_node_with_children("STATS", b"", &[&quality], None);
+        build_pbstree(&[&stats])
+    }
+
+    #[test]
+    fn read_stats_quality_histogram_present() {
+        let tree = quality_tree(&[(2, 10), (30, 4000), (40, 999)]);
+        let hist = read_stats_quality_histogram(&tree).unwrap();
+        assert_eq!(hist.len(), QUALITY_HISTOGRAM_BINS);
+        assert_eq!(hist[2], 10);
+        assert_eq!(hist[30], 4000);
+        assert_eq!(hist[40], 999);
+        // Every unpopulated bin is zero: the loader only writes non-zero
+        // counts, and the comparison treats "absent" as "zero occurrences".
+        assert_eq!(hist.iter().sum::<u64>(), 5009);
+    }
+
+    #[test]
+    fn read_stats_quality_histogram_absent() {
+        let tree = build_pbstree(&[]);
+        assert_eq!(read_stats_quality_histogram(&tree), None);
+    }
+
+    #[test]
+    fn read_stats_quality_histogram_empty_node_is_none() {
+        // A STATS/QUALITY node with no PHRED_* children is not an anchor.
+        // Returning Some(all-zero) here would refuse every healthy archive
+        // carrying such a node.
+        let quality = build_meta_node("QUALITY", b"", None);
+        let stats = build_meta_node_with_children("STATS", b"", &[&quality], None);
+        let tree = build_pbstree(&[&stats]);
+        assert_eq!(read_stats_quality_histogram(&tree), None);
+    }
+
+    #[test]
+    fn read_stats_quality_histogram_ignores_out_of_range_bins() {
+        // 256 is one past the last valid Phred bin; skipping it rather than
+        // indexing must not panic or drop the valid bins alongside it.
+        let tree = quality_tree(&[(30, 7), (256, 1), (99999, 1)]);
+        let hist = read_stats_quality_histogram(&tree).unwrap();
+        assert_eq!(hist[30], 7);
+        assert_eq!(hist.iter().sum::<u64>(), 7);
     }
 
     // -----------------------------------------------------------------------

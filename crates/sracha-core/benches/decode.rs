@@ -51,6 +51,7 @@ fn config(out: &std::path::Path, threads: usize, compression: CompressionMode) -
         stdout: false,
         cancelled: None,
         strict: false,
+        verify: false,
         http_client: None,
         keep_sra: false,
         paired_suffix: sracha_core::fastq::PairedSuffix::Numeric,

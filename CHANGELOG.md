@@ -56,6 +56,15 @@ A 386-accession x 2-split A/B against 0.4.2, with `fasterq-dump` as reference:
 base-count check on PacBio archives with a CONSENSUS table, fixed before
 release. Every other new check held across the full breadth.
 
+### Features
+
+- `--verify` checks decoded quality *values* against the archive's
+  `STATS/QUALITY` histogram (#124). Every other quality check compares
+  lengths, so a decode emitting the right number of plausible bytes at the
+  wrong values passed all of them. Off by default — it costs one increment per
+  base — and skipped where quality is synthesized rather than decoded
+  (SRA-Lite, `--fasta`). Strict-fatal as `quality_histogram_mismatch`.
+
 ### Fixes
 
 - Decline ABI SOLiD archives by name instead of blaming the KAR layout

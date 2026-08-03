@@ -109,6 +109,20 @@ sracha get SRR28588231 --no-strict
 Benign-fallback counters (SRA-lite all-zero quality blobs, truncated-spot
 recovery) remain informational either way.
 
+Those checks all compare *lengths*, so a decode that produced the right
+number of plausible quality bytes at the wrong values would pass every one of
+them. `--verify` adds the missing check: it tallies the quality values sracha
+decodes and compares them against `STATS/QUALITY`, the per-value histogram
+the loader wrote when the archive was built.
+
+```bash
+sracha get SRR28588231 --verify
+```
+
+It is opt-in because it costs one increment per base, and it is skipped for
+archives whose quality is synthesized rather than decoded (SRA-Lite,
+`--fasta`), where the emitted bytes are deliberately not the stored ones.
+
 ## cSRA (aligned SRA)
 
 sracha decodes compressed/aligned SRA archives (cSRA) in pure Rust,

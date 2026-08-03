@@ -11,6 +11,53 @@ mod defline;
 pub use defline::DeflineTemplate;
 pub(crate) use defline::append_record_templated;
 
+/// Bins in the decoded-quality histogram — one per possible raw Phred byte,
+/// matching ncbi-vdb's `MAX_QUALITY` and therefore the shape of the loader's
+/// `STATS/QUALITY` node.
+pub const QUALITY_HISTOGRAM_BINS: usize = 256;
+
+/// Per-value tally of the raw Phred bytes the decoder produced, indexed by
+/// Phred value (before the +33 FASTQ offset).
+///
+/// Compared at end of run against the loader's `STATS/QUALITY`. Every other
+/// quality check in [`IntegrityDiag`] compares lengths, so a decode that
+/// produces the right *number* of plausible bytes passes all of them; this is
+/// the only one that looks at the values.
+#[derive(Debug)]
+pub struct QualityHistogram([AtomicU64; QUALITY_HISTOGRAM_BINS]);
+
+impl Default for QualityHistogram {
+    fn default() -> Self {
+        Self(std::array::from_fn(|_| AtomicU64::new(0)))
+    }
+}
+
+impl QualityHistogram {
+    /// Fold one blob's locally-accumulated counts into the shared tally.
+    ///
+    /// Callers accumulate into a stack-local `[u64; 256]` and publish once per
+    /// blob. A `fetch_add` per base would be contended across every rayon
+    /// worker — the shape that cost the page-map rewrite in #101 2.4x before
+    /// it was caught.
+    pub fn publish(&self, local: &[u64; QUALITY_HISTOGRAM_BINS]) {
+        for (bin, &n) in local.iter().enumerate() {
+            if n != 0 {
+                self.0[bin].fetch_add(n, Ordering::Relaxed);
+            }
+        }
+    }
+
+    /// Snapshot the tally as plain counts.
+    pub fn snapshot(&self) -> Vec<u64> {
+        self.0.iter().map(|c| c.load(Ordering::Relaxed)).collect()
+    }
+
+    /// Total bases tallied across all bins.
+    pub fn total(&self) -> u64 {
+        self.0.iter().map(|c| c.load(Ordering::Relaxed)).sum()
+    }
+}
+
 /// Aggregated data-integrity counters captured during FASTQ formatting.
 ///
 /// Populated by [`format_read`] / [`format_spot`] and aggregated upstream by
@@ -67,6 +114,17 @@ pub struct IntegrityDiag {
     /// decode where every stream agrees on the wrong answer — #118 emitted
     /// exactly half of five runs that way.
     pub base_count_mismatch: AtomicU64,
+    /// Per-value tally of the raw Phred bytes the decoder produced. Only
+    /// populated under `--verify`; compared at end of run against the
+    /// loader's `STATS/QUALITY`.
+    pub quality_histogram: QualityHistogram,
+    /// Quality bins whose decoded count disagreed with `STATS/QUALITY`.
+    ///
+    /// The first check that verifies quality *values* rather than lengths.
+    /// #111 and #113 were both caught only because a wrong-sized buffer
+    /// disagreed with the sequence stream; a decode emitting the right number
+    /// of plausible bytes at the wrong values passed everything else here.
+    pub quality_histogram_mismatch: AtomicU64,
     /// Blobs whose full quality payload was all-zero (SRA-lite style) and
     /// was replaced with a uniform Phred fallback.
     pub all_zero_quality_blobs: AtomicU64,
@@ -74,6 +132,23 @@ pub struct IntegrityDiag {
     /// reads. Typically indicates READ_LEN / READ_TYPE disagreement.
     pub paired_spot_violations: AtomicU64,
     /// Spots whose READ_LEN values would extend past the decoded sequence.
+    ///
+    /// Deliberately excluded from [`any_strict_fatal`](Self::any_strict_fatal)
+    /// — not because truncation is benign, but because it cannot reach a user
+    /// silently. The decoder increments this and then `break`s out of the
+    /// blob, which leaves the consumed offset short of the decoded length and
+    /// therefore always trips
+    /// [`sequence_blob_length_mismatch`](Self::sequence_blob_length_mismatch)
+    /// for the same blob. That counter is strict-fatal. The one shape that
+    /// escapes it — a zero-length READ blob paired with non-empty READ_LEN,
+    /// where consumed and decoded are both 0 — drops every spot in the blob
+    /// and so trips [`spot_count_mismatch`](Self::spot_count_mismatch)
+    /// instead. Either way a strict run already refuses; promoting this
+    /// counter would duplicate a refusal, not add one.
+    ///
+    /// Measured, not assumed: zero on all 17 archives of the local corpus
+    /// (Illumina, PacBio, Nanopore, BGISEQ, cSRA, and both srf-load-era
+    /// schemas), including the five repaired in #120.
     pub truncated_spots: AtomicU64,
 }
 
@@ -87,6 +162,7 @@ impl IntegrityDiag {
             || self.sequence_blob_length_mismatch.load(Ordering::Relaxed) != 0
             || self.base_count_mismatch.load(Ordering::Relaxed) != 0
             || self.spot_count_mismatch.load(Ordering::Relaxed) != 0
+            || self.quality_histogram_mismatch.load(Ordering::Relaxed) != 0
             || self.all_zero_quality_blobs.load(Ordering::Relaxed) != 0
             || self.paired_spot_violations.load(Ordering::Relaxed) != 0
             || self.truncated_spots.load(Ordering::Relaxed) != 0
@@ -95,8 +171,8 @@ impl IntegrityDiag {
     /// Return `true` if any counter that should abort a strict-mode run is
     /// non-zero. Excludes [`Self::all_zero_quality_blobs`] (expected for
     /// SRA-lite archives, which ship synthesized quality by design) and
-    /// [`Self::truncated_spots`] (decoder-side truncation fallback — small
-    /// non-zero counts are noise rather than silent corruption).
+    /// [`Self::truncated_spots`] (already covered — see that field's docs for
+    /// why it cannot fire without a strict-fatal counter firing alongside it).
     pub fn any_strict_fatal(&self) -> bool {
         self.quality_length_mismatches.load(Ordering::Relaxed) != 0
             || self.quality_invalid_bytes.load(Ordering::Relaxed) != 0
@@ -105,6 +181,7 @@ impl IntegrityDiag {
             || self.sequence_blob_length_mismatch.load(Ordering::Relaxed) != 0
             || self.base_count_mismatch.load(Ordering::Relaxed) != 0
             || self.spot_count_mismatch.load(Ordering::Relaxed) != 0
+            || self.quality_histogram_mismatch.load(Ordering::Relaxed) != 0
             || self.paired_spot_violations.load(Ordering::Relaxed) != 0
     }
 
@@ -114,6 +191,7 @@ impl IntegrityDiag {
             "quality_length_mismatches={}, quality_invalid_bytes={}, quality_overruns={}, \
              quality_blob_length_mismatch={}, sequence_blob_length_mismatch={}, \
              base_count_mismatch={}, spot_count_mismatch={}, \
+             quality_histogram_mismatch={}, \
              all_zero_quality_blobs={}, paired_spot_violations={}, \
              truncated_spots={}",
             self.quality_length_mismatches.load(Ordering::Relaxed),
@@ -123,6 +201,7 @@ impl IntegrityDiag {
             self.sequence_blob_length_mismatch.load(Ordering::Relaxed),
             self.base_count_mismatch.load(Ordering::Relaxed),
             self.spot_count_mismatch.load(Ordering::Relaxed),
+            self.quality_histogram_mismatch.load(Ordering::Relaxed),
             self.all_zero_quality_blobs.load(Ordering::Relaxed),
             self.paired_spot_violations.load(Ordering::Relaxed),
             self.truncated_spots.load(Ordering::Relaxed),
@@ -2171,5 +2250,53 @@ mod tests {
             .fetch_add(1, Ordering::Relaxed);
         assert!(spots_only.any_strict_fatal());
         assert_eq!(spots_only.base_count_mismatch.load(Ordering::Relaxed), 0);
+    }
+
+    // -----------------------------------------------------------------------
+    // QualityHistogram / quality_histogram_mismatch
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn quality_histogram_starts_empty() {
+        let h = QualityHistogram::default();
+        assert_eq!(h.total(), 0);
+        assert_eq!(h.snapshot().len(), QUALITY_HISTOGRAM_BINS);
+        assert!(h.snapshot().iter().all(|&n| n == 0));
+    }
+
+    #[test]
+    fn quality_histogram_publish_accumulates_per_bin() {
+        let h = QualityHistogram::default();
+        let mut a = [0u64; QUALITY_HISTOGRAM_BINS];
+        a[30] = 5;
+        a[2] = 1;
+        h.publish(&a);
+
+        let mut b = [0u64; QUALITY_HISTOGRAM_BINS];
+        b[30] = 7;
+        b[40] = 2;
+        h.publish(&b);
+
+        let snap = h.snapshot();
+        assert_eq!(snap[2], 1);
+        assert_eq!(snap[30], 12);
+        assert_eq!(snap[40], 2);
+        assert_eq!(h.total(), 15);
+    }
+
+    /// The whole point of #124: every other quality counter compares lengths,
+    /// so a decode emitting the right *number* of plausible bytes at the wrong
+    /// values must have somewhere to land — and must abort a strict run.
+    #[test]
+    fn quality_histogram_mismatch_is_strict_fatal() {
+        let d = IntegrityDiag::default();
+        assert!(!d.any_strict_fatal());
+        d.quality_histogram_mismatch.fetch_add(3, Ordering::Relaxed);
+        assert!(d.any(), "must be reported");
+        assert!(d.any_strict_fatal(), "and must fail a strict run");
+        assert!(d.summary().contains("quality_histogram_mismatch=3"));
+        // Independent of every length-based counter, which is the point.
+        assert_eq!(d.quality_length_mismatches.load(Ordering::Relaxed), 0);
+        assert_eq!(d.quality_blob_length_mismatch.load(Ordering::Relaxed), 0);
     }
 }
