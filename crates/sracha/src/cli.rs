@@ -346,11 +346,13 @@ pub struct FastqArgs {
     pub no_progress: bool,
 
     /// Disable strict integrity checking. By default, sracha fails on any
-    /// data-integrity anomaly it cannot silently fall back on (quality length
-    /// mismatch, invalid quality bytes, quality overruns, paired-spot
-    /// violations); pass this flag to downgrade those failures to warnings.
-    /// Benign-fallback counters (SRA-lite all-zero quality blobs and
-    /// truncated-spot recovery) stay informational either way.
+    /// data-integrity anomaly it cannot silently fall back on: quality or
+    /// sequence streams that do not correspond to each other, decoded bases
+    /// or spots that disagree with the archive's own recorded totals,
+    /// invalid quality bytes, quality overruns, and paired-spot violations.
+    /// Pass this flag to downgrade those failures to warnings. Benign-fallback
+    /// counters (SRA-lite all-zero quality blobs and truncated-spot recovery)
+    /// stay informational either way.
     #[arg(long, help_heading = "Advanced")]
     pub no_strict: bool,
 
@@ -506,11 +508,13 @@ pub struct GetArgs {
     pub prefer_sdl: bool,
 
     /// Disable strict integrity checking. By default, sracha fails on any
-    /// data-integrity anomaly it cannot silently fall back on (quality length
-    /// mismatch, invalid quality bytes, quality overruns, paired-spot
-    /// violations); pass this flag to downgrade those failures to warnings.
-    /// Benign-fallback counters (SRA-lite all-zero quality blobs and
-    /// truncated-spot recovery) stay informational either way.
+    /// data-integrity anomaly it cannot silently fall back on: quality or
+    /// sequence streams that do not correspond to each other, decoded bases
+    /// or spots that disagree with the archive's own recorded totals,
+    /// invalid quality bytes, quality overruns, and paired-spot violations.
+    /// Pass this flag to downgrade those failures to warnings. Benign-fallback
+    /// counters (SRA-lite all-zero quality blobs and truncated-spot recovery)
+    /// stay informational either way.
     #[arg(long, help_heading = "Advanced")]
     pub no_strict: bool,
 

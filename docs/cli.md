@@ -109,7 +109,7 @@ sracha get [OPTIONS] [ACCESSION]...
 | `--prefetch-depth <N>` | `2` | Number of accessions to download ahead of the decoder. Larger values hide slow networks behind decode at the cost of one extra temp SRA file per step. Multi-accession `get` only |
 | `--keep-sra` | | Keep the downloaded SRA file in the output directory instead of deleting it after decode |
 | `--no-progress` | | Disable progress bar |
-| `--no-strict` | | Downgrade strict-fatal data-integrity anomalies (quality length mismatch, invalid quality bytes, quality overruns, paired-spot violations) from hard failures to warnings. Strict is the default. Benign-fallback counters (SRA-lite all-zero quality blobs, truncated-spot recovery) stay informational either way |
+| `--no-strict` | | Downgrade strict-fatal data-integrity anomalies from hard failures to warnings. Strict mode fails when the quality and sequence streams do not correspond, when decoded bases or spots disagree with the archive's own recorded totals, or on invalid quality bytes, quality overruns and paired-spot violations. Strict is the default. Benign-fallback counters (SRA-lite all-zero quality blobs, truncated-spot recovery) stay informational either way |
 | `--verify` | | Also check decoded quality *values* against the archive's `STATS/QUALITY` histogram. Every other quality check compares lengths, so this is the only one that notices a decode emitting the right number of plausible quality bytes at the wrong values. Costs one increment per base; skipped where quality is synthesized rather than decoded (SRA-Lite, `--fasta`) |
 
 ---
@@ -192,7 +192,7 @@ sracha fastq [OPTIONS] <INPUT>...
 | `--folder-per-accession` | | Place each accession's outputs inside its own `<output-dir>/<accession>/` subdirectory |
 | `-f, --force` | | Overwrite existing files |
 | `--no-progress` | | Disable progress bar |
-| `--no-strict` | | Downgrade strict-fatal data-integrity anomalies (quality length mismatch, invalid quality bytes, quality overruns, paired-spot violations) from hard failures to warnings. Strict is the default. Benign-fallback counters (SRA-lite all-zero quality blobs, truncated-spot recovery) stay informational either way |
+| `--no-strict` | | Downgrade strict-fatal data-integrity anomalies from hard failures to warnings. Strict mode fails when the quality and sequence streams do not correspond, when decoded bases or spots disagree with the archive's own recorded totals, or on invalid quality bytes, quality overruns and paired-spot violations. Strict is the default. Benign-fallback counters (SRA-lite all-zero quality blobs, truncated-spot recovery) stay informational either way |
 | `--verify` | | Also check decoded quality *values* against the archive's `STATS/QUALITY` histogram. Every other quality check compares lengths, so this is the only one that notices a decode emitting the right number of plausible quality bytes at the wrong values. Costs one increment per base; skipped where quality is synthesized rather than decoded (SRA-Lite, `--fasta`) |
 
 ---
@@ -376,6 +376,12 @@ Dump row-level data for the chosen columns. Values are typed by a
 name-based heuristic (READ as bases, READ_LEN as an array, and so on);
 unrecognized columns render as hex.
 
+`-C READ` renders the *logical* READ column — the 2na basecalls with the
+ALTREAD ambiguity mask applied — so ambiguous positions show as `N` and the
+output matches `vdb-dump`. Releases before 0.5.0 showed the physical column
+without the mask, which disagreed with `vdb-dump` wherever a submitter
+recorded an ambiguity.
+
 ```
 sracha vdb dump <SOURCE> [-T TABLE] [-C COLUMNS] [-x COLUMNS] [-R ROWS] [-f FORMAT]
 ```
@@ -434,7 +440,7 @@ How common `fasterq-dump` / `fastq-dump` options map to sracha:
 | `-O, --outdir <DIR>` | `-O, --output-dir <DIR>` | Same |
 | `-e, --threads <N>` | `-t, --threads <N>` | Decode + compression threads |
 | `--split-3` | `--split split-3` | Default in both |
-| `--split-files` | `--split split-files` | One file per read slot; skipped reads still consume their number |
+| `--split-files` | `--split split-files` | One file per read slot; skipped reads still consume their number. An archive storing a single read per spot writes a bare `ACC.fastq`, with no `_1` suffix |
 | `--split-spot` | `--split split-spot` | All reads of a spot in one file |
 | `--concatenate-reads` / no split | `--split interleaved` | Single interleaved stream |
 | `-Z, --stdout` | `-Z, --stdout` | Interleaved FASTQ to stdout |

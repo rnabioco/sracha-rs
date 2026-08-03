@@ -97,10 +97,17 @@ filereport alongside the NCBI info table.
 
 ## Data integrity
 
-Strict integrity checking is on by default. sracha fails the run when it
-detects quality length mismatches, invalid quality bytes, quality
-overruns, or paired-spot violations in the decoded data. Pass
-`--no-strict` to downgrade these anomalies to warnings and keep going:
+Strict integrity checking is on by default. sracha fails the run rather than
+write output it cannot vouch for. It refuses when the quality and sequence
+streams do not correspond to each other, when the decoded bases or spot count
+disagree with the totals the archive itself records, or on invalid quality
+bytes, quality overruns and paired-spot violations.
+
+The last of those matter most: several decoders have shipped bugs that produced
+correct spot counts, correct read names and a zero exit code alongside wrong
+data, and comparing against the archive's own recorded totals is what catches
+that class. Pass `--no-strict` to downgrade these anomalies to warnings and
+keep going:
 
 ```bash
 sracha get SRR28588231 --no-strict
@@ -153,13 +160,17 @@ Quality scores will be uniform: Q30 for pass-filter reads, Q3 for rejects.
 | Mode | Flag | Output |
 |------|------|--------|
 | split-3 (default) | `--split split-3` | `_1.fastq.gz`, `_2.fastq.gz`, plus `.fastq.gz` for spots with fewer than two biological reads |
-| split-files | `--split split-files` | one file per read slot: `_1.fastq.gz`, `_2.fastq.gz`, ... |
+| split-files | `--split split-files` | one file per read slot: `_1.fastq.gz`, `_2.fastq.gz`, ... — but a bare `.fastq.gz` when the archive stores a single read per spot |
 | split-spot | `--split split-spot` | single file |
 | interleaved | `--split interleaved` | single file, R1/R2 alternating |
 
 In `split-files` the number comes from the read's slot in the spot, matching
 fasterq-dump: if a spot's first read is empty or technical, its second read
-still goes to `_2.fastq.gz` and no `_1.fastq.gz` is written. `split-3`
+still goes to `_2.fastq.gz` and no `_1.fastq.gz` is written. The suffix is
+dropped entirely when the archive stores only one read per spot — that run
+writes `ACC.fastq.gz`, again matching fasterq-dump. The decision keys off the
+number of reads the archive *stores*, not how many survive filtering, so a
+two-read spot whose first read is a dropped adapter still writes `_2`. `split-3`
 instead numbers only the reads it writes, so the same spot's lone read lands
 in the unpaired `.fastq.gz`.
 

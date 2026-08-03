@@ -17,8 +17,11 @@ Fast SRA downloader and FASTQ converter, written in pure Rust.
 - **Split modes** -- split-3, split-files, split-spot, interleaved
 - **Resumable downloads** -- picks up where it left off
 - **Stdout streaming** -- `-Z` pipes FASTQ straight into downstream tools
-- **Integrity checks** -- MD5 verification on download and decode
-- **Platform support** -- Illumina, BGISEQ/DNBSEQ, Element, Ultima, PacBio, Nanopore (legacy 454 and Ion Torrent are not supported)
+- **Integrity checks** -- MD5 verification on download and decode, plus strict
+  checks that refuse to write records sracha cannot vouch for (`--no-strict`
+  downgrades them to warnings; `--verify` additionally checks quality *values*
+  against the archive's recorded histogram)
+- **Platform support** -- Illumina, BGISEQ/DNBSEQ, Element, Ultima, PacBio, Nanopore (legacy 454, SOLiD, Ion Torrent, Helicos and Capillary are declined with a clear error)
 - **Single static binary** -- no Python, no C dependencies
 
 ## Quick start
