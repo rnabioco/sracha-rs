@@ -11,12 +11,15 @@
 #
 # Not every row exercises the FASTQ decoder. `sracha fastq` declines cSRA and
 # the legacy platforms — 454, Ion Torrent, capillary — and cannot read ABI
-# SOLiD colorspace at all (#109). Those five rows check that both binaries
-# decline identically (verdict REJECT_CSRA / REJECT_PLATFORM / REJECTED_BOTH
-# in ab_corpus.sh); reach their decode paths with `sracha vdb dump` instead.
-# Treating a REJECT as decode coverage is the mistake this note exists to
-# prevent, and the `covers` column says so per row rather than leaving it to
-# be inferred from the platform.
+# SOLiD colorspace at all (#109). Those five rows produce only a REJECT
+# verdict from the FASTQ leg (REJECT_CSRA / REJECT_PLATFORM / REJECTED_BOTH),
+# which says the two binaries decline identically and nothing about decode.
+# Their decode paths are reached by ab_corpus.sh's `vdb dump` leg, which runs
+# by default and diffs a row window against vdb-dump — on SRR000001 that is
+# READ, QUALITY, X, Y, READ_LEN and READ_START where the FASTQ leg sees
+# nothing at all. Treating a REJECT as decode coverage is the mistake this
+# note exists to prevent, and the `covers` column says so per row rather than
+# leaving it to be inferred from the platform.
 #
 # Usage:
 #   awk -F'\t' '$2=="core" && !/^#/ {print $1}' validation/corpus.tsv > core.txt
