@@ -398,16 +398,24 @@ fn decode_and_write(
     if table != "SEQUENCE" {
         tracing::info!("{accession}: reading reads from {table} table");
     }
-    let cursor = VdbCursor::open_table(&mut archive, sra_path, table)?;
-
     // Check platform — reject legacy platforms with complex read structures.
-    if let Some(platform) = cursor.platform()
-        && is_unsupported_platform(platform)
+    //
+    // This runs before the cursor opens, not after. The cursor requires a
+    // physical READ column, and ABI SOLiD archives have none: colorspace
+    // reads live in CSREAD/ALTCSREAD. Checking after the open meant SOLiD
+    // runs died in the column probe with "SEQUENCE table not found in KAR
+    // archive", telling the user their file was broken when it was merely
+    // an encoding sracha declines (issue #109). The platform lives in
+    // `md/cur`, which every archive carries, so asking first costs one
+    // small metadata read and gives every declined platform the same
+    // message.
+    if let Some(platform) = crate::vdb::cursor::archive_platform(&mut archive, table)
+        && is_unsupported_platform(&platform)
     {
-        return Err(Error::UnsupportedPlatform {
-            platform: platform.to_string(),
-        });
+        return Err(Error::UnsupportedPlatform { platform });
     }
+
+    let cursor = VdbCursor::open_table(&mut archive, sra_path, table)?;
 
     // Detect SRA-lite from actual file: the QUALITY column is absent
     // (classic variant) or the VDB metadata carries the `SOFTWARE/delite`

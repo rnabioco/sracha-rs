@@ -177,6 +177,40 @@ fn ensure_srr000001() -> PathBuf {
     path
 }
 
+/// Ensure the DRR010063 fixture (ABI SOLiD / AB 5500xl, 27 MiB).
+///
+/// The only colorspace shape in the validation corpus: a flat table whose
+/// columns are `ALTCSREAD CSREAD QUALITY X Y` — no `READ` at all. Covers
+/// issue #109, where the missing READ column made the cursor blame the KAR
+/// layout instead of the platform.
+fn ensure_drr010063() -> PathBuf {
+    static DOWNLOAD: Once = Once::new();
+    let path = fixtures_dir().join("DRR010063.sra");
+
+    DOWNLOAD.call_once(|| {
+        if path.exists() {
+            return;
+        }
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+
+        let url = "https://sra-pub-run-odp.s3.amazonaws.com/sra/DRR010063/DRR010063";
+        eprintln!("downloading DRR010063 fixture from {url} ...");
+
+        let resp = reqwest::blocking::get(url)
+            .unwrap_or_else(|e| panic!("failed to download DRR010063: {e}"));
+        assert!(
+            resp.status().is_success(),
+            "HTTP {} downloading DRR010063 fixture",
+            resp.status()
+        );
+        let bytes = resp.bytes().unwrap();
+        std::fs::write(&path, &bytes).unwrap();
+    });
+
+    assert!(path.exists(), "fixture not found at {}", path.display());
+    path
+}
+
 /// Ensure the VDB-3418 fixture (BAM-loaded cSRA, 12 MiB, 985 SEQUENCE /
 /// 938 PRIMARY_ALIGNMENT rows; schema `NCBI:align:db:alignment_sorted#1.3`).
 ///
@@ -1507,6 +1541,35 @@ fn ls454_platform_is_rejected_end_to_end() {
         "no FASTQ output should be written for rejected platform, found: {:?}",
         files.iter().map(|e| e.file_name()).collect::<Vec<_>>(),
     );
+}
+
+#[ignore]
+#[test]
+fn abi_solid_platform_is_rejected_end_to_end() {
+    // Issue #109: ABI SOLiD stores colorspace bases in CSREAD/ALTCSREAD and
+    // has no READ column, so the cursor's column probe used to fail before
+    // the platform check ran and reported "SEQUENCE table not found in KAR
+    // archive" — a corruption claim about a perfectly good file. DRR010063
+    // is a flat table (no `tbl/` wrapper), which is also the layout where the
+    // platform has to come from the root `md/cur`.
+    let sra_path = ensure_drr010063();
+    let tmp = tempfile::tempdir().unwrap();
+    let config = test_config(tmp.path(), SplitMode::SplitFiles, CompressionMode::None);
+
+    let result = sracha_core::pipeline::run_fastq(&sra_path, Some("DRR010063"), &config);
+    match result {
+        Err(sracha_core::error::Error::UnsupportedPlatform { platform }) => {
+            assert_eq!(
+                platform, "ABI_SOLID",
+                "expected ABI_SOLID rejection, got {platform}",
+            );
+        }
+        Ok(stats) => panic!(
+            "ABI SOLiD must be rejected, but decode succeeded with {} spots",
+            stats.spots_read,
+        ),
+        Err(e) => panic!("unexpected non-UnsupportedPlatform error: {e}"),
+    }
 }
 
 #[ignore]

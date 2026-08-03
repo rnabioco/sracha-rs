@@ -696,11 +696,7 @@ impl VdbCursor {
             archive: &mut KarArchive<R>,
             path: &str,
         ) -> Option<(Option<Vec<ReadDescriptor>>, Option<String>)> {
-            let md_bytes = archive.read_file(path).ok()?;
-            if md_bytes.len() < 8 {
-                return None;
-            }
-            let tree_data = md_bytes[8..].to_vec();
+            let tree_data = md_tree_data(archive, path)?;
             let rps = match crate::metadata::parse_read_structure(&tree_data) {
                 Ok(descs) => Some(descs),
                 Err(e) => {
@@ -962,6 +958,44 @@ fn find_table_col_base<R: Read + Seek>(archive: &KarArchive<R>, table: &str) -> 
 /// SEQUENCE (`insp_db_type()`). Used by the pipeline to pick the table.
 pub fn archive_has_consensus_table<R: Read + Seek>(archive: &KarArchive<R>) -> bool {
     find_table_col_base(archive, "CONSENSUS").is_ok()
+}
+
+/// Read an `md/cur` metadata blob and strip the 8-byte KDB header, leaving
+/// the PBSTree node data that the [`crate::metadata`] parsers expect.
+fn md_tree_data<R: Read + Seek>(archive: &mut KarArchive<R>, path: &str) -> Option<Vec<u8>> {
+    let md_bytes = archive.read_file(path).ok()?;
+    if md_bytes.len() < 8 {
+        return None;
+    }
+    Some(md_bytes[8..].to_vec())
+}
+
+/// Read the run's sequencing platform from VDB metadata alone, without
+/// opening a single column.
+///
+/// [`VdbCursor::open_table`] requires a physical `READ` column, so a caller
+/// that learns the platform from a live cursor cannot learn it at all for
+/// archives that keep their bases somewhere else. ABI SOLiD is exactly that
+/// shape: colorspace reads live in `CSREAD`/`ALTCSREAD` and there is no
+/// `READ`, so the column probe fails first and the user is told the SEQUENCE
+/// table is missing — a claim about file integrity, when the file is fine and
+/// merely encoded in a way sracha does not decode (issue #109). Callers that
+/// decline runs on platform grounds must therefore ask *before* they open the
+/// cursor.
+///
+/// Looks in the table's own `md/cur` first, then the database-level one,
+/// matching the precedence [`VdbCursor`] uses for its own platform field, and
+/// works for flat tables (no `tbl/` wrapper) because the root `md/cur` is
+/// where they keep it.
+pub fn archive_platform<R: Read + Seek>(
+    archive: &mut KarArchive<R>,
+    table: &str,
+) -> Option<String> {
+    md_tree_data(archive, &format!("tbl/{table}/md/cur"))
+        .and_then(|tree| crate::metadata::detect_platform(&tree))
+        .or_else(|| {
+            md_tree_data(archive, "md/cur").and_then(|tree| crate::metadata::detect_platform(&tree))
+        })
 }
 
 /// Reject archives that need ncbi-vdb's schema-aware virtual cursor.
@@ -1505,6 +1539,66 @@ mod tests {
         let cursor = VdbCursor::open(&mut archive, &sra_path).unwrap();
 
         assert_eq!(cursor.platform(), Some("ILLUMINA"));
+        let _ = std::fs::remove_file(&sra_path);
+    }
+
+    /// Build a flat (non-database) colorspace archive: a root-level `col/`
+    /// holding only `CSREAD`, plus a root `md/cur`. This is the ABI SOLiD
+    /// shape (DRR010063) — the bases are colorspace and there is no `READ`
+    /// column anywhere in the archive.
+    fn build_flat_colorspace_archive(md_bytes: &[u8]) -> Vec<u8> {
+        let col_data = b"01230";
+        let idx1 = build_idx1_v1(col_data.len() as u64, 1, 0);
+        let idx0 = build_kdb_blob_loc(0, 5, 1, 1);
+
+        let mut data_section = Vec::new();
+        let idx1_off = 0u64;
+        data_section.extend_from_slice(&idx1);
+        let idx0_off = data_section.len() as u64;
+        data_section.extend_from_slice(&idx0);
+        let data_off = data_section.len() as u64;
+        data_section.extend_from_slice(col_data);
+        let md_off = data_section.len() as u64;
+        data_section.extend_from_slice(md_bytes);
+
+        let idx1_node = build_file_node("idx1", idx1_off, idx1.len() as u64);
+        let idx0_node = build_file_node("idx0", idx0_off, idx0.len() as u64);
+        let data_node = build_file_node("data", data_off, col_data.len() as u64);
+
+        let csread_dir = build_dir_node("CSREAD", &[&data_node, &idx0_node, &idx1_node]);
+        let col_dir = build_dir_node("col", &[&csread_dir]);
+        let md_file = build_file_node("cur", md_off, md_bytes.len() as u64);
+        let md_dir = build_dir_node("md", &[&md_file]);
+
+        build_kar_archive(&[&col_dir, &md_dir], &data_section)
+    }
+
+    /// Issue #109: a colorspace archive's platform must be readable without
+    /// opening a column, because the column probe can never succeed on one.
+    #[test]
+    fn archive_platform_reads_colorspace_archive_without_a_read_column() {
+        let md = build_metadata_bytes(&[], Some(b"NCBI:SRA:ABI:tbl:v2#1.0.4"));
+        let archive_bytes = build_flat_colorspace_archive(&md);
+        let sra_path = write_temp_sra(&archive_bytes);
+        let mut archive = KarArchive::open(Cursor::new(archive_bytes)).unwrap();
+
+        assert_eq!(
+            archive_platform(&mut archive, "SEQUENCE").as_deref(),
+            Some("ABI_SOLID"),
+            "platform must come from md/cur, which needs no column",
+        );
+
+        // And the reason it has to: opening the cursor on the same archive
+        // fails in the column probe, blaming the KAR layout for what is
+        // really an encoding sracha declines. Callers must ask about the
+        // platform before they get here.
+        let Err(err) = VdbCursor::open(&mut archive, &sra_path) else {
+            panic!("a colorspace archive has no READ column, so the cursor cannot open");
+        };
+        assert!(
+            err.to_string().contains("table not found"),
+            "expected the column-probe failure this check pre-empts, got: {err}",
+        );
         let _ = std::fs::remove_file(&sra_path);
     }
 
