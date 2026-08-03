@@ -4,6 +4,14 @@
 
 ### Fixes
 
+- Decline ABI SOLiD archives by name instead of blaming the KAR layout
+  (#109). SOLiD keeps colorspace bases in `CSREAD`/`ALTCSREAD` and has no
+  `READ` column, so the cursor's column probe failed before the platform check
+  ran and reported "SEQUENCE table not found in KAR archive" — pointing users
+  at a corrupt file or a bad download rather than at an encoding sracha does
+  not decode. The platform now comes from `md/cur` before any column opens, so
+  SOLiD gets the same message as the other legacy platforms.
+
 - Verify the decoded spot count against the SEQUENCE table's row count
   (#117). `BIO_BASE_COUNT` cannot see a run that emits the right total bases
   across the wrong number of spots — issue #22 was exactly that shape.
