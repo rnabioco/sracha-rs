@@ -52,7 +52,7 @@ open an issue with the accession.
 ### Validation
 
 A 386-accession x 2-split A/B against 0.4.2, with `fasterq-dump` as reference:
-609 rows unchanged, 145 fixed, **1 regression** — a false positive in the new
+611 rows unchanged, 145 fixed, **1 regression** — a false positive in the new
 base-count check on PacBio archives with a CONSENSUS table, fixed before
 release. Every other new check held across the full breadth.
 
