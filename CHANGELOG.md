@@ -1,6 +1,60 @@
 # Changelog
 
-## Unreleased
+## 0.5.0 (2026-08-02)
+
+### Upgrade note
+
+Three things change. The first two affect output; the third affects whether a
+run succeeds at all.
+
+**1. `--split-files` filenames change for single-read runs.** Archives storing
+one read per spot now produce `ACC.fastq`, matching `fasterq-dump`, where
+earlier releases produced `ACC_1.fastq`. Read content is unchanged, and
+`--split-3` / `--split-spot` already matched.
+
+This is the widest-reaching change: **123 of 386** accessions in a random SRA
+sample are single-layout, so roughly a third of `--split-files` conversions
+produce a differently-named file, and a pipeline globbing `${ACC}_1.fastq`
+will find nothing. Runs with two or more *stored* reads are unaffected,
+including when only one survives filtering — DRR004435, whose 2 bp adapter is
+dropped, still writes `DRR004435_2.fastq`.
+
+**2. Output content changes on some archives. Re-convert anything you hold
+that was produced by 0.4.2 or earlier from these classes.**
+
+| class | symptom before | accessions |
+|---|---|---|
+| `latf-load` on `NCBI:align:tbl:seq#1` | **half of all bases missing** | 5 |
+| srf-load-era Illumina (`izip` quality) | every quality byte wrong | 4 |
+| `q4` Illumina schema (4-channel log-odds) | every quality byte wrong | 1 |
+| deduplicated ALTREAD page maps | `N` emitted as a confident basecall | 2 |
+
+**12 of 386** sampled accessions (~3%) are affected, concentrated in older DDBJ
+(`DRR`) submissions; modern Illumina runs are not. All four classes produced
+correct spot counts, correct read names and a zero exit code, so nothing
+downstream would have flagged them.
+
+`sracha vdb dump -C READ` output also changes: it now applies the ALTREAD
+ambiguity mask and so matches `vdb-dump` rather than showing the physical
+column.
+
+**3. Strict integrity checking can now refuse archives it previously
+converted.** Five new checks compare the decode against itself and against the
+archive's own recorded totals, and they are fatal under the default strict
+mode. An archive whose decode is wrong in a way sracha cannot fix now fails
+instead of writing plausible-looking output. `--no-strict` restores the
+previous behaviour and downgrades every counter to a warning.
+
+This is deliberate: refusing to convert is recoverable, silently wrong data in
+a published dataset is not. If you hit a refusal on an archive you need, please
+open an issue with the accession.
+
+### Validation
+
+A 386-accession x 2-split A/B against 0.4.2, with `fasterq-dump` as reference:
+609 rows unchanged, 145 fixed, **1 regression** — a false positive in the new
+base-count check on PacBio archives with a CONSENSUS table, fixed before
+release. Every other new check held across the full breadth.
 
 ### Fixes
 
