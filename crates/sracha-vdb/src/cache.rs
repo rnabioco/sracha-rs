@@ -323,31 +323,24 @@ impl CachedColumn {
     /// (one nibble per byte). Used for `REFERENCE.CMP_READ` and
     /// `SEQUENCE.CMP_READ`.
     pub fn read_2na_row(&self, row_id: i64) -> Result<Vec<u8>> {
+        self.read_2na_range(row_id, 0, usize::MAX)
+    }
+
+    /// `take` bases of a 2na row starting `skip` bases into it.
+    ///
+    /// Callers that want a short span out of a wide row should use this
+    /// rather than slicing [`read_2na_row`](Self::read_2na_row): a refseq
+    /// chunk is 5,000 bases and an alignment typically needs ~100, so
+    /// unpacking the whole row throws away 98% of the work. `take` is
+    /// clamped to what the row actually holds.
+    pub fn read_2na_range(&self, row_id: i64, skip: usize, take: usize) -> Result<Vec<u8>> {
         debug_assert!(matches!(self.kind, ColumnKind::TwoNa));
         self.with_blob(row_id, |blob, logical_offset| {
-            // Two storage shapes. Variable-length rows (SEQUENCE/REFERENCE
-            // CMP_READ) carry a page map with per-row extents. Fixed-width
-            // rows (a refseq object's READ) are stored as v1 blobs with no
-            // page map at all — rows sit back to back at `row_length`
-            // bases each. The final row of a column is short, so clamp to
-            // what the payload actually holds.
-            let (start_bases, len_bases) = match (&blob.page_map, blob.row_length) {
-                (Some(_), _) => {
-                    let extent = blob.extent(logical_offset)?;
-                    (extent.offset as usize, extent.len as usize)
-                }
-                (None, Some(row_length)) => {
-                    let width = row_length as usize;
-                    let start = logical_offset * width;
-                    let available = (blob.bytes.len() * 8 / 2).saturating_sub(start);
-                    (start, width.min(available))
-                }
-                (None, None) => {
-                    return Err(Error::Format(
-                        "2na column: neither a page map nor a fixed row length".into(),
-                    ));
-                }
-            };
+            let (start_bases, len_bases) = two_na_extent(blob, logical_offset)?;
+            // Narrow to the requested window before doing any unpacking.
+            let skipped = skip.min(len_bases);
+            let start_bases = start_bases + skipped;
+            let len_bases = (len_bases - skipped).min(take);
             if len_bases == 0 {
                 return Ok(Vec::new());
             }
@@ -370,6 +363,41 @@ impl CachedColumn {
             }
             Ok(out)
         })
+    }
+
+    /// Bases in a 2na row, without unpacking any of them. Callers need
+    /// this to place a right-aligned ALTREAD mask when they are only
+    /// reading part of the row.
+    pub fn two_na_row_len(&self, row_id: i64) -> Result<usize> {
+        debug_assert!(matches!(self.kind, ColumnKind::TwoNa));
+        self.with_blob(row_id, |blob, logical_offset| {
+            Ok(two_na_extent(blob, logical_offset)?.1)
+        })
+    }
+}
+
+/// Where a 2na row sits in its decoded blob, as `(first base, base count)`.
+///
+/// Two storage shapes. Variable-length rows (SEQUENCE/REFERENCE CMP_READ)
+/// carry a page map with per-row extents. Fixed-width rows (a refseq
+/// object's READ) are v1 blobs with no page map at all — rows sit back to
+/// back at `row_length` bases each. A column's final row is short, so
+/// clamp to what the payload actually holds.
+fn two_na_extent(blob: &DecodedColumnBlob, logical_offset: usize) -> Result<(usize, usize)> {
+    match (&blob.page_map, blob.row_length) {
+        (Some(_), _) => {
+            let extent = blob.extent(logical_offset)?;
+            Ok((extent.offset as usize, extent.len as usize))
+        }
+        (None, Some(row_length)) => {
+            let width = row_length as usize;
+            let start = logical_offset * width;
+            let available = (blob.bytes.len() * 8 / 2).saturating_sub(start);
+            Ok((start, width.min(available)))
+        }
+        (None, None) => Err(Error::Format(
+            "2na column: neither a page map nor a fixed row length".into(),
+        )),
     }
 }
 

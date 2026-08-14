@@ -389,45 +389,64 @@ impl RefSeqReaders {
                 )));
             }
             let offset = (pos % msl) as usize;
-            let chunk = chunk_bases(read, altread.as_ref(), row)?;
-            if offset >= chunk.len() {
+            let row_len = read.two_na_row_len(row)?;
+            if offset >= row_len {
                 return Err(Error::Format(format!(
-                    "refseq {}: offset {offset} past chunk {row} ({} bases)",
+                    "refseq {}: offset {offset} past chunk {row} ({row_len} bases)",
                     obj.seq_id,
-                    chunk.len()
                 )));
             }
-            let take = (len - out.len()).min(chunk.len() - offset);
-            out.extend_from_slice(&chunk[offset..offset + take]);
+            let take = (len - out.len()).min(row_len - offset);
+            chunk_bases_into(&mut out, read, altread.as_ref(), row, offset, take, row_len)?;
             pos += take as u64;
         }
         Ok(out)
     }
 }
 
-/// Decode one refseq chunk row: 2na `READ` overlaid with the left-trimmed,
-/// right-aligned 4na `ALTREAD` mask. Where ALTREAD is non-zero it wins —
-/// that is how Ns and other ambiguity codes survive a 2na store.
-fn chunk_bases(read: &CachedColumn, altread: Option<&CachedColumn>, row: i64) -> Result<Vec<u8>> {
-    let mut bases = read.read_2na_row(row)?;
+/// Append `take` bases from chunk `row`, starting `offset` into it: 2na
+/// `READ` overlaid with the left-trimmed, right-aligned 4na `ALTREAD` mask.
+/// Where ALTREAD is non-zero it wins — that is how Ns and other ambiguity
+/// codes survive a 2na store.
+///
+/// Windowed rather than whole-row: a refseq chunk is `MAX_SEQ_LEN` (5,000)
+/// bases and an alignment usually wants ~100 of them, so unpacking the
+/// whole chunk per alignment dominated the decode.
+fn chunk_bases_into(
+    out: &mut Vec<u8>,
+    read: &CachedColumn,
+    altread: Option<&CachedColumn>,
+    row: i64,
+    offset: usize,
+    take: usize,
+    row_len: usize,
+) -> Result<()> {
+    let base = out.len();
+    out.extend_from_slice(&read.read_2na_range(row, offset, take)?);
+
     let Some(alt) = altread else {
-        return Ok(bases);
+        return Ok(());
     };
     let mask = alt.read_byte_row(row)?;
     if mask.is_empty() {
-        return Ok(bases);
+        return Ok(());
     }
-    // `trim<ALIGN_LEFT, 0>` drops leading zeros, so the stored mask is a
-    // suffix of the row: align it to the right before overlaying.
-    let shift = bases.len().saturating_sub(mask.len());
+    // `trim<ALIGN_LEFT, 0>` drops leading zeros, so the stored mask covers
+    // the *last* `mask.len()` bases of the row. Map those onto our window.
+    let mask_start = row_len.saturating_sub(mask.len());
     for (i, &m) in mask.iter().enumerate() {
-        if m != 0
-            && let Some(slot) = bases.get_mut(shift + i)
-        {
+        if m == 0 {
+            continue;
+        }
+        let abs = mask_start + i;
+        if abs < offset || abs >= offset + take {
+            continue;
+        }
+        if let Some(slot) = out.get_mut(base + (abs - offset)) {
             *slot = m & 0x0F;
         }
     }
-    Ok(bases)
+    Ok(())
 }
 
 /// Path a refseq object is cached at within `dir`.

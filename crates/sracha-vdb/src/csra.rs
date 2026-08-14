@@ -18,6 +18,7 @@ use crate::inspect;
 use crate::kar::KarArchive;
 use crate::kdb::ColumnReader;
 use crate::reference::ReferenceCursor;
+use crate::reference::ReferenceLayout;
 use crate::refseq::RefSeqStore;
 use crate::restore::{align_restore_read, seq_restore_read};
 
@@ -164,6 +165,19 @@ fn archive_has_seq_column<R: Read + Seek>(
         .any(|k| k == &exact || k.starts_with(&prefix))
 }
 
+/// Per-accession state shared by every cSRA decode worker.
+///
+/// Decode constructs a [`CsraCursor`] per chunk — thousands of times for a
+/// large run — so anything whose cost scales with the archive rather than
+/// the chunk belongs here, built once and shared by `Arc`.
+#[derive(Default, Clone)]
+pub struct CsraShared {
+    /// Locally-materialised external reference objects, keyed by SEQ_ID.
+    pub refseqs: Option<Arc<RefSeqStore>>,
+    /// The REFERENCE table's chunk layout.
+    pub reference: Option<Arc<ReferenceLayout>>,
+}
+
 pub struct CsraCursor {
     // SEQUENCE-side columns. `cmp_read` is absent on fully-aligned runs,
     // where no spot has unaligned residue to splice in.
@@ -215,19 +229,22 @@ impl CsraCursor {
         main_path: &Path,
         vdbcache: Option<(&mut KarArchive<R>, &Path)>,
     ) -> Result<Self> {
-        Self::open_with_refseqs(main, main_path, vdbcache, None)
+        Self::open_with_shared(main, main_path, vdbcache, None)
     }
 
-    /// As [`open_any`](Self::open_any), plus external reference objects for
-    /// archives whose REFERENCE table carries only the chunk layout and
-    /// leaves the bases in NCBI refseq objects named by `SEQ_ID`. Pass
-    /// `None` when the archive embeds its bases.
-    pub fn open_with_refseqs<R: Read + Seek>(
+    /// As [`open_any`](Self::open_any), plus the per-accession state in
+    /// [`CsraShared`] — external reference objects for archives that leave
+    /// their bases in NCBI refseq objects, and the REFERENCE chunk layout.
+    /// Pass `None` for a one-shot open; decode paths should build a
+    /// `CsraShared` once and hand the same one to every worker.
+    pub fn open_with_shared<R: Read + Seek>(
         main: &mut KarArchive<R>,
         main_path: &Path,
         vdbcache: Option<(&mut KarArchive<R>, &Path)>,
-        refseqs: Option<&Arc<RefSeqStore>>,
+        shared: Option<&CsraShared>,
     ) -> Result<Self> {
+        let refseqs = shared.and_then(|s| s.refseqs.as_ref());
+        let layout = shared.and_then(|s| s.reference.as_ref());
         // SEQUENCE-side columns always live in the main archive — the
         // vdbcache only carries the alignment + reference halves.
         let col_base = inspect::column_base_path_public(main, Some("SEQUENCE"))?;
@@ -285,7 +302,8 @@ impl CsraCursor {
                     return Err(external_refseq_error());
                 }
                 let alignment = AlignmentCursor::open(main, main_path)?;
-                let reference = ReferenceCursor::open_with_external(main, main_path, refseqs)?;
+                let reference =
+                    ReferenceCursor::open_with_external(main, main_path, refseqs, layout)?;
                 (alignment, reference)
             }
             Some((cache, cache_path)) => {
@@ -303,12 +321,12 @@ impl CsraCursor {
                     if !main_has_ref_cmp_read && !have_refseqs {
                         return Err(external_refseq_error());
                     }
-                    ReferenceCursor::open_with_external(main, main_path, refseqs)?
+                    ReferenceCursor::open_with_external(main, main_path, refseqs, layout)?
                 } else if archive_has_table(cache, "REFERENCE") {
                     if !archive_has_reference_cmp_read(cache) && !have_refseqs {
                         return Err(external_refseq_error());
                     }
-                    ReferenceCursor::open_with_external(cache, cache_path, refseqs)?
+                    ReferenceCursor::open_with_external(cache, cache_path, refseqs, layout)?
                 } else {
                     return Err(Error::Format(
                         "cSRA: REFERENCE table not found in main archive or vdbcache".into(),

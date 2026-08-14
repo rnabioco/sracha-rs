@@ -1411,6 +1411,14 @@ fn run_fastq_csra(
 
     let file = std::fs::File::open(sra_path)?;
     let mut archive = KarArchive::open(std::io::BufReader::new(file))?;
+    // Read the REFERENCE chunk layout once for the whole accession. Workers
+    // build a cursor per chunk, so anything archive-sized has to be hoisted
+    // out of that path or it dominates the decode.
+    let shared = crate::vdb::csra::CsraShared {
+        refseqs,
+        reference: crate::vdb::reference::ReferenceLayout::open(&mut archive, sra_path)?
+            .map(Arc::new),
+    };
     // Open the vdbcache sidecar when present. Each decode worker opens
     // its own copy below (mmap/file handles are not Send across rayon
     // threads), so the top-level one is only used for the SEQUENCE
@@ -1427,12 +1435,8 @@ fn run_fastq_csra(
                 (Some(a), Some(p)) => Some((a, p)),
                 _ => None,
             };
-        match CsraCursor::open_with_refseqs(
-            &mut archive,
-            sra_path,
-            vdbcache_for_open,
-            refseqs.as_ref(),
-        ) {
+        match CsraCursor::open_with_shared(&mut archive, sra_path, vdbcache_for_open, Some(&shared))
+        {
             Ok(c) => c,
             // Known-unsupported cSRA shape (external refseq, static READ_LEN).
             // Surface a distinct error carrying the accession so the CLI can
@@ -1547,9 +1551,10 @@ fn run_fastq_csra(
                     (Some(a), Some(p)) => Some((a, p)),
                     _ => None,
                 };
-            // `refseqs` is an Arc of already-opened mmaps: cheap to share,
-            // and each worker's `RefSeqReaders` view is built fresh here.
-            CsraCursor::open_with_refseqs(&mut archive, sra_path, cache_opt, refseqs.as_ref())?
+            // `shared` holds Arcs of already-opened mmaps and the parsed
+            // REFERENCE layout: cheap to clone into each chunk, where only
+            // the per-worker blob caches get built fresh.
+            CsraCursor::open_with_shared(&mut archive, sra_path, cache_opt, Some(&shared))?
         };
         let mut per_slot: HashMap<OutputSlot, (Vec<u8>, u64)> = HashMap::new();
         let mut itoa_buf = itoa::Buffer::new();
