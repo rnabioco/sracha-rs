@@ -109,7 +109,7 @@ impl ReferenceCursor {
         let first_row = seq_len.first_row_id().unwrap_or(1);
         let row_count = seq_len.row_count();
 
-        let cmp_read = cmp_read.map(|c| CachedColumn::new_random(c, ColumnKind::TwoNa));
+        let cmp_read = cmp_read.map(|c| CachedColumn::new(c, ColumnKind::TwoNa));
         let external = refseqs.map(RefSeqReaders::new);
         let layout = match layout {
             Some(l) => l.clone(),

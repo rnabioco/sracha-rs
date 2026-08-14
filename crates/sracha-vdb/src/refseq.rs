@@ -328,10 +328,10 @@ impl RefSeqReaders {
                 cols.insert(
                     seq_id.clone(),
                     (
-                        CachedColumn::from_shared_random(read.clone(), ColumnKind::TwoNa),
+                        CachedColumn::from_shared(read.clone(), ColumnKind::TwoNa),
                         altread
                             .as_ref()
-                            .map(|c| CachedColumn::from_shared_random(c.clone(), ColumnKind::Zip)),
+                            .map(|c| CachedColumn::from_shared(c.clone(), ColumnKind::Zip)),
                     ),
                 );
             }
