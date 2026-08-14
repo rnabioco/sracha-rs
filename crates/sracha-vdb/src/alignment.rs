@@ -26,7 +26,6 @@ use crate::kdb::ColumnReader;
 #[derive(Debug, Clone)]
 pub struct AlignmentRow {
     pub global_ref_start: u64,
-    pub ref_len: u32,
     /// One byte per base of the final reconstructed read; `1` at positions
     /// that differ from the reference, `0` otherwise.
     pub has_mismatch: Vec<u8>,
@@ -44,16 +43,38 @@ impl AlignmentRow {
     ///
     /// Not the stored `REF_LEN`. The align schema feeds
     /// `align_restore_read` a projection sized by `out_ref_len_internal`
-    /// (`align.vschema:510`), which is `NCBI:align:get_ref_len #2` —
-    /// `read_len + sum(ref_offset)` (`libs/axf/cigar.c:1976`). `REF_LEN`
-    /// prefers the stored column and only falls back to that expression,
-    /// so on archives with soft clipping the two differ and the stored
-    /// value is short. Fully-aligned runs have them coincide, which is why
-    /// this went unnoticed until a clipped archive turned up.
+    /// (`align.vschema:510`), which `REF_LEN` only falls back to — so on
+    /// clipped archives the stored value is short.
+    ///
+    /// This is the running *peak* of the reference cursor, not the closing
+    /// sum. `NCBI:align:get_ref_len #2` (`cigar.c:1976`) uses the sum,
+    /// which is right whenever the cursor never reaches further than it
+    /// ends up; version 1 keeps the peak for exactly the case where it
+    /// does (`cigar.c:1925-1940`), and a deletion followed by an insertion
+    /// is that case — the cursor touches `read_len + 1` while the offsets
+    /// sum to `read_len - 1`. Over-estimating only fetches a few unused
+    /// bases; under-estimating fails the decode.
     pub fn ref_span(&self) -> u32 {
-        let sum: i64 = self.ref_offset.iter().map(|&o| i64::from(o)).sum();
-        let span = self.has_mismatch.len() as i64 + sum;
-        span.max(0) as u32
+        // Mirrors `align_restore_read`'s cursor exactly, back-up guard and
+        // all, and takes the high-water mark of the index it reads.
+        let mut rri: i64 = 0;
+        let mut bi: i64 = 0;
+        let mut oi = 0usize;
+        let mut needed: i64 = 0;
+        for di in 0..self.has_mismatch.len() {
+            if self.has_ref_offset.get(di).copied().unwrap_or(0) != 0
+                && bi >= 0
+                && let Some(&off) = self.ref_offset.get(oi)
+            {
+                bi = i64::from(off);
+                rri += bi;
+                oi += 1;
+            }
+            needed = needed.max(rri + 1);
+            rri += 1;
+            bi += 1;
+        }
+        needed.max(0) as u32
     }
 }
 
@@ -127,8 +148,11 @@ impl AlignmentCursor {
     /// rows within the same blob amortise the decode over thousands of
     /// reads rather than re-running deflate / irzip per row.
     pub fn read_row(&self, row_id: i64) -> Result<AlignmentRow> {
+        // REF_LEN is deliberately not read: the restore sizes its
+        // reference projection from `AlignmentRow::ref_span` instead, so
+        // reading the stored column would be a sixth random column read
+        // per alignment for a value nothing consumes.
         let global_ref_start = self.global_ref_start.read_scalar_i64(row_id)? as u64;
-        let ref_len = self.ref_len.read_scalar_u32(row_id)?;
         let has_mismatch = self.has_mismatch.read_bool_row(row_id)?;
         let has_ref_offset = self.has_ref_offset.read_bool_row(row_id)?;
         let mismatch = self.mismatch.read_byte_row(row_id)?;
@@ -136,7 +160,6 @@ impl AlignmentCursor {
 
         Ok(AlignmentRow {
             global_ref_start,
-            ref_len,
             has_mismatch,
             has_ref_offset,
             mismatch,
@@ -149,41 +172,60 @@ impl AlignmentCursor {
 mod ref_span_tests {
     use super::AlignmentRow;
 
-    fn row(read_len: usize, offsets: Vec<i32>) -> AlignmentRow {
+    /// `at` places each offset at a read position, setting HAS_REF_OFFSET.
+    fn row(read_len: usize, at: &[(usize, i32)]) -> AlignmentRow {
+        let mut has_ref_offset = vec![0u8; read_len];
+        let mut ref_offset = Vec::new();
+        for &(pos, off) in at {
+            has_ref_offset[pos] = 1;
+            ref_offset.push(off);
+        }
         AlignmentRow {
             global_ref_start: 0,
-            ref_len: 0,
             has_mismatch: vec![0; read_len],
-            has_ref_offset: vec![0; read_len],
+            has_ref_offset,
             mismatch: Vec::new(),
-            ref_offset: offsets,
+            ref_offset,
         }
+    }
+
+    fn closing_sum(r: &AlignmentRow) -> i64 {
+        r.has_mismatch.len() as i64 + r.ref_offset.iter().map(|&o| i64::from(o)).sum::<i64>()
     }
 
     /// No indels: the projection is exactly the read length.
     #[test]
     fn ungapped_span_is_read_len() {
-        assert_eq!(row(100, vec![]).ref_span(), 100);
+        assert_eq!(row(100, &[]).ref_span(), 100);
     }
 
-    /// A deletion widens the reference projection past the read length —
-    /// this is the case where a stored REF_LEN that only covers the
-    /// unclipped span leaves the restore walking off the end.
+    /// A deletion widens the reference projection past the read length.
     #[test]
     fn deletion_widens_span() {
-        assert_eq!(row(100, vec![5]).ref_span(), 105);
+        assert_eq!(row(100, &[(50, 5)]).ref_span(), 105);
     }
 
     /// An insertion narrows it.
     #[test]
     fn insertion_narrows_span() {
-        assert_eq!(row(100, vec![-3]).ref_span(), 97);
+        assert_eq!(row(100, &[(50, -3)]).ref_span(), 97);
+    }
+
+    /// A large insertion near the end leaves the cursor's high-water mark
+    /// far above where it closes. Sizing the projection by the closing sum
+    /// — what `get_ref_len #2` computes — reads past the end partway
+    /// through. This is the shape that broke SRR622461.
+    #[test]
+    fn peak_reach_beats_closing_sum() {
+        let r = row(100, &[(95, -50)]);
+        assert_eq!(closing_sum(&r), 50);
+        assert_eq!(r.ref_span(), 95);
     }
 
     /// Offsets that would drive it negative clamp at zero rather than
     /// wrapping into a huge unsigned span.
     #[test]
     fn over_shortening_clamps_to_zero() {
-        assert_eq!(row(10, vec![-50]).ref_span(), 0);
+        assert_eq!(row(10, &[(0, -50)]).ref_span(), 0);
     }
 }

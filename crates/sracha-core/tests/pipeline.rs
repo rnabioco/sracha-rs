@@ -1028,7 +1028,9 @@ fn csra_align_restore_read_row_1() {
     let read_len = row.has_mismatch.len();
     assert_eq!(read_len, 36185);
 
-    let ref_read = refs.fetch_span(row.global_ref_start, row.ref_len).unwrap();
+    let ref_read = refs
+        .fetch_span(row.global_ref_start, row.ref_span())
+        .unwrap();
     let bases = align_restore_read(
         &ref_read,
         &row.has_mismatch,
@@ -1088,7 +1090,7 @@ fn csra_seq_restore_read_row_1() {
         &read_types,
         |alignment_id| {
             let row = align.read_row(alignment_id)?;
-            let ref_read = refs.fetch_span(row.global_ref_start, row.ref_len)?;
+            let ref_read = refs.fetch_span(row.global_ref_start, row.ref_span())?;
             align_restore_read(
                 &ref_read,
                 &row.has_mismatch,
