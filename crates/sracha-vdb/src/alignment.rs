@@ -39,6 +39,24 @@ pub struct AlignmentRow {
     pub ref_offset: Vec<i32>,
 }
 
+impl AlignmentRow {
+    /// How many reference bases the restore actually walks.
+    ///
+    /// Not the stored `REF_LEN`. The align schema feeds
+    /// `align_restore_read` a projection sized by `out_ref_len_internal`
+    /// (`align.vschema:510`), which is `NCBI:align:get_ref_len #2` —
+    /// `read_len + sum(ref_offset)` (`libs/axf/cigar.c:1976`). `REF_LEN`
+    /// prefers the stored column and only falls back to that expression,
+    /// so on archives with soft clipping the two differ and the stored
+    /// value is short. Fully-aligned runs have them coincide, which is why
+    /// this went unnoticed until a clipped archive turned up.
+    pub fn ref_span(&self) -> u32 {
+        let sum: i64 = self.ref_offset.iter().map(|&o| i64::from(o)).sum();
+        let span = self.has_mismatch.len() as i64 + sum;
+        span.max(0) as u32
+    }
+}
+
 /// Handle to the PRIMARY_ALIGNMENT table columns we consume during cSRA decode.
 pub struct AlignmentCursor {
     global_ref_start: CachedColumn,
@@ -124,5 +142,48 @@ impl AlignmentCursor {
             mismatch,
             ref_offset,
         })
+    }
+}
+
+#[cfg(test)]
+mod ref_span_tests {
+    use super::AlignmentRow;
+
+    fn row(read_len: usize, offsets: Vec<i32>) -> AlignmentRow {
+        AlignmentRow {
+            global_ref_start: 0,
+            ref_len: 0,
+            has_mismatch: vec![0; read_len],
+            has_ref_offset: vec![0; read_len],
+            mismatch: Vec::new(),
+            ref_offset: offsets,
+        }
+    }
+
+    /// No indels: the projection is exactly the read length.
+    #[test]
+    fn ungapped_span_is_read_len() {
+        assert_eq!(row(100, vec![]).ref_span(), 100);
+    }
+
+    /// A deletion widens the reference projection past the read length —
+    /// this is the case where a stored REF_LEN that only covers the
+    /// unclipped span leaves the restore walking off the end.
+    #[test]
+    fn deletion_widens_span() {
+        assert_eq!(row(100, vec![5]).ref_span(), 105);
+    }
+
+    /// An insertion narrows it.
+    #[test]
+    fn insertion_narrows_span() {
+        assert_eq!(row(100, vec![-3]).ref_span(), 97);
+    }
+
+    /// Offsets that would drive it negative clamp at zero rather than
+    /// wrapping into a huge unsigned span.
+    #[test]
+    fn over_shortening_clamps_to_zero() {
+        assert_eq!(row(10, vec![-50]).ref_span(), 0);
     }
 }

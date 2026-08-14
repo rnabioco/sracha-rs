@@ -450,7 +450,7 @@ impl CsraCursor {
                 let row = self.alignment.read_row(alignment_id)?;
                 let ref_read = self
                     .reference
-                    .fetch_span(row.global_ref_start, row.ref_len)?;
+                    .fetch_span(row.global_ref_start, row.ref_span())?;
                 align_restore_read(
                     &ref_read,
                     &row.has_mismatch,
