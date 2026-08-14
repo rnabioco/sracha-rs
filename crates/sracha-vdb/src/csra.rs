@@ -182,6 +182,10 @@ pub struct CsraCursor {
     // SEQUENCE-side columns. `cmp_read` is absent on fully-aligned runs,
     // where no spot has unaligned residue to splice in.
     cmp_read: Option<CachedColumn>,
+    /// Ambiguity mask over `cmp_read`, when the archive stores one. 2na
+    /// cannot represent N, so without this the unaligned half of a read
+    /// decodes its Ns as a confident `A`.
+    cmp_altread: Option<CachedColumn>,
     primary_alignment_id: CachedColumn,
     read_len: CachedColumn,
     read_type: CachedColumn,
@@ -277,6 +281,13 @@ impl CsraCursor {
         } else {
             None
         };
+        // `NCBI:align:tbl:cmp_base_space` pairs CMP_READ with CMP_ALTREAD
+        // and bit_ors them; archives without ambiguity codes omit it.
+        let cmp_altread = if archive_has_seq_column(main, &col_base, "CMP_ALTREAD") {
+            Some(open_col(main, "CMP_ALTREAD")?)
+        } else {
+            None
+        };
         let primary_alignment_id = open_col(main, "PRIMARY_ALIGNMENT_ID")?;
         let read_len = open_col(main, "READ_LEN")?;
         let read_type = open_col(main, "READ_TYPE")?;
@@ -343,6 +354,7 @@ impl CsraCursor {
 
         Ok(Self {
             cmp_read: cmp_read.map(|c| CachedColumn::new(c, ColumnKind::TwoNa)),
+            cmp_altread: cmp_altread.map(|c| CachedColumn::new(c, ColumnKind::Zip)),
             primary_alignment_id: CachedColumn::new(
                 primary_alignment_id,
                 ColumnKind::Irzip { elem_bits: 64 },
@@ -441,10 +453,19 @@ impl CsraCursor {
         let align_ids = self.primary_alignment_id.read_i64_row(row_id)?;
         let read_lens = self.read_len.read_u32_row(row_id)?;
         let read_types = self.read_type.read_byte_row(row_id)?;
-        let cmp_read_2na = match &self.cmp_read {
+        let mut cmp_read_2na = match &self.cmp_read {
             Some(c) => c.read_2na_row(row_id)?,
             None => Vec::new(),
         };
+        // Restore ambiguity codes into the unaligned bases before splicing:
+        // 2na has no N, so the mask is the only thing that distinguishes an
+        // uncalled base from an A.
+        if let Some(alt) = &self.cmp_altread
+            && !cmp_read_2na.is_empty()
+        {
+            let mask = alt.read_byte_row(row_id)?;
+            crate::refseq::overlay_altread(&mut cmp_read_2na, &mask);
+        }
         let quality = self.quality.read_byte_row(row_id)?;
 
         if read_lens.len() != align_ids.len() || read_types.len() != align_ids.len() {

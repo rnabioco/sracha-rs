@@ -277,7 +277,7 @@ fn unpack_2na_to_4na(packed: &[u8], num_bases: usize) -> Vec<u8> {
 /// Fold a `trim<ALIGN_LEFT, 0>` 4na mask over the tail of `bases`.
 /// Non-zero nibbles win — this is what keeps ambiguity codes (mostly N)
 /// from decoding as a confident basecall.
-fn overlay_altread(bases: &mut [u8], mask: &[u8]) {
+pub(crate) fn overlay_altread(bases: &mut [u8], mask: &[u8]) {
     let shift = bases.len().saturating_sub(mask.len());
     for (i, &m) in mask.iter().enumerate() {
         if m != 0
