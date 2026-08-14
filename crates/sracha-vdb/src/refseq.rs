@@ -133,11 +133,25 @@ pub struct RefSeqStore {
     objects: HashMap<String, Arc<RefSeqObject>>,
 }
 
+/// Where an opened refseq object keeps its bases.
+enum RefSeqBases {
+    /// Physical `READ` (+ optional `ALTREAD`) columns, chunked at
+    /// `max_seq_len` bases per row. The layout for whole chromosomes.
+    Columns {
+        read: Arc<ColumnReader>,
+        altread: Option<Arc<ColumnReader>>,
+    },
+    /// The whole sequence inlined in static metadata (`col/READ/row`), with
+    /// no physical columns at all. Short references are stored this way —
+    /// GRCh37's unlocalized contigs (`GL000207.1`, 4,262 bp) among them.
+    /// Already unpacked to 4na-bin at open time; these are kilobytes.
+    Inline(Arc<Vec<u8>>),
+}
+
 /// One opened refseq object.
 pub struct RefSeqObject {
     seq_id: String,
-    read: Arc<ColumnReader>,
-    altread: Option<Arc<ColumnReader>>,
+    bases: RefSeqBases,
     max_seq_len: u32,
     first_row: i64,
     row_count: u64,
@@ -177,29 +191,59 @@ impl RefSeqObject {
         let mut archive = KarArchive::open(std::io::BufReader::new(file))?;
         let col_base = inspect::column_base_path_public(&archive, None)?;
 
-        let read = ColumnReader::open(&mut archive, &format!("{col_base}/READ"), path)
-            .map_err(|e| Error::Format(format!("refseq {seq_id}: READ: {e}")))?;
-        let altread = ColumnReader::open(&mut archive, &format!("{col_base}/ALTREAD"), path).ok();
-
-        let first_row = read.first_row_id().unwrap_or(1);
-        let row_count = read.row_count();
-
         // MAX_SEQ_LEN / TOTAL_SEQ_LEN / CIRCULAR are static metadata on a
-        // refseq object, not physical columns.
+        // refseq object, not physical columns — and on short references so
+        // are the bases themselves.
         let meta = inspect::read_table_metadata(&mut archive, None).unwrap_or_default();
         let max_seq_len = meta_u32(&meta, "col/MAX_SEQ_LEN/row")
             .filter(|&v| v > 0)
             .unwrap_or(crate::reference::DEFAULT_MAX_SEQ_LEN);
-        let total_seq_len =
-            meta_u64(&meta, "STATS/TOTAL_SEQ_LEN").unwrap_or(row_count * u64::from(max_seq_len));
         let circular = meta_u32(&meta, "col/CIRCULAR/row")
             .map(|v| v != 0)
             .unwrap_or(false);
 
+        let read = ColumnReader::open(&mut archive, &format!("{col_base}/READ"), path).ok();
+        let (bases, first_row, row_count, default_total) = match read {
+            Some(read) => {
+                let altread =
+                    ColumnReader::open(&mut archive, &format!("{col_base}/ALTREAD"), path).ok();
+                let first_row = read.first_row_id().unwrap_or(1);
+                let row_count = read.row_count();
+                (
+                    RefSeqBases::Columns {
+                        read: Arc::new(read),
+                        altread: altread.map(Arc::new),
+                    },
+                    first_row,
+                    row_count,
+                    row_count * u64::from(max_seq_len),
+                )
+            }
+            None => {
+                let packed = meta_bytes(&meta, "col/READ/row").ok_or_else(|| {
+                    Error::Format(format!(
+                        "refseq {seq_id}: no READ column and no inline bases in metadata"
+                    ))
+                })?;
+                let seq_len = meta_u32(&meta, "col/SEQ_LEN/row")
+                    .filter(|&v| v > 0)
+                    .unwrap_or((packed.len() * 4) as u32) as usize;
+                let mut bases = unpack_2na_to_4na(packed, seq_len);
+                if let Some(mask) = meta_bytes(&meta, "col/ALTREAD/row") {
+                    overlay_altread(&mut bases, mask);
+                }
+                let len = bases.len() as u64;
+                (RefSeqBases::Inline(Arc::new(bases)), 1, 1, len)
+            }
+        };
+
+        let total_seq_len = meta_u64(&meta, "STATS/TOTAL_SEQ_LEN")
+            .filter(|&v| v > 0)
+            .unwrap_or(default_total);
+
         Ok(Self {
             seq_id: seq_id.to_string(),
-            read: Arc::new(read),
-            altread: altread.map(Arc::new),
+            bases,
             max_seq_len,
             first_row,
             row_count,
@@ -207,6 +251,40 @@ impl RefSeqObject {
             circular,
         })
     }
+}
+
+/// 2na-packed bases (2 bits each, MSB-first) to 4na-bin, one nibble per byte.
+fn unpack_2na_to_4na(packed: &[u8], num_bases: usize) -> Vec<u8> {
+    const LUT: [u8; 4] = [0x1, 0x2, 0x4, 0x8]; // A C G T
+    let mut out = Vec::with_capacity(num_bases);
+    for i in 0..num_bases {
+        let bit = i * 2;
+        let Some(byte) = packed.get(bit / 8) else {
+            break;
+        };
+        out.push(LUT[((byte >> (6 - (bit % 8))) & 0x03) as usize]);
+    }
+    out
+}
+
+/// Fold a `trim<ALIGN_LEFT, 0>` 4na mask over the tail of `bases`.
+/// Non-zero nibbles win — this is what keeps ambiguity codes (mostly N)
+/// from decoding as a confident basecall.
+fn overlay_altread(bases: &mut [u8], mask: &[u8]) {
+    let shift = bases.len().saturating_sub(mask.len());
+    for (i, &m) in mask.iter().enumerate() {
+        if m != 0
+            && let Some(slot) = bases.get_mut(shift + i)
+        {
+            *slot = m & 0x0F;
+        }
+    }
+}
+
+/// Raw bytes of a static metadata node, if it holds any.
+fn meta_bytes<'a>(nodes: &'a [crate::metadata::MetaNode], path: &str) -> Option<&'a [u8]> {
+    let v = &crate::metadata::find_meta_node(nodes, path)?.value;
+    (!v.is_empty()).then_some(v.as_slice())
 }
 
 /// Read a little-endian scalar out of the static metadata tree. Values are
@@ -244,15 +322,19 @@ impl RefSeqReaders {
     pub fn new(store: &Arc<RefSeqStore>) -> Self {
         let mut cols = HashMap::with_capacity(store.objects.len());
         for (seq_id, obj) in &store.objects {
-            cols.insert(
-                seq_id.clone(),
-                (
-                    CachedColumn::from_shared(obj.read.clone(), ColumnKind::TwoNa),
-                    obj.altread
-                        .as_ref()
-                        .map(|c| CachedColumn::from_shared(c.clone(), ColumnKind::Zip)),
-                ),
-            );
+            // Inline objects need no per-worker state — their bases are a
+            // shared, already-decoded buffer.
+            if let RefSeqBases::Columns { read, altread } = &obj.bases {
+                cols.insert(
+                    seq_id.clone(),
+                    (
+                        CachedColumn::from_shared(read.clone(), ColumnKind::TwoNa),
+                        altread
+                            .as_ref()
+                            .map(|c| CachedColumn::from_shared(c.clone(), ColumnKind::Zip)),
+                    ),
+                );
+            }
         }
         Self {
             store: store.clone(),
@@ -267,17 +349,32 @@ impl RefSeqReaders {
             .store
             .get(seq_id)
             .ok_or_else(|| Error::Format(format!("refseq {seq_id}: not materialised")))?;
-        let (read, altread) = self
-            .cols
-            .get(seq_id)
-            .ok_or_else(|| Error::Format(format!("refseq {seq_id}: no reader")))?;
 
-        let msl = u64::from(obj.max_seq_len);
         let mut pos = if obj.circular && obj.total_seq_len > 0 {
             pos % obj.total_seq_len
         } else {
             pos
         };
+
+        // Inline objects are one contiguous buffer — no chunk walk needed.
+        if let RefSeqBases::Inline(all) = &obj.bases {
+            let start = pos as usize;
+            let end = start + len;
+            if end > all.len() {
+                return Err(Error::Format(format!(
+                    "refseq {}: [{start}..{end}) past end ({} bases)",
+                    obj.seq_id,
+                    all.len()
+                )));
+            }
+            return Ok(all[start..end].to_vec());
+        }
+
+        let (read, altread) = self
+            .cols
+            .get(seq_id)
+            .ok_or_else(|| Error::Format(format!("refseq {seq_id}: no reader")))?;
+        let msl = u64::from(obj.max_seq_len);
         let mut out = Vec::with_capacity(len);
         while out.len() < len {
             let row = obj.first_row + (pos / msl) as i64;
