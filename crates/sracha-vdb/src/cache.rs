@@ -61,10 +61,16 @@ impl DecodedColumnBlob {
     /// With no page map every row is one element wide at its own index.
     pub fn extent(&self, logical_offset: usize) -> Result<RowExtent> {
         if self.extents.is_empty() {
-            return Ok(RowExtent {
-                offset: logical_offset as u32,
-                len: 1,
-            });
+            // Random-access columns skip the eager expansion; ask the page
+            // map for just this row. Without a page map there is nothing to
+            // consult and every row is one element wide at its own index.
+            return match &self.page_map {
+                Some(pm) => pm.extent_at(logical_offset),
+                None => Ok(RowExtent {
+                    offset: logical_offset as u32,
+                    len: 1,
+                }),
+            };
         }
         self.extents.get(logical_offset).copied().ok_or_else(|| {
             Error::Format(format!(
@@ -82,12 +88,39 @@ impl DecodedColumnBlob {
 pub(crate) struct CachedColumn {
     col: Arc<ColumnReader>,
     kind: ColumnKind,
+    /// Skip expanding every row extent when a blob is decoded, and look up
+    /// rows one at a time instead.
+    ///
+    /// Blobs here hold thousands of rows, and cSRA reads them at random
+    /// (alignments arrive in spot order but sit in reference order), so a
+    /// blob is typically decoded to serve a single row. Expanding all of
+    /// its extents to index one was 70% of decode time. Sequential
+    /// consumers — the plain pipeline — keep the eager expansion, which is
+    /// cheaper once several rows of a blob get read.
+    random_access: bool,
     cache: RefCell<Option<DecodedColumnBlob>>,
 }
 
 impl CachedColumn {
     pub fn new(col: ColumnReader, kind: ColumnKind) -> Self {
         Self::from_shared(Arc::new(col), kind)
+    }
+
+    /// As [`new`](Self::new), for a column whose rows are read in random
+    /// order. See the `random_access` field.
+    pub fn new_random(col: ColumnReader, kind: ColumnKind) -> Self {
+        Self {
+            random_access: true,
+            ..Self::from_shared(Arc::new(col), kind)
+        }
+    }
+
+    /// As [`from_shared`](Self::from_shared), for random-order reads.
+    pub fn from_shared_random(col: Arc<ColumnReader>, kind: ColumnKind) -> Self {
+        Self {
+            random_access: true,
+            ..Self::from_shared(col, kind)
+        }
     }
 
     /// Wrap a `ColumnReader` that is already shared. External refseq
@@ -98,6 +131,7 @@ impl CachedColumn {
         Self {
             col,
             kind,
+            random_access: false,
             cache: RefCell::new(None),
         }
     }
@@ -141,11 +175,15 @@ impl CachedColumn {
         };
         let page_map = decoded.page_map;
         let row_length = decoded.row_length;
-        let extents = page_map
-            .as_ref()
-            .map(|pm| pm.row_extents())
-            .transpose()?
-            .unwrap_or_default();
+        let extents = if self.random_access {
+            Vec::new()
+        } else {
+            page_map
+                .as_ref()
+                .map(|pm| pm.row_extents())
+                .transpose()?
+                .unwrap_or_default()
+        };
 
         *self.cache.borrow_mut() = Some(DecodedColumnBlob {
             start_id,

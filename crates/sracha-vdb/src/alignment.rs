@@ -88,15 +88,15 @@ impl AlignmentCursor {
         let row_count = global_ref_start.row_count();
 
         Ok(Self {
-            global_ref_start: CachedColumn::new(
+            global_ref_start: CachedColumn::new_random(
                 global_ref_start,
                 ColumnKind::Irzip { elem_bits: 64 },
             ),
-            ref_len: CachedColumn::new(ref_len, ColumnKind::Irzip { elem_bits: 32 }),
-            has_mismatch: CachedColumn::new(has_mismatch, ColumnKind::Zip),
-            has_ref_offset: CachedColumn::new(has_ref_offset, ColumnKind::Zip),
-            mismatch: CachedColumn::new(mismatch, ColumnKind::Zip),
-            ref_offset: CachedColumn::new(ref_offset, ColumnKind::Irzip { elem_bits: 32 }),
+            ref_len: CachedColumn::new_random(ref_len, ColumnKind::Irzip { elem_bits: 32 }),
+            has_mismatch: CachedColumn::new_random(has_mismatch, ColumnKind::Zip),
+            has_ref_offset: CachedColumn::new_random(has_ref_offset, ColumnKind::Zip),
+            mismatch: CachedColumn::new_random(mismatch, ColumnKind::Zip),
+            ref_offset: CachedColumn::new_random(ref_offset, ColumnKind::Irzip { elem_bits: 32 }),
             row_count,
             first_row,
         })

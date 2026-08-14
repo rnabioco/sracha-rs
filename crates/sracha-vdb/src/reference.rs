@@ -109,7 +109,7 @@ impl ReferenceCursor {
         let first_row = seq_len.first_row_id().unwrap_or(1);
         let row_count = seq_len.row_count();
 
-        let cmp_read = cmp_read.map(|c| CachedColumn::new(c, ColumnKind::TwoNa));
+        let cmp_read = cmp_read.map(|c| CachedColumn::new_random(c, ColumnKind::TwoNa));
         let external = refseqs.map(RefSeqReaders::new);
         let layout = match layout {
             Some(l) => l.clone(),
@@ -188,12 +188,17 @@ impl ReferenceCursor {
             remaining -= take;
             offset_in_chunk = 0;
             if remaining > 0 {
-                // Two sequences never share a chunk, and no alignment runs
-                // past the end of its reference — so continuing into a
-                // chunk with a different SEQ_ID means the span (or the
-                // archive) is wrong. Walking on silently would splice
-                // bases from the next chromosome into the read.
-                self.check_same_reference(chunk_row, chunk_row + 1)?;
+                // Stop at the end of this reference and return a short
+                // span, exactly as ncbi-vdb's `ref_sub_select` does — its
+                // read loop is bounded by the reference's `stop_id`
+                // (libs/axf/ref-tbl-sub-select.c:204). A span can overrun
+                // the end when soft clipping widens it; those positions are
+                // mismatches and never read the reference, so the caller
+                // never notices. Splicing in the next chromosome's bases
+                // would silently corrupt the read.
+                if !self.same_reference(chunk_row, chunk_row + 1)? {
+                    break;
+                }
                 chunk_row += 1;
             }
         }
@@ -258,21 +263,18 @@ impl ReferenceCursor {
         Ok(())
     }
 
-    /// Error unless two chunk rows belong to the same reference sequence.
-    /// A no-op on archives without a `SEQ_ID` column (nothing to compare).
-    fn check_same_reference(&self, a: i64, b: i64) -> Result<()> {
+    /// Do two chunk rows belong to the same reference sequence?
+    ///
+    /// Always true on archives with no `SEQ_ID` column (one reference, so
+    /// nothing to cross); false once `b` runs off the end of the table.
+    fn same_reference(&self, a: i64, b: i64) -> Result<bool> {
         if self.layout.seq_id.is_empty() {
-            return Ok(());
+            return Ok(b < self.first_row + self.row_count as i64);
         }
-        let ida = self.layout.seq_id(a, self.first_row)?;
-        let idb = self.layout.seq_id(b, self.first_row)?;
-        if ida != idb {
-            return Err(Error::Format(format!(
-                "reference span crosses the boundary between {ida} (chunk {a}) \
-                 and {idb} (chunk {b})"
-            )));
+        if b >= self.first_row + self.row_count as i64 {
+            return Ok(false);
         }
-        Ok(())
+        Ok(self.layout.seq_id(a, self.first_row)? == self.layout.seq_id(b, self.first_row)?)
     }
 }
 
