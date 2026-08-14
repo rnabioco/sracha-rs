@@ -78,6 +78,10 @@ pub struct ReferenceLayout {
     seq_id: Vec<u32>,
     /// Distinct external reference accessions, in first-seen order.
     seq_id_names: Vec<String>,
+    /// Absolute row where each reference's chunks start, parallel to
+    /// `seq_id_names`. A span that wraps a circular reference restarts
+    /// here.
+    first_row_by_id: Vec<i64>,
 }
 
 impl ReferenceCursor {
@@ -175,6 +179,7 @@ impl ReferenceCursor {
         let mut chunk_row = first_chunk_row;
 
         let mut out = Vec::with_capacity(ref_len as usize);
+        let mut wrapped = false;
         while remaining > 0 {
             let chunk_len = self.layout.seq_len(chunk_row, self.first_row)? as usize;
             if offset_in_chunk > chunk_len {
@@ -188,18 +193,28 @@ impl ReferenceCursor {
             remaining -= take;
             offset_in_chunk = 0;
             if remaining > 0 {
-                // Stop at the end of this reference and return a short
-                // span, exactly as ncbi-vdb's `ref_sub_select` does — its
-                // read loop is bounded by the reference's `stop_id`
-                // (libs/axf/ref-tbl-sub-select.c:204). A span can overrun
-                // the end when soft clipping widens it; those positions are
-                // mismatches and never read the reference, so the caller
-                // never notices. Splicing in the next chromosome's bases
-                // would silently corrupt the read.
-                if !self.same_reference(chunk_row, chunk_row + 1)? {
+                if self.same_reference(chunk_row, chunk_row + 1)? {
+                    chunk_row += 1;
+                } else if !wrapped && self.is_circular_at(chunk_row)? {
+                    // A circular reference — the mitochondrion, plasmids —
+                    // has alignments that span its origin, so running off
+                    // the end means starting over at its first chunk
+                    // (ncbi-vdb does the same,
+                    // libs/axf/ref-tbl-sub-select.c:228). Once only: a span
+                    // longer than the whole reference would otherwise loop.
+                    chunk_row = self.layout.reference_start(chunk_row, self.first_row)?;
+                    wrapped = true;
+                } else {
+                    // End of a linear reference. Return the short span
+                    // rather than failing, exactly as `ref_sub_select`
+                    // does — its read loop is bounded by the reference's
+                    // `stop_id` (ref-tbl-sub-select.c:204). A span can
+                    // overrun when soft clipping widens it, and those
+                    // positions are mismatches that never read the
+                    // reference. Splicing in the next chromosome's bases
+                    // would silently corrupt the read.
                     break;
                 }
-                chunk_row += 1;
             }
         }
         Ok(out)
@@ -261,6 +276,17 @@ impl ReferenceCursor {
         let seq_id = self.layout.seq_id(chunk_row, self.first_row)?;
         out.extend_from_slice(&external.bases_at(seq_id, seq_start - 1 + offset as u64, take)?);
         Ok(())
+    }
+
+    /// Is the reference at `row` circular? Only external refseq objects
+    /// carry the flag; an archive that embeds its bases reports false.
+    fn is_circular_at(&self, row: i64) -> Result<bool> {
+        let (Some(external), false) = (self.external.as_ref(), self.layout.seq_id.is_empty())
+        else {
+            return Ok(false);
+        };
+        let seq_id = self.layout.seq_id(row, self.first_row)?;
+        Ok(external.is_circular(seq_id))
     }
 
     /// Do two chunk rows belong to the same reference sequence?
@@ -335,6 +361,7 @@ impl ReferenceLayout {
         let mut seq_start = Vec::with_capacity(if seq_start_col.is_some() { n } else { 0 });
         let mut seq_id = Vec::with_capacity(if seq_id_col.is_some() { n } else { 0 });
         let mut seq_id_names: Vec<String> = Vec::new();
+        let mut first_row_by_id: Vec<i64> = Vec::new();
         // REFERENCE rows are grouped by SEQ_ID, so remembering the last one
         // turns the intern lookup into a pointer compare for all but the
         // handful of rows that start a new reference.
@@ -358,6 +385,7 @@ impl ReferenceLayout {
                             .position(|n| n == name)
                             .unwrap_or_else(|| {
                                 seq_id_names.push(name.to_string());
+                                first_row_by_id.push(row);
                                 seq_id_names.len() - 1
                             }) as u32;
                         last = Some((name.to_string(), idx));
@@ -373,6 +401,7 @@ impl ReferenceLayout {
             seq_start,
             seq_id,
             seq_id_names,
+            first_row_by_id,
         })
     }
 
@@ -398,6 +427,12 @@ impl ReferenceLayout {
     fn seq_id(&self, row: i64, first_row: i64) -> Result<&str> {
         let i = Self::index(row, first_row, self.seq_id.len(), "SEQ_ID")?;
         Ok(&self.seq_id_names[self.seq_id[i] as usize])
+    }
+
+    /// First chunk row of the reference that `row` belongs to.
+    fn reference_start(&self, row: i64, first_row: i64) -> Result<i64> {
+        let i = Self::index(row, first_row, self.seq_id.len(), "SEQ_ID")?;
+        Ok(self.first_row_by_id[self.seq_id[i] as usize])
     }
 }
 

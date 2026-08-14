@@ -180,6 +180,13 @@ impl RefSeqStore {
         self.objects.contains_key(seq_id)
     }
 
+    /// Is this reference circular? Alignments may span the origin of one
+    /// (the mitochondrion, plasmids), so a span reaching its end has to
+    /// wrap to its start rather than stop.
+    pub fn is_circular(&self, seq_id: &str) -> bool {
+        self.objects.get(seq_id).is_some_and(|o| o.circular)
+    }
+
     fn get(&self, seq_id: &str) -> Option<&Arc<RefSeqObject>> {
         self.objects.get(seq_id)
     }
@@ -340,6 +347,11 @@ impl RefSeqReaders {
             store: store.clone(),
             cols,
         }
+    }
+
+    /// Is this reference circular? See [`RefSeqStore::is_circular`].
+    pub fn is_circular(&self, seq_id: &str) -> bool {
+        self.store.is_circular(seq_id)
     }
 
     /// `len` reference bases as 4na-bin bytes, starting at 0-based
