@@ -48,6 +48,7 @@ pub use config::{PipelineConfig, PipelineStats};
 
 mod blob_decode;
 mod marker;
+pub mod refseq;
 mod validate;
 use blob_decode::{
     BlobDecodeCtx, RawBlobData, decode_blob_to_fastq, decode_raw, decode_zip_encoding,
@@ -280,10 +281,31 @@ fn wrap_blob_integrity(accession: &str, err: Error) -> Error {
     }
 }
 
+/// Return the canonical `.sra.vdbcache` sidecar path if it exists on disk
+/// next to `sra_path`. Both cSRA dispatch sites (`run_fastq` for local
+/// files, `decode_sra` for `sracha get`) need the same probe.
+fn csra_vdbcache_path(sra_path: &std::path::Path) -> Option<PathBuf> {
+    let candidate = crate::vdb::csra::vdbcache_sidecar_path(sra_path);
+    candidate.exists().then_some(candidate)
+}
+
 /// Select the best mirror URL for downloading.
 ///
 /// Prefers cloud mirrors (s3, gs) over NCBI on-premises servers because
 /// cloud CDNs are typically much faster for parallel chunked downloads.
+/// Mirror preference by service label — lower sorts first.
+/// Cloud mirrors beat NCBI on-premises for parallel chunked downloads.
+/// Shared with the external-reference fetcher so both rank identically.
+pub(crate) fn mirror_priority(service: &str) -> u8 {
+    match service {
+        "s3" | "s3-direct" => 0,
+        "gs" => 1,
+        s if s.contains("sra-ncbi") => 2,
+        "ncbi" => 3,
+        _ => 4,
+    }
+}
+
 fn select_mirror(resolved: &ResolvedAccession) -> Result<String> {
     let mirrors = &resolved.sra_file.mirrors;
     if mirrors.is_empty() {
@@ -293,21 +315,9 @@ fn select_mirror(resolved: &ResolvedAccession) -> Result<String> {
         });
     }
 
-    // Prefer cloud mirrors — much faster for parallel downloads.
-    // Priority: s3 > gs > sra-ncbi > ncbi > any
-    let priority = |s: &str| -> u8 {
-        match s {
-            "s3" | "s3-direct" => 0,
-            "gs" => 1,
-            s if s.contains("sra-ncbi") => 2,
-            "ncbi" => 3,
-            _ => 4,
-        }
-    };
-
     let best = mirrors
         .iter()
-        .min_by_key(|m| priority(m.service.as_str()))
+        .min_by_key(|m| mirror_priority(m.service.as_str()))
         .unwrap();
 
     tracing::debug!(
@@ -1212,20 +1222,13 @@ pub fn run_fastq(
             .to_string()
     });
 
-    // Reference-compressed cSRA dispatch: archives with SEQUENCE.CMP_READ
-    // plus sibling PRIMARY_ALIGNMENT + REFERENCE tables can't decode
-    // through the regular VdbCursor (it reads physical READ only); route
-    // them through CsraCursor's splice. v1 handles one uncompressed output
-    // file and ignores split / compression / stdout flags — a follow-up
-    // will port CsraCursor to the batched pipeline.
-    let vdbcache_candidate = crate::vdb::csra::vdbcache_sidecar_path(sra_path);
-    let vdbcache_for_probe = if vdbcache_candidate.exists() {
-        Some(vdbcache_candidate.as_path())
-    } else {
-        None
-    };
-    if crate::vdb::csra::looks_like_decodable_csra(sra_path, vdbcache_for_probe).unwrap_or(false) {
-        return run_fastq_csra(sra_path, &acc, config, vdbcache_for_probe);
+    // Reference-compressed cSRA dispatch: archives whose bases live in
+    // PRIMARY_ALIGNMENT + REFERENCE rather than a physical SEQUENCE.READ
+    // can't decode through the regular VdbCursor; route them through
+    // CsraCursor's splice.
+    let vdbcache = csra_vdbcache_path(sra_path);
+    if crate::vdb::csra::looks_like_decodable_csra(sra_path, vdbcache.as_deref()).unwrap_or(false) {
+        return run_fastq_csra(sra_path, &acc, config, vdbcache.as_deref());
     }
 
     // Detect SRA-lite by checking if the quality column is absent.
@@ -1394,6 +1397,18 @@ fn run_fastq_csra(
     use crate::vdb::kar::KarArchive;
     use crate::vdb::restore::fourna_to_ascii;
 
+    // External reference objects, opened once and shared by every decode
+    // worker: the mmaps are immutable, and each worker gets its own blob
+    // caches via `RefSeqReaders`. `config.refseq_paths` is populated by
+    // `refseq::prepare_external_refseqs` before decode starts.
+    let refseqs: Option<Arc<crate::vdb::refseq::RefSeqStore>> = if config.refseq_paths.is_empty() {
+        None
+    } else {
+        Some(Arc::new(crate::vdb::refseq::RefSeqStore::open(
+            &config.refseq_paths,
+        )?))
+    };
+
     let file = std::fs::File::open(sra_path)?;
     let mut archive = KarArchive::open(std::io::BufReader::new(file))?;
     // Open the vdbcache sidecar when present. Each decode worker opens
@@ -1412,7 +1427,12 @@ fn run_fastq_csra(
                 (Some(a), Some(p)) => Some((a, p)),
                 _ => None,
             };
-        match CsraCursor::open_any(&mut archive, sra_path, vdbcache_for_open) {
+        match CsraCursor::open_with_refseqs(
+            &mut archive,
+            sra_path,
+            vdbcache_for_open,
+            refseqs.as_ref(),
+        ) {
             Ok(c) => c,
             // Known-unsupported cSRA shape (external refseq, static READ_LEN).
             // Surface a distinct error carrying the accession so the CLI can
@@ -1527,7 +1547,9 @@ fn run_fastq_csra(
                     (Some(a), Some(p)) => Some((a, p)),
                     _ => None,
                 };
-            CsraCursor::open_any(&mut archive, sra_path, cache_opt)?
+            // `refseqs` is an Arc of already-opened mmaps: cheap to share,
+            // and each worker's `RefSeqReaders` view is built fresh here.
+            CsraCursor::open_with_refseqs(&mut archive, sra_path, cache_opt, refseqs.as_ref())?
         };
         let mut per_slot: HashMap<OutputSlot, (Vec<u8>, u64)> = HashMap::new();
         let mut itoa_buf = itoa::Buffer::new();
@@ -1607,27 +1629,35 @@ fn run_fastq_csra(
             .num_threads(num_threads)
             .build()
             .map_err(|e| Error::Pipeline(format!("cSRA threadpool: {e}")))?;
-        let results: Vec<Result<Vec<SlotChunk>>> = pool.install(|| {
-            chunks
-                .par_iter()
-                .map(|(s, e)| decode_chunk(*s, *e))
-                .collect()
-        });
-        for (chunk_res, (s, e)) in results.into_iter().zip(chunks.iter()) {
-            let chunk = chunk_res?;
-            spots_read += (e - s) as u64;
-            for (slot, bytes, records) in chunk {
-                if let Some(ref mut sw) = stdout_writer {
-                    sw.write_all(&bytes).map_err(Error::Io)?;
-                } else {
-                    get_writer(slot, &mut writers, &mut output_paths)?;
-                    writers
-                        .get_mut(&slot)
-                        .unwrap()
-                        .write_all(&bytes)
-                        .map_err(Error::Io)?;
+        // Decode a bounded batch of chunks at a time and drain it before
+        // starting the next. Collecting every chunk first would hold the
+        // entire FASTQ output in memory — fine for a 12 MB test fixture,
+        // several GB on a real run. Four chunks per thread keeps every
+        // worker fed while capping the buffer at tens of MB.
+        let batch = num_threads.saturating_mul(4).max(1);
+        for window in chunks.chunks(batch) {
+            let results: Vec<Result<Vec<SlotChunk>>> = pool.install(|| {
+                window
+                    .par_iter()
+                    .map(|(s, e)| decode_chunk(*s, *e))
+                    .collect()
+            });
+            for (chunk_res, (s, e)) in results.into_iter().zip(window.iter()) {
+                let chunk = chunk_res?;
+                spots_read += (e - s) as u64;
+                for (slot, bytes, records) in chunk {
+                    if let Some(ref mut sw) = stdout_writer {
+                        sw.write_all(&bytes).map_err(Error::Io)?;
+                    } else {
+                        get_writer(slot, &mut writers, &mut output_paths)?;
+                        writers
+                            .get_mut(&slot)
+                            .unwrap()
+                            .write_all(&bytes)
+                            .map_err(Error::Io)?;
+                    }
+                    reads_written += records;
                 }
-                reads_written += records;
             }
         }
     } else {
@@ -2114,13 +2144,31 @@ pub fn decode_sra(downloaded: &DownloadedSra, config: &PipelineConfig) -> Result
     }
 
     let diag = Arc::new(IntegrityDiag::default());
-    let (spots_read, reads_written, mut output_files) = match decode_and_write(
-        &downloaded.temp_path,
-        &downloaded.accession,
-        config,
-        downloaded.is_lite,
-        &diag,
-    ) {
+    // Reference-compressed cSRA needs CsraCursor, exactly as `run_fastq`
+    // does for local files. Without this, `sracha get` on an aligned run
+    // fell through to VdbCursor and died in `reject_if_csra`.
+    let vdbcache = csra_vdbcache_path(&downloaded.temp_path);
+    let decoded =
+        if crate::vdb::csra::looks_like_decodable_csra(&downloaded.temp_path, vdbcache.as_deref())
+            .unwrap_or(false)
+        {
+            run_fastq_csra(
+                &downloaded.temp_path,
+                &downloaded.accession,
+                config,
+                vdbcache.as_deref(),
+            )
+            .map(|s| (s.spots_read, s.reads_written, s.output_files))
+        } else {
+            decode_and_write(
+                &downloaded.temp_path,
+                &downloaded.accession,
+                config,
+                downloaded.is_lite,
+                &diag,
+            )
+        };
+    let (spots_read, reads_written, mut output_files) = match decoded {
         Ok(result) => result,
         Err(Error::Cancelled { output_files }) => {
             // Delete completion marker (may not exist yet).
@@ -2367,6 +2415,8 @@ mod tests {
             metadata_md5: None,
             metadata_size: None,
             metadata_service: None,
+            refseq_paths: Vec::new(),
+            refseq_cache_dir: None,
         }
     }
 

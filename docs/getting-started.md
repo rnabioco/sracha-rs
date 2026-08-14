@@ -136,6 +136,19 @@ sracha decodes compressed/aligned SRA archives (cSRA) in pure Rust,
 producing byte-identical FASTQ to fasterq-dump. No special flag is
 required — sracha detects the schema and switches decoders automatically.
 
+Runs aligned to a public assembly store only the chunk layout in their
+`REFERENCE` table; the bases live in separate NCBI refseq objects named by
+`SEQ_ID` (e.g. `CM000663.1` for GRCh37 chr1). sracha fetches those on
+demand and caches them so later runs against the same assembly reuse them:
+
+```bash
+sracha get ERR10213669                              # fetches GRCh37 once (~700 MiB)
+sracha get ERR10213669 --refseq-cache /scratch/refs # or pick the location
+```
+
+The cache defaults to `$SRACHA_REFSEQ_DIR`, else `~/.cache/sracha/refseq`.
+Put it on shared storage to amortise it across a group or a cluster.
+
 ## SRA-lite
 
 SRA-lite files are smaller (4-10x) because they use simplified quality

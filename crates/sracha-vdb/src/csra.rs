@@ -9,6 +9,7 @@
 
 use std::io::{Read, Seek};
 use std::path::Path;
+use std::sync::Arc;
 
 use crate::alignment::AlignmentCursor;
 use crate::cache::{CachedColumn, ColumnKind};
@@ -17,6 +18,7 @@ use crate::inspect;
 use crate::kar::KarArchive;
 use crate::kdb::ColumnReader;
 use crate::reference::ReferenceCursor;
+use crate::refseq::RefSeqStore;
 use crate::restore::{align_restore_read, seq_restore_read};
 
 /// Given a `.sra` path, return the canonical `.sra.vdbcache` sibling path
@@ -40,12 +42,15 @@ pub(crate) fn archive_has_table<R: Read + Seek>(archive: &KarArchive<R>, table: 
         .any(|k| k == &exact || k.ends_with(&suffix))
 }
 
-fn archive_has_seq_cmp_read<R: Read + Seek>(archive: &KarArchive<R>) -> bool {
-    let exact = "tbl/SEQUENCE/col/CMP_READ";
-    let nested = "/tbl/SEQUENCE/col/CMP_READ";
+/// Does the KAR TOC contain `tbl/SEQUENCE/col/{col}` (at the archive root
+/// or nested under a single accession prefix)? Cheap TOC scan — no column
+/// open — so callers can branch on archive shape before doing any work.
+fn archive_has_seq_col<R: Read + Seek>(archive: &KarArchive<R>, col: &str) -> bool {
+    let exact = format!("tbl/SEQUENCE/col/{col}");
+    let nested = format!("/tbl/SEQUENCE/col/{col}");
     archive.entries().keys().any(|k| {
-        k == exact
-            || k.ends_with(nested)
+        k == &exact
+            || k.ends_with(&nested)
             || k.starts_with(&format!("{exact}/"))
             || k.contains(&format!("{nested}/"))
     })
@@ -69,11 +74,13 @@ fn archive_has_reference_cmp_read<R: Read + Seek>(archive: &KarArchive<R>) -> bo
 
 /// Inspect the KAR archive at `sra_path` (and optional `.vdbcache`
 /// sidecar) and return true if the pair looks like a reference-
-/// compressed cSRA decodable by `CsraCursor`. `SEQUENCE/col/CMP_READ`
-/// must live in the main archive (the SEQUENCE half is never
-/// sidecar'd). `PRIMARY_ALIGNMENT` and `REFERENCE` may live in either
-/// archive — older monolithic cSRA (VDB-3418) keeps them in main,
-/// modern NCBI uploads split them into `.sra.vdbcache`.
+/// compressed cSRA decodable by `CsraCursor`. The SEQUENCE half always
+/// lives in the main archive (it is never sidecar'd) and must carry
+/// either `CMP_READ` (partially-aligned runs keep their unaligned
+/// residue there) or, for fully-aligned runs, `PRIMARY_ALIGNMENT_ID`
+/// with no physical `READ` at all. `PRIMARY_ALIGNMENT` and `REFERENCE`
+/// may live in either archive — older monolithic cSRA (VDB-3418) keeps
+/// them in main, some NCBI uploads split them into `.sra.vdbcache`.
 ///
 /// Pure TOC scan — no column reads — so safe to call up-front from
 /// `pipeline::run_fastq`.
@@ -84,7 +91,15 @@ pub fn looks_like_decodable_csra(sra_path: &Path, vdbcache_path: Option<&Path>) 
         _ => None,
     };
 
-    let has_seq_cmp_read = archive_has_seq_cmp_read(&main);
+    let has_seq_cmp_read = archive_has_seq_col(&main, "CMP_READ");
+    // Fully-aligned runs (e.g. ERR10213669) store no unaligned residue
+    // whatsoever: bam-load emits neither CMP_READ nor a physical READ, and
+    // every base is reconstructed from PRIMARY_ALIGNMENT. Requiring
+    // CMP_READ would skip them; requiring the absence of READ keeps plain
+    // (unaligned) SRA out.
+    let fully_aligned = !has_seq_cmp_read
+        && archive_has_seq_col(&main, "PRIMARY_ALIGNMENT_ID")
+        && !archive_has_seq_col(&main, "READ");
     let has_primary = archive_has_table(&main, "PRIMARY_ALIGNMENT")
         || cache
             .as_ref()
@@ -96,7 +111,7 @@ pub fn looks_like_decodable_csra(sra_path: &Path, vdbcache_path: Option<&Path>) 
             .map(|c| archive_has_table(c, "REFERENCE"))
             .unwrap_or(false);
 
-    Ok(has_seq_cmp_read && has_primary && has_reference)
+    Ok((has_seq_cmp_read || fully_aligned) && has_primary && has_reference)
 }
 
 fn open_kar(path: &Path) -> Result<KarArchive<std::io::BufReader<std::fs::File>>> {
@@ -150,8 +165,9 @@ fn archive_has_seq_column<R: Read + Seek>(
 }
 
 pub struct CsraCursor {
-    // SEQUENCE-side columns
-    cmp_read: CachedColumn,
+    // SEQUENCE-side columns. `cmp_read` is absent on fully-aligned runs,
+    // where no spot has unaligned residue to splice in.
+    cmp_read: Option<CachedColumn>,
     primary_alignment_id: CachedColumn,
     read_len: CachedColumn,
     read_type: CachedColumn,
@@ -199,6 +215,19 @@ impl CsraCursor {
         main_path: &Path,
         vdbcache: Option<(&mut KarArchive<R>, &Path)>,
     ) -> Result<Self> {
+        Self::open_with_refseqs(main, main_path, vdbcache, None)
+    }
+
+    /// As [`open_any`](Self::open_any), plus external reference objects for
+    /// archives whose REFERENCE table carries only the chunk layout and
+    /// leaves the bases in NCBI refseq objects named by `SEQ_ID`. Pass
+    /// `None` when the archive embeds its bases.
+    pub fn open_with_refseqs<R: Read + Seek>(
+        main: &mut KarArchive<R>,
+        main_path: &Path,
+        vdbcache: Option<(&mut KarArchive<R>, &Path)>,
+        refseqs: Option<&Arc<RefSeqStore>>,
+    ) -> Result<Self> {
         // SEQUENCE-side columns always live in the main archive — the
         // vdbcache only carries the alignment + reference halves.
         let col_base = inspect::column_base_path_public(main, Some("SEQUENCE"))?;
@@ -213,18 +242,35 @@ impl CsraCursor {
         if !archive_has_seq_column(main, &col_base, "READ_LEN") {
             return Err(fixed_length_readlen_error());
         }
+        // Reference bases must come from somewhere: embedded CMP_READ in
+        // either archive, or external refseq objects the caller fetched.
+        let have_refseqs = refseqs.is_some_and(|s| !s.is_empty());
         let main_has_ref_cmp_read = archive_has_reference_cmp_read(main);
         let cache_has_ref_cmp_read =
             matches!(&vdbcache, Some((c, _)) if archive_has_reference_cmp_read(c));
-        if !main_has_ref_cmp_read && !cache_has_ref_cmp_read {
+        if !main_has_ref_cmp_read && !cache_has_ref_cmp_read && !have_refseqs {
             return Err(external_refseq_error());
         }
 
-        let cmp_read = open_col(main, "CMP_READ")?;
+        // Absent on fully-aligned runs — `read_spot` then splices from an
+        // empty unaligned buffer, which `seq_restore_read` handles as long
+        // as every read really is aligned (it errors loudly otherwise).
+        let cmp_read = if archive_has_seq_column(main, &col_base, "CMP_READ") {
+            Some(open_col(main, "CMP_READ")?)
+        } else {
+            None
+        };
         let primary_alignment_id = open_col(main, "PRIMARY_ALIGNMENT_ID")?;
         let read_len = open_col(main, "READ_LEN")?;
         let read_type = open_col(main, "READ_TYPE")?;
-        let quality = open_col(main, "QUALITY")?;
+        // Same QUALITY/ORIGINAL_QUALITY duality the plain cursor handles
+        // (see `cursor.rs`); bam-load-produced cSRA often has only the
+        // latter.
+        let quality = if archive_has_seq_column(main, &col_base, "QUALITY") {
+            open_col(main, "QUALITY")?
+        } else {
+            open_col(main, "ORIGINAL_QUALITY")?
+        };
 
         let primary_in_main = archive_has_table(main, "PRIMARY_ALIGNMENT");
         let reference_in_main = archive_has_table(main, "REFERENCE");
@@ -235,11 +281,11 @@ impl CsraCursor {
         // duration of its scope.
         let (alignment, reference) = match vdbcache {
             None => {
-                if !archive_has_reference_cmp_read(main) {
+                if !main_has_ref_cmp_read && !have_refseqs {
                     return Err(external_refseq_error());
                 }
                 let alignment = AlignmentCursor::open(main, main_path)?;
-                let reference = ReferenceCursor::open(main, main_path)?;
+                let reference = ReferenceCursor::open_with_external(main, main_path, refseqs)?;
                 (alignment, reference)
             }
             Some((cache, cache_path)) => {
@@ -254,15 +300,15 @@ impl CsraCursor {
                     ));
                 };
                 let reference = if reference_in_main {
-                    if !archive_has_reference_cmp_read(main) {
+                    if !main_has_ref_cmp_read && !have_refseqs {
                         return Err(external_refseq_error());
                     }
-                    ReferenceCursor::open(main, main_path)?
+                    ReferenceCursor::open_with_external(main, main_path, refseqs)?
                 } else if archive_has_table(cache, "REFERENCE") {
-                    if !archive_has_reference_cmp_read(cache) {
+                    if !archive_has_reference_cmp_read(cache) && !have_refseqs {
                         return Err(external_refseq_error());
                     }
-                    ReferenceCursor::open(cache, cache_path)?
+                    ReferenceCursor::open_with_external(cache, cache_path, refseqs)?
                 } else {
                     return Err(Error::Format(
                         "cSRA: REFERENCE table not found in main archive or vdbcache".into(),
@@ -272,11 +318,13 @@ impl CsraCursor {
             }
         };
 
-        let first_row = cmp_read.first_row_id().unwrap_or(1);
-        let row_count = cmp_read.row_count();
+        // Row extent comes from PRIMARY_ALIGNMENT_ID rather than CMP_READ:
+        // it is the one SEQUENCE column present on every cSRA shape.
+        let first_row = primary_alignment_id.first_row_id().unwrap_or(1);
+        let row_count = primary_alignment_id.row_count();
 
         Ok(Self {
-            cmp_read: CachedColumn::new(cmp_read, ColumnKind::TwoNa),
+            cmp_read: cmp_read.map(|c| CachedColumn::new(c, ColumnKind::TwoNa)),
             primary_alignment_id: CachedColumn::new(
                 primary_alignment_id,
                 ColumnKind::Irzip { elem_bits: 64 },
@@ -375,7 +423,10 @@ impl CsraCursor {
         let align_ids = self.primary_alignment_id.read_i64_row(row_id)?;
         let read_lens = self.read_len.read_u32_row(row_id)?;
         let read_types = self.read_type.read_byte_row(row_id)?;
-        let cmp_read_2na = self.cmp_read.read_2na_row(row_id)?;
+        let cmp_read_2na = match &self.cmp_read {
+            Some(c) => c.read_2na_row(row_id)?,
+            None => Vec::new(),
+        };
         let quality = self.quality.read_byte_row(row_id)?;
 
         if read_lens.len() != align_ids.len() || read_types.len() != align_ids.len() {

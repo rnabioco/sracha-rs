@@ -19,6 +19,7 @@ pub mod kdb;
 pub mod metadata;
 pub(crate) mod ptrie;
 pub mod reference;
+pub mod refseq;
 pub mod restore;
 pub mod row_range;
 

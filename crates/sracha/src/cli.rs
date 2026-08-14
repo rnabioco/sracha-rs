@@ -363,6 +363,13 @@ pub struct FastqArgs {
     /// is skipped for archives that synthesize quality (SRA-Lite, --fasta).
     #[arg(long, help_heading = "Advanced")]
     pub verify: bool,
+
+    /// Directory for cached external reference sequences, used by aligned
+    /// (cSRA) runs whose reference bases live in NCBI refseq objects rather
+    /// than in the archive itself. Shared across accessions and runs.
+    /// Defaults to $SRACHA_REFSEQ_DIR, else ~/.cache/sracha/refseq.
+    #[arg(long, value_name = "DIR", help_heading = "Advanced")]
+    pub refseq_cache: Option<PathBuf>,
 }
 
 #[derive(Args)]
@@ -561,6 +568,13 @@ pub struct GetArgs {
     /// Format for `--dry-run` output.
     #[arg(long, value_enum, default_value = "tsv", help_heading = "Advanced")]
     pub dry_run_format: DryRunFormat,
+
+    /// Directory for cached external reference sequences, used by aligned
+    /// (cSRA) runs whose reference bases live in NCBI refseq objects rather
+    /// than in the archive itself. Shared across accessions and runs.
+    /// Defaults to $SRACHA_REFSEQ_DIR, else ~/.cache/sracha/refseq.
+    #[arg(long, value_name = "DIR", help_heading = "Advanced")]
+    pub refseq_cache: Option<PathBuf>,
 }
 
 #[derive(Clone, Copy, ValueEnum, Default)]

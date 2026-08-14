@@ -759,8 +759,11 @@ fn route_segments_to_slots(
 ) -> Vec<(OutputSlot, FastqRecord)> {
     let mut results = Vec::with_capacity(segments.len());
     let format = |seg: &ReadSegment<'_>| {
+        // cSRA's SEQUENCE table carries no NAME column, so fasterq-dump
+        // synthesizes the spot id as the name (`DSD_FASTQ_SYN_NAME`) rather
+        // than omitting the field — same rule the plain decode path applies
+        // in `blob_decode`. `spot_name` is the spot number here.
         if let Some(tmpl) = config.seq_defline.as_ref() {
-            // cSRA has no NAME column, so `$sn` resolves to empty here.
             let mut data = Vec::new();
             append_record_templated(
                 &mut data,
@@ -769,14 +772,20 @@ fn route_segments_to_slots(
                 run_name,
                 spot_name,
                 seg.mate_idx,
-                None,
+                Some(spot_name),
                 seg.sequence,
                 seg.quality,
                 None,
             );
             FastqRecord { data }
         } else {
-            format_read(run_name, spot_name, None, seg.sequence, seg.quality)
+            format_read(
+                run_name,
+                spot_name,
+                Some(spot_name),
+                seg.sequence,
+                seg.quality,
+            )
         }
     };
 
@@ -954,8 +963,9 @@ mod tests {
         assert_eq!(results.len(), 1);
         let data = &results[0].1.data;
         let text = std::str::from_utf8(data).unwrap();
-        // No NAME column → fasterq-dump omits the name field (no spot-id repeat).
-        assert!(text.starts_with("@SRR123456.42 length=4\n"));
+        // No NAME column → fasterq-dump synthesizes the spot id as the
+        // name field (DSD_FASTQ_SYN_NAME), rather than omitting it.
+        assert!(text.starts_with("@SRR123456.42 42 length=4\n"));
     }
 
     #[test]
@@ -967,8 +977,8 @@ mod tests {
         assert_eq!(results.len(), 2);
         let r1 = std::str::from_utf8(&results[0].1.data).unwrap();
         let r2 = std::str::from_utf8(&results[1].1.data).unwrap();
-        assert!(r1.starts_with("@SRR999.99 length=4\n"));
-        assert!(r2.starts_with("@SRR999.99 length=4\n"));
+        assert!(r1.starts_with("@SRR999.99 99 length=4\n"));
+        assert!(r2.starts_with("@SRR999.99 99 length=4\n"));
     }
 
     #[test]
@@ -982,7 +992,7 @@ mod tests {
 
         assert_eq!(results.len(), 1);
         let text = std::str::from_utf8(&results[0].1.data).unwrap();
-        assert_eq!(text, "@SRR1.1 length=4\nACGT\n+SRR1.1 length=4\nIIII\n");
+        assert_eq!(text, "@SRR1.1 1 length=4\nACGT\n+SRR1.1 1 length=4\nIIII\n");
     }
 
     // -----------------------------------------------------------------------
@@ -1147,10 +1157,16 @@ mod tests {
         let r1 = std::str::from_utf8(&results[0].1.data).unwrap();
         let r2 = std::str::from_utf8(&results[1].1.data).unwrap();
 
-        assert_eq!(r1, "@SRR1.10 length=4\nAACC\n+SRR1.10 length=4\nIIII\n");
+        assert_eq!(
+            r1,
+            "@SRR1.10 10 length=4\nAACC\n+SRR1.10 10 length=4\nIIII\n"
+        );
         // N-masking is now handled in the pipeline layer, not format_read.
         // Bases pass through unchanged regardless of quality.
-        assert_eq!(r2, "@SRR1.10 length=4\nGGTT\n+SRR1.10 length=4\n!!!!\n");
+        assert_eq!(
+            r2,
+            "@SRR1.10 10 length=4\nGGTT\n+SRR1.10 10 length=4\n!!!!\n"
+        );
     }
 
     // -----------------------------------------------------------------------
@@ -1666,7 +1682,7 @@ mod tests {
         let results = format_spot(&spot, "SRR1", &config);
 
         let text = std::str::from_utf8(&results[0].1.data).unwrap();
-        assert!(text.starts_with("@SRR1.spot.123_abc length=4\n"));
+        assert!(text.starts_with("@SRR1.spot.123_abc spot.123_abc length=4\n"));
     }
 
     // -----------------------------------------------------------------------

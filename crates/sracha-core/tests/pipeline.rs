@@ -377,6 +377,8 @@ fn test_config(
         metadata_md5: None,
         metadata_size: None,
         metadata_service: None,
+        refseq_paths: Vec::new(),
+        refseq_cache_dir: None,
     }
 }
 

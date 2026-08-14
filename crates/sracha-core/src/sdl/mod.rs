@@ -811,7 +811,7 @@ fn parse_run_accessions_from_csv(body: &str) -> Vec<String> {
 }
 
 /// Extract a [`ResolvedFile`] from an [`SdlFile`] response entry.
-fn resolved_file_from_sdl(sdl_file: &SdlFile) -> Result<ResolvedFile> {
+pub(crate) fn resolved_file_from_sdl(sdl_file: &SdlFile) -> Result<ResolvedFile> {
     let mirrors: Vec<ResolvedMirror> = sdl_file
         .locations
         .iter()

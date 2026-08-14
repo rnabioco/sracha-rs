@@ -1,5 +1,24 @@
 # Changelog
 
+## Unreleased
+
+### Features
+
+- Decode aligned cSRA whose reference bases live outside the archive (#74).
+  Runs aligned to a public assembly keep only the chunk layout in
+  `REFERENCE`; the bases are fetched from NCBI refseq objects named by
+  `SEQ_ID` and cached in `~/.cache/sracha/refseq` (override with
+  `--refseq-cache` or `$SRACHA_REFSEQ_DIR`) for reuse across runs. Also
+  handles fully-aligned archives, which store no `SEQUENCE.CMP_READ` at all.
+
+### Fixes
+
+- `sracha get` now routes reference-compressed cSRA through the cSRA decoder.
+  Only `sracha fastq` did, so `get` on an aligned run died in the plain
+  cursor's cSRA rejection even when the archive was decodable.
+- `sracha info` on a split cSRA no longer errors: detection was sidecar-aware
+  but the cursor open was not.
+
 ## 0.5.0 (2026-08-02)
 
 ### Upgrade note

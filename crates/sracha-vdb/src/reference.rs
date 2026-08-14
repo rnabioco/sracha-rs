@@ -12,11 +12,14 @@
 use std::io::{Read, Seek};
 use std::path::Path;
 
+use std::sync::Arc;
+
 use crate::cache::{CachedColumn, ColumnKind};
 use crate::error::{Error, Result};
 use crate::inspect;
 use crate::kar::KarArchive;
 use crate::kdb::ColumnReader;
+use crate::refseq::{BASE_N, RefSeqReaders, RefSeqStore};
 
 /// BAM-load's standard chunk size. REFERENCE rows each hold up to this many
 /// bases (last chunk of a reference may be shorter, recorded in SEQ_LEN).
@@ -25,18 +28,34 @@ use crate::kdb::ColumnReader;
 /// and only fall back to this historical default when neither the column nor
 /// the SEQ_LEN-derived estimate is available — a wrong value silently corrupts
 /// cSRA reads via [`plan_span_start`].
-const DEFAULT_MAX_SEQ_LEN: u32 = 5000;
+pub(crate) const DEFAULT_MAX_SEQ_LEN: u32 = 5000;
 
 /// Upper bound on REFERENCE rows sampled when deriving MAX_SEQ_LEN from
 /// SEQ_LEN, keeping `open()` cheap on references with millions of chunks.
 const MAX_SEQ_LEN_SAMPLE_ROWS: u64 = 256;
 
-/// Handle to the REFERENCE table's CMP_READ + SEQ_LEN columns.
+/// Handle to the REFERENCE table's chunk layout and, where present, its
+/// embedded bases.
+///
+/// Bases come from one of two places, decided per chunk row exactly as
+/// ncbi-vdb's `ref_restore_read` does: the embedded `CMP_READ` column, or
+/// an external refseq object named by `SEQ_ID`. An archive may need both
+/// (`CMP_READ` present but short for some rows), so this is not an
+/// either/or split at the table level.
 pub struct ReferenceCursor {
     /// 2na-packed base bytes per chunk (unpacked to 4na-bin on read).
-    cmp_read: CachedColumn,
+    /// Absent when the run stores no reference bases at all.
+    cmp_read: Option<CachedColumn>,
     /// Real chunk length in bases (≤ `max_seq_len`). Stored as u32 irzip.
     seq_len: CachedColumn,
+    /// External reference accession per chunk. Absent on archives that
+    /// embed everything (e.g. VDB-3418).
+    seq_id: Option<CachedColumn>,
+    /// 1-based start of the chunk within its reference; 0 means "this
+    /// chunk is `SEQ_LEN` Ns" and addresses nothing externally.
+    seq_start: Option<CachedColumn>,
+    /// Locally-materialised refseq objects, when the caller supplied them.
+    external: Option<RefSeqReaders>,
     max_seq_len: u32,
     first_row: i64,
     row_count: u64,
@@ -44,17 +63,35 @@ pub struct ReferenceCursor {
 
 impl ReferenceCursor {
     pub fn open<R: Read + Seek>(archive: &mut KarArchive<R>, sra_path: &Path) -> Result<Self> {
+        Self::open_with_external(archive, sra_path, None)
+    }
+
+    /// Open the REFERENCE table, optionally backed by external refseq
+    /// objects for chunks whose bases are not embedded.
+    pub fn open_with_external<R: Read + Seek>(
+        archive: &mut KarArchive<R>,
+        sra_path: &Path,
+        refseqs: Option<&Arc<RefSeqStore>>,
+    ) -> Result<Self> {
         let col_base = inspect::column_base_path_public(archive, Some("REFERENCE"))?;
         let open = |archive: &mut KarArchive<R>, name: &str| -> Result<ColumnReader> {
             ColumnReader::open(archive, &format!("{col_base}/{name}"), sra_path)
                 .map_err(|e| Error::Format(format!("REFERENCE/{name}: {e}")))
         };
-        let cmp_read = open(archive, "CMP_READ")?;
+        let cmp_read = open(archive, "CMP_READ").ok();
         let seq_len = open(archive, "SEQ_LEN")?;
-        let first_row = cmp_read.first_row_id().unwrap_or(1);
-        let row_count = cmp_read.row_count();
+        let seq_id = open(archive, "SEQ_ID").ok();
+        let seq_start = open(archive, "SEQ_START").ok();
+        // Row extent tracks SEQ_LEN: it is the one column present on every
+        // REFERENCE shape, embedded or external.
+        let first_row = seq_len.first_row_id().unwrap_or(1);
+        let row_count = seq_len.row_count();
 
-        let cmp_read = CachedColumn::new(cmp_read, ColumnKind::TwoNa);
+        let cmp_read = cmp_read.map(|c| CachedColumn::new(c, ColumnKind::TwoNa));
+        let seq_id = seq_id.map(|c| CachedColumn::new(c, ColumnKind::Zip));
+        let seq_start =
+            seq_start.map(|c| CachedColumn::new(c, ColumnKind::Irzip { elem_bits: 32 }));
+        let external = refseqs.map(RefSeqReaders::new);
         let seq_len = CachedColumn::new(seq_len, ColumnKind::Irzip { elem_bits: 32 });
 
         // Resolve the real chunk size instead of assuming 5000. Prefer the
@@ -83,6 +120,9 @@ impl ReferenceCursor {
         Ok(Self {
             cmp_read,
             seq_len,
+            seq_id,
+            seq_start,
+            external,
             max_seq_len,
             first_row,
             row_count,
@@ -120,22 +160,91 @@ impl ReferenceCursor {
                     "reference: offset {offset_in_chunk} past chunk {chunk_row} len {chunk_len}"
                 )));
             }
-            let chunk_bases = self.cmp_read.read_2na_row(chunk_row)?;
-            if chunk_bases.len() != chunk_len {
-                return Err(Error::Format(format!(
-                    "REFERENCE.CMP_READ row {chunk_row}: page_map says {} bases, \
-                     SEQ_LEN says {chunk_len}",
-                    chunk_bases.len()
-                )));
-            }
+            let chunk_bases = self.chunk_bases(chunk_row, chunk_len)?;
             let available = chunk_len - offset_in_chunk;
             let take = remaining.min(available);
             out.extend_from_slice(&chunk_bases[offset_in_chunk..offset_in_chunk + take]);
             remaining -= take;
-            chunk_row += 1;
             offset_in_chunk = 0;
+            if remaining > 0 {
+                // Two sequences never share a chunk, and no alignment runs
+                // past the end of its reference — so continuing into a
+                // chunk with a different SEQ_ID means the span (or the
+                // archive) is wrong. Walking on silently would splice
+                // bases from the next chromosome into the read.
+                self.check_same_reference(chunk_row, chunk_row + 1)?;
+                chunk_row += 1;
+            }
         }
         Ok(out)
+    }
+
+    /// Resolve one chunk row's bases, mirroring ncbi-vdb's
+    /// `ref_restore_read`: prefer embedded `CMP_READ`, pad a short row with
+    /// Ns, treat `SEQ_START == 0` as an all-N chunk, and otherwise fetch
+    /// from the external refseq object named by `SEQ_ID`.
+    fn chunk_bases(&self, chunk_row: i64, chunk_len: usize) -> Result<Vec<u8>> {
+        if let Some(cmp) = &self.cmp_read {
+            let bases = cmp.read_2na_row(chunk_row)?;
+            if bases.len() >= chunk_len {
+                let mut bases = bases;
+                bases.truncate(chunk_len);
+                return Ok(bases);
+            }
+            if !bases.is_empty() {
+                let mut bases = bases;
+                bases.resize(chunk_len, BASE_N);
+                return Ok(bases);
+            }
+        }
+
+        let Some(seq_start_col) = &self.seq_start else {
+            return Err(Error::Format(format!(
+                "REFERENCE row {chunk_row}: no embedded bases and no SEQ_START \
+                 column to locate external ones"
+            )));
+        };
+        let seq_start = seq_start_col.read_scalar_u32(chunk_row)? as u64;
+        if seq_start == 0 {
+            return Ok(vec![BASE_N; chunk_len]);
+        }
+
+        let external = self.external.as_ref().ok_or_else(|| {
+            Error::CsraUnsupported(
+                "cSRA: reference bases are stored externally but no refseq \
+                 objects were provided"
+                    .into(),
+            )
+        })?;
+        let seq_id = self.seq_id_at(chunk_row)?;
+        external.bases_at(&seq_id, seq_start - 1, chunk_len)
+    }
+
+    /// `SEQ_ID` for a chunk row, as a string.
+    fn seq_id_at(&self, chunk_row: i64) -> Result<String> {
+        let col = self.seq_id.as_ref().ok_or_else(|| {
+            Error::Format(format!(
+                "REFERENCE row {chunk_row}: external bases needed but no SEQ_ID column"
+            ))
+        })?;
+        let bytes = col.read_byte_row(chunk_row)?;
+        Ok(String::from_utf8_lossy(&bytes).trim().to_string())
+    }
+
+    /// Error unless two chunk rows belong to the same reference sequence.
+    /// A no-op on archives without a `SEQ_ID` column (nothing to compare).
+    fn check_same_reference(&self, a: i64, b: i64) -> Result<()> {
+        if self.seq_id.is_none() {
+            return Ok(());
+        }
+        let (ida, idb) = (self.seq_id_at(a)?, self.seq_id_at(b)?);
+        if ida != idb {
+            return Err(Error::Format(format!(
+                "reference span crosses the boundary between {ida} (chunk {a}) \
+                 and {idb} (chunk {b})"
+            )));
+        }
+        Ok(())
     }
 }
 
