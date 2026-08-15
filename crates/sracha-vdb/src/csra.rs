@@ -12,7 +12,7 @@ use std::path::Path;
 use std::sync::Arc;
 
 use crate::alignment::AlignmentCursor;
-use crate::cache::{CachedColumn, ColumnKind};
+use crate::cache::{CachedColumn, ColLabel, ColumnKind};
 use crate::error::{Error, Result};
 use crate::inspect;
 use crate::kar::KarArchive;
@@ -353,15 +353,20 @@ impl CsraCursor {
         let row_count = primary_alignment_id.row_count();
 
         Ok(Self {
-            cmp_read: cmp_read.map(|c| CachedColumn::new(c, ColumnKind::TwoNa)),
-            cmp_altread: cmp_altread.map(|c| CachedColumn::new(c, ColumnKind::Zip)),
+            cmp_read: cmp_read
+                .map(|c| CachedColumn::new(c, ColumnKind::TwoNa).labelled(ColLabel::SeqCmpRead)),
+            cmp_altread: cmp_altread
+                .map(|c| CachedColumn::new(c, ColumnKind::Zip).labelled(ColLabel::SeqCmpAltread)),
             primary_alignment_id: CachedColumn::new(
                 primary_alignment_id,
                 ColumnKind::Irzip { elem_bits: 64 },
-            ),
-            read_len: CachedColumn::new(read_len, ColumnKind::Irzip { elem_bits: 32 }),
-            read_type: CachedColumn::new(read_type, ColumnKind::Zip),
-            quality: CachedColumn::new(quality, ColumnKind::Zip),
+            )
+            .labelled(ColLabel::SeqAlignId),
+            read_len: CachedColumn::new(read_len, ColumnKind::Irzip { elem_bits: 32 })
+                .labelled(ColLabel::SeqReadLen),
+            read_type: CachedColumn::new(read_type, ColumnKind::Zip)
+                .labelled(ColLabel::SeqReadType),
+            quality: CachedColumn::new(quality, ColumnKind::Zip).labelled(ColLabel::SeqQuality),
             alignment,
             reference,
             row_count,

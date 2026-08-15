@@ -1498,7 +1498,14 @@ fn run_fastq_csra(
     // Opening CsraCursor inside rayon workers means we don't need to
     // share the top-level one; drop it here to release its file handle
     // and avoid the small double-open cost on single-threaded paths.
-    let total_spots = csra.row_count();
+    let mut total_spots = csra.row_count();
+    // Diagnostic: cap the decode so a measurement run takes a minute
+    // instead of an hour. Unset in normal use.
+    if let Ok(v) = std::env::var("SRACHA_MAX_SPOTS")
+        && let Ok(n) = v.parse::<u64>()
+    {
+        total_spots = total_spots.min(n);
+    }
     let first_row = csra.first_row();
     drop(csra);
     drop(archive);
@@ -1698,6 +1705,10 @@ fn run_fastq_csra(
             std::fs::rename(tmp_path, final_path).map_err(Error::Io)?;
             final_paths.push(final_path.clone());
         }
+    }
+
+    if std::env::var_os("SRACHA_COLSTATS").is_some() {
+        crate::vdb::cache::dump_column_stats();
     }
 
     Ok(FastqStats {

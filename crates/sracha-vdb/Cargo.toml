@@ -23,3 +23,9 @@ tracing.workspace = true
 proptest.workspace = true
 reqwest = { workspace = true, features = ["blocking"] }
 tempfile.workspace = true
+
+[features]
+# Per-column blob-cache counters, printed by `dump_column_stats`. Off by
+# default: the counters sit in the hot path, so this is for investigation
+# runs, not production.
+colstats = []
