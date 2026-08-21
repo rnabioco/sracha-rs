@@ -7,7 +7,7 @@
 use std::io::{Read, Seek};
 use std::path::Path;
 
-use crate::cache::{CachedColumn, ColumnKind};
+use crate::cache::{CachedColumn, ColLabel, ColumnKind};
 use crate::error::{Error, Result};
 use crate::inspect;
 use crate::kar::KarArchive;
@@ -112,12 +112,16 @@ impl AlignmentCursor {
             global_ref_start: CachedColumn::new(
                 global_ref_start,
                 ColumnKind::Irzip { elem_bits: 64 },
-            ),
+            )
+            .labelled(ColLabel::PaGlobalRefStart),
             ref_len: CachedColumn::new(ref_len, ColumnKind::Irzip { elem_bits: 32 }),
-            has_mismatch: CachedColumn::new(has_mismatch, ColumnKind::Zip),
-            has_ref_offset: CachedColumn::new(has_ref_offset, ColumnKind::Zip),
-            mismatch: CachedColumn::new(mismatch, ColumnKind::Zip),
-            ref_offset: CachedColumn::new(ref_offset, ColumnKind::Irzip { elem_bits: 32 }),
+            has_mismatch: CachedColumn::new(has_mismatch, ColumnKind::Zip)
+                .labelled(ColLabel::PaHasMismatch),
+            has_ref_offset: CachedColumn::new(has_ref_offset, ColumnKind::Zip)
+                .labelled(ColLabel::PaHasRefOffset),
+            mismatch: CachedColumn::new(mismatch, ColumnKind::Zip).labelled(ColLabel::PaMismatch),
+            ref_offset: CachedColumn::new(ref_offset, ColumnKind::Irzip { elem_bits: 32 })
+                .labelled(ColLabel::PaRefOffset),
             row_count,
             first_row,
         })

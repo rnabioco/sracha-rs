@@ -24,7 +24,7 @@ use std::io::{Read, Seek};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-use crate::cache::{CachedColumn, ColumnKind};
+use crate::cache::{CachedColumn, ColLabel, ColumnKind};
 use crate::error::{Error, Result};
 use crate::inspect;
 use crate::kar::KarArchive;
@@ -335,10 +335,12 @@ impl RefSeqReaders {
                 cols.insert(
                     seq_id.clone(),
                     (
-                        CachedColumn::from_shared(read.clone(), ColumnKind::TwoNa),
-                        altread
-                            .as_ref()
-                            .map(|c| CachedColumn::from_shared(c.clone(), ColumnKind::Zip)),
+                        CachedColumn::from_shared(read.clone(), ColumnKind::TwoNa)
+                            .labelled(ColLabel::RefSeqRead),
+                        altread.as_ref().map(|c| {
+                            CachedColumn::from_shared(c.clone(), ColumnKind::Zip)
+                                .labelled(ColLabel::RefSeqAltread)
+                        }),
                     ),
                 );
             }

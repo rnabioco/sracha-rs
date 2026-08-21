@@ -10,10 +10,128 @@
 
 use std::cell::RefCell;
 use std::sync::Arc;
+#[cfg(feature = "colstats")]
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use crate::blob::{self, DecodedBlob, PageMap, RowExtent};
 use crate::error::{Error, Result};
 use crate::kdb::ColumnReader;
+
+/// Above this many rows in a single blob, don't expand every row's extent
+/// on decode — look rows up one at a time instead.
+///
+/// A constant-valued column is stored as one run covering the whole table:
+/// `SEQUENCE.READ_LEN` on a fixed-length run is a single blob spanning every
+/// spot. Expanding that to read one row allocated ~740 MB per decode worker
+/// and accounted for 99.6% of all extent expansion on SRR622461. Blobs below
+/// the threshold keep the eager path, which is cheaper once several rows of
+/// a blob get read — measured, not assumed.
+const EAGER_EXTENT_MAX_ROWS: u64 = 1 << 20;
+
+/// Diagnostic label so per-column blob-cache behaviour can be attributed.
+/// Profilers lose the caller of `row_extents_range` to inlining, so the
+/// counters below are the only way to tell which column is thrashing.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ColLabel {
+    Other,
+    SeqCmpRead,
+    SeqCmpAltread,
+    SeqQuality,
+    SeqAlignId,
+    SeqReadLen,
+    SeqReadType,
+    PaGlobalRefStart,
+    PaHasMismatch,
+    PaHasRefOffset,
+    PaMismatch,
+    PaRefOffset,
+    RefCmpRead,
+    RefSeqRead,
+    RefSeqAltread,
+}
+
+impl ColLabel {
+    #[allow(dead_code)]
+    pub(crate) const COUNT: usize = 15;
+
+    #[cfg(feature = "colstats")]
+    fn idx(self) -> usize {
+        self as usize
+    }
+
+    #[cfg(feature = "colstats")]
+    fn name(i: usize) -> &'static str {
+        [
+            "other",
+            "SEQ.CMP_READ",
+            "SEQ.CMP_ALTREAD",
+            "SEQ.QUALITY",
+            "SEQ.PRIMARY_ALIGNMENT_ID",
+            "SEQ.READ_LEN",
+            "SEQ.READ_TYPE",
+            "PA.GLOBAL_REF_START",
+            "PA.HAS_MISMATCH",
+            "PA.HAS_REF_OFFSET",
+            "PA.MISMATCH",
+            "PA.REF_OFFSET",
+            "REFERENCE.CMP_READ",
+            "refseq.READ",
+            "refseq.ALTREAD",
+        ][i]
+    }
+}
+
+// One counter per label. `AtomicU64` has interior mutability, so this is
+// spelled out rather than built from a `const` initialiser.
+#[cfg(feature = "colstats")]
+#[allow(clippy::declare_interior_mutable_const)]
+const ZERO: AtomicU64 = AtomicU64::new(0);
+#[cfg(feature = "colstats")]
+static HITS: [AtomicU64; ColLabel::COUNT] = [ZERO; ColLabel::COUNT];
+#[cfg(feature = "colstats")]
+static MISSES: [AtomicU64; ColLabel::COUNT] = [ZERO; ColLabel::COUNT];
+#[cfg(feature = "colstats")]
+static EXTENTS: [AtomicU64; ColLabel::COUNT] = [ZERO; ColLabel::COUNT];
+
+#[cfg(feature = "colstats")]
+#[inline]
+fn bump(counters: &[AtomicU64; ColLabel::COUNT], label: ColLabel, n: u64) {
+    counters[label.idx()].fetch_add(n, Ordering::Relaxed);
+}
+
+/// Print per-column blob-cache stats to stderr. Diagnostic only.
+#[cfg(not(feature = "colstats"))]
+pub fn dump_column_stats() {
+    eprintln!("column stats unavailable: rebuild with --features sracha-vdb/colstats");
+}
+
+/// Print per-column blob-cache stats to stderr. Diagnostic only.
+#[cfg(feature = "colstats")]
+pub fn dump_column_stats() {
+    eprintln!(
+        "{:<26} {:>14} {:>14} {:>7} {:>16}",
+        "column", "hits", "misses", "miss%", "extents expanded"
+    );
+    let mut total_extents = 0u64;
+    for i in 0..ColLabel::COUNT {
+        let h = HITS[i].load(Ordering::Relaxed);
+        let m = MISSES[i].load(Ordering::Relaxed);
+        let e = EXTENTS[i].load(Ordering::Relaxed);
+        total_extents += e;
+        if h + m == 0 {
+            continue;
+        }
+        eprintln!(
+            "{:<26} {:>14} {:>14} {:>6.1}% {:>16}",
+            ColLabel::name(i),
+            h,
+            m,
+            100.0 * m as f64 / (h + m) as f64,
+            e
+        );
+    }
+    eprintln!("{:<26} {:>54}", "TOTAL extents expanded", total_extents);
+}
 
 /// How a column's blob payload is decoded once `blob::decode_blob` has
 /// stripped the envelope / headers / page map. Caller selects the kind
@@ -61,10 +179,16 @@ impl DecodedColumnBlob {
     /// With no page map every row is one element wide at its own index.
     pub fn extent(&self, logical_offset: usize) -> Result<RowExtent> {
         if self.extents.is_empty() {
-            return Ok(RowExtent {
-                offset: logical_offset as u32,
-                len: 1,
-            });
+            // Either the blob was too wide to expand (see
+            // `EAGER_EXTENT_MAX_ROWS`) or it has no page map at all, in
+            // which case every row is one element wide at its own index.
+            return match &self.page_map {
+                Some(pm) => pm.extent_at(logical_offset),
+                None => Ok(RowExtent {
+                    offset: logical_offset as u32,
+                    len: 1,
+                }),
+            };
         }
         self.extents.get(logical_offset).copied().ok_or_else(|| {
             Error::Format(format!(
@@ -82,6 +206,7 @@ impl DecodedColumnBlob {
 pub(crate) struct CachedColumn {
     col: Arc<ColumnReader>,
     kind: ColumnKind,
+    label: ColLabel,
     cache: RefCell<Option<DecodedColumnBlob>>,
 }
 
@@ -98,8 +223,15 @@ impl CachedColumn {
         Self {
             col,
             kind,
+            label: ColLabel::Other,
             cache: RefCell::new(None),
         }
+    }
+
+    /// Tag this column for the diagnostic counters.
+    pub fn labelled(mut self, label: ColLabel) -> Self {
+        self.label = label;
+        self
     }
 
     /// Ensure the blob containing `row_id` is decoded (reusing the cached
@@ -123,9 +255,13 @@ impl CachedColumn {
             if let Some(cached) = borrow.as_ref()
                 && cached.start_id == start_id
             {
+                #[cfg(feature = "colstats")]
+                bump(&HITS, self.label, 1);
                 return f(cached, logical_offset);
             }
         }
+        #[cfg(feature = "colstats")]
+        bump(&MISSES, self.label, 1);
 
         let raw = self.col.read_raw_blob_slice(row_id)?;
         let decoded = blob::decode_blob(
@@ -141,11 +277,12 @@ impl CachedColumn {
         };
         let page_map = decoded.page_map;
         let row_length = decoded.row_length;
-        let extents = page_map
-            .as_ref()
-            .map(|pm| pm.row_extents())
-            .transpose()?
-            .unwrap_or_default();
+        let extents = match page_map.as_ref() {
+            Some(pm) if pm.total_rows() <= EAGER_EXTENT_MAX_ROWS => pm.row_extents()?,
+            _ => Vec::new(),
+        };
+        #[cfg(feature = "colstats")]
+        bump(&EXTENTS, self.label, extents.len() as u64);
 
         *self.cache.borrow_mut() = Some(DecodedColumnBlob {
             start_id,

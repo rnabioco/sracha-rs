@@ -360,6 +360,26 @@ impl PageMap {
         self.row_extents_range(0, self.total_rows() as usize)
     }
 
+    /// One row's extent, without materialising the rest of the blob.
+    ///
+    /// Costs one step per length run crossed, not one per row (see
+    /// `LengthRunCursor::skip_rows`), so it is O(1) on the RLE blobs that
+    /// make eager expansion ruinous — a constant-valued column stores the
+    /// whole table as a single run.
+    pub fn extent_at(&self, row: usize) -> Result<RowExtent> {
+        let mut found = None;
+        self.for_each_row_extent(row, 1, |_, e| {
+            found = Some(e);
+            Ok(())
+        })?;
+        found.ok_or_else(|| {
+            Error::Format(format!(
+                "page_map: row {row} outside blob of {} rows",
+                self.total_rows()
+            ))
+        })
+    }
+
     /// [`row_extents`](Self::row_extents) for the window `[skip, skip + take)`.
     pub fn row_extents_range(&self, skip: usize, take: usize) -> Result<Vec<RowExtent>> {
         let mut out = Vec::with_capacity(take.min(self.total_rows() as usize));

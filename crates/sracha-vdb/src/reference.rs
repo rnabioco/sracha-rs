@@ -14,7 +14,7 @@ use std::path::Path;
 
 use std::sync::Arc;
 
-use crate::cache::{CachedColumn, ColumnKind};
+use crate::cache::{CachedColumn, ColLabel, ColumnKind};
 use crate::error::{Error, Result};
 use crate::inspect;
 use crate::kar::KarArchive;
@@ -113,7 +113,8 @@ impl ReferenceCursor {
         let first_row = seq_len.first_row_id().unwrap_or(1);
         let row_count = seq_len.row_count();
 
-        let cmp_read = cmp_read.map(|c| CachedColumn::new(c, ColumnKind::TwoNa));
+        let cmp_read = cmp_read
+            .map(|c| CachedColumn::new(c, ColumnKind::TwoNa).labelled(ColLabel::RefCmpRead));
         let external = refseqs.map(RefSeqReaders::new);
         let layout = match layout {
             Some(l) => l.clone(),
