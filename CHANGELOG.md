@@ -1,5 +1,48 @@
 # Changelog
 
+## Unreleased
+
+### Features
+
+- Decode aligned cSRA whose reference bases live outside the archive (#74).
+  Runs aligned to a public assembly keep only the chunk layout in
+  `REFERENCE`; the bases are fetched from NCBI refseq objects named by
+  `SEQ_ID` and cached in `~/.cache/sracha/refseq` (override with
+  `--refseq-cache` or `$SRACHA_REFSEQ_DIR`) for reuse across runs. Also
+  handles fully-aligned archives, which store no `SEQUENCE.CMP_READ` at all.
+
+### Upgrade note
+
+**Re-convert aligned (cSRA) output produced by 0.5.0 or earlier.** Archives
+that store their unaligned bases as `CMP_READ` + `CMP_ALTREAD` had every
+ambiguity code emitted as a confident `A` — 2na cannot represent `N` and the
+mask was ignored. On SRR622461 that was ~1.7% of reads, including
+fully-unaligned spots that came out as 100 `A`s instead of 100 `N`s. Spot
+counts, read counts and qualities were all correct and the exit code was
+zero, so nothing downstream would have flagged it.
+
+### Fixes
+
+- Restore ambiguity codes in the unaligned half of a cSRA read
+  (`SEQUENCE.CMP_ALTREAD`) — see the upgrade note.
+- `sracha get` now routes reference-compressed cSRA through the cSRA decoder.
+  Only `sracha fastq` did, so `get` on an aligned run died in the plain
+  cursor's cSRA rejection even when the archive was decodable.
+- Size an alignment's reference projection from `REF_OFFSET` rather than the
+  stored `REF_LEN`, and by the reference cursor's peak rather than its close.
+  Soft-clipped archives failed with "ref cursor N outside ref_read (N)".
+- Wrap spans that cross the origin of a circular reference (the
+  mitochondrion), and return a short span at the end of a linear one instead
+  of failing.
+- Don't consume a `REF_OFFSET` per flag during a BAM `B` (back-up) operation.
+- cSRA deflines now carry the synthesized spot id, matching `fasterq-dump`
+  and sracha's own unaligned path.
+- `sracha info` on a split cSRA no longer errors: detection was sidecar-aware
+  but the cursor open was not.
+- cSRA decode no longer holds the entire FASTQ output in memory before
+  writing (7.7 GiB resident on a 1 GiB archive; now streams in bounded
+  batches).
+
 ## 0.5.0 (2026-08-02)
 
 ### Upgrade note

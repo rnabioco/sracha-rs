@@ -87,6 +87,17 @@ pub struct PipelineConfig {
     /// Mirror service label (e.g. `s3`, `gs`, `ncbi`) recorded into the
     /// metadata sidecar.
     pub metadata_service: Option<String>,
+    /// External reference objects already materialised on local disk, as
+    /// `(REFERENCE.SEQ_ID, path)`. Populated by
+    /// [`prepare_external_refseqs`] before decode so the sync decode path
+    /// never touches the network.
+    ///
+    /// [`prepare_external_refseqs`]: crate::pipeline::refseq::prepare_external_refseqs
+    pub refseq_paths: Vec<(String, PathBuf)>,
+    /// Override for the shared external-reference cache directory
+    /// (`--refseq-cache`). `None` uses `$SRACHA_REFSEQ_DIR` or the
+    /// platform cache dir.
+    pub refseq_cache_dir: Option<PathBuf>,
 }
 
 impl PipelineConfig {
@@ -154,6 +165,8 @@ mod tests {
             metadata_md5: None,
             metadata_size: None,
             metadata_service: None,
+            refseq_paths: Vec::new(),
+            refseq_cache_dir: None,
         }
     }
 

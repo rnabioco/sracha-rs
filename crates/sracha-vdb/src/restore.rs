@@ -78,16 +78,24 @@ pub fn align_restore_read(
     let mut mmi = 0usize; // mismatch read cursor
     let mut roi = 0usize; // ref_offset read cursor
     let mut rri: i64 = 0; // reference read cursor (signed — ref_offset may rewind)
+    // Last applied ref_offset, advanced once per output base. It only goes
+    // negative on a BAM `B` (back-up) operation, and while it is negative
+    // the pending has_ref_offset flags belong to that same back-up and must
+    // not each consume another offset — see the `bi >= 0` guard in
+    // ncbi-vdb/libs/axf/align-restore-read.c:101. Without this, archives
+    // carrying B operations over-advance `rri` and walk off the reference.
+    let mut bi: i64 = 0;
 
     for di in 0..read_len {
-        if has_ref_offset[di] != 0 {
+        if has_ref_offset[di] != 0 && bi >= 0 {
             let off = *ref_offset.get(roi).ok_or_else(|| {
                 Error::Format(format!(
                     "align_restore_read: ref_offset cursor {roi} past array of {}",
                     ref_offset.len()
                 ))
             })?;
-            rri += off as i64;
+            bi = off as i64;
+            rri += bi;
             roi += 1;
         }
 
@@ -111,6 +119,7 @@ pub fn align_restore_read(
         }
 
         rri += 1;
+        bi += 1;
     }
     Ok(out)
 }
@@ -228,6 +237,32 @@ pub fn seq_restore_read(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A BAM `B` (back-up) operation sets one negative REF_OFFSET but
+    /// flags every base it rewinds over in HAS_REF_OFFSET. Only the first
+    /// of those flags consumes an offset; the rest are part of the same
+    /// back-up (`bi >= 0` guard, align-restore-read.c:101). Consuming one
+    /// per flag reads past the end of REF_OFFSET and over-advances the
+    /// reference cursor.
+    #[test]
+    fn back_up_operation_consumes_one_ref_offset() {
+        // ref = A C G T, read walks 0,1,2 then backs up 2 and re-reads 1,2,3.
+        let ref_read = vec![0x1, 0x2, 0x4, 0x8];
+        let has_mismatch = vec![0, 0, 0, 0, 0, 0];
+        let has_ref_offset = vec![0, 0, 0, 1, 1, 0];
+        let ref_offset = vec![-2];
+
+        let out = align_restore_read(
+            &ref_read,
+            &has_mismatch,
+            &[],
+            &has_ref_offset,
+            &ref_offset,
+            6,
+        )
+        .expect("back-up must not consume a second offset");
+        assert_eq!(out, vec![0x1, 0x2, 0x4, 0x2, 0x4, 0x8]);
+    }
 
     #[test]
     fn complement_involution() {

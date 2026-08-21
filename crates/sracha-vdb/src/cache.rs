@@ -9,6 +9,7 @@
 //! hot-path row lookups are O(1) once the blob is warm.
 
 use std::cell::RefCell;
+use std::sync::Arc;
 
 use crate::blob::{self, DecodedBlob, PageMap, RowExtent};
 use crate::error::{Error, Result};
@@ -48,6 +49,10 @@ pub(crate) struct DecodedColumnBlob {
     /// for bit-packed rows, bytes for byte rows, elements for integer rows,
     /// bases for 2na rows.
     pub extents: Vec<RowExtent>,
+    /// Fixed elements-per-row declared by a v1 blob header. v1 blobs carry
+    /// no page map because every row is the same width — refseq `READ`
+    /// columns are stored this way (one `MAX_SEQ_LEN` chunk per row).
+    pub row_length: Option<u64>,
 }
 
 impl DecodedColumnBlob {
@@ -75,13 +80,21 @@ impl DecodedColumnBlob {
 /// Not thread-safe — expects to be owned by a single-threaded consumer
 /// (cSRA decode spawns one `CsraCursor` per rayon worker).
 pub(crate) struct CachedColumn {
-    col: ColumnReader,
+    col: Arc<ColumnReader>,
     kind: ColumnKind,
     cache: RefCell<Option<DecodedColumnBlob>>,
 }
 
 impl CachedColumn {
     pub fn new(col: ColumnReader, kind: ColumnKind) -> Self {
+        Self::from_shared(Arc::new(col), kind)
+    }
+
+    /// Wrap a `ColumnReader` that is already shared. External refseq
+    /// objects are opened once per accession and read by every decode
+    /// worker, so the mmap is shared while each worker keeps its own
+    /// single-slot blob cache (which is `RefCell`, hence not `Sync`).
+    pub fn from_shared(col: Arc<ColumnReader>, kind: ColumnKind) -> Self {
         Self {
             col,
             kind,
@@ -127,6 +140,7 @@ impl CachedColumn {
             ColumnKind::TwoNa => decoded.data.to_vec(),
         };
         let page_map = decoded.page_map;
+        let row_length = decoded.row_length;
         let extents = page_map
             .as_ref()
             .map(|pm| pm.row_extents())
@@ -138,6 +152,7 @@ impl CachedColumn {
             bytes,
             page_map,
             extents,
+            row_length,
         });
 
         let borrow = self.cache.borrow();
@@ -308,18 +323,28 @@ impl CachedColumn {
     /// (one nibble per byte). Used for `REFERENCE.CMP_READ` and
     /// `SEQUENCE.CMP_READ`.
     pub fn read_2na_row(&self, row_id: i64) -> Result<Vec<u8>> {
+        self.read_2na_range(row_id, 0, usize::MAX)
+    }
+
+    /// `take` bases of a 2na row starting `skip` bases into it.
+    ///
+    /// Callers that want a short span out of a wide row should use this
+    /// rather than slicing [`read_2na_row`](Self::read_2na_row): a refseq
+    /// chunk is 5,000 bases and an alignment typically needs ~100, so
+    /// unpacking the whole row throws away 98% of the work. `take` is
+    /// clamped to what the row actually holds.
+    pub fn read_2na_range(&self, row_id: i64, skip: usize, take: usize) -> Result<Vec<u8>> {
         debug_assert!(matches!(self.kind, ColumnKind::TwoNa));
         self.with_blob(row_id, |blob, logical_offset| {
-            let pm = blob.page_map.as_ref().ok_or_else(|| {
-                Error::Format("2na column: page_map required for record boundaries".into())
-            })?;
-            let _ = pm; // presence-only check; extents already cached.
-            let extent = blob.extent(logical_offset)?;
-            let len_bases = extent.len as usize;
+            let (start_bases, len_bases) = two_na_extent(blob, logical_offset)?;
+            // Narrow to the requested window before doing any unpacking.
+            let skipped = skip.min(len_bases);
+            let start_bases = start_bases + skipped;
+            let len_bases = (len_bases - skipped).min(take);
             if len_bases == 0 {
                 return Ok(Vec::new());
             }
-            let start_bits = (extent.offset as usize) * 2;
+            let start_bits = start_bases * 2;
 
             // 2na → 4na nibble lookup. Bases are MSB-first within each
             // byte (verified by cross-check against vdb-dump on
@@ -338,6 +363,41 @@ impl CachedColumn {
             }
             Ok(out)
         })
+    }
+
+    /// Bases in a 2na row, without unpacking any of them. Callers need
+    /// this to place a right-aligned ALTREAD mask when they are only
+    /// reading part of the row.
+    pub fn two_na_row_len(&self, row_id: i64) -> Result<usize> {
+        debug_assert!(matches!(self.kind, ColumnKind::TwoNa));
+        self.with_blob(row_id, |blob, logical_offset| {
+            Ok(two_na_extent(blob, logical_offset)?.1)
+        })
+    }
+}
+
+/// Where a 2na row sits in its decoded blob, as `(first base, base count)`.
+///
+/// Two storage shapes. Variable-length rows (SEQUENCE/REFERENCE CMP_READ)
+/// carry a page map with per-row extents. Fixed-width rows (a refseq
+/// object's READ) are v1 blobs with no page map at all — rows sit back to
+/// back at `row_length` bases each. A column's final row is short, so
+/// clamp to what the payload actually holds.
+fn two_na_extent(blob: &DecodedColumnBlob, logical_offset: usize) -> Result<(usize, usize)> {
+    match (&blob.page_map, blob.row_length) {
+        (Some(_), _) => {
+            let extent = blob.extent(logical_offset)?;
+            Ok((extent.offset as usize, extent.len as usize))
+        }
+        (None, Some(row_length)) => {
+            let width = row_length as usize;
+            let start = logical_offset * width;
+            let available = (blob.bytes.len() * 8 / 2).saturating_sub(start);
+            Ok((start, width.min(available)))
+        }
+        (None, None) => Err(Error::Format(
+            "2na column: neither a page map nor a fixed row length".into(),
+        )),
     }
 }
 
@@ -503,6 +563,7 @@ mod tests {
             bytes: Vec::new(),
             page_map: None,
             extents: Vec::new(),
+            row_length: None,
         };
         assert_eq!(blob.extent(0).unwrap(), RowExtent { offset: 0, len: 1 });
         assert_eq!(blob.extent(42).unwrap(), RowExtent { offset: 42, len: 1 });
@@ -519,6 +580,7 @@ mod tests {
                 RowExtent { offset: 0, len: 3 },
                 RowExtent { offset: 3, len: 3 },
             ],
+            row_length: None,
         };
         assert_eq!(blob.extent(0).unwrap(), RowExtent { offset: 0, len: 3 });
         assert_eq!(blob.extent(2).unwrap(), RowExtent { offset: 3, len: 3 });

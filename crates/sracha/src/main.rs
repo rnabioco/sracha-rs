@@ -345,7 +345,7 @@ async fn main() -> Result<()> {
                     continue;
                 }
 
-                let pipeline_config = sracha_core::pipeline::PipelineConfig {
+                let mut pipeline_config = sracha_core::pipeline::PipelineConfig {
                     output_dir: args.output_dir.clone(),
                     split_mode,
                     compression,
@@ -372,7 +372,33 @@ async fn main() -> Result<()> {
                     metadata_md5: None,
                     metadata_size: None,
                     metadata_service: None,
+                    refseq_paths: Vec::new(),
+                    refseq_cache_dir: args.refseq_cache.clone(),
                 };
+
+                // Aligned runs whose REFERENCE holds only the chunk layout
+                // need the assembly's bases fetched before decode; a no-op
+                // for every other archive shape.
+                match sracha_core::pipeline::refseq::prepare_external_refseqs(
+                    sra_path,
+                    None,
+                    &pipeline_config,
+                )
+                .await
+                {
+                    Ok(paths) => pipeline_config.refseq_paths = paths,
+                    Err(e) => {
+                        let acc = sra_path
+                            .file_stem()
+                            .and_then(|s| s.to_str())
+                            .unwrap_or("unknown")
+                            .to_string();
+                        let client = sracha_core::http::default_client();
+                        suggest_ena_fallback(&client, &acc, &e.to_string()).await;
+                        fastq_skipped.push(acc);
+                        continue;
+                    }
+                }
 
                 let stats = match sracha_core::pipeline::run_fastq(sra_path, None, &pipeline_config)
                 {
@@ -646,6 +672,8 @@ async fn main() -> Result<()> {
                         metadata_md5: resolved.sra_file.md5.clone(),
                         metadata_size: Some(resolved.sra_file.size),
                         metadata_service: primary.map(|m| m.service.clone()),
+                        refseq_paths: Vec::new(),
+                        refseq_cache_dir: args.refseq_cache.clone(),
                     }
                 }
             };
@@ -694,7 +722,7 @@ async fn main() -> Result<()> {
                     break;
                 }
 
-                let pipeline_config = make_config(resolved);
+                let mut pipeline_config = make_config(resolved);
 
                 // ---- ENA fast path ------------------------------------------------
                 if let Some(ena) = &ena_results[i] {
@@ -775,6 +803,25 @@ async fn main() -> Result<()> {
                 }
                 // Skip trailing ENA indices after the one we just spawned.
                 let _ = i;
+
+                // Aligned runs that keep only the chunk layout in REFERENCE
+                // need the assembly's bases on disk before decode starts.
+                // Async, and once per accession — rayon workers never fetch.
+                match sracha_core::pipeline::refseq::prepare_external_refseqs(
+                    &downloaded.temp_path,
+                    None,
+                    &pipeline_config,
+                )
+                .await
+                {
+                    Ok(paths) => pipeline_config.refseq_paths = paths,
+                    Err(e) => {
+                        suggest_ena_fallback(&http_client, &resolved.accession, &e.to_string())
+                            .await;
+                        skipped_accessions.push(resolved.accession.clone());
+                        continue;
+                    }
+                }
 
                 // Decode (CPU-bound) while the next download runs in the background.
                 let source = resolved
@@ -1381,7 +1428,24 @@ fn print_local_file_info(path: &std::path::Path) {
         None
     };
     if sracha_core::vdb::csra::looks_like_decodable_csra(path, vdbcache_opt).unwrap_or(false) {
-        print_local_csra_info(path, &mut archive);
+        // Reopen the sidecar as its own archive: the probe above accepts
+        // split archives, so the cursor has to be sidecar-aware too or it
+        // fails on exactly the files we just said we could read.
+        let mut cache_archive = vdbcache_opt.and_then(|p| {
+            std::fs::File::open(p)
+                .map_err(|e| e.to_string())
+                .and_then(|f| {
+                    KarArchive::open(std::io::BufReader::new(f)).map_err(|e| e.to_string())
+                })
+                .map_err(|e| {
+                    eprintln!(
+                        "  {} vdbcache parse failed: {e}",
+                        style::error_label("error:")
+                    );
+                })
+                .ok()
+        });
+        print_local_csra_info(path, &mut archive, cache_archive.as_mut().zip(vdbcache_opt));
         return;
     }
 
@@ -1442,10 +1506,11 @@ fn print_local_file_info(path: &std::path::Path) {
 fn print_local_csra_info<R: std::io::Read + std::io::Seek>(
     path: &std::path::Path,
     archive: &mut sracha_core::vdb::kar::KarArchive<R>,
+    vdbcache: Option<(&mut sracha_core::vdb::kar::KarArchive<R>, &std::path::Path)>,
 ) {
     use sracha_core::vdb::csra::CsraCursor;
 
-    let csra = match CsraCursor::open(archive, path) {
+    let csra = match CsraCursor::open_any(archive, path, vdbcache) {
         Ok(c) => c,
         Err(e) => {
             eprintln!("  {} cSRA cursor failed: {e}", style::error_label("error:"));
