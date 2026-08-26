@@ -115,7 +115,7 @@ async fn main() -> Result<()> {
             // the filesystem, by which point these files are on disk, so the
             // two checks compose rather than double-count.
             let ena_bytes: u64 = ena_results.iter().flatten().map(|e| e.total_size).sum();
-            if ena_bytes > 0 {
+            if ena_bytes > 0 && !args.no_disk_check {
                 check_disk_space(ena_bytes, &args.output_dir)?;
             }
 
@@ -215,7 +215,12 @@ async fn main() -> Result<()> {
             // size is the whole requirement.
             let sizes = expected_bytes_each(&resolved_all, &[], SraDisposition::KeepArchive);
             check_download_confirmation(&resolved_all, &sizes, args.yes, has_projects)?;
-            check_disk_space(sizes.iter().sum(), &args.output_dir)?;
+            if !args.no_disk_check {
+                check_disk_space(
+                    peak_disk_bytes(&sizes, SraDisposition::KeepArchive),
+                    &args.output_dir,
+                )?;
+            }
 
             for resolved in &resolved_all {
                 let acc = &resolved.accession;
@@ -551,15 +556,25 @@ async fn main() -> Result<()> {
 
             // `get` decodes each NCBI archive to FASTQ written beside it, so
             // peak disk is archive + output. ENA-served runs skip both.
-            let sizes = expected_bytes_each(
-                &resolved_all,
-                &ena_results,
+            // `--stdout` skips the output too: nothing is written, and each
+            // temp archive is deleted as its decode ends, so only the runs in
+            // flight count. (ENA and --stdout are mutually exclusive — see
+            // `ena_compatible` above — so the two branches never mix.)
+            let disposition = if args.stdout {
+                SraDisposition::StreamToStdout {
+                    // The accession being decoded, plus the prefetch queue.
+                    in_flight: args.prefetch_depth.max(1).saturating_add(1),
+                }
+            } else {
                 SraDisposition::DecodeToFastq {
                     compressed: !matches!(compression, sracha_core::fastq::CompressionMode::None),
-                },
-            );
+                }
+            };
+            let sizes = expected_bytes_each(&resolved_all, &ena_results, disposition);
             check_download_confirmation(&resolved_all, &sizes, args.yes, has_projects)?;
-            check_disk_space(sizes.iter().sum(), &args.output_dir)?;
+            if !args.no_disk_check {
+                check_disk_space(peak_disk_bytes(&sizes, disposition), &args.output_dir)?;
+            }
 
             let format_label = if args.fasta { "FASTA" } else { "FASTQ" };
             tracing::info!(
@@ -2046,6 +2061,30 @@ enum SraDisposition {
     /// it — the temp `.sracha-tmp-<acc>.sra` is not removed until decode
     /// finishes, so both exist at once.
     DecodeToFastq { compressed: bool },
+    /// `get --stdout`: the FASTQ is streamed, never written, and each temp
+    /// archive is deleted the moment its decode finishes. Only the runs in
+    /// flight — the one decoding plus the prefetch queue — occupy disk, so
+    /// peak is bounded by `in_flight` archives no matter how long the batch.
+    StreamToStdout { in_flight: usize },
+}
+
+/// Peak bytes on disk for the whole batch, as distinct from total bytes
+/// transferred.
+///
+/// For dispositions that leave every run's output on disk these are the same
+/// number, so the per-run sizes just add up. Under `--stdout` they are not:
+/// the archives are transient, so only the largest `in_flight` of them are
+/// ever resident at once (see #137 — summing them made a streaming run
+/// demand disk proportional to the batch size it never uses).
+fn peak_disk_bytes(sizes: &[u64], disposition: SraDisposition) -> u64 {
+    match disposition {
+        SraDisposition::StreamToStdout { in_flight } => {
+            let mut sorted = sizes.to_vec();
+            sorted.sort_unstable_by(|a, b| b.cmp(a));
+            sorted.into_iter().take(in_flight.max(1)).sum()
+        }
+        SraDisposition::KeepArchive | SraDisposition::DecodeToFastq { .. } => sizes.iter().sum(),
+    }
 }
 
 /// Assumed gzip/zstd ratio for FASTQ output.
@@ -2108,7 +2147,11 @@ fn expected_bytes_each(
             // ENA files land directly as the deliverable — no archive, no decode.
             Some(ena) => ena.total_size,
             None => match disposition {
-                SraDisposition::KeepArchive => r.sra_file.size,
+                // Streaming writes no FASTQ at all, so the archive is the
+                // entire footprint — same as `fetch`, minus the permanence.
+                SraDisposition::KeepArchive | SraDisposition::StreamToStdout { .. } => {
+                    r.sra_file.size
+                }
                 SraDisposition::DecodeToFastq { compressed } => r
                     .sra_file
                     .size
@@ -2146,7 +2189,8 @@ fn check_disk_space(required_bytes: u64, output_dir: &Path) -> Result<()> {
 
     if total_size > available {
         anyhow::bail!(
-            "not enough disk space: download requires {} but only {} available in {}",
+            "not enough disk space: download requires {} but only {} available in {} \
+             (pass --no-disk-check to skip this preflight)",
             format_size(total_size),
             format_size(available),
             output_dir.display(),
@@ -2511,6 +2555,70 @@ mod tests {
             SraDisposition::DecodeToFastq { compressed: true },
         );
         assert_eq!(total(sizes), 4096);
+    }
+
+    // -----------------------------------------------------------------------
+    // peak_disk_bytes / --stdout sizing (#137)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn expected_bytes_stdout_excludes_fastq_output() {
+        // Streaming writes no FASTQ to disk, so the estimate that
+        // DecodeToFastq adds must not appear.
+        let resolved = vec![make_resolved_with_runinfo("SRR1", 1000, 1, &[100, 100])];
+        let sizes = expected_bytes_each(
+            &resolved,
+            &[],
+            SraDisposition::StreamToStdout { in_flight: 2 },
+        );
+        assert_eq!(total(sizes), 1000);
+    }
+
+    #[test]
+    fn peak_disk_sums_every_run_when_output_is_kept() {
+        let sizes = [1000, 500, 2000];
+        assert_eq!(peak_disk_bytes(&sizes, SraDisposition::KeepArchive), 3500);
+        assert_eq!(
+            peak_disk_bytes(&sizes, SraDisposition::DecodeToFastq { compressed: true }),
+            3500
+        );
+    }
+
+    #[test]
+    fn peak_disk_stdout_counts_only_the_runs_in_flight() {
+        // The largest two archives, not all four: the rest are deleted as
+        // their decodes finish.
+        let sizes = [1000, 500, 2000, 300];
+        assert_eq!(
+            peak_disk_bytes(&sizes, SraDisposition::StreamToStdout { in_flight: 2 }),
+            3000
+        );
+    }
+
+    #[test]
+    fn peak_disk_stdout_is_flat_in_batch_size() {
+        // The point of #137: a 500-run streaming batch must not demand 500x
+        // the disk of a 2-run one.
+        let small = [1000u64; 2];
+        let large = [1000u64; 500];
+        let d = SraDisposition::StreamToStdout { in_flight: 2 };
+        assert_eq!(peak_disk_bytes(&small, d), peak_disk_bytes(&large, d));
+    }
+
+    #[test]
+    fn peak_disk_stdout_handles_degenerate_in_flight() {
+        // in_flight is clamped to at least one archive, so a zero can never
+        // turn the check into a no-op that admits an impossible transfer.
+        let sizes = [1000, 4000];
+        assert_eq!(
+            peak_disk_bytes(&sizes, SraDisposition::StreamToStdout { in_flight: 0 }),
+            4000
+        );
+        // More slots than runs is fine too — it just sums what exists.
+        assert_eq!(
+            peak_disk_bytes(&sizes, SraDisposition::StreamToStdout { in_flight: 99 }),
+            5000
+        );
     }
 
     // -----------------------------------------------------------------------
