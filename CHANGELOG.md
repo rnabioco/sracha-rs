@@ -1,18 +1,6 @@
 # Changelog
 
-## Unreleased
-
-### Features
-
-- `--no-disk-check` on `get` and `fetch` opts out of the free-disk-space
-  preflight entirely, for output filesystems that autoscale or report a
-  quota `statvfs` can't see through (#137).
-- Decode aligned cSRA whose reference bases live outside the archive (#74).
-  Runs aligned to a public assembly keep only the chunk layout in
-  `REFERENCE`; the bases are fetched from NCBI refseq objects named by
-  `SEQ_ID` and cached in `~/.cache/sracha/refseq` (override with
-  `--refseq-cache` or `$SRACHA_REFSEQ_DIR`) for reuse across runs. Also
-  handles fully-aligned archives, which store no `SEQUENCE.CMP_READ` at all.
+## 0.6.0 (2026-08-26)
 
 ### Upgrade note
 
@@ -23,6 +11,34 @@ mask was ignored. On SRR622461 that was ~1.7% of reads, including
 fully-unaligned spots that came out as 100 `A`s instead of 100 `N`s. Spot
 counts, read counts and qualities were all correct and the exit code was
 zero, so nothing downstream would have flagged it.
+
+### Features
+
+- Decode aligned cSRA whose reference bases live outside the archive (#74).
+  Runs aligned to a public assembly keep only the chunk layout in
+  `REFERENCE`; the bases are fetched from NCBI refseq objects named by
+  `SEQ_ID` and cached in `~/.cache/sracha/refseq` (override with
+  `--refseq-cache` or `$SRACHA_REFSEQ_DIR`) for reuse across runs. Also
+  handles fully-aligned archives, which store no `SEQUENCE.CMP_READ` at all.
+- `--verify` checks decoded quality *values* against the archive's
+  `STATS/QUALITY` histogram (#124). Every other quality check compares
+  lengths, so a decode emitting the right number of plausible bytes at the
+  wrong values passed all of them. Off by default — it costs one increment per
+  base — and skipped where quality is synthesized rather than decoded
+  (SRA-Lite, `--fasta`). Strict-fatal as `quality_histogram_mismatch`.
+- `--no-disk-check` on `get` and `fetch` opts out of the free-disk-space
+  preflight entirely, for output filesystems that autoscale or report a
+  quota `statvfs` can't see through (#137).
+
+### Performance
+
+- Reading one row from a run-length-encoded blob no longer expands the whole
+  blob's extents (#134). `SEQUENCE.READ_LEN` on a fixed-length run is stored
+  as a single run covering every spot, and expanding it per decode accounted
+  for 99.6% of all extent expansion — from 0.4% of the cache misses. Blobs
+  over 1M rows now walk the page map's length runs instead: ERR10213669 goes
+  150s → 87s wall and 2.5 GB → 860 MB peak RSS, a 400k-spot slice of
+  SRR622461 18.4s → 7.4s.
 
 ### Fixes
 
@@ -51,6 +67,14 @@ zero, so nothing downstream would have flagged it.
 - cSRA decode no longer holds the entire FASTQ output in memory before
   writing (7.7 GiB resident on a 1 GiB archive; now streams in bounded
   batches).
+
+### Validation
+
+- `validation/ab_corpus.sh` gains a `vdb dump` leg — a pinned row window per
+  column, diffed against `vdb-dump` — and records per-accession CPU and peak
+  RSS for both binaries (#107, #108). The harness only ever diffed FASTQ
+  bytes, which is how a `vdb dump` regression (#104) and a 2.4x decode-cost
+  regression (#101) each survived a full corpus run unflagged.
 
 ## 0.5.0 (2026-08-02)
 
@@ -107,15 +131,6 @@ A 386-accession x 2-split A/B against 0.4.2, with `fasterq-dump` as reference:
 611 rows unchanged, 145 fixed, **1 regression** — a false positive in the new
 base-count check on PacBio archives with a CONSENSUS table, fixed before
 release. Every other new check held across the full breadth.
-
-### Features
-
-- `--verify` checks decoded quality *values* against the archive's
-  `STATS/QUALITY` histogram (#124). Every other quality check compares
-  lengths, so a decode emitting the right number of plausible bytes at the
-  wrong values passed all of them. Off by default — it costs one increment per
-  base — and skipped where quality is synthesized rather than decoded
-  (SRA-Lite, `--fasta`). Strict-fatal as `quality_histogram_mismatch`.
 
 ### Fixes
 
