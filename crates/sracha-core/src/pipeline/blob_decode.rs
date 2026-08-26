@@ -725,8 +725,10 @@ pub(crate) fn decode_blob_to_fastq(
         let rl_bytes = decode_irzip_column(&rldecoded)?;
 
         let mut lengths: Vec<u32> = rl_bytes
-            .chunks_exact(4)
-            .map(|chunk| u32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]))
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .map(|&chunk| u32::from_le_bytes(chunk))
             .collect();
 
         // Trim to just the rows that pair with this READ blob: skip
@@ -985,13 +987,17 @@ pub(crate) fn decode_blob_to_fastq(
         // X/Y values are already decoded as u32 by irzip/izip (stored as
         // little-endian 4-byte groups in the output Vec<u8>).
         let x_vals: Vec<u32> = x_bytes
-            .chunks_exact(4)
-            .map(|c| u32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .map(|&c| u32::from_le_bytes(c))
             .collect();
 
         let y_vals: Vec<u32> = y_bytes
-            .chunks_exact(4)
-            .map(|c| u32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .map(|&c| u32::from_le_bytes(c))
             .collect();
 
         // Pick the template per spot using the skey spot_start mapping.

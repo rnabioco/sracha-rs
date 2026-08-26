@@ -3109,8 +3109,10 @@ mod tests {
         }
         let expanded = pm.expand_rows(&data, 4).unwrap();
         let vals: Vec<u32> = expanded
-            .chunks_exact(4)
-            .map(|c| u32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .map(|&c| u32::from_le_bytes(c))
             .collect();
         assert_eq!(vals, vec![100, 100, 200, 200, 200, 300]);
     }
@@ -3132,8 +3134,10 @@ mod tests {
         assert_eq!(expanded.len(), 5 * 4); // 5 rows * 4 bytes each
 
         let vals: Vec<u32> = expanded
-            .chunks_exact(4)
-            .map(|c| u32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .map(|&c| u32::from_le_bytes(c))
             .collect();
         assert_eq!(vals, vec![42, 42, 42, 99, 99]);
     }
@@ -3171,8 +3175,10 @@ mod tests {
         }
         let expanded = pm.expand_rows(&data, 4).unwrap();
         let vals: Vec<u32> = expanded
-            .chunks_exact(4)
-            .map(|c| u32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .map(|&c| u32::from_le_bytes(c))
             .collect();
         assert_eq!(vals, vec![42, 99, 42]);
     }
@@ -3208,8 +3214,10 @@ mod tests {
 
         let expanded = pm.expand_rows(&data, 4).unwrap();
         let vals: Vec<u32> = expanded
-            .chunks_exact(4)
-            .map(|c| u32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .map(|&c| u32::from_le_bytes(c))
             .collect();
         // row0=[10] row1=[10] row2=[20,21,22] row3=[30] row4=[30]
         assert_eq!(vals, vec![10, 10, 20, 21, 22, 30, 30]);
@@ -3279,8 +3287,10 @@ mod tests {
         // 2 + 1 + 3 = 6 logical rows, each 2 u32s.
         assert_eq!(expanded.len(), 6 * 8);
         let vals: Vec<u32> = expanded
-            .chunks_exact(4)
-            .map(|c| u32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .map(|&c| u32::from_le_bytes(c))
             .collect();
         assert_eq!(vals, vec![10, 11, 10, 11, 20, 21, 30, 31, 30, 31, 30, 31]);
 
@@ -3633,8 +3643,10 @@ mod tests {
 
         let result = irzip_decode(&data, 32, 4, 100, delta_both, 0x01, None).unwrap();
         let vals: Vec<u32> = result
-            .chunks_exact(4)
-            .map(|c| u32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .map(|&c| u32::from_le_bytes(c))
             .collect();
         assert_eq!(vals, vec![100, 110, 105, 115]);
     }
@@ -3665,8 +3677,10 @@ mod tests {
 
         let result = irzip_decode(&data, 32, 4, 100, delta_pos, 0x01, series2).unwrap();
         let vals: Vec<u32> = result
-            .chunks_exact(4)
-            .map(|c| u32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .map(|&c| u32::from_le_bytes(c))
             .collect();
         assert_eq!(vals, vec![100, 200, 105, 203]);
     }
@@ -3700,8 +3714,10 @@ mod tests {
 
         let result = irzip_decode(&data, 32, 4, 1000, delta_both, 0x01, series2).unwrap();
         let vals: Vec<u32> = result
-            .chunks_exact(4)
-            .map(|c| u32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .map(|&c| u32::from_le_bytes(c))
             .collect();
         assert_eq!(vals, vec![1000, 2000, 1015, 1990]);
     }
@@ -3808,8 +3824,10 @@ mod tests {
                 mapping: RowMapping::RepeatCounts(runs.clone()),
             };
             let got: Vec<u32> = pm.expand_rows(&data, 4).unwrap()
-                .chunks_exact(4)
-                .map(|c| u32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+                .as_chunks::<4>()
+                .0
+                .iter()
+                .map(|&c| u32::from_le_bytes(c))
                 .collect();
             let expected: Vec<u32> = values
                 .iter()
