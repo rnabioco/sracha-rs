@@ -4,6 +4,9 @@
 
 ### Features
 
+- `--no-disk-check` on `get` and `fetch` opts out of the free-disk-space
+  preflight entirely, for output filesystems that autoscale or report a
+  quota `statvfs` can't see through (#137).
 - Decode aligned cSRA whose reference bases live outside the archive (#74).
   Runs aligned to a public assembly keep only the chunk layout in
   `REFERENCE`; the bases are fetched from NCBI refseq objects named by
@@ -23,6 +26,12 @@ zero, so nothing downstream would have flagged it.
 
 ### Fixes
 
+- `sracha get --stdout` no longer demands disk for output it never writes
+  (#137). The preflight sized a streaming run as if every accession's FASTQ
+  landed on disk and every temp archive stayed there, so peak was
+  `sum(archive + fastq)` across the whole batch. Streaming writes no FASTQ at
+  all and deletes each archive as its decode ends, so the requirement is now
+  the largest `--prefetch-depth + 1` archives — flat in batch size.
 - Restore ambiguity codes in the unaligned half of a cSRA read
   (`SEQUENCE.CMP_ALTREAD`) — see the upgrade note.
 - `sracha get` now routes reference-compressed cSRA through the cSRA decoder.

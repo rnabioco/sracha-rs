@@ -106,6 +106,7 @@ sracha get [OPTIONS] [ACCESSION]...
 | `--prefer-sdl` | | Skip direct S3 and resolve via the SDL API |
 | `--prefer-ena` | | Try ENA FASTQ mirrors first; fall back to the NCBI SRA path if ENA has no FASTQ for the accession or its output config is incompatible with the requested split/compression |
 | `--no-runinfo` | | Skip EUtils RunInfo API call (derive read structure from VDB metadata) |
+| `--no-disk-check` | | Skip the free-disk-space preflight. Useful when the output filesystem autoscales, or when `statvfs` reports a quota that does not reflect what the job can actually use |
 | `--prefetch-depth <N>` | `2` | Number of accessions to download ahead of the decoder. Larger values hide slow networks behind decode at the cost of one extra temp SRA file per step. Multi-accession `get` only |
 | `--keep-sra` | | Keep the downloaded SRA file in the output directory instead of deleting it after decode |
 | `--no-progress` | | Disable progress bar |
@@ -142,6 +143,7 @@ sracha fetch [OPTIONS] [ACCESSION]...
 | `-y, --yes` | | Confirm project downloads and large downloads (>100 GiB) |
 | `--prefer-sdl` | | Skip direct S3 and resolve via the SDL API |
 | `--prefer-ena` | | Fetch pre-computed FASTQ.gz from ENA's mirror instead of the SRA binary. Falls back to the NCBI path when ENA has no FASTQ for an accession |
+| `--no-disk-check` | | Skip the free-disk-space preflight. Useful when the output filesystem autoscales, or when `statvfs` reports a quota that does not reflect what the job can actually use |
 | `--no-progress` | | Disable progress bar |
 
 ---

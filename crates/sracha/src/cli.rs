@@ -225,6 +225,12 @@ pub struct FetchArgs {
     #[arg(long)]
     pub no_progress: bool,
 
+    /// Skip the free-disk-space preflight check entirely. Useful when the
+    /// output filesystem autoscales, or when `statvfs` reports a quota that
+    /// doesn't reflect what the job can actually use.
+    #[arg(long, help_heading = "Advanced")]
+    pub no_disk_check: bool,
+
     /// Skip MD5 verification after download (verification is on by default)
     #[arg(long, help_heading = "Advanced")]
     pub no_validate: bool,
@@ -504,6 +510,12 @@ pub struct GetArgs {
     /// Disable download resume (re-download from scratch)
     #[arg(long, help_heading = "Advanced")]
     pub no_resume: bool,
+
+    /// Skip the free-disk-space preflight check entirely. Useful when the
+    /// output filesystem autoscales, or when `statvfs` reports a quota that
+    /// doesn't reflect what the job can actually use.
+    #[arg(long, help_heading = "Advanced")]
+    pub no_disk_check: bool,
 
     /// Skip the EUtils RunInfo API call (read structure will be derived
     /// from VDB file metadata instead).
