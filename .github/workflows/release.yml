@@ -47,9 +47,10 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
         with:
           targets: ${{ matrix.target }}
-      - uses: Swatinem/rust-cache@v2
-        with:
-          key: ${{ matrix.target }}${{ matrix.suffix }}
+      # No rust-cache here on purpose. This workflow only ever runs on a tag
+      # push, and a cache saved under refs/tags/vX is never visible to the
+      # next tag — so every restore missed and every save burned ~300 MB of
+      # the repo's 10 GB quota, evicting the CI caches that do get reused.
 
       - name: Install musl tools (x86_64)
         if: matrix.target == 'x86_64-unknown-linux-musl'
@@ -57,9 +58,14 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y musl-tools
 
+      # Built from source on purpose: cross's newest *release* is v0.2.5
+      # (Feb 2023), which predates edition 2024, so the prebuilt binary
+      # taiki-e/install-action would fetch cannot build this workspace.
+      # --locked resolves against cross's own Cargo.lock so a release two
+      # months from now compiles the same dependency set as this one.
       - name: Install cross (aarch64-linux)
         if: matrix.target == 'aarch64-unknown-linux-musl'
-        run: cargo install cross --git https://github.com/cross-rs/cross
+        run: cargo install cross --git https://github.com/cross-rs/cross --locked
 
       - name: Build (cross)
         if: matrix.target == 'aarch64-unknown-linux-musl'

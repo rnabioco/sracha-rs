@@ -3,34 +3,71 @@ name: CI
 on:
   push:
     branches: [main]
+    # Kept in sync with the pull_request list below by hand: GitHub Actions'
+    # workflow parser rejects YAML anchors, so the two cannot share one node.
+    paths-ignore:
+      - "**/*.md"
+      - "docs/**"
+      - "zensical.toml"
+      - ".github/workflows/docs.yml"
   pull_request:
     branches: [main]
+    paths-ignore:
+      - "**/*.md"
+      - "docs/**"
+      - "zensical.toml"
+      - ".github/workflows/docs.yml"
+
+concurrency:
+  # Supersede a PR's in-flight run when it is pushed again. Pushes to main are
+  # never cancelled: each main commit has to keep its own pass/fail record and
+  # finish saving the caches every PR restores from.
+  group: ci-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 env:
   CARGO_TERM_COLOR: always
   RUST_BACKTRACE: 1
+  # Debuginfo is most of the target-dir bytes the cache has to ship and is
+  # never read here — no CI job opens a debugger or wants source lines in a
+  # backtrace, and frame *names* still resolve without it. The coverage job
+  # opts back in below.
+  CARGO_PROFILE_DEV_DEBUG: 0
+  CARGO_PROFILE_TEST_DEBUG: 0
 
 jobs:
   check:
     name: Check
     runs-on: ubuntu-latest
+    timeout-minutes: 15
     steps:
       - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: clippy, rustfmt
       - uses: Swatinem/rust-cache@v2
+        with:
+          # Read the test jobs' target dir for prebuilt dependency rlibs
+          # rather than keeping a third near-identical copy of them. Clippy's
+          # own metadata is written with a different fingerprint, so nothing
+          # collides; save-if false keeps it out of the shared entry.
+          shared-key: tests
+          save-if: false
       - name: Format
         run: cargo fmt --all -- --check
+      # This type-checks every target under every feature. A `cargo check`
+      # with the same flags afterwards only re-derives what clippy just
+      # proved, so there isn't one.
       - name: Clippy
         run: cargo clippy --all-targets --all-features -- -D warnings
-      - name: Check
-        run: cargo check --all-targets --all-features
 
   test:
     name: Test (${{ matrix.os }})
     needs: check
+    timeout-minutes: 20
     strategy:
+      # One platform failing should not cancel the other's report.
+      fail-fast: false
       matrix:
         os: [ubuntu-latest, macos-latest]
     runs-on: ${{ matrix.os }}
@@ -38,6 +75,12 @@ jobs:
       - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
+        with:
+          # Shared with `check` and `integration`, which compile the same
+          # crates with the same flags. rust-cache still partitions by
+          # os/arch, so ubuntu and macOS keep separate entries.
+          shared-key: tests
+          save-if: ${{ github.ref == 'refs/heads/main' }}
       - uses: taiki-e/install-action@nextest
       - name: Run tests
         run: cargo nextest run --all-features --profile ci
@@ -46,29 +89,50 @@ jobs:
     name: Integration Test
     needs: check
     runs-on: ubuntu-latest
+    timeout-minutes: 30
     steps:
       - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: tests
+          save-if: false
       - uses: taiki-e/install-action@nextest
       - name: Cache SRA fixture
         uses: actions/cache@v6
         with:
           path: crates/sracha-core/tests/fixtures
           key: sra-fixture-SRR28588231-v1
+      # Deliberately the same cargo arguments as the Test job. `-p
+      # sracha-core` would resolve features over only that package's subgraph,
+      # dropping sracha-vdb's `colstats` and forcing a full rebuild of the
+      # workspace under a second feature set; narrowing to the package with a
+      # nextest filter instead leaves the build identical, so this reuses the
+      # binaries already in the shared cache.
       - name: Run integration tests
-        run: cargo nextest run -p sracha-core --all-features --profile ci --run-ignored=ignored-only
+        run: >
+          cargo nextest run --all-features --profile ci
+          --run-ignored=ignored-only -E 'package(sracha-core)'
 
   coverage:
     name: Coverage
     needs: check
     runs-on: ubuntu-latest
+    timeout-minutes: 25
+    env:
+      # llvm-cov resolves counters back to source lines, so this job keeps the
+      # debuginfo the rest of the workflow drops.
+      CARGO_PROFILE_TEST_DEBUG: 1
     steps:
       - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: llvm-tools-preview
+      # Instrumented builds carry their own RUSTFLAGS, so this job cannot
+      # share the test cache and keeps a key of its own.
       - uses: Swatinem/rust-cache@v2
+        with:
+          save-if: ${{ github.ref == 'refs/heads/main' }}
       - uses: taiki-e/install-action@nextest
       - uses: taiki-e/install-action@cargo-llvm-cov
       # Coverage measures the default (non-ignored) test suite only; the
@@ -111,9 +175,14 @@ jobs:
   msrv:
     name: MSRV (1.95)
     runs-on: ubuntu-latest
+    timeout-minutes: 15
     steps:
       - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@1.95.0
+      # A different rustc means a different fingerprint for every artifact, so
+      # this job cannot share the stable jobs' cache.
       - uses: Swatinem/rust-cache@v2
+        with:
+          save-if: ${{ github.ref == 'refs/heads/main' }}
       - name: Check MSRV
         run: cargo check --all-targets

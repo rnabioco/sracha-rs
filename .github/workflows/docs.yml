@@ -3,6 +3,17 @@ name: Docs
 on:
   push:
     branches: [main]
+    # The site is built from Markdown, zensical.toml, and the pixi env that
+    # provides zensical — a Rust-only commit cannot change its output.
+    # `**/*.md` also covers CHANGELOG.md, which docs/changelog.md snippet-includes.
+    paths:
+      - "**/*.md"
+      - "docs/**"
+      - "zensical.toml"
+      - "pixi.toml"
+      - "pixi.lock"
+      - ".github/workflows/docs.yml"
+  workflow_dispatch:
 
 permissions:
   contents: read
@@ -16,9 +27,15 @@ concurrency:
 jobs:
   build:
     runs-on: ubuntu-latest
+    timeout-minutes: 15
     steps:
       - uses: actions/checkout@v7
       - uses: prefix-dev/setup-pixi@v0.10.1
+        with:
+          # Keyed on pixi.lock; skips re-solving and re-downloading the env
+          # on every docs commit.
+          cache: true
+          environments: default
       - name: Build docs
         run: pixi run docs-build
       - uses: actions/upload-pages-artifact@v5
@@ -28,6 +45,7 @@ jobs:
   deploy:
     needs: build
     runs-on: ubuntu-latest
+    timeout-minutes: 10
     environment:
       name: github-pages
       url: ${{ steps.deployment.outputs.page_url }}
