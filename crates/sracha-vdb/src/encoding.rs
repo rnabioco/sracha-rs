@@ -103,12 +103,19 @@ pub fn unpack_2na(packed: &[u8], num_bases: usize) -> Vec<u8> {
     // Pre-size the output. Previously `Vec::with_capacity` + per-iter
     // `extend_from_slice` forced LLVM to emit a capacity check and len
     // writeback inside the hot loop (~33% of its time per `perf
-    // annotate`). With a sized Vec and `chunks_exact_mut(4)` the loop
-    // becomes load-byte → LUT-load → 4-byte store, with no bookkeeping.
+    // annotate`). With a sized Vec and `as_chunks_mut::<4>()` the loop
+    // becomes load-byte → LUT-load → 4-byte store, with no bookkeeping:
+    // the chunk is a `[u8; 4]`, so the store is a plain array assignment
+    // rather than a `copy_from_slice` with a length check to elide.
     let mut bases = vec![0u8; num_bases];
 
-    for (chunk, &byte) in bases.chunks_exact_mut(4).zip(packed[..full_bytes].iter()) {
-        chunk.copy_from_slice(&LUT_2NA[byte as usize]);
+    for (chunk, &byte) in bases
+        .as_chunks_mut::<4>()
+        .0
+        .iter_mut()
+        .zip(packed[..full_bytes].iter())
+    {
+        *chunk = LUT_2NA[byte as usize];
     }
 
     if trailing > 0 && full_bytes < packed.len() {
@@ -139,7 +146,12 @@ pub fn unpack_4na(packed: &[u8], num_bases: usize) -> Vec<u8> {
     // writeback — mirrors unpack_2na's pattern.
     let mut bases = vec![0u8; output_len];
 
-    for (chunk, &byte) in bases.chunks_exact_mut(2).zip(packed[..full_bytes].iter()) {
+    for (chunk, &byte) in bases
+        .as_chunks_mut::<2>()
+        .0
+        .iter_mut()
+        .zip(packed[..full_bytes].iter())
+    {
         chunk[0] = DNA_4NA[((byte >> 4) & 0x0F) as usize];
         chunk[1] = DNA_4NA[(byte & 0x0F) as usize];
     }
@@ -242,7 +254,9 @@ pub fn merge_altread_bin(bases: &mut [u8], altread_bytes: &[u8], num_bases: usiz
 /// Returns one phred byte per base. Input length must be a multiple of 4.
 pub fn qual4_log_odds_to_phred(qual4: &[u8]) -> Vec<u8> {
     qual4
-        .chunks_exact(4)
+        .as_chunks::<4>()
+        .0
+        .iter()
         .map(|c| log_odds_to_phred(c[0] as i8))
         .collect()
 }

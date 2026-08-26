@@ -883,8 +883,10 @@ fn cell_to_json(kind: CellKind, bytes: &[u8]) -> Value {
         | CellKind::AsciiBytes => Value::String(String::from_utf8_lossy(bytes).into_owned()),
         CellKind::U32Array => {
             let vals: Vec<Value> = bytes
-                .chunks_exact(4)
-                .map(|c| json!(u32::from_le_bytes(c.try_into().unwrap())))
+                .as_chunks::<4>()
+                .0
+                .iter()
+                .map(|&c| json!(u32::from_le_bytes(c)))
                 .collect();
             Value::Array(vals)
         }
@@ -931,11 +933,11 @@ fn write_u32_array<W: Write>(
     if lead != 0 {
         w.write_all(&[lead])?;
     }
-    for (i, chunk) in bytes.chunks_exact(4).enumerate() {
+    for (i, &chunk) in bytes.as_chunks::<4>().0.iter().enumerate() {
         if i > 0 {
             w.write_all(sep)?;
         }
-        let v = u32::from_le_bytes(chunk.try_into().unwrap());
+        let v = u32::from_le_bytes(chunk);
         write!(w, "{v}")?;
     }
     if trail != 0 {
