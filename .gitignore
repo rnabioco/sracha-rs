@@ -3,6 +3,7 @@
 .pixi
 *.lock
 !Cargo.lock
+!pixi.lock
 ext/
 .sracha-tmp-*
 crates/sracha-core/tests/fixtures/*.sra
