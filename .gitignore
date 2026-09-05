@@ -17,3 +17,6 @@ validation/
 
 # development artifacts
 .sracha-done-*
+
+# byte-compiled .github/scripts
+__pycache__/
