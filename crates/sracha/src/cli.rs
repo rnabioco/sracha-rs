@@ -373,7 +373,8 @@ pub struct FastqArgs {
     /// Directory for cached external reference sequences, used by aligned
     /// (cSRA) runs whose reference bases live in NCBI refseq objects rather
     /// than in the archive itself. Shared across accessions and runs.
-    /// Defaults to $SRACHA_REFSEQ_DIR, else ~/.cache/sracha/refseq.
+    /// Defaults to $SRACHA_REFSEQ_DIR, else the platform cache dir
+    /// (~/.cache/sracha/refseq, or %LOCALAPPDATA%\sracha\refseq on Windows).
     #[arg(long, value_name = "DIR", help_heading = "Advanced")]
     pub refseq_cache: Option<PathBuf>,
 }
@@ -584,7 +585,8 @@ pub struct GetArgs {
     /// Directory for cached external reference sequences, used by aligned
     /// (cSRA) runs whose reference bases live in NCBI refseq objects rather
     /// than in the archive itself. Shared across accessions and runs.
-    /// Defaults to $SRACHA_REFSEQ_DIR, else ~/.cache/sracha/refseq.
+    /// Defaults to $SRACHA_REFSEQ_DIR, else the platform cache dir
+    /// (~/.cache/sracha/refseq, or %LOCALAPPDATA%\sracha\refseq on Windows).
     #[arg(long, value_name = "DIR", help_heading = "Advanced")]
     pub refseq_cache: Option<PathBuf>,
 }

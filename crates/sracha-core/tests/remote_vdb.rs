@@ -15,7 +15,6 @@
 use std::fs::File;
 use std::io::{BufRead, BufReader, Write};
 use std::net::{TcpListener, TcpStream};
-use std::os::unix::fs::FileExt;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::Once;
@@ -140,7 +139,7 @@ fn handle_one(mut stream: TcpStream, file: &File, len: u64) -> bool {
     let (start, end) = range.unwrap_or((0, len - 1));
     let end = end.min(len - 1);
     let mut buf = vec![0u8; (end - start + 1) as usize];
-    file.read_exact_at(&mut buf, start).unwrap();
+    sracha_core::util::read_exact_at(file, &mut buf, start).unwrap();
     let head = format!(
         "HTTP/1.1 206 Partial Content\r\nContent-Length: {}\r\n\
          Content-Range: bytes {start}-{end}/{len}\r\nConnection: close\r\n\r\n",

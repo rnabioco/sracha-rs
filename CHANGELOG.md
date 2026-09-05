@@ -1,5 +1,40 @@
 # Changelog
 
+## Unreleased
+
+### Features
+
+**Windows is now a supported platform** ([#146]). Releases carry an
+`x86_64-pc-windows-msvc` `.zip` alongside the existing Linux and macOS
+tarballs, holding a single statically linked `sracha.exe` — the CRT is linked
+in, so there is no Visual C++ redistributable to install. CI runs the unit
+suite on Windows, and the integration suite too, since only that one
+downloads, mmaps, and then deletes a real archive — the interaction Windows is
+strictest about.
+
+Note that Bioconda builds for Linux and macOS only and has no Windows
+channel, so `bioconda::sracha` and the BioContainers images remain
+Linux/macOS-only. Windows users take the release `.zip`, `cargo install`, or
+WSL2.
+
+### Fixes
+
+- The parallel chunked downloader wrote through `pwrite`, which is Unix-only.
+  Positional reads and writes now go through a portable shim
+  (`util::write_all_at` / `util::read_exact_at`) that uses `pwrite` on Unix
+  and `seek_write`/`seek_read` on Windows.
+- The external-reference cache directory had no Windows branch, so aligned
+  (cSRA) runs failed outright unless `--refseq-cache` or `$SRACHA_REFSEQ_DIR`
+  was set. It now falls back to `%LOCALAPPDATA%`, then `%USERPROFILE%`.
+- `~/` in `--accession-file` paths expands via `%USERPROFILE%` when `HOME` is
+  unset.
+- The pre-download disk-space check was a silent no-op off Unix; it now uses
+  `GetDiskFreeSpaceExW` on Windows.
+- ANSI escape processing is enabled on the Windows console at startup, so
+  styled output renders instead of printing raw `\x1b[` sequences.
+
+[#146]: https://github.com/rnabioco/sracha-rs/issues/146
+
 ## 0.6.0 (2026-08-26)
 
 ### Upgrade note
