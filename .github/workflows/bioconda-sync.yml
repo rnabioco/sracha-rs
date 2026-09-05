@@ -57,7 +57,12 @@ jobs:
             "" \
             "quay.io publishes no \`latest\` tag for BioContainers images, so these" \
             "pins name a concrete \`<version>--<build>\` and have to be refreshed" \
-            "after each release." > pr-body.md
+            "after each release." \
+            "" \
+            "The \`?v=\` on the Anaconda badge URLs is flipped in the same pass." \
+            "Those badges render the current version themselves, but GitHub" \
+            "serves README images through its camo proxy, which caches them long" \
+            "past a release — changing the URL is what forces a re-fetch." > pr-body.md
 
           gh pr create \
             --head "$BRANCH" \
