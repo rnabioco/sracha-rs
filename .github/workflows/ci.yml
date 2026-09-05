@@ -69,7 +69,7 @@ jobs:
       # One platform failing should not cancel the other's report.
       fail-fast: false
       matrix:
-        os: [ubuntu-latest, macos-latest]
+        os: [ubuntu-latest, macos-latest, windows-latest]
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v7
@@ -78,18 +78,35 @@ jobs:
         with:
           # Shared with `check` and `integration`, which compile the same
           # crates with the same flags. rust-cache still partitions by
-          # os/arch, so ubuntu and macOS keep separate entries.
+          # os/arch, so each OS keeps a separate entry.
           shared-key: tests
           save-if: ${{ github.ref == 'refs/heads/main' }}
       - uses: taiki-e/install-action@nextest
+      - name: Install NASM (Windows)
+        if: runner.os == 'Windows'
+        # reqwest's `rustls` feature pins the aws-lc-rs crypto provider, and
+        # aws-lc-sys assembles its x86_64 routines with NASM, which is not on
+        # the runner image. CMake is. Chocolatey ships with the runner, so
+        # this needs no third-party action.
+        run: |
+          choco install nasm -y --no-progress
+          echo "C:\Program Files\NASM" >> $env:GITHUB_PATH
       - name: Run tests
         run: cargo nextest run --all-features --profile ci
 
   integration:
-    name: Integration Test
+    name: Integration Test (${{ matrix.os }})
     needs: check
-    runs-on: ubuntu-latest
     timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      # Windows is here, and not only in `test`, on purpose: the #[ignore]d
+      # tests are the only ones that download a real archive, mmap it, and
+      # then delete or rename it. Windows refuses to unlink a file with a live
+      # mapping, so that interaction cannot be proved by the unit tests.
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@stable
@@ -98,6 +115,11 @@ jobs:
           shared-key: tests
           save-if: false
       - uses: taiki-e/install-action@nextest
+      - name: Install NASM (Windows)
+        if: runner.os == 'Windows'
+        run: |
+          choco install nasm -y --no-progress
+          echo "C:\Program Files\NASM" >> $env:GITHUB_PATH
       - name: Cache SRA fixture
         uses: actions/cache@v6
         with:

@@ -50,6 +50,12 @@ pub fn refseq_cache_dir(override_dir: Option<&Path>) -> Result<PathBuf> {
         } else {
             PathBuf::from(home).join(".cache")
         }
+    } else if let Some(local) = std::env::var_os("LOCALAPPDATA") {
+        // Windows: %LOCALAPPDATA% is the per-user, non-roaming cache root.
+        PathBuf::from(local)
+    } else if let Some(profile) = std::env::var_os("USERPROFILE") {
+        // Older/stripped Windows environments where LOCALAPPDATA is unset.
+        PathBuf::from(profile).join("AppData").join("Local")
     } else {
         return Err(Error::Pipeline(
             "cannot locate a cache directory for external references — set \

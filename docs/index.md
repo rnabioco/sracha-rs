@@ -68,7 +68,14 @@ the [CLI Reference](cli.md) for all options.
 ### From binary releases
 
 Download pre-built binaries from the
-[releases page](https://github.com/rnabioco/sracha-rs/releases).
+[releases page](https://github.com/rnabioco/sracha-rs/releases), which covers
+Linux (x86_64, aarch64), macOS (Intel, Apple silicon), and Windows (x86_64).
+Unix targets ship a `.tar.gz`; Windows ships a `.zip` holding a single
+statically linked `sracha.exe` with no runtime to install.
+
+On Linux and macOS x86_64, pick the `-v2` build unless you know the host has
+AVX2, in which case `-v3` decodes faster. ARM and Windows builds ship a single
+binary.
 
 ### From source
 
@@ -83,6 +90,10 @@ cargo install --git https://github.com/rnabioco/sracha-rs sracha
 ```bash
 pixi add bioconda::sracha
 ```
+
+Bioconda builds for Linux (x86_64, aarch64) and macOS (Intel, Apple silicon)
+only — it has no Windows channel, so this and the container images below are
+not available on Windows. Use the release `.zip`, `cargo install`, or WSL2.
 
 ### With containers
 

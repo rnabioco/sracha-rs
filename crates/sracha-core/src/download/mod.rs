@@ -431,7 +431,7 @@ impl Drop for ChunkTicks<'_> {
 /// Streams hyper's response pieces through a bounded mpsc into a
 /// single `spawn_blocking` writer that uses `pwrite` on a shared
 /// `std::fs::File` (opened once in `download_file`). Pieces are
-/// coalesced into a 1 MiB buffer before each `write_all_at`, which
+/// coalesced into a 1 MiB buffer before each positional write, which
 /// keeps syscall count near the chunk count instead of the piece
 /// count (hyper emits ~16 KiB pieces, so at 70 MiB/s that's ~4500
 /// syscalls/s without batching). The channel is bounded at 4 pieces
@@ -468,7 +468,6 @@ async fn try_download_chunk(
     let writer_file = file.clone();
     let writer_start = chunk.start;
     let writer = tokio::task::spawn_blocking(move || -> std::io::Result<u64> {
-        use std::os::unix::fs::FileExt;
         const WRITE_THRESHOLD: usize = 1 << 20; // 1 MiB
         let mut offset = writer_start;
         let mut total = 0u64;
@@ -477,13 +476,13 @@ async fn try_download_chunk(
             total += piece.len() as u64;
             buf.extend_from_slice(&piece);
             if buf.len() >= WRITE_THRESHOLD {
-                writer_file.write_all_at(&buf, offset)?;
+                crate::util::write_all_at(&writer_file, &buf, offset)?;
                 offset += buf.len() as u64;
                 buf.clear();
             }
         }
         if !buf.is_empty() {
-            writer_file.write_all_at(&buf, offset)?;
+            crate::util::write_all_at(&writer_file, &buf, offset)?;
         }
         Ok(total)
     });

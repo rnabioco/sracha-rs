@@ -57,6 +57,8 @@ async fn main() -> Result<()> {
         libc::signal(libc::SIGPIPE, libc::SIG_DFL);
     }
 
+    enable_windows_ansi();
+
     let cli = Cli::parse();
 
     // Set up tracing
@@ -1221,10 +1223,15 @@ async fn main() -> Result<()> {
 /// Lines in the accession list file are trimmed; blank lines and lines
 /// starting with `#` are skipped.
 fn expand_tilde(s: &str) -> String {
-    if let Some(rest) = s.strip_prefix("~/")
-        && let Ok(home) = std::env::var("HOME")
-    {
-        return format!("{home}/{rest}");
+    if let Some(rest) = s.strip_prefix("~/") {
+        // `HOME` is unset on Windows; `USERPROFILE` is the equivalent. A
+        // forward slash joins fine there too, so the format is shared.
+        if let Some(home) = std::env::var_os("HOME")
+            .or_else(|| std::env::var_os("USERPROFILE"))
+            .and_then(|h| h.into_string().ok())
+        {
+            return format!("{home}/{rest}");
+        }
     }
     s.to_string()
 }
@@ -2200,6 +2207,37 @@ fn check_disk_space(required_bytes: u64, output_dir: &Path) -> Result<()> {
     Ok(())
 }
 
+/// Turn on VT escape processing for the console attached to stderr.
+///
+/// `style::*` writes ANSI escapes unconditionally. Modern Windows consoles
+/// understand them, but only once a process opts in — without this, a
+/// `conhost` session prints the raw `\x1b[1m` sequences instead of rendering
+/// them. Best-effort by design: when stderr is redirected to a file or a pipe
+/// there is no console mode to set, and the call simply fails and is ignored.
+#[cfg(windows)]
+fn enable_windows_ansi() {
+    use windows_sys::Win32::Foundation::INVALID_HANDLE_VALUE;
+    use windows_sys::Win32::System::Console::{
+        ENABLE_VIRTUAL_TERMINAL_PROCESSING, GetConsoleMode, GetStdHandle, STD_ERROR_HANDLE,
+        SetConsoleMode,
+    };
+
+    unsafe {
+        let handle = GetStdHandle(STD_ERROR_HANDLE);
+        if handle.is_null() || handle == INVALID_HANDLE_VALUE {
+            return;
+        }
+        let mut mode = 0u32;
+        if GetConsoleMode(handle, &mut mode) == 0 {
+            return;
+        }
+        SetConsoleMode(handle, mode | ENABLE_VIRTUAL_TERMINAL_PROCESSING);
+    }
+}
+
+#[cfg(not(windows))]
+fn enable_windows_ansi() {}
+
 /// Query available disk space via `statvfs`.
 #[cfg(unix)]
 fn available_space(path: &Path) -> Option<u64> {
@@ -2216,7 +2254,35 @@ fn available_space(path: &Path) -> Option<u64> {
     Some(stat.f_bavail as u64 * stat.f_frsize as u64)
 }
 
-#[cfg(not(unix))]
+/// Query available disk space via `GetDiskFreeSpaceExW`.
+///
+/// The Win32 call wants a directory path, and returns the quota-aware free
+/// space for the calling user rather than the raw volume free space — which
+/// is what the preflight actually wants to compare an output size against.
+#[cfg(windows)]
+fn available_space(path: &Path) -> Option<u64> {
+    use std::os::windows::ffi::OsStrExt;
+
+    // Wide, NUL-terminated. Reject interior NULs the same way CString does.
+    let mut wide: Vec<u16> = path.as_os_str().encode_wide().collect();
+    if wide.contains(&0) {
+        return None;
+    }
+    wide.push(0);
+
+    let mut free_to_caller: u64 = 0;
+    let ok = unsafe {
+        windows_sys::Win32::Storage::FileSystem::GetDiskFreeSpaceExW(
+            wide.as_ptr(),
+            &mut free_to_caller,
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+        )
+    };
+    (ok != 0).then_some(free_to_caller)
+}
+
+#[cfg(not(any(unix, windows)))]
 fn available_space(_path: &Path) -> Option<u64> {
     None
 }
@@ -2627,14 +2693,17 @@ mod tests {
 
     #[test]
     fn available_space_returns_some_for_real_path() {
-        let space = available_space(Path::new("/tmp"));
+        let space = available_space(&std::env::temp_dir());
         assert!(space.is_some());
         assert!(space.unwrap() > 0);
     }
 
     #[test]
     fn available_space_returns_none_for_nonexistent() {
-        let space = available_space(Path::new("/nonexistent/path/that/does/not/exist"));
+        // An absolute path on a volume that exists, but a directory that does
+        // not — so both statvfs and GetDiskFreeSpaceExW fail on the lookup.
+        let missing = std::env::temp_dir().join("sracha-nonexistent-abcdef123456");
+        let space = available_space(&missing);
         assert!(space.is_none());
     }
 }

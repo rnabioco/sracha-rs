@@ -64,6 +64,81 @@ pub fn jitter_ms(max: u64) -> u64 {
     nanos % max
 }
 
+/// Write `buf` in full at absolute byte `offset`, without relying on the
+/// file's cursor.
+///
+/// The parallel chunked downloader has many threads writing disjoint ranges of
+/// one shared handle at once, so every write must name its own offset. Unix
+/// gets that from `pwrite`; Windows from `WriteFile` with an explicit
+/// `OVERLAPPED` offset. Both are genuinely positional, so concurrent calls
+/// against a shared handle stay correct.
+///
+/// Windows' `seek_write` does move the handle's cursor as a side effect. That
+/// is harmless for the caller that matters: the download handle is opened
+/// write-only and touched exclusively through this function, so nothing reads
+/// the cursor back.
+#[cfg(unix)]
+pub fn write_all_at(file: &std::fs::File, buf: &[u8], offset: u64) -> std::io::Result<()> {
+    std::os::unix::fs::FileExt::write_all_at(file, buf, offset)
+}
+
+#[cfg(windows)]
+pub fn write_all_at(file: &std::fs::File, mut buf: &[u8], mut offset: u64) -> std::io::Result<()> {
+    // Windows has no `write_all_at`, and a short write is not an error there,
+    // so drive the loop the way std's Unix implementation does.
+    use std::os::windows::fs::FileExt;
+    while !buf.is_empty() {
+        match file.seek_write(buf, offset) {
+            Ok(0) => {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::WriteZero,
+                    "failed to write whole buffer",
+                ));
+            }
+            Ok(n) => {
+                buf = &buf[n..];
+                offset += n as u64;
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {}
+            Err(e) => return Err(e),
+        }
+    }
+    Ok(())
+}
+
+/// Fill `buf` from absolute byte `offset`, without relying on the file's
+/// cursor. The read counterpart of [`write_all_at`].
+#[cfg(unix)]
+pub fn read_exact_at(file: &std::fs::File, buf: &mut [u8], offset: u64) -> std::io::Result<()> {
+    std::os::unix::fs::FileExt::read_exact_at(file, buf, offset)
+}
+
+#[cfg(windows)]
+pub fn read_exact_at(
+    file: &std::fs::File,
+    mut buf: &mut [u8],
+    mut offset: u64,
+) -> std::io::Result<()> {
+    use std::os::windows::fs::FileExt;
+    while !buf.is_empty() {
+        match file.seek_read(buf, offset) {
+            Ok(0) => {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::UnexpectedEof,
+                    "failed to fill whole buffer",
+                ));
+            }
+            Ok(n) => {
+                buf = &mut buf[n..];
+                offset += n as u64;
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {}
+            Err(e) => return Err(e),
+        }
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -127,5 +202,46 @@ mod tests {
         assert_eq!(format_bases(1_500), "1.5 Kbp");
         assert_eq!(format_bases(2_500_000), "2.50 Mbp");
         assert_eq!(format_bases(3_000_000_000), "3.00 Gbp");
+    }
+
+    // positional I/O shim
+
+    #[test]
+    fn positional_io_round_trip() {
+        use std::io::Write;
+
+        let mut tmp = tempfile::NamedTempFile::new().unwrap();
+        tmp.write_all(&[0u8; 64]).unwrap();
+        tmp.flush().unwrap();
+
+        let file = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(tmp.path())
+            .unwrap();
+
+        // Write two disjoint ranges out of order, as the chunked downloader does.
+        write_all_at(&file, b"world", 32).unwrap();
+        write_all_at(&file, b"hello", 8).unwrap();
+
+        let mut buf = [0u8; 5];
+        read_exact_at(&file, &mut buf, 8).unwrap();
+        assert_eq!(&buf, b"hello");
+        read_exact_at(&file, &mut buf, 32).unwrap();
+        assert_eq!(&buf, b"world");
+
+        // Untouched bytes stay zero: nothing was written at the cursor.
+        let mut head = [0xffu8; 8];
+        read_exact_at(&file, &mut head, 0).unwrap();
+        assert_eq!(head, [0u8; 8]);
+    }
+
+    #[test]
+    fn read_exact_at_past_eof_errors() {
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        let file = std::fs::File::open(tmp.path()).unwrap();
+        let mut buf = [0u8; 4];
+        let err = read_exact_at(&file, &mut buf, 0).unwrap_err();
+        assert_eq!(err.kind(), std::io::ErrorKind::UnexpectedEof);
     }
 }

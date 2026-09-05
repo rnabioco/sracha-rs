@@ -41,6 +41,15 @@ jobs:
             suffix: -v3
           - target: aarch64-apple-darwin
             os: macos-latest
+          # Windows ships one baseline binary rather than the v2/v3 pair: the
+          # Windows audience for this tool is small enough that a second
+          # artifact is more of a "which do I pick?" tax than a speedup.
+          # crt-static keeps the promise the README makes for every other
+          # target — one file, no runtime to install (MSVC otherwise links the
+          # CRT dynamically and the exe needs VCRUNTIME140.dll).
+          - target: x86_64-pc-windows-msvc
+            os: windows-latest
+            extra_rustflags: -C target-feature=+crt-static
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v7
@@ -67,6 +76,15 @@ jobs:
         if: matrix.target == 'aarch64-unknown-linux-musl'
         run: cargo install cross --git https://github.com/cross-rs/cross --locked
 
+      - name: Install NASM (Windows)
+        if: runner.os == 'Windows'
+        # reqwest's `rustls` feature pins the aws-lc-rs crypto provider, and
+        # aws-lc-sys assembles its x86_64 routines with NASM, which the runner
+        # image does not carry (it does have the CMake that build also wants).
+        run: |
+          choco install nasm -y --no-progress
+          echo "C:\Program Files\NASM" >> $env:GITHUB_PATH
+
       - name: Build (cross)
         if: matrix.target == 'aarch64-unknown-linux-musl'
         run: cross build --release --target ${{ matrix.target }}
@@ -74,23 +92,33 @@ jobs:
       - name: Build (native)
         if: matrix.target != 'aarch64-unknown-linux-musl'
         env:
-          # Empty for ARM (no cpu set); raises the ISA floor for x86 variants.
-          RUSTFLAGS: ${{ matrix.cpu && format('-C target-cpu={0}', matrix.cpu) || '' }}
+          # Empty for ARM (no cpu set); raises the ISA floor for x86 variants;
+          # appends whatever a target asks for on top (Windows: static CRT).
+          RUSTFLAGS: ${{ format('{0} {1}', matrix.cpu && format('-C target-cpu={0}', matrix.cpu) || '', matrix.extra_rustflags || '') }}
         run: cargo build --release --target ${{ matrix.target }}
 
       - name: Package
         shell: bash
         run: |
           version="${GITHUB_REF_NAME#v}"
+          name="sracha-${version}-${{ matrix.target }}${{ matrix.suffix }}"
           cd target/${{ matrix.target }}/release
-          tar czf ../../../sracha-${version}-${{ matrix.target }}${{ matrix.suffix }}.tar.gz sracha
+          if [ -f sracha.exe ]; then
+            # Explorer opens a .zip natively; a .tar.gz would send Windows
+            # users looking for a third-party extractor.
+            7z a "../../../${name}.zip" sracha.exe
+          else
+            tar czf "../../../${name}.tar.gz" sracha
+          fi
           cd ../../..
 
       - name: Upload artifact
         uses: actions/upload-artifact@v7
         with:
           name: sracha-${{ github.ref_name }}-${{ matrix.target }}${{ matrix.suffix }}
-          path: sracha-*-${{ matrix.target }}${{ matrix.suffix }}.tar.gz
+          path: |
+            sracha-*-${{ matrix.target }}${{ matrix.suffix }}.tar.gz
+            sracha-*-${{ matrix.target }}${{ matrix.suffix }}.zip
 
   release:
     name: Create Release
@@ -118,4 +146,6 @@ jobs:
         uses: softprops/action-gh-release@v3
         with:
           body_path: release_notes.md
-          files: artifacts/**/*.tar.gz
+          files: |
+            artifacts/**/*.tar.gz
+            artifacts/**/*.zip

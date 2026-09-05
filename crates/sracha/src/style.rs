@@ -1,4 +1,9 @@
 //! Centralized styling for CLI output.
+//!
+//! These color unconditionally. They are called from both `println!` (the
+//! `info` report tables) and `eprintln!` (progress and diagnostics), so there
+//! is no single stream to test here. `enable_windows_ansi` in `main.rs` makes
+//! sure the escapes render rather than print raw on a Windows console.
 
 use owo_colors::OwoColorize;
 use std::fmt::Display;
