@@ -3,20 +3,17 @@ name: CI
 on:
   push:
     branches: [main]
-    # Kept in sync with the pull_request list below by hand: GitHub Actions'
-    # workflow parser rejects YAML anchors, so the two cannot share one node.
     paths-ignore:
       - "**/*.md"
       - "docs/**"
       - "zensical.toml"
       - ".github/workflows/docs.yml"
+  # Deliberately unfiltered, unlike the push trigger above. `CI Status` is a
+  # required check on main, and a required check that never runs leaves a PR
+  # blocked on a report that will never arrive — which would strand every
+  # docs-only PR, the weekly bioconda-sync bot's included.
   pull_request:
     branches: [main]
-    paths-ignore:
-      - "**/*.md"
-      - "docs/**"
-      - "zensical.toml"
-      - ".github/workflows/docs.yml"
 
 concurrency:
   # Supersede a PR's in-flight run when it is pushed again. Pushes to main are
@@ -208,3 +205,31 @@ jobs:
           save-if: ${{ github.ref == 'refs/heads/main' }}
       - name: Check MSRV
         run: cargo check --all-targets
+
+  ci-status:
+    # The one required check on main. Naming a single aggregate here rather
+    # than each matrix leg means adding or renaming a platform never silently
+    # drops a requirement (a required check that no longer exists blocks
+    # everything) or leaves a new one ungated.
+    #
+    # `integration` and `coverage` are watched but not gated: the integration
+    # suite downloads real archives from NCBI, so making it blocking would let
+    # an NCBI outage stop all merges. They still run, and still report.
+    name: CI Status
+    if: always()
+    needs: [check, test, msrv, integration, coverage]
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check gating jobs
+        env:
+          RESULTS: ${{ needs.check.result }} ${{ needs.test.result }} ${{ needs.msrv.result }}
+        run: |
+          echo "check/test/msrv: $RESULTS"
+          echo "integration: ${{ needs.integration.result }} (not gating)"
+          echo "coverage:    ${{ needs.coverage.result }} (not gating)"
+          for r in $RESULTS; do
+            case "$r" in
+              success|skipped) ;;
+              *) echo "::error::a gating job did not pass ($r)"; exit 1 ;;
+            esac
+          done
