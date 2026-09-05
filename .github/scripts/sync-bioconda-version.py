@@ -15,6 +15,13 @@ Two independent sources, because they can legitimately disagree:
   * the `conda` directive pin comes from anaconda.org, which is the package
     that `conda`/`pixi` would actually resolve.
 
+The Anaconda badges are rewritten too, for a different reason: they render the
+current version by themselves, but GitHub serves README images through its
+camo proxy, which caches them long past a release. The `?v=` on those URLs is
+a cache-buster with no meaning to anaconda.org, so flipping it is what makes
+the badge re-fetch. It is flipped only when a pin actually moved, so a
+no-change week still produces no diff and no PR.
+
 Usage:
     sync-bioconda-version.py            # rewrite the files in place
     sync-bioconda-version.py --check    # exit 1 if anything is out of date
@@ -44,6 +51,24 @@ ANACONDA_PKG = "https://api.anaconda.org/package/bioconda/sracha"
 CONTAINER_TAG_RE = re.compile(r"(?<=sracha:)(\d[\d.]*)--([A-Za-z0-9_]+)")
 # `conda 'bioconda::sracha=0.3.11'`
 CONDA_PIN_RE = re.compile(r"(?<=bioconda::sracha=)(\d[\d.]*)")
+# `anaconda.org/bioconda/sracha/badges/version.svg?v=1`, with the query string
+# optional — a badge that has never been flipped does not carry one yet.
+BADGE_RE = re.compile(r"(anaconda\.org/bioconda/sracha/badges/\w+\.svg)(?:\?v=(\d+))?")
+
+
+def flip_badge_cache_busters(text: str) -> str:
+    """Toggle every Anaconda badge URL's `?v=` between 1 and 2.
+
+    The value itself is meaningless; only the change matters, because that is
+    what makes GitHub's camo proxy treat it as a new image and fetch it again.
+    Alternating between two values keeps the URL from growing forever.
+    """
+
+    def flip(match: re.Match) -> str:
+        url, current = match.group(1), match.group(2)
+        return f"{url}?v={2 if current == '1' else 1}"
+
+    return BADGE_RE.sub(flip, text)
 
 
 def fetch_json(url: str) -> dict:
@@ -105,7 +130,9 @@ def main() -> int:
             continue
         stale.append(relative)
         if not args.check:
-            path.write_text(updated)
+            # Only after a pin moved: --check stays a question about pins, and
+            # flipping unconditionally would open an empty PR every week.
+            path.write_text(flip_badge_cache_busters(updated))
 
     if not stale:
         print("pins are up to date")
