@@ -1,6 +1,6 @@
 # 🌶️ sracha 🌶️
 
-[![Anaconda-Server Badge](https://anaconda.org/bioconda/sracha/badges/version.svg?v=1)](https://anaconda.org/bioconda/sracha) [![Anaconda-Server Badge](https://anaconda.org/bioconda/sracha/badges/downloads.svg?v=1)](https://anaconda.org/bioconda/sracha)
+[![Anaconda-Server Badge](https://anaconda.org/bioconda/sracha/badges/version.svg?v=2)](https://anaconda.org/bioconda/sracha) [![Anaconda-Server Badge](https://anaconda.org/bioconda/sracha/badges/downloads.svg?v=2)](https://anaconda.org/bioconda/sracha)
 
 Fast SRA downloader and FASTQ converter, written in pure Rust.
 
@@ -150,11 +150,11 @@ local build required.
 
 ```bash
 # Docker / Podman
-docker run --rm quay.io/biocontainers/sracha:0.6.0--h54198d6_0 sracha --help
+docker run --rm quay.io/biocontainers/sracha:0.7.0--h54198d6_0 sracha --help
 
 # Singularity / Apptainer
 singularity run \
-  https://depot.galaxyproject.org/singularity/sracha:0.6.0--h54198d6_0 sracha --help
+  https://depot.galaxyproject.org/singularity/sracha:0.7.0--h54198d6_0 sracha --help
 ```
 
 These tags track the current Bioconda release and are refreshed weekly by a
