@@ -306,6 +306,92 @@ pub fn qual4_decode(src: &[u8], dcount: usize, qmin: i8, qmax: i8) -> Result<Vec
 /// the iZip probe — that closes the path behind issue #30, where SRA-Lite
 /// quality blobs were read as iZip with arbitrary `data_count` values.
 pub fn decode_quality_encoding(decoded: &blob::DecodedBlob<'_>) -> Result<Vec<u8>> {
+    let mut q = decode_quality_payload(decoded)?;
+    if let Some(frame) = delta_average_frame(decoded) {
+        undelta_average(&mut q, frame, decoded.page_map.as_ref(), decoded.row_length)?;
+    }
+    Ok(q)
+}
+
+/// The `delta_average` frame of a blob header stack, when it carries one.
+///
+/// `NCBI:tbl:phred_quality` stores `.QUALITY` as
+/// `delta_average_zip_encoding#1`: the encoder replaces each byte with
+/// `avg[position_in_row] - byte`, then deflates. The stack is therefore
+/// `zip` first and the `delta_average` frame second — version 1, args
+/// `[max_row_bytes, elem_bytes]`, one op per row position holding that
+/// position's modal value (delta_average.c `VBlobCreateEncode`). A frame with
+/// `max_row_bytes == 0` means the encoder skipped the transform (too few rows,
+/// or long rows) and the data is already plain.
+fn delta_average_frame<'a>(
+    decoded: &'a blob::DecodedBlob<'_>,
+) -> Option<&'a blob::BlobHeaderFrame> {
+    decoded
+        .headers
+        .get(1)
+        .filter(|h| h.version == 1 && h.args.len() == 2 && h.args[0] > 0)
+}
+
+/// Invert `delta_average` in place (delta_average.c `undelta_average`).
+///
+/// Walks the stored rows — rows the page map deduplicates are stored once, so
+/// each stored row is visited once — and sets `byte = avg[position] - byte`
+/// with the position restarting at every row.
+fn undelta_average(
+    data: &mut [u8],
+    frame: &blob::BlobHeaderFrame,
+    page_map: Option<&blob::PageMap>,
+    row_length: Option<u64>,
+) -> Result<()> {
+    let max_row_bytes = frame.args[0] as usize;
+    let elem_bytes = frame.args[1] as usize;
+    if frame.ops.len() != max_row_bytes || elem_bytes == 0 {
+        return Err(Error::Format(format!(
+            "delta_average: header has {} averages for {} row bytes (elem_bytes {})",
+            frame.ops.len(),
+            max_row_bytes,
+            elem_bytes
+        )));
+    }
+    let avg = &frame.ops;
+    let apply = |data: &mut [u8], start: usize, len: usize| -> Result<()> {
+        let end = start
+            .checked_add(len)
+            .filter(|&e| e <= data.len() && len <= max_row_bytes)
+            .ok_or_else(|| Error::Format("delta_average: row exceeds blob data".into()))?;
+        for (a, b) in avg.iter().zip(data[start..end].iter_mut()) {
+            *b = a.wrapping_sub(*b);
+        }
+        Ok(())
+    };
+    match page_map {
+        Some(pm) => {
+            // Rows the writer deduplicated share a start offset; restore each
+            // stored row once. Identity maps have no sharing.
+            let dedupe = !pm.mapping.is_identity();
+            let mut seen = std::collections::HashSet::new();
+            for e in pm.row_extents()? {
+                let (start, len) = (e.offset as usize * elem_bytes, e.len as usize * elem_bytes);
+                if len == 0 || (dedupe && !seen.insert(start)) {
+                    continue;
+                }
+                apply(data, start, len)?;
+            }
+        }
+        None => {
+            let row = row_length.map_or(data.len(), |r| r as usize * elem_bytes);
+            if row > 0 {
+                for start in (0..data.len()).step_by(row) {
+                    let len = row.min(data.len() - start);
+                    apply(data, start, len)?;
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+fn decode_quality_payload(decoded: &blob::DecodedBlob<'_>) -> Result<Vec<u8>> {
     if decoded.data.is_empty() {
         return decode_zip_encoding(decoded);
     }
@@ -374,7 +460,7 @@ pub fn decode_quality_encoding(decoded: &blob::DecodedBlob<'_>) -> Result<Vec<u8
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::blob::{DecodedBlob, PageMap, RowMapping};
+    use crate::blob::{BlobHeaderFrame, DecodedBlob, PageMap, RowMapping};
     use std::borrow::Cow;
 
     /// Build a minimal v1 blob: header byte with rls=3 (implicit row_length=1),
@@ -571,6 +657,51 @@ mod tests {
         };
         let got = decode_irzip_column(&decoded).expect("passthrough must succeed");
         assert_eq!(got, raw);
+    }
+
+    #[test]
+    fn undelta_average_restores_each_row_position() {
+        // Two stored rows of 3 bytes: avg - byte at each position.
+        let frame = BlobHeaderFrame {
+            version: 1,
+            ops: vec![40, 30, 20],
+            args: vec![3, 1],
+            ..Default::default()
+        };
+        let mut data = vec![1, 2, 3, 40, 0, 20];
+        undelta_average(&mut data, &frame, None, Some(3)).unwrap();
+        assert_eq!(data, vec![39, 28, 17, 0, 30, 0]);
+    }
+
+    #[test]
+    fn undelta_average_restores_shared_rows_once() {
+        // Rows 0 and 1 share data record 0; row 2 is record 1.
+        let frame = BlobHeaderFrame {
+            version: 1,
+            ops: vec![10, 10],
+            args: vec![2, 1],
+            ..Default::default()
+        };
+        let pm = PageMap {
+            data_recs: 2,
+            lengths: vec![2],
+            leng_runs: vec![3],
+            mapping: RowMapping::RepeatCounts(vec![2, 1]),
+        };
+        let mut data = vec![1, 2, 3, 4];
+        undelta_average(&mut data, &frame, Some(&pm), None).unwrap();
+        assert_eq!(data, vec![9, 8, 7, 6]);
+    }
+
+    #[test]
+    fn undelta_average_rejects_short_average_table() {
+        let frame = BlobHeaderFrame {
+            version: 1,
+            ops: vec![1],
+            args: vec![2, 1],
+            ..Default::default()
+        };
+        assert!(undelta_average(&mut [0, 0], &frame, None, Some(2)).is_err());
     }
 
     #[test]
