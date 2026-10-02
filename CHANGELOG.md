@@ -1,5 +1,16 @@
 # Changelog
 
+## 0.7.1 (2026-10-02)
+
+### Fixes
+
+- QUALITY columns written with `delta_average_zip_encoding` (runs loaded by
+  `fastq-load` 2.2.x, e.g. ERR324296) were inflated but never un-deltaed, so
+  quality strings came out as garbage and the integrity check failed with
+  `quality_invalid_bytes`. The per-position average is now restored ([#156]).
+
+[#156]: https://github.com/rnabioco/sracha-rs/issues/156
+
 ## 0.7.0 (2026-09-05)
 
 ### Features
