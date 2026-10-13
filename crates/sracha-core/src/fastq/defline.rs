@@ -74,6 +74,16 @@ impl DeflineTemplate {
             .strip_prefix('@')
             .or_else(|| s.strip_prefix('>'))
             .unwrap_or(s);
+        Self::compile(body, s, "--seq-defline")
+    }
+
+    /// Compile a `--qual-defline` template string. A single leading `+` is
+    /// stripped (the formatter re-adds it), so `+` alone yields a bare `+` line.
+    pub fn parse_qual(s: &str) -> Result<Self, String> {
+        Self::compile(s.strip_prefix('+').unwrap_or(s), s, "--qual-defline")
+    }
+
+    fn compile(body: &str, s: &str, flag: &str) -> Result<Self, String> {
         let bytes = body.as_bytes();
 
         let mut tokens: Vec<DeflineToken> = Vec::new();
@@ -103,7 +113,7 @@ impl DeflineTemplate {
                 b"rl" => DeflineVar::ReadLen,
                 b"sg" => {
                     return Err(format!(
-                        "spot-group ($sg) is not supported in --seq-defline; {SUPPORTED}"
+                        "spot-group ($sg) is not supported in {flag}; {SUPPORTED}"
                     ));
                 }
                 other => {
@@ -157,6 +167,34 @@ impl DeflineTemplate {
     }
 }
 
+/// Spot/read identity needed to expand a `--qual-defline` template on the
+/// default (non-templated) FASTQ path.
+#[derive(Clone, Copy)]
+pub struct QualLine<'a> {
+    pub template: &'a DeflineTemplate,
+    pub spot_id: &'a [u8],
+    pub read_id: u32,
+}
+
+impl QualLine<'_> {
+    pub(super) fn append(
+        &self,
+        out: &mut Vec<u8>,
+        run_name: &str,
+        spot_name: Option<&[u8]>,
+        read_len: usize,
+    ) {
+        self.template.append_body(
+            out,
+            run_name,
+            self.spot_id,
+            self.read_id,
+            spot_name,
+            read_len,
+        );
+    }
+}
+
 const SUPPORTED: &str = "supported variables: $ac (accession) $si (spot id) \
                          $ri (read id) $sn (spot name) $rl (read length), \
                          and $$ for a literal '$'";
@@ -178,6 +216,7 @@ pub fn append_record_templated(
     spot_name: Option<&[u8]>,
     sequence: &[u8],
     quality: &[u8],
+    qual_template: Option<&DeflineTemplate>,
     diag: Option<&IntegrityDiag>,
 ) {
     let len = sequence.len();
@@ -195,9 +234,14 @@ pub fn append_record_templated(
         return;
     }
 
-    // `+` line repeats the defline body (sracha convention). Single memcpy.
+    // `+` line repeats the defline body (sracha convention, single memcpy)
+    // unless `--qual-defline` supplies its own template.
     out.push(b'+');
-    out.extend_from_within(body_start..body_end);
+    if let Some(q) = qual_template {
+        q.append_body(out, run_name, spot_id, read_id, spot_name, len);
+    } else {
+        out.extend_from_within(body_start..body_end);
+    }
     out.push(b'\n');
 
     let quality = super::repair_quality(quality, len, diag);
@@ -277,7 +321,7 @@ mod tests {
         let t = DeflineTemplate::parse("@$ac.$si.$ri").unwrap();
         let mut out = Vec::new();
         append_record_templated(
-            &mut out, &t, false, "SRR1", b"7", 2, None, b"ACGT", b"IIII", None,
+            &mut out, &t, false, "SRR1", b"7", 2, None, b"ACGT", b"IIII", None, None,
         );
         assert_eq!(
             String::from_utf8(out).unwrap(),
@@ -290,8 +334,83 @@ mod tests {
         let t = DeflineTemplate::parse("@$ac.$si.$ri").unwrap();
         let mut out = Vec::new();
         append_record_templated(
-            &mut out, &t, true, "SRR1", b"7", 2, None, b"ACGT", b"", None,
+            &mut out, &t, true, "SRR1", b"7", 2, None, b"ACGT", b"", None, None,
         );
         assert_eq!(String::from_utf8(out).unwrap(), ">SRR1.7.2\nACGT\n");
+    }
+
+    #[test]
+    fn qual_defline_plus_alone_is_bare() {
+        let q = DeflineTemplate::parse_qual("+").unwrap();
+        let t = DeflineTemplate::parse("@$ac.$si.$ri").unwrap();
+        let mut out = Vec::new();
+        append_record_templated(
+            &mut out,
+            &t,
+            false,
+            "SRR1",
+            b"7",
+            2,
+            None,
+            b"ACGT",
+            b"IIII",
+            Some(&q),
+            None,
+        );
+        assert_eq!(
+            String::from_utf8(out).unwrap(),
+            "@SRR1.7.2\nACGT\n+\nIIII\n"
+        );
+    }
+
+    #[test]
+    fn qual_defline_template_expands() {
+        let q = DeflineTemplate::parse_qual("+$ac.$si").unwrap();
+        let t = DeflineTemplate::parse("$si/$ri").unwrap();
+        let mut out = Vec::new();
+        append_record_templated(
+            &mut out,
+            &t,
+            false,
+            "SRR1",
+            b"7",
+            2,
+            None,
+            b"ACGT",
+            b"IIII",
+            Some(&q),
+            None,
+        );
+        assert_eq!(
+            String::from_utf8(out).unwrap(),
+            "@7/2\nACGT\n+SRR1.7\nIIII\n"
+        );
+    }
+
+    #[test]
+    fn qual_defline_ignored_for_fasta() {
+        let q = DeflineTemplate::parse_qual("+").unwrap();
+        let t = DeflineTemplate::parse("$si").unwrap();
+        let mut out = Vec::new();
+        append_record_templated(
+            &mut out,
+            &t,
+            true,
+            "SRR1",
+            b"7",
+            1,
+            None,
+            b"ACGT",
+            b"",
+            Some(&q),
+            None,
+        );
+        assert_eq!(String::from_utf8(out).unwrap(), ">7\nACGT\n");
+    }
+
+    #[test]
+    fn parse_qual_rejects_spot_group() {
+        let err = DeflineTemplate::parse_qual("+$sg").unwrap_err();
+        assert!(err.contains("--qual-defline"), "{err}");
     }
 }

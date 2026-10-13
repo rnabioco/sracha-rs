@@ -516,6 +516,7 @@ fn decode_and_write(
         fasta: config.fasta,
         paired_suffix: config.paired_suffix,
         seq_defline: config.seq_defline.clone(),
+        qual_defline: config.qual_defline.clone(),
     };
 
     // Create output directory (not needed for stdout mode).
@@ -1458,6 +1459,7 @@ fn run_fastq_csra(
         fasta: config.fasta,
         paired_suffix: config.paired_suffix,
         seq_defline: config.seq_defline.clone(),
+        qual_defline: config.qual_defline.clone(),
     };
 
     if !config.stdout {
@@ -2425,6 +2427,7 @@ mod tests {
             keep_sra: false,
             paired_suffix: crate::fastq::PairedSuffix::Numeric,
             seq_defline: None,
+            qual_defline: None,
             folder_per_accession: false,
             metadata: Some(metadata),
             metadata_url: None,

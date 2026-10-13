@@ -1458,6 +1458,7 @@ pub(crate) fn decode_blob_to_fastq(
                             original_name,
                             seq,
                             qual,
+                            config.qual_defline.as_ref(),
                             Some(diag),
                         );
                     } else if config.fasta {
@@ -1471,6 +1472,14 @@ pub(crate) fn decode_blob_to_fastq(
                             desc,
                             seq,
                             qual,
+                            config
+                                .qual_defline
+                                .as_ref()
+                                .map(|template| crate::fastq::QualLine {
+                                    template,
+                                    spot_id: spot_number,
+                                    read_id: seg.mate_idx,
+                                }),
                             Some(diag),
                         );
                     }

@@ -1,5 +1,14 @@
 # Changelog
 
+## Unreleased
+
+### Features
+
+- `sracha {get,fastq} --qual-defline <TEMPLATE>` sets the FASTQ `+` line
+  independently of `--seq-defline` (e.g. `+` for a bare `+`) ([#162]).
+
+[#162]: https://github.com/rnabioco/sracha-rs/issues/162
+
 ## 0.7.1 (2026-10-02)
 
 ### Fixes

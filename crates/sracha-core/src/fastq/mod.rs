@@ -9,7 +9,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 mod defline;
 pub use defline::DeflineTemplate;
-pub(crate) use defline::append_record_templated;
+pub(crate) use defline::{QualLine, append_record_templated};
 
 /// Bins in the decoded-quality histogram — one per possible raw Phred byte,
 /// matching ncbi-vdb's `MAX_QUALITY` and therefore the shape of the loader's
@@ -275,6 +275,9 @@ pub struct FastqConfig {
     /// the split-spot/interleaved `<spot>/<mate>` labeling is bypassed (the
     /// template's `$ri` distinguishes mates instead).
     pub seq_defline: Option<DeflineTemplate>,
+    /// Optional custom `+`-line template (`--qual-defline`). `None` mirrors
+    /// the sequence defline. Ignored for FASTA output.
+    pub qual_defline: Option<DeflineTemplate>,
 }
 
 impl Default for FastqConfig {
@@ -286,6 +289,7 @@ impl Default for FastqConfig {
             fasta: false,
             paired_suffix: PairedSuffix::Numeric,
             seq_defline: None,
+            qual_defline: None,
         }
     }
 }
@@ -385,6 +389,7 @@ pub fn format_read_with_diag(
         original_name,
         sequence,
         quality,
+        None,
         diag,
     );
     FastqRecord { data }
@@ -397,6 +402,7 @@ pub fn format_read_with_diag(
 /// once and copied to the `+` line via [`Vec::extend_from_within`], saving
 /// one round of `itoa` + string concatenation per record.
 #[inline]
+#[allow(clippy::too_many_arguments)]
 pub fn append_fastq_record(
     out: &mut Vec<u8>,
     run_name: &str,
@@ -404,6 +410,7 @@ pub fn append_fastq_record(
     original_name: Option<&[u8]>,
     sequence: &[u8],
     quality: &[u8],
+    qual_line: Option<QualLine<'_>>,
     diag: Option<&IntegrityDiag>,
 ) {
     let len = sequence.len();
@@ -426,9 +433,14 @@ pub fn append_fastq_record(
     out.extend_from_slice(sequence);
     out.push(b'\n');
 
-    // + line repeats defline. Single intra-Vec memcpy, no re-formatting.
+    // + line repeats defline (single intra-Vec memcpy, no re-formatting)
+    // unless `--qual-defline` supplies its own template.
     out.push(b'+');
-    out.extend_from_within(body_start..body_end);
+    if let Some(q) = qual_line {
+        q.append(out, run_name, original_name, len);
+    } else {
+        out.extend_from_within(body_start..body_end);
+    }
     out.push(b'\n');
 
     out.extend_from_slice(&quality);
@@ -775,17 +787,27 @@ fn route_segments_to_slots(
                 Some(spot_name),
                 seg.sequence,
                 seg.quality,
+                config.qual_defline.as_ref(),
                 None,
             );
             FastqRecord { data }
         } else {
-            format_read(
+            let mut data = Vec::new();
+            append_fastq_record(
+                &mut data,
                 run_name,
                 spot_name,
                 Some(spot_name),
                 seg.sequence,
                 seg.quality,
-            )
+                config.qual_defline.as_ref().map(|template| QualLine {
+                    template,
+                    spot_id: spot_name,
+                    read_id: seg.mate_idx,
+                }),
+                None,
+            );
+            FastqRecord { data }
         }
     };
 
@@ -2017,6 +2039,51 @@ mod tests {
         assert_eq!(config.split_mode, SplitMode::Split3);
         assert!(config.skip_technical);
         assert!(config.min_read_len.is_none());
+    }
+
+    #[test]
+    fn qual_defline_on_default_defline_path() {
+        let q = DeflineTemplate::parse_qual("+").unwrap();
+        let mut out = Vec::new();
+        append_fastq_record(
+            &mut out,
+            "RUN",
+            b"1/2",
+            None,
+            b"ACGT",
+            b"IIII",
+            Some(QualLine {
+                template: &q,
+                spot_id: b"1",
+                read_id: 2,
+            }),
+            None,
+        );
+        assert_eq!(
+            String::from_utf8(out).unwrap(),
+            "@RUN.1/2 length=4\nACGT\n+\nIIII\n"
+        );
+
+        let q = DeflineTemplate::parse_qual("+$ac.$si.$ri").unwrap();
+        let mut out = Vec::new();
+        append_fastq_record(
+            &mut out,
+            "RUN",
+            b"1/2",
+            None,
+            b"ACGT",
+            b"IIII",
+            Some(QualLine {
+                template: &q,
+                spot_id: b"1",
+                read_id: 2,
+            }),
+            None,
+        );
+        assert_eq!(
+            String::from_utf8(out).unwrap(),
+            "@RUN.1/2 length=4\nACGT\n+RUN.1.2\nIIII\n"
+        );
     }
 
     // -----------------------------------------------------------------------
