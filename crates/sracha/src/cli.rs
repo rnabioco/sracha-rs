@@ -291,6 +291,17 @@ pub struct FastqArgs {
     )]
     pub seq_defline: Option<fastq::DeflineTemplate>,
 
+    /// Custom template for the '+' line (same variables as --seq-defline).
+    /// A leading '+' is optional; '+' alone writes a bare '+' line.
+    /// Default: mirror --seq-defline. Ignored with --fasta.
+    #[arg(
+        long,
+        value_name = "TEMPLATE",
+        help_heading = "Output",
+        value_parser = fastq::DeflineTemplate::parse_qual,
+    )]
+    pub qual_defline: Option<fastq::DeflineTemplate>,
+
     /// Overwrite existing files
     #[arg(short, long, help_heading = "Output")]
     pub force: bool,
@@ -423,6 +434,17 @@ pub struct GetArgs {
         value_parser = fastq::DeflineTemplate::parse,
     )]
     pub seq_defline: Option<fastq::DeflineTemplate>,
+
+    /// Custom template for the '+' line (same variables as --seq-defline).
+    /// A leading '+' is optional; '+' alone writes a bare '+' line.
+    /// Default: mirror --seq-defline. Ignored with --fasta.
+    #[arg(
+        long,
+        value_name = "TEMPLATE",
+        help_heading = "Output",
+        value_parser = fastq::DeflineTemplate::parse_qual,
+    )]
+    pub qual_defline: Option<fastq::DeflineTemplate>,
 
     /// Overwrite existing files
     #[arg(short, long, help_heading = "Output")]

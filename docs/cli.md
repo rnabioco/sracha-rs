@@ -74,6 +74,7 @@ sracha get [OPTIONS] [ACCESSION]...
 | `--paired-suffix <STYLE>` | `numeric` | Suffix style for paired/split FASTQ outputs: `numeric` (`_1`/`_2`, matches fasterq-dump and ENA) or `r` (`_R1`/`_R2`, matches Illumina BCL output) |
 | `--fasta` | | Output FASTA instead of FASTQ (drops quality scores) |
 | `--seq-defline <TEMPLATE>` | | Custom defline template, fasterq-dump `--seq-defline` syntax (see [Custom deflines](#custom-deflines)) |
+| `--qual-defline <TEMPLATE>` | | Custom `+`-line template, same variables as `--seq-defline`; `+` alone writes a bare `+` ([#162](https://github.com/rnabioco/sracha-rs/issues/162)) |
 | `--min-read-len <N>` | | Minimum read length filter |
 | `--include-technical` | | Include technical reads (skipped by default) |
 | `--metadata <FORMAT>` | | Write a `<accession>.metadata.{tsv,json}` sidecar alongside each FASTQ output, capturing BioSample/SAMN, Sample/SRS, BioProject, library strategy/source/selection/layout, instrument, experiment, study, scientific name, tax id, bases, and release dates from the EUtils RunInfo CSV. Values: `tsv`, `json`, `both` |
@@ -172,6 +173,7 @@ sracha fastq [OPTIONS] <INPUT>...
 | `--paired-suffix <STYLE>` | `numeric` | Suffix style for paired/split FASTQ outputs: `numeric` (`_1`/`_2`, matches fasterq-dump and ENA) or `r` (`_R1`/`_R2`, matches Illumina BCL output) |
 | `--fasta` | | Output FASTA instead of FASTQ (drops quality scores) |
 | `--seq-defline <TEMPLATE>` | | Custom defline template, fasterq-dump `--seq-defline` syntax (see [Custom deflines](#custom-deflines)) |
+| `--qual-defline <TEMPLATE>` | | Custom `+`-line template, same variables as `--seq-defline`; `+` alone writes a bare `+` ([#162](https://github.com/rnabioco/sracha-rs/issues/162)) |
 | `--min-read-len <N>` | | Minimum read length filter |
 | `--include-technical` | | Include technical reads (skipped by default) |
 | `-Z, --stdout` | | Write to stdout (implies `--no-progress`) |
@@ -424,8 +426,9 @@ Notes:
 
 - A leading `@` (or `>` for FASTA) is optional — it is stripped, and sracha adds
   the correct record prefix automatically.
-- The `+` (quality) line always mirrors the sequence defline. There is no
-  separate `--qual-defline`.
+- The `+` (quality) line mirrors the sequence defline unless `--qual-defline <TEMPLATE>`
+  is given. It takes the same variables; a leading `+` is optional and `+` alone
+  writes a bare `+` line. Ignored with `--fasta`.
 - When a template is given, the `split-spot`/`interleaved` modes do **not** add
   their implicit `<spot>/<mate>` suffix — use `$ri` in the template to
   distinguish mates instead.
@@ -452,7 +455,7 @@ How common `fasterq-dump` / `fastq-dump` options map to sracha:
 | `-M, --min-read-len <N>` | `--min-read-len <N>` | Same |
 | `-p, --progress` | (on by default) | Disable with `--no-progress` |
 | `-t, --temp <DIR>` | (automatic) | Temp files are managed internally |
-| `--qual-defline <FMT>` | *(unsupported)* | The `+` line mirrors `--seq-defline` |
+| `--qual-defline <FMT>` | `--qual-defline <FMT>` | Same variables as `--seq-defline`; `+` alone writes a bare `+` line |
 | `--rowid-as-name` | *(unsupported)* | Use `--seq-defline` with `$si` |
 | gzip via external pipe | `--gzip-level` / `--zstd` | Compression is built in (gzip on by default) |
 

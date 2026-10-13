@@ -67,6 +67,9 @@ pub struct PipelineConfig {
     /// Optional custom defline template (`--seq-defline`). `None` uses the
     /// built-in `{run}.{spot} {desc} length={len}` format.
     pub seq_defline: Option<crate::fastq::DeflineTemplate>,
+    /// Optional custom `+`-line template (`--qual-defline`). `None` mirrors
+    /// the sequence defline.
+    pub qual_defline: Option<crate::fastq::DeflineTemplate>,
     /// Place each accession's outputs (FASTQ + sidecars + temp SRA) inside
     /// its own subdirectory of `output_dir`, named after the accession.
     /// When `false`, all files land flat in `output_dir`.
@@ -159,6 +162,7 @@ mod tests {
             keep_sra: false,
             paired_suffix: crate::fastq::PairedSuffix::Numeric,
             seq_defline: None,
+            qual_defline: None,
             folder_per_accession,
             metadata: None,
             metadata_url: None,

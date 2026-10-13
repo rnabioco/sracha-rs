@@ -371,6 +371,7 @@ fn test_config(
         keep_sra: false,
         paired_suffix: sracha_core::fastq::PairedSuffix::Numeric,
         seq_defline: None,
+        qual_defline: None,
         folder_per_accession: false,
         metadata: None,
         metadata_url: None,
