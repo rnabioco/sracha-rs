@@ -18,10 +18,7 @@ use std::sync::atomic::Ordering;
 use itoa;
 
 use crate::error::Result;
-use crate::fastq::{
-    FastqConfig, IntegrityDiag, OutputSlot, QUALITY_HISTOGRAM_BINS, SplitMode, append_fasta_record,
-    append_fastq_record,
-};
+use crate::fastq::{FastqConfig, IntegrityDiag, OutputSlot, QUALITY_HISTOGRAM_BINS, SplitMode};
 
 use super::BlobSlotOutput;
 
@@ -1406,123 +1403,72 @@ pub(crate) fn decode_blob_to_fastq(
 
         if !segments.is_empty() {
             // Append a segment's formatted record to the slot's accumulated
-            // buffer, inserting a new slot on first use. `spot_label` is
-            // the `@RUN.<label>` field — interleaved/split-spot pass a
-            // `<spot>/<mate>` form for multi-read spots; other modes pass
-            // the bare spot number. `desc` is the second defline field
-            // (the original Illumina name when present, else the bare
-            // spot number — never the mate-suffixed label, which is why
-            // we accept it as an explicit parameter rather than letting
-            // `append_fastq_record` derive it from `spot_label`).
-            let mut emit =
-                |slot: OutputSlot, seg: &ReadSeg, spot_label: &[u8], desc: Option<&[u8]>| {
-                    let lut_idx = slot_lut_index(slot);
-                    let buf = if let Some(i) = lut_idx {
-                        slot_lut[i].get_or_insert_with(|| BlobSlotOutput {
-                            slot,
-                            bytes: Vec::with_capacity(per_slot_reserve),
-                            records: 0,
-                        })
-                    } else {
-                        // Overflow path for ReadN(n) where n exceeds the
-                        // LUT capacity — virtually impossible in practice
-                        // (SRA's max reads-per-spot is bounded by metadata),
-                        // but kept correct for forward compatibility.
-                        match slot_overflow.iter().position(|s| s.slot == slot) {
-                            Some(i) => &mut slot_overflow[i],
-                            None => {
-                                slot_overflow.push(BlobSlotOutput {
-                                    slot,
-                                    bytes: Vec::with_capacity(per_slot_reserve),
-                                    records: 0,
-                                });
-                                slot_overflow.last_mut().unwrap()
-                            }
+            // buffer, inserting a new slot on first use. Record rendering
+            // (FASTA/FASTQ, custom deflines, the `/MATE` suffix) is the
+            // shared `append_segment_record`, the same one the cSRA path
+            // uses, so the two cannot drift.
+            let style = crate::fastq::RecordStyle {
+                fasta: config.fasta,
+                seq_defline: config.seq_defline.as_ref(),
+                qual_defline: config.qual_defline.as_ref(),
+            };
+            let mut emit = |slot: OutputSlot, seg: &ReadSeg| {
+                let lut_idx = slot_lut_index(slot);
+                let buf = if let Some(i) = lut_idx {
+                    slot_lut[i].get_or_insert_with(|| BlobSlotOutput {
+                        slot,
+                        bytes: Vec::with_capacity(per_slot_reserve),
+                        records: 0,
+                    })
+                } else {
+                    // Overflow path for ReadN(n) where n exceeds the
+                    // LUT capacity — virtually impossible in practice
+                    // (SRA's max reads-per-spot is bounded by metadata),
+                    // but kept correct for forward compatibility.
+                    match slot_overflow.iter().position(|s| s.slot == slot) {
+                        Some(i) => &mut slot_overflow[i],
+                        None => {
+                            slot_overflow.push(BlobSlotOutput {
+                                slot,
+                                bytes: Vec::with_capacity(per_slot_reserve),
+                                records: 0,
+                            });
+                            slot_overflow.last_mut().unwrap()
                         }
-                    };
-                    let seq = &sequence[seg.start..seg.start + seg.len];
-                    if let Some(tmpl) = config.seq_defline.as_ref() {
-                        // Custom defline: feed the raw fields ($si = bare spot
-                        // number, $ri = read index) and let the template decide
-                        // layout — bypass the `<spot>/<mate>` label and forced
-                        // `desc` that the default split-spot/interleaved path
-                        // bakes into `spot_label`/`desc`.
-                        let qual = &quality[seg.start..seg.start + seg.len];
-                        crate::fastq::append_record_templated(
-                            &mut buf.bytes,
-                            tmpl,
-                            config.fasta,
-                            run_name,
-                            spot_number,
-                            seg.mate_idx,
-                            original_name,
-                            seq,
-                            qual,
-                            config.qual_defline.as_ref(),
-                            Some(diag),
-                        );
-                    } else if config.fasta {
-                        append_fasta_record(&mut buf.bytes, run_name, spot_label, desc, seq);
-                    } else {
-                        let qual = &quality[seg.start..seg.start + seg.len];
-                        append_fastq_record(
-                            &mut buf.bytes,
-                            run_name,
-                            spot_label,
-                            desc,
-                            seq,
-                            qual,
-                            config
-                                .qual_defline
-                                .as_ref()
-                                .map(|template| crate::fastq::QualLine {
-                                    template,
-                                    spot_id: spot_number,
-                                    read_id: seg.mate_idx,
-                                }),
-                            Some(diag),
-                        );
                     }
-                    buf.records += 1;
                 };
+                let range = seg.start..seg.start + seg.len;
+                crate::fastq::append_segment_record(
+                    &mut buf.bytes,
+                    style,
+                    config.split_mode,
+                    &crate::fastq::SegmentRecord {
+                        run_name,
+                        spot_number,
+                        mate_idx: seg.mate_idx,
+                        original_name,
+                        description,
+                        sequence: &sequence[range.clone()],
+                        // FASTA output never reads quality; don't index it.
+                        quality: if config.fasta { &[] } else { &quality[range] },
+                    },
+                    Some(diag),
+                );
+                buf.records += 1;
+            };
 
-            match config.split_mode {
-                SplitMode::Split3 | SplitMode::SplitFiles => {
-                    let bio_reads = segments.iter().filter(|s| s.biological).count();
-                    for (emit_idx, seg) in segments.iter().enumerate() {
-                        let slot = crate::fastq::slot_for_segment(
-                            config.split_mode,
-                            seg.mate_idx,
-                            emit_idx,
-                            bio_reads,
-                            spot_read_lengths.len(),
-                        );
-                        emit(slot, seg, spot_number, description);
-                    }
-                }
-                SplitMode::Interleaved | SplitMode::SplitSpot => {
-                    // fasterq-dump's --split-spot writes deflines as
-                    // `@RUN.SPOT/MATE DESC …` so mates of a paired read
-                    // are distinguishable in a single stream. The /MATE
-                    // suffix uses the read's *original* spot-read index
-                    // (1-based, pre-filter) so an archive whose read 1
-                    // is technical-only still emits the biological read
-                    // as `/2` (matches fasterq behavior on DRR004435 et
-                    // al). Force a concrete description (original name
-                    // or bare spot number) so the suffix doesn't leak
-                    // into the description via `append_fastq_record`'s
-                    // default fallback.
-                    let mut name_buf: Vec<u8> = Vec::with_capacity(spot_number.len() + 4);
-                    let mut mate_buf = itoa::Buffer::new();
-                    for seg in &segments {
-                        name_buf.clear();
-                        name_buf.extend_from_slice(spot_number);
-                        name_buf.push(b'/');
-                        name_buf.extend_from_slice(mate_buf.format(seg.mate_idx).as_bytes());
-                        let desc = description.or(Some(spot_number));
-                        emit(OutputSlot::Single, seg, &name_buf, desc);
-                    }
-                }
+            // `slot_for_segment` sends every segment to the single stream in
+            // split-spot/interleaved mode, so one routing loop covers all modes.
+            let bio_reads = segments.iter().filter(|s| s.biological).count();
+            for (emit_idx, seg) in segments.iter().enumerate() {
+                let slot = crate::fastq::slot_for_segment(
+                    config.split_mode,
+                    seg.mate_idx,
+                    emit_idx,
+                    bio_reads,
+                    spot_read_lengths.len(),
+                );
+                emit(slot, seg);
             }
         }
 

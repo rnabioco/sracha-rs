@@ -1812,3 +1812,48 @@ fn validate_flipped_bytes_surface_integrity_errors() {
         "validate should still iterate blobs even with mid-file corruption"
     );
 }
+
+/// The cSRA path used to ignore `--fasta` (it wrote FASTQ records into the
+/// `.fasta` file) and to drop the `/MATE` suffix in split-spot output. It now
+/// shares its record writer with the plain path (#173).
+#[ignore]
+#[test]
+fn csra_fasta_output_has_fasta_records() {
+    let path = ensure_vdb_3418();
+    let tmp = tempfile::tempdir().unwrap();
+    let mut config = test_config(tmp.path(), SplitMode::Split3, CompressionMode::None);
+    config.fasta = true;
+
+    let stats = sracha_core::pipeline::run_fastq(&path, Some("VDB-3418"), &config).unwrap();
+    assert_eq!(stats.spots_read, 985);
+    let out = std::fs::read_to_string(&stats.output_files[0]).unwrap();
+    assert!(stats.output_files[0].to_string_lossy().ends_with(".fasta"));
+    assert_eq!(out.lines().filter(|l| l.starts_with('>')).count(), 985);
+    assert_eq!(out.lines().filter(|l| l.starts_with('@')).count(), 0);
+    assert_eq!(out.lines().count(), 985 * 2, "header + sequence per record");
+}
+
+#[ignore]
+#[test]
+fn csra_split_spot_matches_fasterq_dump() {
+    // Reference: `fasterq-dump --split-spot VDB-3418.sra` (sra-tools 3.2.1),
+    // md5 below. The defline carries `/MATE`: `@VDB-3418.1/1 1 length=36185`.
+    let path = ensure_vdb_3418();
+    let tmp = tempfile::tempdir().unwrap();
+    let config = test_config(tmp.path(), SplitMode::SplitSpot, CompressionMode::None);
+
+    let stats = sracha_core::pipeline::run_fastq(&path, Some("VDB-3418"), &config).unwrap();
+    assert_eq!(stats.output_files.len(), 1);
+    let first_line = std::fs::read_to_string(&stats.output_files[0])
+        .unwrap()
+        .lines()
+        .next()
+        .unwrap()
+        .to_string();
+    assert_eq!(first_line, "@VDB-3418.1/1 1 length=36185");
+    assert_eq!(
+        md5_file(&stats.output_files[0]),
+        "098000dfe5b3453054502680980aebe7",
+        "cSRA split-spot output diverges from fasterq-dump"
+    );
+}

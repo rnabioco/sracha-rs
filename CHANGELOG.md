@@ -26,11 +26,16 @@
   `--metadata` sidecar named the first-listed one. Every site now uses one
   preference rule. `info`'s `Bases` now uses NCBI's reported count, marked
   `~` when estimated ([#172]).
+- cSRA runs ignored `--fasta` (FASTQ records were written into the `.fasta`
+  file) and dropped the `/MATE` suffix in `--split split-spot`/`interleaved`
+  output. Both decode paths now share one record writer, and `split-spot`
+  output on VDB-3418 is byte-identical to `fasterq-dump` ([#173]).
 
 [#166]: https://github.com/rnabioco/sracha-rs/issues/166
 [#167]: https://github.com/rnabioco/sracha-rs/issues/167
 [#168]: https://github.com/rnabioco/sracha-rs/issues/168
 [#172]: https://github.com/rnabioco/sracha-rs/issues/172
+[#173]: https://github.com/rnabioco/sracha-rs/issues/173
 
 ## 0.7.2 (2026-10-13)
 

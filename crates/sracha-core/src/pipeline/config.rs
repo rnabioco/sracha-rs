@@ -136,6 +136,22 @@ pub struct PipelineStats {
     pub integrity: Arc<IntegrityDiag>,
 }
 
+impl From<&PipelineConfig> for crate::fastq::FastqConfig {
+    /// The formatting subset of a pipeline config. One conversion for both
+    /// decode paths, so a new formatting field is added in exactly one place.
+    fn from(c: &PipelineConfig) -> Self {
+        Self {
+            split_mode: c.split_mode,
+            skip_technical: c.skip_technical,
+            min_read_len: c.min_read_len,
+            fasta: c.fasta,
+            paired_suffix: c.paired_suffix,
+            seq_defline: c.seq_defline.clone(),
+            qual_defline: c.qual_defline.clone(),
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

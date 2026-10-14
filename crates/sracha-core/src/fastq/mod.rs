@@ -606,6 +606,130 @@ pub fn read_is_biological(read_types: &[u8], i: usize) -> bool {
     }
 }
 
+/// How records are rendered, independent of where the spot came from.
+///
+/// Both decode paths (plain SRA in `pipeline::blob_decode`, cSRA through
+/// [`format_spot`]) hand this plus a [`SegmentRecord`] to
+/// [`append_segment_record`], so a rendering rule — FASTA vs FASTQ, custom
+/// deflines, the `/MATE` suffix — lives in exactly one place.
+#[derive(Clone, Copy)]
+pub(crate) struct RecordStyle<'a> {
+    pub fasta: bool,
+    pub seq_defline: Option<&'a DeflineTemplate>,
+    pub qual_defline: Option<&'a DeflineTemplate>,
+}
+
+impl<'a> From<&'a FastqConfig> for RecordStyle<'a> {
+    fn from(c: &'a FastqConfig) -> Self {
+        Self {
+            fasta: c.fasta,
+            seq_defline: c.seq_defline.as_ref(),
+            qual_defline: c.qual_defline.as_ref(),
+        }
+    }
+}
+
+/// One read segment plus everything needed to name it.
+pub(crate) struct SegmentRecord<'a> {
+    pub run_name: &'a str,
+    /// Bare spot number (`$si`), never the mate-suffixed label.
+    pub spot_number: &'a [u8],
+    /// 1-based read index within the spot, before filtering (`$ri`, and the
+    /// `/MATE` suffix in split-spot/interleaved output).
+    pub mate_idx: u32,
+    /// The NAME column value, if any (`$sn`).
+    pub original_name: Option<&'a [u8]>,
+    /// Default-defline description: the original name, the synthesized spot
+    /// number, or `None` when the table has no NAME column.
+    pub description: Option<&'a [u8]>,
+    pub sequence: &'a [u8],
+    /// Ignored (and may be empty) for FASTA output.
+    pub quality: &'a [u8],
+}
+
+/// Append one segment's record to `out`.
+///
+/// For the default defline in `split-spot`/`interleaved` modes the label is
+/// `<spot>/<mate>` — fasterq-dump's `@RUN.SPOT/MATE DESC …` — so mates of a
+/// spot are distinguishable in the single stream. The mate is the read's
+/// *original* 1-based index (pre-filter), so an archive whose read 1 is
+/// technical-only still emits the biological read as `/2`. The description
+/// is forced concrete (name, else spot number) so the suffix cannot leak
+/// into it. A custom `--seq-defline` bypasses all of that: the template's
+/// `$ri` distinguishes mates instead.
+#[inline]
+pub(crate) fn append_segment_record(
+    out: &mut Vec<u8>,
+    style: RecordStyle<'_>,
+    split_mode: SplitMode,
+    seg: &SegmentRecord<'_>,
+    diag: Option<&IntegrityDiag>,
+) {
+    if let Some(tmpl) = style.seq_defline {
+        append_record_templated(
+            out,
+            tmpl,
+            style.fasta,
+            seg.run_name,
+            seg.spot_number,
+            seg.mate_idx,
+            seg.original_name,
+            seg.sequence,
+            seg.quality,
+            style.qual_defline,
+            diag,
+        );
+        return;
+    }
+
+    let suffixed = matches!(split_mode, SplitMode::Interleaved | SplitMode::SplitSpot);
+    // `<spot>/<mate>` is built on the stack: this runs per record on the
+    // decode hot path, and spot numbers + mate indexes are short.
+    let mut stack = [0u8; 48];
+    let mut heap: Vec<u8>;
+    let label: &[u8] = if suffixed {
+        let mut itoa_buf = itoa::Buffer::new();
+        let mate = itoa_buf.format(seg.mate_idx).as_bytes();
+        let n = seg.spot_number.len() + 1 + mate.len();
+        let dst: &mut [u8] = if n <= stack.len() {
+            &mut stack[..n]
+        } else {
+            heap = vec![0u8; n];
+            &mut heap[..]
+        };
+        dst[..seg.spot_number.len()].copy_from_slice(seg.spot_number);
+        dst[seg.spot_number.len()] = b'/';
+        dst[seg.spot_number.len() + 1..].copy_from_slice(mate);
+        dst
+    } else {
+        seg.spot_number
+    };
+    let description = if suffixed {
+        seg.description.or(Some(seg.spot_number))
+    } else {
+        seg.description
+    };
+
+    if style.fasta {
+        append_fasta_record(out, seg.run_name, label, description, seg.sequence);
+    } else {
+        append_fastq_record(
+            out,
+            seg.run_name,
+            label,
+            description,
+            seg.sequence,
+            seg.quality,
+            style.qual_defline.map(|template| QualLine {
+                template,
+                spot_id: seg.spot_number,
+                read_id: seg.mate_idx,
+            }),
+            diag,
+        );
+    }
+}
+
 /// A read segment extracted from a spot, after filtering.
 struct ReadSegment<'a> {
     sequence: &'a [u8],
@@ -770,45 +894,29 @@ fn route_segments_to_slots(
     spot_reads: usize,
 ) -> Vec<(OutputSlot, FastqRecord)> {
     let mut results = Vec::with_capacity(segments.len());
+    let style = RecordStyle::from(config);
     let format = |seg: &ReadSegment<'_>| {
         // cSRA's SEQUENCE table carries no NAME column, so fasterq-dump
         // synthesizes the spot id as the name (`DSD_FASTQ_SYN_NAME`) rather
         // than omitting the field — same rule the plain decode path applies
         // in `blob_decode`. `spot_name` is the spot number here.
-        if let Some(tmpl) = config.seq_defline.as_ref() {
-            let mut data = Vec::new();
-            append_record_templated(
-                &mut data,
-                tmpl,
-                config.fasta,
+        let mut data = Vec::new();
+        append_segment_record(
+            &mut data,
+            style,
+            config.split_mode,
+            &SegmentRecord {
                 run_name,
-                spot_name,
-                seg.mate_idx,
-                Some(spot_name),
-                seg.sequence,
-                seg.quality,
-                config.qual_defline.as_ref(),
-                None,
-            );
-            FastqRecord { data }
-        } else {
-            let mut data = Vec::new();
-            append_fastq_record(
-                &mut data,
-                run_name,
-                spot_name,
-                Some(spot_name),
-                seg.sequence,
-                seg.quality,
-                config.qual_defline.as_ref().map(|template| QualLine {
-                    template,
-                    spot_id: spot_name,
-                    read_id: seg.mate_idx,
-                }),
-                None,
-            );
-            FastqRecord { data }
-        }
+                spot_number: spot_name,
+                mate_idx: seg.mate_idx,
+                original_name: Some(spot_name),
+                description: Some(spot_name),
+                sequence: seg.sequence,
+                quality: seg.quality,
+            },
+            None,
+        );
+        FastqRecord { data }
     };
 
     let bio_reads = segments.iter().filter(|s| s.biological).count();
@@ -1014,7 +1122,13 @@ mod tests {
 
         assert_eq!(results.len(), 1);
         let text = std::str::from_utf8(&results[0].1.data).unwrap();
-        assert_eq!(text, "@SRR1.1 1 length=4\nACGT\n+SRR1.1 1 length=4\nIIII\n");
+        // split-spot carries `/MATE` on the label, as fasterq-dump does. This
+        // used to expect no suffix, which encoded the cSRA path's drift from
+        // the plain path (#173).
+        assert_eq!(
+            text,
+            "@SRR1.1/1 1 length=4\nACGT\n+SRR1.1/1 1 length=4\nIIII\n"
+        );
     }
 
     // -----------------------------------------------------------------------
@@ -2084,6 +2198,160 @@ mod tests {
             String::from_utf8(out).unwrap(),
             "@RUN.1/2 length=4\nACGT\n+RUN.1.2\nIIII\n"
         );
+    }
+
+    // -----------------------------------------------------------------------
+    // Shared segment-record writer (plain and cSRA paths, #173)
+    // -----------------------------------------------------------------------
+
+    fn render_segment(config: &FastqConfig, mate_idx: u32, name: Option<&[u8]>) -> String {
+        let mut out = Vec::new();
+        append_segment_record(
+            &mut out,
+            RecordStyle::from(config),
+            config.split_mode,
+            &SegmentRecord {
+                run_name: "RUN",
+                spot_number: b"7",
+                mate_idx,
+                original_name: name,
+                description: name,
+                sequence: b"ACGT",
+                quality: b"IIII",
+            },
+            None,
+        );
+        String::from_utf8(out).unwrap()
+    }
+
+    #[test]
+    fn segment_record_matrix_split_mode_by_format() {
+        let mut cfg = FastqConfig::default();
+
+        // FASTQ, split-3: bare spot number, no suffix.
+        assert_eq!(
+            render_segment(&cfg, 2, None),
+            "@RUN.7 length=4\nACGT\n+RUN.7 length=4\nIIII\n"
+        );
+
+        // FASTQ, split-spot / interleaved: `/MATE` on the label and a
+        // concrete description so the suffix cannot leak into it.
+        for mode in [SplitMode::SplitSpot, SplitMode::Interleaved] {
+            cfg.split_mode = mode;
+            assert_eq!(
+                render_segment(&cfg, 2, None),
+                "@RUN.7/2 7 length=4\nACGT\n+RUN.7/2 7 length=4\nIIII\n"
+            );
+            assert_eq!(
+                render_segment(&cfg, 1, Some(b"NAME")),
+                "@RUN.7/1 NAME length=4\nACGT\n+RUN.7/1 NAME length=4\nIIII\n"
+            );
+        }
+
+        // FASTA gets the same labels, no `+`/quality lines.
+        cfg.fasta = true;
+        assert_eq!(render_segment(&cfg, 2, None), ">RUN.7/2 7 length=4\nACGT\n");
+        cfg.split_mode = SplitMode::Split3;
+        assert_eq!(render_segment(&cfg, 2, None), ">RUN.7 length=4\nACGT\n");
+    }
+
+    #[test]
+    fn segment_record_custom_defline_skips_mate_suffix() {
+        let mut cfg = FastqConfig {
+            split_mode: SplitMode::SplitSpot,
+            seq_defline: Some(DeflineTemplate::parse("@$ac.$si.$ri").unwrap()),
+            ..Default::default()
+        };
+        assert_eq!(
+            render_segment(&cfg, 2, None),
+            "@RUN.7.2\nACGT\n+RUN.7.2\nIIII\n"
+        );
+        cfg.qual_defline = Some(DeflineTemplate::parse_qual("+").unwrap());
+        assert_eq!(render_segment(&cfg, 2, None), "@RUN.7.2\nACGT\n+\nIIII\n");
+    }
+
+    #[test]
+    fn segment_record_long_spot_number_uses_heap_label() {
+        // A label longer than the stack buffer must still come out intact.
+        let long = vec![b'9'; 60];
+        let cfg = FastqConfig {
+            split_mode: SplitMode::SplitSpot,
+            ..Default::default()
+        };
+        let mut out = Vec::new();
+        append_segment_record(
+            &mut out,
+            RecordStyle::from(&cfg),
+            cfg.split_mode,
+            &SegmentRecord {
+                run_name: "RUN",
+                spot_number: &long,
+                mate_idx: 12,
+                original_name: None,
+                description: None,
+                sequence: b"AC",
+                quality: b"II",
+            },
+            None,
+        );
+        let s = String::from_utf8(out).unwrap();
+        assert!(
+            s.starts_with(&format!("@RUN.{}/12 ", "9".repeat(60))),
+            "{s}"
+        );
+    }
+
+    fn csra_style_spot() -> SpotRecord {
+        SpotRecord {
+            name: b"7".to_vec(),
+            sequence: b"ACGTACGT".to_vec(),
+            quality: b"IIIIIIII".to_vec(),
+            read_lengths: vec![4, 4],
+            read_types: vec![1, 1],
+            read_filter: Vec::new(),
+            spot_group: Vec::new(),
+        }
+    }
+
+    /// The cSRA path (`format_spot`) used to ignore `--fasta`: it always
+    /// emitted FASTQ blocks while naming the file `.fasta`.
+    #[test]
+    fn format_spot_honors_fasta() {
+        let cfg = FastqConfig {
+            fasta: true,
+            ..Default::default()
+        };
+        let out = format_spot(&csra_style_spot(), "RUN", &cfg);
+        assert_eq!(out.len(), 2);
+        for (_, rec) in &out {
+            let text = String::from_utf8(rec.data.clone()).unwrap();
+            assert!(text.starts_with('>'), "{text}");
+            assert!(!text.contains('+'), "{text}");
+        }
+    }
+
+    /// ...and in split-spot / interleaved mode it dropped the `/MATE` suffix
+    /// that the plain path (and fasterq-dump) write.
+    #[test]
+    fn format_spot_split_spot_has_mate_suffix() {
+        let cfg = FastqConfig {
+            split_mode: SplitMode::SplitSpot,
+            ..Default::default()
+        };
+        let out = format_spot(&csra_style_spot(), "RUN", &cfg);
+        let heads: Vec<String> = out
+            .iter()
+            .map(|(_, r)| {
+                String::from_utf8(r.data.clone())
+                    .unwrap()
+                    .lines()
+                    .next()
+                    .unwrap()
+                    .to_string()
+            })
+            .collect();
+        assert_eq!(heads, ["@RUN.7/1 7 length=4", "@RUN.7/2 7 length=4"]);
+        assert!(out.iter().all(|(slot, _)| *slot == OutputSlot::Single));
     }
 
     // -----------------------------------------------------------------------
