@@ -44,6 +44,10 @@
 - `sracha get` now prints the single-end `--split` warning, and `sracha fastq`
   on a cSRA run now appends its `sracha-stats.jsonl` line and prints the same
   warning; both commands share one post-decode path ([#175]).
+- `get` never downloaded a run's `.vdbcache`, so split-archive cSRA could not
+  be decoded; it now does, and `fetch` shares the same download code. `fetch`
+  reports `cached`/`resumed` instead of always `downloaded`, and a re-downloaded
+  corrupt cache file no longer counts as a cache hit ([#176]).
 
 [#166]: https://github.com/rnabioco/sracha-rs/issues/166
 [#167]: https://github.com/rnabioco/sracha-rs/issues/167
@@ -54,6 +58,7 @@
 [#173]: https://github.com/rnabioco/sracha-rs/issues/173
 [#174]: https://github.com/rnabioco/sracha-rs/issues/174
 [#175]: https://github.com/rnabioco/sracha-rs/issues/175
+[#176]: https://github.com/rnabioco/sracha-rs/issues/176
 
 ## 0.7.2 (2026-10-13)
 

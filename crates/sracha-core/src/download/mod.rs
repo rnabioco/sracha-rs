@@ -1138,6 +1138,14 @@ pub async fn download_file(
         } else {
             0
         };
+        // Only a strictly partial file is resumable. A full-size file that
+        // reached here failed its MD5/prefix check and is rewritten from
+        // scratch, so it must count as a full transfer, not a cache hit.
+        let existing_size = if existing_size < file_size {
+            existing_size
+        } else {
+            0
+        };
 
         let bytes_remaining = file_size.saturating_sub(existing_size);
         bytes_transferred = bytes_remaining;

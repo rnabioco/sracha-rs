@@ -118,7 +118,11 @@ sracha get [OPTIONS] [ACCESSION]...
 
 ## sracha fetch
 
-Download SRA files without conversion.
+Download SRA files without conversion. When the run has a `.vdbcache`
+companion (split-archive cSRA) it is saved beside the archive as
+`<ACC>.sra.vdbcache`; `sracha fastq` picks it up from there. `get` downloads
+the same companion, so both commands report each transfer as `downloaded`,
+`resumed` or `cached`.
 
 ```
 sracha fetch [OPTIONS] [ACCESSION]...
