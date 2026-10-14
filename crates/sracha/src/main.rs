@@ -304,34 +304,9 @@ async fn main() -> Result<()> {
                     continue;
                 }
 
-                let mut pipeline_config = sracha_core::pipeline::PipelineConfig {
-                    output_dir: args.output_dir.clone(),
-                    split_mode,
-                    compression,
-                    threads: args.threads,
-                    connections: 1,
-                    skip_technical: !args.include_technical,
-                    min_read_len: args.min_read_len,
-                    force: args.force,
-                    progress: !args.no_progress && !args.stdout,
-                    run_info: None,
-                    fasta: args.fasta,
-                    resume: true,
-                    stdout: args.stdout,
-                    cancelled: None,
-                    http_client: None,
-                    strict: !args.no_strict,
-                    verify: args.verify,
-                    keep_sra: false,
-                    paired_suffix: args.paired_suffix.into(),
-                    seq_defline: args.seq_defline.clone(),
-                    qual_defline: args.qual_defline.clone(),
-                    folder_per_accession: args.folder_per_accession,
-                    metadata: None,
-                    metadata_row: None,
-                    refseq_paths: Vec::new(),
-                    refseq_cache_dir: args.refseq_cache.clone(),
-                };
+                // Local files: one connection, no sidecar, no run-info — all
+                // the `PipelineConfig` defaults on top of the shared flags.
+                let mut pipeline_config = args.pipeline_config(split_mode, compression);
 
                 // Aligned runs whose REFERENCE holds only the chunk layout
                 // need the assembly's bases fetched before decode; a no-op
@@ -534,8 +509,6 @@ async fn main() -> Result<()> {
                 resolved_all.len()
             );
 
-            let progress = !args.no_progress && !args.stdout;
-
             // Check platform — reject legacy platforms with complex read structures.
             // Only applies to accessions that will go through VDB decode; ENA
             // serves pre-decoded FASTQ so the platform is irrelevant there.
@@ -610,35 +583,24 @@ async fn main() -> Result<()> {
             let make_config = {
                 let http_client = http_client.clone();
                 let cancelled = cancelled.clone();
+                // Shared decode flags, built once; each accession layers its
+                // own run-info, sidecar row and download settings on top.
+                let base = args.pipeline_config(split_mode, compression);
+                let connections = args.connections;
+                let resume = !args.no_resume;
+                let keep_sra = args.keep_sra;
+                let metadata = args.metadata;
                 move |resolved: &ResolvedAccession| sracha_core::pipeline::PipelineConfig {
-                    output_dir: args.output_dir.clone(),
-                    split_mode,
-                    compression,
-                    threads: args.threads,
-                    connections: args.connections,
-                    skip_technical: !args.include_technical,
-                    min_read_len: args.min_read_len,
-                    force: args.force,
-                    progress,
+                    connections,
                     run_info: resolved.run_info.clone(),
-                    fasta: args.fasta,
-                    resume: !args.no_resume,
-                    stdout: args.stdout,
+                    resume,
                     cancelled: Some(cancelled.clone()),
-                    strict: !args.no_strict,
-                    verify: args.verify,
                     http_client: Some(http_client.clone()),
-                    keep_sra: args.keep_sra,
-                    paired_suffix: args.paired_suffix.into(),
-                    seq_defline: args.seq_defline.clone(),
-                    qual_defline: args.qual_defline.clone(),
-                    folder_per_accession: args.folder_per_accession,
-                    metadata: args.metadata.map(Into::into),
-                    metadata_row: args
-                        .metadata
+                    keep_sra,
+                    metadata: metadata.map(Into::into),
+                    metadata_row: metadata
                         .map(|_| sracha_core::metadata::RunMetadata::from_resolved(resolved)),
-                    refseq_paths: Vec::new(),
-                    refseq_cache_dir: args.refseq_cache.clone(),
+                    ..base.clone()
                 }
             };
 

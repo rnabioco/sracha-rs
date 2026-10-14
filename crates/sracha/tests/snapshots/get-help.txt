@@ -1,0 +1,164 @@
+Download, convert, and compress in one shot
+
+Usage: sracha get [OPTIONS] [ACCESSIONS]...
+
+Arguments:
+  [ACCESSIONS]...
+          SRA accession(s) to download and convert (run, study, or BioProject)
+
+Options:
+      --accession-list <ACCESSION_LIST>
+          Read accessions from a file (one per line)
+
+  -v, --verbose...
+          Log verbosity (-v, -vv, -vvv)
+
+  -q, --quiet
+          Suppress all output except errors
+
+  -t, --threads <THREADS>
+          Number of threads for decode
+          
+          [default: 8]
+
+      --connections <CONNECTIONS>
+          HTTP connections per file
+          
+          [default: 8]
+
+  -y, --yes
+          Confirm project downloads and large downloads (>100 GiB)
+
+      --no-progress
+          Disable progress bar
+
+  -h, --help
+          Print help (see a summary with '-h')
+
+Output:
+  -O, --output-dir <OUTPUT_DIR>
+          Output directory
+          
+          [default: .]
+
+  -Z, --stdout
+          Write to stdout (stream interleaved FASTQ, auto-delete temp SRA)
+
+      --split <SPLIT>
+          Split mode
+
+          Possible values:
+          - split-3:     Paired reads to _1/_2, unpaired to _0
+          - split-files: Nth read to Nth file
+          - split-spot:  All reads to one file
+          - interleaved: R1/R2 interleaved in one file
+          
+          [default: split-3]
+
+      --paired-suffix <PAIRED_SUFFIX>
+          Suffix style for paired/split FASTQ outputs. `numeric` -> `_1.fastq`/`_2.fastq` (default, matches fasterq-dump and ENA). `r` -> `_R1.fastq`/`_R2.fastq` (matches Illumina BCL output convention)
+
+          Possible values:
+          - numeric: `_1.fastq` / `_2.fastq` (default, matches fasterq-dump and ENA)
+          - r:       `_R1.fastq` / `_R2.fastq` (matches Illumina BCL output convention)
+          
+          [default: numeric]
+
+      --fasta
+          Output FASTA instead of FASTQ (drops quality scores)
+
+      --seq-defline <TEMPLATE>
+          Custom defline template (fasterq-dump `--seq-defline` syntax). Variables: $ac (accession) $si (spot id) $ri (read id) $sn (spot/read name) $rl (read length) $lg (LINKAGE_GROUP, e.g. 10x 'CB:..|UB:..'; cSRA runs only); $$ is a literal '$'. Example: '@$ac.$si.$ri'. For PacBio/ONT, $sn is the native read name (e.g. PacBio 'm64012_.../ccs', ONT '<uuid> ch=.. start_time=..'); it is also the default header. The '+' line mirrors this. ($sg/spot-group unsupported.)
+
+      --qual-defline <TEMPLATE>
+          Custom template for the '+' line (same variables as --seq-defline). A leading '+' is optional; '+' alone writes a bare '+' line. Default: mirror --seq-defline. Ignored with --fasta
+
+  -f, --force
+          Overwrite existing files
+
+      --folder-per-accession
+          Place each accession's outputs (FASTQ + sidecars) inside its own subdirectory of the output directory, named after the accession. Default: all files flat in the output directory
+
+      --metadata <METADATA>
+          Write run metadata (BioSample, library, instrument, etc.) sidecar file(s) alongside each FASTQ output
+
+          Possible values:
+          - tsv:  Write a single TSV sidecar (`<acc>.metadata.tsv`)
+          - json: Write a single JSON sidecar (`<acc>.metadata.json`)
+          - both: Write both TSV and JSON sidecars
+
+Compression:
+      --no-gzip
+          Disable gzip compression (compressed by default)
+
+      --gzip-level <GZIP_LEVEL>
+          Gzip compression level [default: 1]
+
+      --zstd
+          Use zstd compression instead of gzip
+
+      --zstd-level <ZSTD_LEVEL>
+          Zstd compression level (1-22) [default: 3]
+
+Filtering:
+      --min-read-len <MIN_READ_LEN>
+          Minimum read length
+
+      --include-technical
+          Include technical reads (skipped by default)
+
+Advanced:
+      --prefetch-depth <PREFETCH_DEPTH>
+          Number of accessions to download ahead of the decoder. A larger value hides slow networks behind decode, at the cost of one extra temp SRA file per depth step. Only applies to multi-accession `get` runs
+          
+          [default: 2]
+
+      --format <FORMAT>
+          Download format
+
+          Possible values:
+          - sra:     Full quality scores
+          - sralite: Simplified quality scores (smaller files)
+          
+          [default: sra]
+
+      --no-resume
+          Disable download resume (re-download from scratch)
+
+      --no-disk-check
+          Skip the free-disk-space preflight check entirely. Useful when the output filesystem autoscales, or when `statvfs` reports a quota that doesn't reflect what the job can actually use
+
+      --no-runinfo
+          Skip the EUtils RunInfo API call (read structure will be derived from VDB file metadata instead)
+
+      --prefer-sdl
+          Skip direct S3 and resolve via the SDL API
+
+      --no-strict
+          Disable strict integrity checking. By default, sracha fails on any data-integrity anomaly it cannot silently fall back on: quality or sequence streams that do not correspond to each other, decoded bases or spots that disagree with the archive's own recorded totals, invalid quality bytes, quality overruns, and paired-spot violations. Pass this flag to downgrade those failures to warnings. Benign-fallback counters (SRA-lite all-zero quality blobs and truncated-spot recovery) stay informational either way
+
+      --verify
+          Verify decoded quality values against the archive's STATS/QUALITY histogram. Every other quality check compares lengths, so this is the only one that notices a decode emitting the right number of plausible quality bytes at the wrong values. Costs one increment per base and is skipped for archives that synthesize quality (SRA-Lite, --fasta)
+
+      --keep-sra
+          Keep the downloaded SRA file in the output directory instead of deleting it after decode. Useful for validation runs that want to re-run another tool (e.g. `fasterq-dump`) on the same input
+
+      --prefer-ena
+          Try ENA FASTQ mirrors first; fall back to NCBI if ENA has no FASTQ or the output config is incompatible. Requires gzip compression and split-3 or split-files (Phase 1 scope). Skips VDB decode entirely
+
+      --head-concurrency <N>
+          Max concurrent S3 HEAD probes during accession resolution. Default 64; clamped to 1–256. The HTTP client's per-host connection pool is sized to match this value at startup, so raising it actually opens more sockets to the SRA bucket (rather than queueing on the pool). Values above ~128 rarely help and risk hitting bucket-side rate limits
+          
+          [default: 64]
+
+      --dry-run
+          Resolve accessions and print what would be downloaded as TSV (default) or JSON. Does not download or decode anything
+
+      --dry-run-format <DRY_RUN_FORMAT>
+          Format for `--dry-run` output
+          
+          [default: tsv]
+          [possible values: tsv, json]
+
+      --refseq-cache <DIR>
+          Directory for cached external reference sequences, used by aligned (cSRA) runs whose reference bases live in NCBI refseq objects rather than in the archive itself. Shared across accessions and runs. Defaults to $SRACHA_REFSEQ_DIR, else the platform cache dir (~/.cache/sracha/refseq, or %LOCALAPPDATA%\sracha\refseq on Windows)
