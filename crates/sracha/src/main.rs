@@ -981,7 +981,7 @@ async fn main() -> Result<()> {
                 let path = std::path::Path::new(p);
                 match InfoRecord::from_local_archive(path) {
                     Ok(rec) if !delim_format => print_local_record(&rec),
-                    Ok(rec) => local_entries.push(InfoEntry::Local(Box::new(rec))),
+                    Ok(rec) => local_entries.push(InfoEntry::Record(Box::new(rec))),
                     Err(message) if !delim_format => {
                         let label = path.file_stem().and_then(|s| s.to_str()).unwrap_or(p);
                         println!("{}", style::header(label));
@@ -1049,17 +1049,45 @@ async fn main() -> Result<()> {
                 style::count(resolved.len()),
             ));
 
+            // RunInfo only knows an average length split evenly across
+            // LibraryLayout, which misreports runs with technical reads
+            // (#167). Read the real per-read structure from each archive's
+            // metadata with range requests; a failed fetch keeps the
+            // (flagged) estimate.
+            let sp = progress::Spinner::start("Reading read structure".to_string());
+            let urls: Vec<Option<String>> = resolved
+                .iter()
+                .map(|r| r.sra_file.mirrors.first().map(|m| m.url.clone()))
+                .collect();
+            let structures = sracha_core::info::fetch_read_structures(urls, 8).await;
+            let records: Vec<InfoRecord> = resolved
+                .iter()
+                .zip(structures)
+                .map(|(r, rs)| {
+                    let mut rec = InfoRecord::from_resolved(r);
+                    if let Some(rs) = rs {
+                        rec.apply_read_structure(rs);
+                    }
+                    rec
+                })
+                .collect();
+            sp.finish("Read structure fetched".to_string());
+
             // `local_entries` is empty in table mode (printed above).
             let mut entries = local_entries;
-            entries.extend(resolved.iter().map(InfoEntry::Ok));
+            entries.extend(
+                records
+                    .iter()
+                    .map(|rec| InfoEntry::Record(Box::new(rec.clone()))),
+            );
 
             match args.format {
                 InfoFormat::Table => {
                     if entries.len() > 1 {
                         // Project/multi-accession: summary table.
                         print_info_table(&entries, None);
-                    } else if let Some(InfoEntry::Ok(r)) = entries.first() {
-                        print_resolved(r);
+                    } else if let (Some(r), Some(rec)) = (resolved.first(), records.first()) {
+                        print_resolved(r, rec);
                     }
                 }
                 InfoFormat::Tsv | InfoFormat::Csv => {
@@ -1482,7 +1510,7 @@ fn print_read_structure(rec: &InfoRecord) {
     }
 }
 
-fn print_resolved(resolved: &ResolvedAccession) {
+fn print_resolved(resolved: &ResolvedAccession, rec: &InfoRecord) {
     let f = &resolved.sra_file;
 
     println!("{}", style::header(&resolved.accession));
@@ -1519,7 +1547,7 @@ fn print_resolved(resolved: &ResolvedAccession) {
     );
 
     if let Some(ref ri) = resolved.run_info {
-        print_read_structure(&InfoRecord::from_resolved(resolved));
+        print_read_structure(rec);
         if let Some(spots) = ri.spots {
             println!(
                 "  {}   {}",
@@ -1633,10 +1661,10 @@ fn print_info_table(entries: &[InfoEntry<'_>], size_overrides: Option<&[u64]>) {
 
     for (idx, entry) in entries.iter().enumerate() {
         match entry {
-            InfoEntry::Ok(_) | InfoEntry::Local(_) => {
+            InfoEntry::Ok(_) | InfoEntry::Record(_) => {
                 let rec = match entry {
                     InfoEntry::Ok(r) => InfoRecord::from_resolved(r),
-                    InfoEntry::Local(rec) => (**rec).clone(),
+                    InfoEntry::Record(rec) => (**rec).clone(),
                     InfoEntry::Error { .. } => unreachable!(),
                 };
                 let row_size = size_overrides

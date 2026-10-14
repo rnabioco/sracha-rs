@@ -22,8 +22,11 @@ pub struct InfoRecord {
     /// Biological read count (`nreads` column).
     pub nreads: Option<usize>,
     /// Per-read lengths, in read order. Includes technical reads when the
-    /// source knows them (local archives).
+    /// source knows them (the archive's own metadata).
     pub read_lengths: Vec<u32>,
+    /// `true` when `read_lengths` is a guess from NCBI RunInfo's average
+    /// length rather than the archive's stored structure.
+    pub lengths_estimated: bool,
     /// `true` = biological, per entry of `read_lengths`. Empty when unknown.
     pub biological: Vec<bool>,
     pub spots: Option<u64>,
@@ -51,6 +54,7 @@ impl InfoRecord {
             },
             nreads: ri.map(|ri| ri.nreads),
             read_lengths: ri.map(|ri| ri.avg_read_len.clone()).unwrap_or_default(),
+            lengths_estimated: ri.is_some_and(|ri| !ri.avg_read_len.is_empty()),
             biological: Vec::new(),
             spots: ri.and_then(|ri| ri.spots),
             size_bytes: Some(r.sra_file.size),
@@ -158,6 +162,14 @@ impl InfoRecord {
         Ok(rec)
     }
 
+    /// Replace the estimated read lengths with the archive's real structure.
+    pub fn apply_read_structure(&mut self, rs: ReadStructure) {
+        self.read_lengths = rs.lengths;
+        self.biological = rs.biological;
+        self.lengths_estimated = false;
+        self.nreads = Some(self.biological_count());
+    }
+
     /// Number of biological reads; every read when types are unknown.
     fn biological_count(&self) -> usize {
         if self.biological.is_empty() {
@@ -189,6 +201,14 @@ impl InfoRecord {
         if l.is_empty() {
             return "-".into();
         }
+        if self.lengths_estimated {
+            return format!("~{}", self.reads_label_exact());
+        }
+        self.reads_label_exact()
+    }
+
+    fn reads_label_exact(&self) -> String {
+        let l = &self.read_lengths;
         let has_tech = self.biological.iter().any(|&b| !b);
         if !has_tech && l.iter().all(|&x| x == l[0]) {
             return format!("{}×{}bp", l.len(), l[0]);
@@ -225,12 +245,71 @@ fn join_semi(it: impl Iterator<Item = String>) -> String {
     it.collect::<Vec<_>>().join(";")
 }
 
-/// One row's worth of `sracha info` state: either a fully resolved record
-/// (from SDL/S3), a local archive record, or an error captured during
-/// resolution so it can still be rendered as a row.
+/// The archive's stored per-read structure, read from VDB metadata.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ReadStructure {
+    pub lengths: Vec<u32>,
+    pub biological: Vec<bool>,
+}
+
+/// Read the true per-read lengths and types of a remote archive using range
+/// requests (metadata only, tens of KB). Blocking: call from `spawn_blocking`.
+pub fn fetch_read_structure(url: &str) -> Result<ReadStructure, String> {
+    use crate::remote::HttpRangeReader;
+    use crate::vdb::kar::KarArchive;
+
+    let reader = HttpRangeReader::open(url).map_err(|e| format!("range open failed: {e}"))?;
+    let mut archive = KarArchive::open(reader).map_err(|e| format!("KAR parse failed: {e}"))?;
+    let descs = crate::vdb::cursor::archive_read_structure(&mut archive, "SEQUENCE")
+        .ok_or_else(|| "no static read structure in archive metadata".to_string())?;
+    Ok(ReadStructure {
+        lengths: descs.iter().map(|&(_, l)| l).collect(),
+        biological: descs.iter().map(|&(t, _)| t == b'B').collect(),
+    })
+}
+
+/// Fetch read structures for many URLs concurrently (at most `concurrency`
+/// in flight). A failed fetch yields `None` so callers fall back to the
+/// RunInfo estimate instead of failing `info`.
+pub async fn fetch_read_structures(
+    urls: Vec<Option<String>>,
+    concurrency: usize,
+) -> Vec<Option<ReadStructure>> {
+    use std::sync::Arc;
+    let sem = Arc::new(tokio::sync::Semaphore::new(concurrency.max(1)));
+    let tasks: Vec<_> = urls
+        .into_iter()
+        .map(|url| {
+            let sem = sem.clone();
+            tokio::spawn(async move {
+                let url = url?;
+                let _permit = sem.acquire_owned().await.ok()?;
+                let u = url.clone();
+                match tokio::task::spawn_blocking(move || fetch_read_structure(&u)).await {
+                    Ok(Ok(rs)) => Some(rs),
+                    Ok(Err(e)) => {
+                        tracing::debug!("{url}: read structure unavailable: {e}");
+                        None
+                    }
+                    Err(_) => None,
+                }
+            })
+        })
+        .collect();
+    let mut out = Vec::with_capacity(tasks.len());
+    for t in tasks {
+        out.push(t.await.ok().flatten());
+    }
+    out
+}
+
+/// One row's worth of `sracha info` state: either a fully built record
+/// (remote run or local archive) or an error captured during resolution so
+/// it can still be rendered as a row. `Ok` is the bare resolved form, used
+/// where no archive read structure was fetched.
 pub enum InfoEntry<'a> {
     Ok(&'a ResolvedAccession),
-    Local(Box<InfoRecord>),
+    Record(Box<InfoRecord>),
     Error { accession: String, message: String },
 }
 
@@ -245,6 +324,7 @@ const COLUMNS: &[&str] = &[
     "md5",
     "read_lengths",
     "read_types",
+    "read_lengths_source",
 ];
 
 /// Emit one header row + one record per entry in TSV (`delim = b'\t'`) or CSV
@@ -256,7 +336,7 @@ pub fn write_delim<W: Write>(w: &mut W, entries: &[InfoEntry<'_>], delim: u8) {
     for entry in entries {
         let rec = match entry {
             InfoEntry::Ok(r) => InfoRecord::from_resolved(r),
-            InfoEntry::Local(rec) => (**rec).clone(),
+            InfoEntry::Record(rec) => (**rec).clone(),
             InfoEntry::Error { accession, .. } => {
                 let mut row = vec![""; COLUMNS.len()];
                 row[0] = accession.as_str();
@@ -276,6 +356,11 @@ fn write_record<W: Write>(w: &mut W, rec: &InfoRecord, delim: u8) {
     let size_bytes = rec.size_bytes.map(|s| s.to_string()).unwrap_or_default();
     let read_lengths = rec.read_lengths_field();
     let read_types = rec.read_types_field();
+    let source = match (rec.read_lengths.is_empty(), rec.lengths_estimated) {
+        (true, _) => "",
+        (false, true) => "runinfo",
+        (false, false) => "archive",
+    };
     write_row(
         w,
         &[
@@ -289,6 +374,7 @@ fn write_record<W: Write>(w: &mut W, rec: &InfoRecord, delim: u8) {
             rec.md5.as_deref().unwrap_or(""),
             read_lengths.as_str(),
             read_types.as_str(),
+            source,
         ],
         delim,
     );
@@ -391,14 +477,14 @@ mod tests {
 
     #[test]
     fn tsv_includes_read_lengths_column() {
-        let lines = render(&[InfoEntry::Local(Box::new(local_record()))], b'\t');
+        let lines = render(&[InfoEntry::Record(Box::new(local_record()))], b'\t');
         assert_eq!(
             lines[0],
-            "accession\tarchive_type\tlayout\tnreads\tspots\tsize_bytes\tplatform\tmd5\tread_lengths\tread_types"
+            "accession\tarchive_type\tlayout\tnreads\tspots\tsize_bytes\tplatform\tmd5\tread_lengths\tread_types\tread_lengths_source"
         );
         assert_eq!(
             lines[1],
-            "SRR18918001\tSRA\tPAIRED\t2\t240732238\t9828828653\tILLUMINA\t\t8;50;16;49\tT;B;T;B"
+            "SRR18918001\tSRA\tPAIRED\t2\t240732238\t9828828653\tILLUMINA\t\t8;50;16;49\tT;B;T;B\tarchive"
         );
     }
 
@@ -408,19 +494,23 @@ mod tests {
         rec.read_lengths = vec![100];
         rec.biological.clear();
         rec.nreads = Some(1);
-        let lines = render(&[InfoEntry::Local(Box::new(rec))], b'\t');
+        let lines = render(&[InfoEntry::Record(Box::new(rec))], b'\t');
         assert!(
             lines[1].starts_with("SRR18918001\tSRA\tSINGLE\t1\t"),
             "{}",
             lines[1]
         );
-        assert!(lines[1].ends_with("\t100\t"), "{}", lines[1]);
+        assert!(lines[1].ends_with("\t100\t\tarchive"), "{}", lines[1]);
     }
 
     #[test]
     fn csv_row_has_no_quoting_for_semicolon_lists() {
-        let lines = render(&[InfoEntry::Local(Box::new(local_record()))], b',');
-        assert!(lines[1].ends_with(",8;50;16;49,T;B;T;B"), "{}", lines[1]);
+        let lines = render(&[InfoEntry::Record(Box::new(local_record()))], b',');
+        assert!(
+            lines[1].ends_with(",8;50;16;49,T;B;T;B,archive"),
+            "{}",
+            lines[1]
+        );
     }
 
     #[test]
@@ -432,7 +522,7 @@ mod tests {
             }],
             b'\t',
         );
-        assert_eq!(lines[1], "SRR0\t\t\t\t\t\t\t\t\t");
+        assert_eq!(lines[1], "SRR0\t\t\t\t\t\t\t\t\t\t");
     }
 
     #[test]
@@ -448,5 +538,46 @@ mod tests {
         };
         assert_eq!(rec.reads_label(), "2×154bp");
         assert_eq!(InfoRecord::default().reads_label(), "-");
+    }
+
+    #[test]
+    fn estimated_lengths_are_marked() {
+        let rec = InfoRecord {
+            accession: "SRR1".into(),
+            archive_type: "SRA",
+            nreads: Some(2),
+            read_lengths: vec![61, 62],
+            lengths_estimated: true,
+            ..Default::default()
+        };
+        assert_eq!(rec.reads_label(), "~61bp+62bp");
+        let lines = render(&[InfoEntry::Record(Box::new(rec))], b'\t');
+        assert!(lines[1].ends_with("\t61;62\t\truninfo"), "{}", lines[1]);
+    }
+
+    #[test]
+    fn apply_read_structure_replaces_estimate() {
+        let mut rec = InfoRecord {
+            accession: "SRR18918001".into(),
+            archive_type: "SRA",
+            nreads: Some(2),
+            read_lengths: vec![61, 62],
+            lengths_estimated: true,
+            ..Default::default()
+        };
+        rec.apply_read_structure(ReadStructure {
+            lengths: vec![8, 50, 16, 49],
+            biological: vec![false, true, false, true],
+        });
+        assert!(!rec.lengths_estimated);
+        assert_eq!(rec.nreads, Some(2));
+        assert_eq!(rec.reads_label(), "8bp(T)+50bp+16bp(T)+49bp");
+    }
+
+    #[tokio::test]
+    async fn unreachable_url_falls_back_to_none() {
+        let out =
+            fetch_read_structures(vec![None, Some("http://127.0.0.1:1/x.sra".into())], 2).await;
+        assert_eq!(out, vec![None, None]);
     }
 }

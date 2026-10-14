@@ -256,3 +256,28 @@ fn remote_vdb_dump_matches_local_for_a_row_range() {
         stats.requests()
     );
 }
+
+/// `info` must report the archive's own read structure, fetched with range
+/// requests, and agree with what a local open of the same file reports.
+#[test]
+#[ignore] // requires network on first run; cached thereafter
+fn remote_read_structure_matches_local_and_stays_small() {
+    use sracha_core::vdb::cursor::VdbCursor;
+
+    let path = ensure_srr28588231();
+    let archive_size = std::fs::metadata(&path).unwrap().len();
+    let server = serve(&path);
+
+    let mut local = open_local(&path);
+    let cursor = VdbCursor::open(&mut local, &path).unwrap();
+    let expected_lens = cursor.metadata_read_lengths().unwrap();
+    let expected_types = cursor.metadata_read_types().unwrap();
+
+    let rs = sracha_core::info::fetch_read_structure(&server.url).unwrap();
+    assert_eq!(rs.lengths, expected_lens);
+    assert_eq!(
+        rs.biological,
+        expected_types.iter().map(|&t| t == 1).collect::<Vec<_>>()
+    );
+    assert!(archive_size > 1 << 20, "fixture should be non-trivial");
+}
