@@ -99,6 +99,43 @@ pub struct PipelineConfig {
     pub refseq_cache_dir: Option<PathBuf>,
 }
 
+impl Default for PipelineConfig {
+    /// The CLI's own defaults where one exists (split-3, gzip level 1, strict
+    /// integrity, resumable downloads), and quiet/inert values elsewhere (no
+    /// progress output, one connection, no sidecar). Struct-update syntax
+    /// (`..Default::default()`) is how callers say "everything but these".
+    fn default() -> Self {
+        Self {
+            output_dir: PathBuf::from("."),
+            split_mode: SplitMode::Split3,
+            compression: CompressionMode::Gzip { level: 1 },
+            threads: 8,
+            connections: 1,
+            skip_technical: true,
+            min_read_len: None,
+            force: false,
+            progress: false,
+            run_info: None,
+            fasta: false,
+            resume: true,
+            stdout: false,
+            cancelled: None,
+            strict: true,
+            verify: false,
+            http_client: None,
+            keep_sra: false,
+            paired_suffix: PairedSuffix::Numeric,
+            seq_defline: None,
+            qual_defline: None,
+            folder_per_accession: false,
+            metadata: None,
+            metadata_row: None,
+            refseq_paths: Vec::new(),
+            refseq_cache_dir: None,
+        }
+    }
+}
+
 impl PipelineConfig {
     /// Directory where outputs for `accession` should be written.
     /// With `folder_per_accession`, this is `output_dir / accession`.
@@ -155,31 +192,11 @@ mod tests {
     fn test_config(folder_per_accession: bool) -> PipelineConfig {
         PipelineConfig {
             output_dir: PathBuf::from("/tmp/x"),
-            split_mode: crate::fastq::SplitMode::Split3,
             compression: crate::fastq::CompressionMode::None,
             threads: 1,
-            connections: 1,
-            skip_technical: true,
-            min_read_len: None,
-            force: false,
-            progress: false,
-            run_info: None,
-            fasta: false,
-            resume: true,
-            stdout: false,
-            cancelled: None,
             strict: false,
-            verify: false,
-            http_client: None,
-            keep_sra: false,
-            paired_suffix: crate::fastq::PairedSuffix::Numeric,
-            seq_defline: None,
-            qual_defline: None,
             folder_per_accession,
-            metadata: None,
-            metadata_row: None,
-            refseq_paths: Vec::new(),
-            refseq_cache_dir: None,
+            ..Default::default()
         }
     }
 

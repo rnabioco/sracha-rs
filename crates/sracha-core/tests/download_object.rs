@@ -7,7 +7,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
 use sracha_core::download::DownloadConfig;
-use sracha_core::fastq::{CompressionMode, PairedSuffix, SplitMode};
+use sracha_core::fastq::CompressionMode;
 use sracha_core::pipeline::{PipelineConfig, download_sra, download_sra_object, vdbcache_path_for};
 use sracha_core::sdl::{ResolvedAccession, ResolvedFile, ResolvedMirror};
 use wiremock::matchers::{method, path};
@@ -223,31 +223,10 @@ async fn vdbcache_is_downloaded_beside_the_archive() {
 fn pipeline_config(output_dir: &Path) -> PipelineConfig {
     PipelineConfig {
         output_dir: output_dir.to_path_buf(),
-        split_mode: SplitMode::Split3,
         compression: CompressionMode::None,
         threads: 2,
-        connections: 1,
-        skip_technical: true,
-        min_read_len: None,
-        force: false,
-        progress: false,
-        run_info: None,
-        fasta: false,
-        resume: true,
-        stdout: false,
-        cancelled: None,
         strict: false,
-        verify: false,
-        http_client: None,
-        keep_sra: false,
-        paired_suffix: PairedSuffix::Numeric,
-        seq_defline: None,
-        qual_defline: None,
-        folder_per_accession: false,
-        metadata: None,
-        metadata_row: None,
-        refseq_paths: Vec::new(),
-        refseq_cache_dir: None,
+        ..Default::default()
     }
 }
 

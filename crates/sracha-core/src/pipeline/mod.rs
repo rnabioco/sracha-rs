@@ -2268,31 +2268,11 @@ mod tests {
     ) -> PipelineConfig {
         PipelineConfig {
             output_dir: output_dir.to_path_buf(),
-            split_mode: crate::fastq::SplitMode::Split3,
             compression: crate::fastq::CompressionMode::None,
             threads: 1,
-            connections: 1,
-            skip_technical: true,
-            min_read_len: None,
-            force: false,
-            progress: false,
-            run_info: None,
-            fasta: false,
-            resume: true,
-            stdout: false,
-            cancelled: None,
             strict: false,
-            verify: false,
-            http_client: None,
-            keep_sra: false,
-            paired_suffix: crate::fastq::PairedSuffix::Numeric,
-            seq_defline: None,
-            qual_defline: None,
-            folder_per_accession: false,
             metadata: Some(metadata),
-            metadata_row: None,
-            refseq_paths: Vec::new(),
-            refseq_cache_dir: None,
+            ..Default::default()
         }
     }
 

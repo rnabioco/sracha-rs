@@ -1,0 +1,99 @@
+Convert SRA file(s) to FASTQ
+
+Usage: sracha fastq [OPTIONS] <INPUTS>...
+
+Arguments:
+  <INPUTS>...
+          SRA file path(s) (.sra files from `sracha fetch`)
+
+Options:
+  -v, --verbose...
+          Log verbosity (-v, -vv, -vvv)
+
+  -q, --quiet
+          Suppress all output except errors
+
+  -t, --threads <THREADS>
+          Number of threads for decode
+          
+          [default: 8]
+
+      --no-progress
+          Disable progress bar
+
+  -h, --help
+          Print help (see a summary with '-h')
+
+Output:
+  -O, --output-dir <OUTPUT_DIR>
+          Output directory
+          
+          [default: .]
+
+  -Z, --stdout
+          Write to stdout
+
+      --split <SPLIT>
+          Split mode
+
+          Possible values:
+          - split-3:     Paired reads to _1/_2, unpaired to _0
+          - split-files: Nth read to Nth file
+          - split-spot:  All reads to one file
+          - interleaved: R1/R2 interleaved in one file
+          
+          [default: split-3]
+
+      --paired-suffix <PAIRED_SUFFIX>
+          Suffix style for paired/split FASTQ outputs. `numeric` -> `_1.fastq`/`_2.fastq` (default, matches fasterq-dump and ENA). `r` -> `_R1.fastq`/`_R2.fastq` (matches Illumina BCL output convention)
+
+          Possible values:
+          - numeric: `_1.fastq` / `_2.fastq` (default, matches fasterq-dump and ENA)
+          - r:       `_R1.fastq` / `_R2.fastq` (matches Illumina BCL output convention)
+          
+          [default: numeric]
+
+      --fasta
+          Output FASTA instead of FASTQ (drops quality scores)
+
+      --seq-defline <TEMPLATE>
+          Custom defline template (fasterq-dump `--seq-defline` syntax). Variables: $ac (accession) $si (spot id) $ri (read id) $sn (spot/read name) $rl (read length) $lg (LINKAGE_GROUP, e.g. 10x 'CB:..|UB:..'; cSRA runs only); $$ is a literal '$'. Example: '@$ac.$si.$ri'. For PacBio/ONT, $sn is the native read name (e.g. PacBio 'm64012_.../ccs', ONT '<uuid> ch=.. start_time=..'); it is also the default header. The '+' line mirrors this. ($sg/spot-group unsupported.)
+
+      --qual-defline <TEMPLATE>
+          Custom template for the '+' line (same variables as --seq-defline). A leading '+' is optional; '+' alone writes a bare '+' line. Default: mirror --seq-defline. Ignored with --fasta
+
+  -f, --force
+          Overwrite existing files
+
+      --folder-per-accession
+          Place each accession's outputs (FASTQ + sidecars) inside its own subdirectory of the output directory, named after the accession. Default: all files flat in the output directory
+
+Compression:
+      --no-gzip
+          Disable gzip compression (compressed by default)
+
+      --gzip-level <GZIP_LEVEL>
+          Gzip compression level [default: 1]
+
+      --zstd
+          Use zstd compression instead of gzip
+
+      --zstd-level <ZSTD_LEVEL>
+          Zstd compression level (1-22) [default: 3]
+
+Filtering:
+      --min-read-len <MIN_READ_LEN>
+          Minimum read length
+
+      --include-technical
+          Include technical reads (skipped by default)
+
+Advanced:
+      --no-strict
+          Disable strict integrity checking. By default, sracha fails on any data-integrity anomaly it cannot silently fall back on: quality or sequence streams that do not correspond to each other, decoded bases or spots that disagree with the archive's own recorded totals, invalid quality bytes, quality overruns, and paired-spot violations. Pass this flag to downgrade those failures to warnings. Benign-fallback counters (SRA-lite all-zero quality blobs and truncated-spot recovery) stay informational either way
+
+      --verify
+          Verify decoded quality values against the archive's STATS/QUALITY histogram. Every other quality check compares lengths, so this is the only one that notices a decode emitting the right number of plausible quality bytes at the wrong values. Costs one increment per base and is skipped for archives that synthesize quality (SRA-Lite, --fasta)
+
+      --refseq-cache <DIR>
+          Directory for cached external reference sequences, used by aligned (cSRA) runs whose reference bases live in NCBI refseq objects rather than in the archive itself. Shared across accessions and runs. Defaults to $SRACHA_REFSEQ_DIR, else the platform cache dir (~/.cache/sracha/refseq, or %LOCALAPPDATA%\sracha\refseq on Windows)
