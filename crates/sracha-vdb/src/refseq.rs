@@ -69,8 +69,7 @@ pub fn external_refs_needed<R: Read + Seek>(
     // A CMP_READ column means the bases may be embedded, but the column can
     // exist and be empty (bam-load keeps it in the schema even when the
     // assembly lives in external refseq objects). So decide per row below.
-    let cmp_read =
-        open(archive, "CMP_READ").map(|c| CachedColumn::new(c, ColumnKind::TwoNa));
+    let cmp_read = open(archive, "CMP_READ").map(|c| CachedColumn::new(c, ColumnKind::TwoNa));
 
     let (Some(seq_id), Some(seq_start), Some(seq_len)) = (
         open(archive, "SEQ_ID"),
