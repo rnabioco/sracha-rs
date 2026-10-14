@@ -649,7 +649,8 @@ pub struct InfoArgs {
     pub prefer_ena: bool,
 
     /// Output format. `table` is human-readable; `tsv`/`csv` emit a single
-    /// header row plus one record per accession for pipeline use.
+    /// header row plus one record per accession for pipeline use; `json`
+    /// emits an array with every field, including title, study and design.
     #[arg(long, value_enum, default_value_t = InfoFormat::Table)]
     pub format: InfoFormat,
 }
@@ -662,6 +663,9 @@ pub enum InfoFormat {
     Tsv,
     /// Comma-separated values, one record per accession
     Csv,
+    /// JSON array, one object per accession, with every field (including
+    /// title, study and design)
+    Json,
 }
 
 #[derive(Args)]

@@ -951,14 +951,10 @@ async fn main() -> Result<()> {
                 .map(|s| expand_tilde(&s))
                 .partition(|s| std::path::Path::new(s).is_file());
 
-            let delim_format = matches!(args.format, InfoFormat::Tsv | InfoFormat::Csv);
-            let delim = if matches!(args.format, InfoFormat::Csv) {
-                b','
-            } else {
-                b'\t'
-            };
-            // Table output prints each local file as it is read; TSV/CSV
-            // collect them so local and remote rows share one header.
+            // `delim_format` = any machine-readable format. Table output prints
+            // each local file as it is read; the others collect them so local
+            // and remote rows share one header (or one JSON array).
+            let delim_format = !matches!(args.format, InfoFormat::Table);
             let mut local_entries: Vec<InfoEntry> = Vec::new();
             for p in &paths {
                 let path = std::path::Path::new(p);
@@ -984,8 +980,7 @@ async fn main() -> Result<()> {
 
             if accessions.is_empty() {
                 if delim_format {
-                    let stdout = std::io::stdout();
-                    sracha_core::info::write_delim(&mut stdout.lock(), &local_entries, delim);
+                    write_info_entries(args.format, &local_entries);
                 }
                 return Ok(());
             }
@@ -1080,16 +1075,15 @@ async fn main() -> Result<()> {
                         print_resolved(rec);
                     }
                 }
-                InfoFormat::Tsv | InfoFormat::Csv => {
-                    let stdout = std::io::stdout();
-                    sracha_core::info::write_delim(&mut stdout.lock(), &entries, delim);
+                InfoFormat::Tsv | InfoFormat::Csv | InfoFormat::Json => {
+                    write_info_entries(args.format, &entries);
                 }
             }
 
             if args.prefer_ena {
-                if matches!(args.format, InfoFormat::Tsv | InfoFormat::Csv) {
+                if delim_format {
                     eprintln!(
-                        "{} --prefer-ena is ignored with --format tsv/csv",
+                        "{} --prefer-ena is ignored with --format tsv/csv/json",
                         style::warn_label("warning:"),
                     );
                 } else {
@@ -1440,6 +1434,18 @@ fn dedup_preserving_order(accessions: &mut Vec<String>) -> usize {
     let mut seen = std::collections::HashSet::new();
     accessions.retain(|acc| seen.insert(acc.clone()));
     before - accessions.len()
+}
+
+/// Write `entries` in a machine-readable `info` format to stdout.
+fn write_info_entries(format: InfoFormat, entries: &[InfoEntry<'_>]) {
+    let stdout = std::io::stdout();
+    let mut out = stdout.lock();
+    match format {
+        InfoFormat::Tsv => sracha_core::info::write_delim(&mut out, entries, b'\t'),
+        InfoFormat::Csv => sracha_core::info::write_delim(&mut out, entries, b','),
+        InfoFormat::Json => sracha_core::info::write_json(&mut out, entries),
+        InfoFormat::Table => {}
+    }
 }
 
 /// Detail view for a local archive, rendered from the shared [`InfoRecord`].

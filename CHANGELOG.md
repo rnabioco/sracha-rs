@@ -12,6 +12,10 @@
   experiment title) plus study and design description from NCBI's EFetch
   XML, as `Title`/`Study`/`Design` lines, a table column, and a `title`
   TSV/CSV column ([#168]).
+- `sracha info --format json` prints an array with every field, including
+  title, study, design, mirrors and read structure, with `null` for unknown
+  values. TSV/CSV gain `format` (`normalized`/`lite`), `bases` and
+  `bases_estimated` columns ([#181]).
 
 ### Fixes
 
@@ -30,6 +34,7 @@
 [#166]: https://github.com/rnabioco/sracha-rs/issues/166
 [#167]: https://github.com/rnabioco/sracha-rs/issues/167
 [#168]: https://github.com/rnabioco/sracha-rs/issues/168
+[#181]: https://github.com/rnabioco/sracha-rs/issues/181
 [#172]: https://github.com/rnabioco/sracha-rs/issues/172
 
 ## 0.7.2 (2026-10-13)

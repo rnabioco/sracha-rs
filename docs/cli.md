@@ -221,7 +221,7 @@ sracha info [OPTIONS] [ACCESSION_OR_PATH]...
 |--------|---------|-------------|
 | `--accession-list <FILE>` | | Read accessions from a file (one per line) |
 | `--prefer-ena` | | Also fetch ENA's FASTQ filereport and show it alongside the NCBI info |
-| `--format <FMT>` | `table` | Output format: `table` (human-readable), `tsv`, or `csv` |
+| `--format <FMT>` | `table` | Output format: `table` (human-readable), `tsv`, `csv`, or `json` (every field) |
 
 For accessions, displays file sizes, available formats, download mirrors,
 and quality information. Study and BioProject accessions are resolved to
@@ -235,8 +235,10 @@ prints its table of contents, schema, and metadata. Paths starting with
 record per accession. Columns: `accession`, `archive_type` (`SRA`/`cSRA`),
 `layout` (`SINGLE`/`PAIRED`/`N-read`), `nreads`, `spots`, `size_bytes`,
 `platform`, `md5`, `read_lengths` (`;`-separated, e.g. `8;50;16;49`) and
-`read_types` (`;`-separated `B`iological/`T`echnical), `read_lengths_source` and `title`.
-Missing fields are empty strings. Local `.sra` paths get a row alongside
+`read_types` (`;`-separated `B`iological/`T`echnical), `read_lengths_source`,
+`title`, `format` (`normalized` or `lite`; empty for local files), `bases` (NCBI's
+reported count, else an estimate) and `bases_estimated` (`true`/`false`).
+`nreads` is the number of biological reads. Missing fields are empty strings. Local `.sra` paths get a row alongside
 remote accessions; `--prefer-ena` is ignored with a stderr warning in these
 formats. `read_lengths` and `read_types` come from the archive's own metadata
 (fetched with small range requests, no download), so technical reads are
@@ -254,9 +256,41 @@ fields are simply empty and the rest of the output is unaffected. Local
 
 ```
 $ sracha info --format tsv SRR28588231.sra
-accession	archive_type	layout	nreads	spots	size_bytes	platform	md5	read_lengths	read_types	read_lengths_source	title
-SRR28588231	SRA	PAIRED	2	66220	23395841	ILLUMINA		301;301	B;B	archive	
+accession	archive_type	layout	nreads	spots	size_bytes	platform	md5	read_lengths	read_types	read_lengths_source	title	format	bases	bases_estimated
+SRR28588231	SRA	PAIRED	2	66220	23395841	ILLUMINA		301;301	B;B	archive				
 ```
+
+`--format json` prints a pretty-printed array with one object per accession and
+every field the other views show. TSV/CSV stay flat; JSON is the superset for
+scripts, and adds the study title, design description, mirror URL, alternate
+mirrors and vdbcache size. Unknown scalars are `null` and empty lists are `[]`
+(no empty-string placeholders). The experiment details are nested:
+
+```json
+{
+  "accession": "SRR18918001",
+  "layout": "PAIRED",
+  "format": "normalized",
+  "read_lengths": [8, 50, 16, 49],
+  "read_types": ["T", "B", "T", "B"],
+  "read_lengths_source": "archive",
+  "title": "scATAC-seq of Drosophila melanogaster: third-instar larval third leg disc",
+  "experiment": {
+    "experiment_title": "scATAC-seq of Drosophila melanogaster: third-instar larval third leg disc",
+    "sample_title": null,
+    "study_title": "Single-Cell Atlas of the Drosophila Leg Disc Identifies a Long Non-Coding RNA in Late Development",
+    "design_description": "10X Genomics scATAC-seq v.1",
+    "library_construction_protocol": null
+  }
+}
+```
+
+An accession that fails to resolve appears as `{"accession": "...", "error": "..."}`
+so one failure does not break the array. Local `.sra` paths and remote accessions
+mix in the same array. Fields shown above are abridged; see the full output for
+`accession`, `path`, `archive_type`, `nreads`, `spots`, `bases`, `bases_estimated`,
+`size_bytes`, `platform`, `md5`, `source`, `source_url`, `alt_mirrors`,
+`vdbcache_size`, `blobs` and `columns`.
 
 ---
 

@@ -22,7 +22,7 @@ const FETCH_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
 
 /// Descriptive fields for one run's experiment package. Absent elements are
 /// `None`; not every run has a sample title, and some have neither title.
-#[derive(Clone, Debug, Default, PartialEq, Eq)]
+#[derive(Clone, Debug, Default, PartialEq, Eq, serde::Serialize)]
 pub struct ExperimentInfo {
     /// `EXPERIMENT/TITLE`.
     pub experiment_title: Option<String>,
