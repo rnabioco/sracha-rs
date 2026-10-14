@@ -1,5 +1,16 @@
 # Changelog
 
+## Unreleased
+
+### Features
+
+- `sracha info --format tsv|csv` now accepts local `.sra` paths and adds
+  `read_lengths` and `read_types` columns; the table and detail views show
+  `Layout`, `Reads` and `Spots` separately, with technical reads marked for
+  local archives ([#166]).
+
+[#166]: https://github.com/rnabioco/sracha-rs/issues/166
+
 ## 0.7.2 (2026-10-13)
 
 ### Features
