@@ -22,7 +22,9 @@ permissions:
 
 concurrency:
   group: pages
-  cancel-in-progress: true
+  # Never cancel a run mid-deploy: a cancelled run leaves its Pages deployment
+  # "in progress", and the next deploy is then refused. Queue instead.
+  cancel-in-progress: false
 
 jobs:
   build:
