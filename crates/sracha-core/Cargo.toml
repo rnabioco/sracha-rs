@@ -19,6 +19,7 @@ crossbeam-channel.workspace = true
 flate2.workspace = true
 indicatif.workspace = true
 itoa.workspace = true
+roxmltree.workspace = true
 libdeflate-sys.workspace = true
 libdeflater.workspace = true
 md-5.workspace = true

@@ -8,7 +8,7 @@
 use std::io::Write;
 use std::path::Path;
 
-use crate::sdl::ResolvedAccession;
+use crate::sdl::{ExperimentInfo, ResolvedAccession};
 
 /// Everything `sracha info` knows about one accession, independent of how it
 /// is rendered or where it came from.
@@ -38,6 +38,8 @@ pub struct InfoRecord {
     /// Local archive details.
     pub blobs: Option<usize>,
     pub columns: Vec<String>,
+    /// Descriptive fields from EFetch XML (remote runs only; best effort).
+    pub experiment: Option<ExperimentInfo>,
 }
 
 impl InfoRecord {
@@ -63,6 +65,7 @@ impl InfoRecord {
             source: r.sra_file.mirrors.first().map(|m| m.service.clone()),
             blobs: None,
             columns: Vec::new(),
+            experiment: None,
         }
     }
 
@@ -160,6 +163,11 @@ impl InfoRecord {
             rec.columns.push("NAME".into());
         }
         Ok(rec)
+    }
+
+    /// Human-readable name: the sample title, else the experiment title.
+    pub fn title(&self) -> Option<&str> {
+        self.experiment.as_ref().and_then(|e| e.title())
     }
 
     /// Replace the estimated read lengths with the archive's real structure.
@@ -325,6 +333,7 @@ const COLUMNS: &[&str] = &[
     "read_lengths",
     "read_types",
     "read_lengths_source",
+    "title",
 ];
 
 /// Emit one header row + one record per entry in TSV (`delim = b'\t'`) or CSV
@@ -375,6 +384,7 @@ fn write_record<W: Write>(w: &mut W, rec: &InfoRecord, delim: u8) {
             read_lengths.as_str(),
             read_types.as_str(),
             source,
+            rec.title().unwrap_or(""),
         ],
         delim,
     );
@@ -480,11 +490,11 @@ mod tests {
         let lines = render(&[InfoEntry::Record(Box::new(local_record()))], b'\t');
         assert_eq!(
             lines[0],
-            "accession\tarchive_type\tlayout\tnreads\tspots\tsize_bytes\tplatform\tmd5\tread_lengths\tread_types\tread_lengths_source"
+            "accession\tarchive_type\tlayout\tnreads\tspots\tsize_bytes\tplatform\tmd5\tread_lengths\tread_types\tread_lengths_source\ttitle"
         );
         assert_eq!(
             lines[1],
-            "SRR18918001\tSRA\tPAIRED\t2\t240732238\t9828828653\tILLUMINA\t\t8;50;16;49\tT;B;T;B\tarchive"
+            "SRR18918001\tSRA\tPAIRED\t2\t240732238\t9828828653\tILLUMINA\t\t8;50;16;49\tT;B;T;B\tarchive\t"
         );
     }
 
@@ -500,14 +510,14 @@ mod tests {
             "{}",
             lines[1]
         );
-        assert!(lines[1].ends_with("\t100\t\tarchive"), "{}", lines[1]);
+        assert!(lines[1].ends_with("\t100\t\tarchive\t"), "{}", lines[1]);
     }
 
     #[test]
     fn csv_row_has_no_quoting_for_semicolon_lists() {
         let lines = render(&[InfoEntry::Record(Box::new(local_record()))], b',');
         assert!(
-            lines[1].ends_with(",8;50;16;49,T;B;T;B,archive"),
+            lines[1].ends_with(",8;50;16;49,T;B;T;B,archive,"),
             "{}",
             lines[1]
         );
@@ -522,7 +532,7 @@ mod tests {
             }],
             b'\t',
         );
-        assert_eq!(lines[1], "SRR0\t\t\t\t\t\t\t\t\t\t");
+        assert_eq!(lines[1], "SRR0\t\t\t\t\t\t\t\t\t\t\t");
     }
 
     #[test]
@@ -552,7 +562,7 @@ mod tests {
         };
         assert_eq!(rec.reads_label(), "~61bp+62bp");
         let lines = render(&[InfoEntry::Record(Box::new(rec))], b'\t');
-        assert!(lines[1].ends_with("\t61;62\t\truninfo"), "{}", lines[1]);
+        assert!(lines[1].ends_with("\t61;62\t\truninfo\t"), "{}", lines[1]);
     }
 
     #[test]
@@ -579,5 +589,26 @@ mod tests {
         let out =
             fetch_read_structures(vec![None, Some("http://127.0.0.1:1/x.sra".into())], 2).await;
         assert_eq!(out, vec![None, None]);
+    }
+
+    #[test]
+    fn title_column_prefers_sample_title_and_quotes_commas_in_csv() {
+        let mut rec = local_record();
+        rec.experiment = Some(ExperimentInfo {
+            experiment_title: Some("exp, title".into()),
+            ..Default::default()
+        });
+        assert_eq!(rec.title(), Some("exp, title"));
+        let lines = render(&[InfoEntry::Record(Box::new(rec.clone()))], b',');
+        assert!(
+            lines[1].ends_with(",archive,\"exp, title\""),
+            "{}",
+            lines[1]
+        );
+
+        rec.experiment.as_mut().unwrap().sample_title = Some("sample".into());
+        assert_eq!(rec.title(), Some("sample"));
+        let lines = render(&[InfoEntry::Record(Box::new(rec))], b'\t');
+        assert!(lines[1].ends_with("\tarchive\tsample"), "{}", lines[1]);
     }
 }

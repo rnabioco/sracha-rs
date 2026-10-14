@@ -8,6 +8,10 @@
   `read_lengths` and `read_types` columns; the table and detail views show
   `Layout`, `Reads` and `Spots` separately, with technical reads marked for
   local archives ([#166]).
+- `sracha info` shows the run's human-readable title (sample title, else
+  experiment title) plus study and design description from NCBI's EFetch
+  XML, as `Title`/`Study`/`Design` lines, a table column, and a `title`
+  TSV/CSV column ([#168]).
 
 ### Fixes
 
@@ -19,6 +23,7 @@
 
 [#166]: https://github.com/rnabioco/sracha-rs/issues/166
 [#167]: https://github.com/rnabioco/sracha-rs/issues/167
+[#168]: https://github.com/rnabioco/sracha-rs/issues/168
 
 ## 0.7.2 (2026-10-13)
 

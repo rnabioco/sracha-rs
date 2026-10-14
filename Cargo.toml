@@ -11,6 +11,8 @@ license = "MIT"
 
 [workspace.dependencies]
 reqwest = { version = "0.13", features = ["form", "json", "rustls", "stream"] }
+# XML (EFetch experiment packages)
+roxmltree = "0.20"
 # Async
 tokio = { version = "1", features = ["full"] }
 

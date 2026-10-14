@@ -1,5 +1,7 @@
+mod experiment;
 mod response;
 
+pub use experiment::{ExperimentInfo, fetch_experiment_info, parse_experiment_packages};
 pub use response::*;
 
 use std::collections::HashMap;
