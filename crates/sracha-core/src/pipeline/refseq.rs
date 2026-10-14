@@ -275,7 +275,7 @@ async fn fetch_all(
 /// `select_mirror` applies to the main SRA object.
 fn mirror_urls(file: &ResolvedFile) -> Vec<String> {
     let mut mirrors: Vec<_> = file.mirrors.iter().collect();
-    mirrors.sort_by_key(|m| crate::pipeline::mirror_priority(&m.service));
+    mirrors.sort_by_key(|m| crate::sdl::mirror_priority(&m.service));
     mirrors.into_iter().map(|m| m.url.clone()).collect()
 }
 

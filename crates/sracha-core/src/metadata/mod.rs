@@ -61,7 +61,7 @@ impl RunMetadata {
     /// primary mirror's URL/service plus everything we know from EUtils
     /// RunInfo. Missing fields stay `None`.
     pub fn from_resolved(r: &ResolvedAccession) -> Self {
-        let primary = r.sra_file.mirrors.first();
+        let primary = r.sra_file.preferred_mirror();
         let ri = r.run_info.as_ref();
         Self {
             accession: r.accession.clone(),

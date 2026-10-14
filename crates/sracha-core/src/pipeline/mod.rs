@@ -289,36 +289,16 @@ fn csra_vdbcache_path(sra_path: &std::path::Path) -> Option<PathBuf> {
     candidate.exists().then_some(candidate)
 }
 
-/// Select the best mirror URL for downloading.
-///
-/// Prefers cloud mirrors (s3, gs) over NCBI on-premises servers because
-/// cloud CDNs are typically much faster for parallel chunked downloads.
-/// Mirror preference by service label — lower sorts first.
-/// Cloud mirrors beat NCBI on-premises for parallel chunked downloads.
-/// Shared with the external-reference fetcher so both rank identically.
-pub(crate) fn mirror_priority(service: &str) -> u8 {
-    match service {
-        "s3" | "s3-direct" => 0,
-        "gs" => 1,
-        s if s.contains("sra-ncbi") => 2,
-        "ncbi" => 3,
-        _ => 4,
-    }
-}
-
+/// Select the best mirror URL for downloading — the same
+/// [`ResolvedFile::preferred_mirror`] that `info`, `get` and the sidecars report.
 fn select_mirror(resolved: &ResolvedAccession) -> Result<String> {
-    let mirrors = &resolved.sra_file.mirrors;
-    if mirrors.is_empty() {
-        return Err(Error::Download {
+    let best = resolved
+        .sra_file
+        .preferred_mirror()
+        .ok_or_else(|| Error::Download {
             accession: resolved.accession.clone(),
             message: "no download mirrors available".into(),
-        });
-    }
-
-    let best = mirrors
-        .iter()
-        .min_by_key(|m| mirror_priority(m.service.as_str()))
-        .unwrap();
+        })?;
 
     tracing::debug!(
         "selected mirror: [{}] {}",

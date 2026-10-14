@@ -133,6 +133,22 @@ pub struct ResolvedMirror {
     pub service: String,
 }
 
+/// Mirror preference by service label — lower sorts first.
+///
+/// Cloud mirrors beat NCBI on-premises servers for parallel chunked
+/// downloads. This is the single ranking rule: downloads, `info`, `get`'s
+/// "from [source]" line and the sidecars all go through
+/// [`ResolvedFile::preferred_mirror`], so what is reported is what is used.
+pub fn mirror_priority(service: &str) -> u8 {
+    match service {
+        "s3" | "s3-direct" => 0,
+        "gs" => 1,
+        s if s.contains("sra-ncbi") => 2,
+        "ncbi" => 3,
+        _ => 4,
+    }
+}
+
 /// A resolved SRA file with download URLs and metadata.
 #[derive(Debug, Clone)]
 pub struct ResolvedFile {
@@ -144,6 +160,23 @@ pub struct ResolvedFile {
     pub md5: Option<String>,
     /// Whether this is an SRA-lite file (quality scores stripped).
     pub is_lite: bool,
+}
+
+impl ResolvedFile {
+    /// The mirror a download will use: lowest [`mirror_priority`], ties
+    /// broken by SDL order. `None` when there are no free mirrors.
+    pub fn preferred_mirror(&self) -> Option<&ResolvedMirror> {
+        self.mirrors
+            .iter()
+            .min_by_key(|m| mirror_priority(&m.service))
+    }
+
+    /// Every mirror except the preferred one, best first.
+    pub fn alternate_mirrors(&self) -> Vec<&ResolvedMirror> {
+        let mut all: Vec<&ResolvedMirror> = self.mirrors.iter().collect();
+        all.sort_by_key(|m| mirror_priority(&m.service));
+        all.into_iter().skip(1).collect()
+    }
 }
 
 /// Read structure metadata from NCBI EUtils.
@@ -814,7 +847,7 @@ fn parse_run_accessions_from_csv(body: &str) -> Vec<String> {
 
 /// Extract a [`ResolvedFile`] from an [`SdlFile`] response entry.
 pub(crate) fn resolved_file_from_sdl(sdl_file: &SdlFile) -> Result<ResolvedFile> {
-    let mirrors: Vec<ResolvedMirror> = sdl_file
+    let mut mirrors: Vec<ResolvedMirror> = sdl_file
         .locations
         .iter()
         .filter(|loc| !loc.ce_required && !loc.pay_required)
@@ -823,6 +856,9 @@ pub(crate) fn resolved_file_from_sdl(sdl_file: &SdlFile) -> Result<ResolvedFile>
             service: loc.service.clone().unwrap_or_else(|| "unknown".into()),
         })
         .collect();
+    // Stable sort: best mirror first, SDL order kept among equals, so even
+    // code that reads `mirrors[0]` agrees with `preferred_mirror()`.
+    mirrors.sort_by_key(|m| mirror_priority(&m.service));
 
     let size = sdl_file.size_bytes().unwrap_or(0);
     let md5 = sdl_file.md5.clone();
@@ -908,6 +944,67 @@ mod tests {
         let resolved = resolved_file_from_sdl(&sdl).unwrap();
         assert_eq!(resolved.mirrors.len(), 2);
         assert_eq!(resolved.size, 5000);
+    }
+
+    #[test]
+    fn resolved_file_orders_mirrors_by_priority() {
+        // SDL lists the on-prem NCBI mirror first; the cloud one must win.
+        let sdl = make_sdl_file(
+            "sra",
+            false,
+            Some(1000),
+            vec![
+                make_location("ncbi", false, false),
+                make_location("gs", false, false),
+                make_location("s3", false, false),
+            ],
+        );
+        let resolved = resolved_file_from_sdl(&sdl).unwrap();
+        let services: Vec<&str> = resolved
+            .mirrors
+            .iter()
+            .map(|m| m.service.as_str())
+            .collect();
+        assert_eq!(services, ["s3", "gs", "ncbi"]);
+    }
+
+    #[test]
+    fn preferred_mirror_matches_download_choice() {
+        let file = ResolvedFile {
+            mirrors: vec![
+                ResolvedMirror {
+                    url: "https://ncbi.example.com/f".into(),
+                    service: "ncbi".into(),
+                },
+                ResolvedMirror {
+                    url: "https://s3.example.com/f".into(),
+                    service: "s3".into(),
+                },
+            ],
+            size: 1,
+            md5: None,
+            is_lite: false,
+        };
+        // Unsorted input (as tests and other constructors may build it).
+        assert_eq!(file.preferred_mirror().unwrap().service, "s3");
+        let alts: Vec<&str> = file
+            .alternate_mirrors()
+            .iter()
+            .map(|m| m.service.as_str())
+            .collect();
+        assert_eq!(alts, ["ncbi"]);
+    }
+
+    #[test]
+    fn preferred_mirror_none_when_empty() {
+        let file = ResolvedFile {
+            mirrors: vec![],
+            size: 0,
+            md5: None,
+            is_lite: false,
+        };
+        assert!(file.preferred_mirror().is_none());
+        assert!(file.alternate_mirrors().is_empty());
     }
 
     #[test]
