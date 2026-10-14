@@ -228,15 +228,7 @@ async fn main() -> Result<()> {
                 let acc = &resolved.accession;
                 let mirror = resolved
                     .sra_file
-                    .mirrors
-                    .iter()
-                    .min_by_key(|m| match m.service.as_str() {
-                        "s3" | "s3-direct" => 0u8,
-                        "gs" => 1,
-                        _ if m.service.contains("sra-ncbi") => 2,
-                        "ncbi" => 3,
-                        _ => 4,
-                    })
+                    .preferred_mirror()
                     .ok_or_else(|| anyhow::anyhow!("no mirrors for {acc}"))?;
                 let url = mirror.url.clone();
                 let output_path = args.output_dir.join(format!("{acc}.sra"));
@@ -278,15 +270,7 @@ async fn main() -> Result<()> {
                 // `.sra.vdbcache` convention.
                 if let Some(ref vdb) = resolved.vdbcache_file {
                     let vdb_mirror = vdb
-                        .mirrors
-                        .iter()
-                        .min_by_key(|m| match m.service.as_str() {
-                            "s3" | "s3-direct" => 0u8,
-                            "gs" => 1,
-                            _ if m.service.contains("sra-ncbi") => 2,
-                            "ncbi" => 3,
-                            _ => 4,
-                        })
+                        .preferred_mirror()
                         .ok_or_else(|| anyhow::anyhow!("no vdbcache mirrors for {acc}"))?;
                     let vdb_url = vdb_mirror.url.clone();
                     let vdb_path = args.output_dir.join(format!("{acc}.sra.vdbcache"));
@@ -662,7 +646,7 @@ async fn main() -> Result<()> {
                 let http_client = http_client.clone();
                 let cancelled = cancelled.clone();
                 move |resolved: &ResolvedAccession| {
-                    let primary = resolved.sra_file.mirrors.first();
+                    let primary = resolved.sra_file.preferred_mirror();
                     sracha_core::pipeline::PipelineConfig {
                         output_dir: args.output_dir.clone(),
                         split_mode,
@@ -845,8 +829,7 @@ async fn main() -> Result<()> {
                 // Decode (CPU-bound) while the next download runs in the background.
                 let source = resolved
                     .sra_file
-                    .mirrors
-                    .first()
+                    .preferred_mirror()
                     .map(|m| m.service.clone())
                     .unwrap_or_else(|| "unknown".into());
                 match tokio::task::block_in_place(|| {
@@ -1057,7 +1040,7 @@ async fn main() -> Result<()> {
             let sp = progress::Spinner::start("Reading read structure and titles".to_string());
             let urls: Vec<Option<String>> = resolved
                 .iter()
-                .map(|r| r.sra_file.mirrors.first().map(|m| m.url.clone()))
+                .map(|r| r.sra_file.preferred_mirror().map(|m| m.url.clone()))
                 .collect();
             // Descriptive fields (titles) come from the EFetch XML; fetch
             // them alongside the structures. Both are best-effort.
@@ -1093,8 +1076,8 @@ async fn main() -> Result<()> {
                     if entries.len() > 1 {
                         // Project/multi-accession: summary table.
                         print_info_table(&entries, None);
-                    } else if let (Some(r), Some(rec)) = (resolved.first(), records.first()) {
-                        print_resolved(r, rec);
+                    } else if let Some(rec) = records.first() {
+                        print_resolved(rec);
                     }
                 }
                 InfoFormat::Tsv | InfoFormat::Csv => {
@@ -1552,14 +1535,12 @@ fn print_read_structure(rec: &InfoRecord) {
     }
 }
 
-fn print_resolved(resolved: &ResolvedAccession, rec: &InfoRecord) {
-    let f = &resolved.sra_file;
-
-    println!("{}", style::header(&resolved.accession));
+fn print_resolved(rec: &InfoRecord) {
+    println!("{}", style::header(&rec.accession));
     print_descriptive_fields(rec);
 
     // Size and format flavor on one line.
-    let format_tag = if f.is_lite {
+    let format_tag = if rec.is_lite {
         "SRA-lite"
     } else {
         "SRA normalized"
@@ -1567,68 +1548,64 @@ fn print_resolved(resolved: &ResolvedAccession, rec: &InfoRecord) {
     println!(
         "  {}     {}  ({})",
         style::label("Size:"),
-        style::value(format_size(f.size)),
+        style::value(format_size(rec.size_bytes.unwrap_or(0))),
         format_tag,
     );
 
-    // Source: whichever mirror sracha will actually use for download.
-    // `s3-direct` means the bucket HEAD probe succeeded; anything else
+    // Source: the preferred mirror — the one sracha will actually download
+    // from. `s3-direct` means the bucket HEAD probe succeeded; anything else
     // (s3/ncbi/gs) came from the SDL locate API.
-    if let Some(primary) = f.mirrors.first() {
+    if let (Some(service), Some(url)) = (&rec.source, &rec.source_url) {
         println!(
             "  {}   [{}] {}",
             style::label("Source:"),
-            style::value(&primary.service),
-            style::path(&primary.url),
+            style::value(service),
+            style::path(url),
         );
     }
 
     println!(
         "  {}      {}",
         style::label("MD5:"),
-        style::value(f.md5.as_deref().unwrap_or("not provided")),
+        style::value(rec.md5.as_deref().unwrap_or("not provided")),
     );
 
-    if let Some(ref ri) = resolved.run_info {
-        print_read_structure(rec);
-        if let Some(spots) = ri.spots {
-            println!(
-                "  {}   {}",
-                style::label("Spots:"),
-                style::count(thousands(spots))
-            );
-            println!(
-                "  {}   {}",
-                style::label("Bases:"),
-                style::value(format_bases(spots * ri.spot_len as u64))
-            );
-        }
-        if let Some(ref plat) = ri.platform {
-            println!("  {} {}", style::label("Platform:"), style::value(plat),);
-        }
+    print_read_structure(rec);
+    if let Some(spots) = rec.spots {
+        println!(
+            "  {}   {}",
+            style::label("Spots:"),
+            style::count(thousands(spots))
+        );
+    }
+    if let Some(bases) = rec.bases {
+        let est = if rec.bases_estimated { "~" } else { "" };
+        println!(
+            "  {}   {}{}",
+            style::label("Bases:"),
+            est,
+            style::value(format_bases(bases))
+        );
+    }
+    if let Some(plat) = &rec.platform {
+        println!("  {} {}", style::label("Platform:"), style::value(plat));
     }
 
-    if let Some(ref vdb) = resolved.vdbcache_file {
+    if let Some(size) = rec.vdbcache_size {
         println!(
             "  {} yes  ({})",
             style::label("VDBcache:"),
-            style::value(format_size(vdb.size)),
+            style::value(format_size(size)),
         );
     }
 
-    // Alternate mirrors, if any — primary already rendered above.
-    if f.mirrors.len() > 1 {
-        let alts: Vec<&str> = f
-            .mirrors
-            .iter()
-            .skip(1)
-            .map(|m| m.service.as_str())
-            .collect();
+    // Alternate mirrors, if any — the preferred one is rendered above.
+    if !rec.alt_mirrors.is_empty() {
         println!(
             "  {}  {} alternate(s) [{}]",
             style::label("Mirrors:"),
-            style::count(alts.len()),
-            alts.join(", "),
+            style::count(rec.alt_mirrors.len()),
+            rec.alt_mirrors.join(", "),
         );
     }
 }

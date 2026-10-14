@@ -93,8 +93,7 @@ async fn resolve_target(input: &str) -> Result<Target> {
 
     let url = resolved
         .sra_file
-        .mirrors
-        .first()
+        .preferred_mirror()
         .map(|m| m.url.clone())
         .ok_or_else(|| anyhow::anyhow!("no download URL found for {acc}"))?;
 

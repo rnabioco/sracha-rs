@@ -21,7 +21,7 @@ pub struct DryRunRow {
 
 impl DryRunRow {
     pub fn from_resolved(r: &ResolvedAccession) -> Self {
-        let primary = r.sra_file.mirrors.first();
+        let primary = r.sra_file.preferred_mirror();
         let ri = r.run_info.as_ref();
         Self {
             accession: r.accession.clone(),

@@ -17,7 +17,10 @@ pub struct InfoRecord {
     pub accession: String,
     /// Local file path; `None` for remote runs.
     pub path: Option<String>,
-    /// `"SRA"` or `"cSRA"`.
+    /// `"SRA"` or `"cSRA"`. One meaning for both origins — reference-compressed
+    /// or not — detected differently: remote runs by the presence of a
+    /// `.vdbcache` sidecar (legacy monolithic cSRA reads as `"SRA"`), local
+    /// archives by opening them.
     pub archive_type: &'static str,
     /// Biological read count (`nreads` column).
     pub nreads: Option<usize>,
@@ -33,8 +36,20 @@ pub struct InfoRecord {
     pub size_bytes: Option<u64>,
     pub platform: Option<String>,
     pub md5: Option<String>,
-    /// Download mirror service (remote only).
+    /// Preferred download mirror service (remote only).
     pub source: Option<String>,
+    /// Preferred download mirror URL (remote only).
+    pub source_url: Option<String>,
+    /// Services of the other mirrors, best first (remote only).
+    pub alt_mirrors: Vec<String>,
+    /// Total bases: NCBI's reported count when present, else an estimate
+    /// (`bases_estimated`) from spots x spot length.
+    pub bases: Option<u64>,
+    pub bases_estimated: bool,
+    /// Size of the `.vdbcache` sidecar, when the run has one (remote only).
+    pub vdbcache_size: Option<u64>,
+    /// SRA-lite (simplified quality) rather than normalized (remote only).
+    pub is_lite: bool,
     /// Local archive details.
     pub blobs: Option<usize>,
     pub columns: Vec<String>,
@@ -46,6 +61,17 @@ impl InfoRecord {
     /// Build a record from a resolved remote run.
     pub fn from_resolved(r: &ResolvedAccession) -> Self {
         let ri = r.run_info.as_ref();
+        let preferred = r.sra_file.preferred_mirror();
+        // NCBI's own base count when it reported one; otherwise spots x the
+        // average spot length, flagged as an estimate.
+        let (bases, bases_estimated) = match ri {
+            Some(ri) => match (ri.bases, ri.spots) {
+                (Some(b), _) => (Some(b), false),
+                (None, Some(s)) if ri.spot_len > 0 => (Some(s * u64::from(ri.spot_len)), true),
+                _ => (None, false),
+            },
+            None => (None, false),
+        };
         Self {
             accession: r.accession.clone(),
             path: None,
@@ -62,7 +88,18 @@ impl InfoRecord {
             size_bytes: Some(r.sra_file.size),
             platform: ri.and_then(|ri| ri.platform.clone()),
             md5: r.sra_file.md5.clone(),
-            source: r.sra_file.mirrors.first().map(|m| m.service.clone()),
+            source: preferred.map(|m| m.service.clone()),
+            source_url: preferred.map(|m| m.url.clone()),
+            alt_mirrors: r
+                .sra_file
+                .alternate_mirrors()
+                .iter()
+                .map(|m| m.service.clone())
+                .collect(),
+            bases,
+            bases_estimated,
+            vdbcache_size: r.vdbcache_file.as_ref().map(|f| f.size),
+            is_lite: r.sra_file.is_lite,
             blobs: None,
             columns: Vec::new(),
             experiment: None,
@@ -610,5 +647,76 @@ mod tests {
         assert_eq!(rec.title(), Some("sample"));
         let lines = render(&[InfoEntry::Record(Box::new(rec))], b'\t');
         assert!(lines[1].ends_with("\tarchive\tsample"), "{}", lines[1]);
+    }
+
+    fn resolved(
+        mirrors: &[(&str, &str)],
+        spots: Option<u64>,
+        spot_len: u32,
+        bases: Option<u64>,
+    ) -> ResolvedAccession {
+        use crate::sdl::{ResolvedFile, ResolvedMirror, RunInfo};
+        ResolvedAccession {
+            accession: "SRR1".into(),
+            sra_file: ResolvedFile {
+                mirrors: mirrors
+                    .iter()
+                    .map(|&(service, url)| ResolvedMirror {
+                        url: url.into(),
+                        service: service.into(),
+                    })
+                    .collect(),
+                size: 10,
+                md5: None,
+                is_lite: true,
+            },
+            vdbcache_file: None,
+            run_info: Some(RunInfo {
+                spots,
+                spot_len,
+                bases,
+                ..Default::default()
+            }),
+        }
+    }
+
+    #[test]
+    fn bases_prefers_runinfo_bases() {
+        let r = resolved(&[], Some(100), 50, Some(4_999));
+        let rec = InfoRecord::from_resolved(&r);
+        assert_eq!(rec.bases, Some(4_999));
+        assert!(!rec.bases_estimated);
+    }
+
+    #[test]
+    fn bases_falls_back_to_marked_estimate() {
+        let r = resolved(&[], Some(100), 50, None);
+        let rec = InfoRecord::from_resolved(&r);
+        assert_eq!(rec.bases, Some(5_000));
+        assert!(rec.bases_estimated);
+
+        let none = InfoRecord::from_resolved(&resolved(&[], None, 50, None));
+        assert_eq!(none.bases, None);
+    }
+
+    #[test]
+    fn record_reports_the_mirror_the_download_uses() {
+        // SDL order puts the on-prem mirror first; the record must still
+        // report the preferred cloud mirror and list the rest as alternates.
+        let r = resolved(
+            &[
+                ("ncbi", "https://ncbi/x"),
+                ("s3", "https://s3/x"),
+                ("gs", "https://gs/x"),
+            ],
+            None,
+            0,
+            None,
+        );
+        let rec = InfoRecord::from_resolved(&r);
+        assert_eq!(rec.source.as_deref(), Some("s3"));
+        assert_eq!(rec.source_url.as_deref(), Some("https://s3/x"));
+        assert_eq!(rec.alt_mirrors, ["gs", "ncbi"]);
+        assert!(rec.is_lite);
     }
 }
