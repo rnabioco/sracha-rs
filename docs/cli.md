@@ -234,14 +234,18 @@ prints its table of contents, schema, and metadata. Paths starting with
 `--format tsv` and `--format csv` emit a single header row followed by one
 record per accession. Columns: `accession`, `archive_type` (`SRA`/`cSRA`),
 `layout` (`SINGLE`/`PAIRED`/`N-read`), `nreads`, `spots`, `size_bytes`,
-`platform`, `md5`. Missing fields are empty strings. Local `.sra` paths and
-`--prefer-ena` are ignored with a stderr warning in these formats.
+`platform`, `md5`, `read_lengths` (`;`-separated, e.g. `8;50;16;49`) and
+`read_types` (`;`-separated `B`iological/`T`echnical; local archives only).
+Missing fields are empty strings. Local `.sra` paths get a row alongside
+remote accessions; `--prefer-ena` is ignored with a stderr warning in these
+formats. For remote runs `read_lengths` is an estimate from NCBI RunInfo
+(see #167); local archives report the stored per-read lengths, including
+technical reads.
 
 ```
-$ sracha info --format tsv SRR2584863 SRR14724462
-accession	archive_type	layout	nreads	spots	size_bytes	platform	md5
-SRR2584863	SRA	PAIRED	2	1553259	302057279	ILLUMINA	c486ca786ca83ec3cef04b7e32e1aa08
-SRR14724462	SRA	PAIRED	2	41135235	4057553143	ILLUMINA	cfb98d8db26ad9ad28c501a4115f0cc5
+$ sracha info --format tsv SRR28588231.sra
+accession	archive_type	layout	nreads	spots	size_bytes	platform	md5	read_lengths	read_types
+SRR28588231	SRA	PAIRED	2	66220	23395841	ILLUMINA		301;301	B;B
 ```
 
 ---

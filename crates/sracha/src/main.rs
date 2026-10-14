@@ -44,7 +44,7 @@ where
 
 use cli::{Cli, Command, InfoFormat};
 use sracha_core::accession::{self, InputAccession};
-use sracha_core::info::InfoEntry;
+use sracha_core::info::{InfoEntry, InfoRecord};
 use sracha_core::sdl::{ResolvedAccession, SdlClient};
 use sracha_core::util::{format_bases, format_size, thousands};
 
@@ -968,19 +968,42 @@ async fn main() -> Result<()> {
                 .map(|s| expand_tilde(&s))
                 .partition(|s| std::path::Path::new(s).is_file());
 
-            if matches!(args.format, InfoFormat::Tsv | InfoFormat::Csv) && !paths.is_empty() {
-                eprintln!(
-                    "{} --format tsv/csv does not support local .sra paths; skipping {} file(s)",
-                    style::warn_label("warning:"),
-                    paths.len(),
-                );
+            let delim_format = matches!(args.format, InfoFormat::Tsv | InfoFormat::Csv);
+            let delim = if matches!(args.format, InfoFormat::Csv) {
+                b','
             } else {
-                for p in &paths {
-                    print_local_file_info(std::path::Path::new(p));
+                b'\t'
+            };
+            // Table output prints each local file as it is read; TSV/CSV
+            // collect them so local and remote rows share one header.
+            let mut local_entries: Vec<InfoEntry> = Vec::new();
+            for p in &paths {
+                let path = std::path::Path::new(p);
+                match InfoRecord::from_local_archive(path) {
+                    Ok(rec) if !delim_format => print_local_record(&rec),
+                    Ok(rec) => local_entries.push(InfoEntry::Local(Box::new(rec))),
+                    Err(message) if !delim_format => {
+                        let label = path.file_stem().and_then(|s| s.to_str()).unwrap_or(p);
+                        println!("{}", style::header(label));
+                        eprintln!("  {} {message}", style::error_label("error:"));
+                    }
+                    Err(message) => {
+                        let accession = path
+                            .file_stem()
+                            .and_then(|s| s.to_str())
+                            .unwrap_or(p)
+                            .to_string();
+                        eprintln!("{} {accession}: {message}", style::error_label("error:"));
+                        local_entries.push(InfoEntry::Error { accession, message });
+                    }
                 }
             }
 
             if accessions.is_empty() {
+                if delim_format {
+                    let stdout = std::io::stdout();
+                    sracha_core::info::write_delim(&mut stdout.lock(), &local_entries, delim);
+                }
                 return Ok(());
             }
 
@@ -1026,7 +1049,9 @@ async fn main() -> Result<()> {
                 style::count(resolved.len()),
             ));
 
-            let entries: Vec<InfoEntry> = resolved.iter().map(InfoEntry::Ok).collect();
+            // `local_entries` is empty in table mode (printed above).
+            let mut entries = local_entries;
+            entries.extend(resolved.iter().map(InfoEntry::Ok));
 
             match args.format {
                 InfoFormat::Table => {
@@ -1037,13 +1062,9 @@ async fn main() -> Result<()> {
                         print_resolved(r);
                     }
                 }
-                InfoFormat::Tsv => {
+                InfoFormat::Tsv | InfoFormat::Csv => {
                     let stdout = std::io::stdout();
-                    sracha_core::info::write_delim(&mut stdout.lock(), &entries, b'\t');
-                }
-                InfoFormat::Csv => {
-                    let stdout = std::io::stdout();
-                    sracha_core::info::write_delim(&mut stdout.lock(), &entries, b',');
+                    sracha_core::info::write_delim(&mut stdout.lock(), &entries, delim);
                 }
             }
 
@@ -1403,167 +1424,62 @@ fn dedup_preserving_order(accessions: &mut Vec<String>) -> usize {
     before - accessions.len()
 }
 
-fn print_local_file_info(path: &std::path::Path) {
-    use sracha_core::vdb::cursor::VdbCursor;
-    use sracha_core::vdb::kar::KarArchive;
-
-    let label = path
-        .file_stem()
-        .and_then(|s| s.to_str())
-        .unwrap_or("unknown");
-
-    let size = std::fs::metadata(path).map(|m| m.len()).unwrap_or(0);
-
-    println!("{}", style::header(label));
-    println!(
-        "  {}    {}",
-        style::label("Path:"),
-        style::path(path.display())
-    );
-    println!(
-        "  {}    {}",
-        style::label("Size:"),
-        style::value(format_size(size))
-    );
-
-    let file = match std::fs::File::open(path) {
-        Ok(f) => f,
-        Err(e) => {
-            eprintln!("  {} open failed: {e}", style::error_label("error:"));
-            return;
-        }
-    };
-    let mut archive = match KarArchive::open(std::io::BufReader::new(file)) {
-        Ok(a) => a,
-        Err(e) => {
-            eprintln!("  {} KAR parse failed: {e}", style::error_label("error:"));
-            return;
-        }
-    };
-    // cSRA dispatch: archives we can decode via CsraCursor don't open as
-    // a plain VdbCursor (no physical READ column). Render a cSRA-flavoured
-    // info block instead of surfacing the reject-if-csra error. When a
-    // `.sra.vdbcache` sidecar exists alongside the .sra, check both so
-    // modern NCBI split-archive cSRA is recognised.
-    let vdbcache = sracha_core::vdb::csra::vdbcache_sidecar_path(path);
-    let vdbcache_opt = if vdbcache.exists() {
-        Some(vdbcache.as_path())
-    } else {
-        None
-    };
-    if sracha_core::vdb::csra::looks_like_decodable_csra(path, vdbcache_opt).unwrap_or(false) {
-        // Reopen the sidecar as its own archive: the probe above accepts
-        // split archives, so the cursor has to be sidecar-aware too or it
-        // fails on exactly the files we just said we could read.
-        let mut cache_archive = vdbcache_opt.and_then(|p| {
-            std::fs::File::open(p)
-                .map_err(|e| e.to_string())
-                .and_then(|f| {
-                    KarArchive::open(std::io::BufReader::new(f)).map_err(|e| e.to_string())
-                })
-                .map_err(|e| {
-                    eprintln!(
-                        "  {} vdbcache parse failed: {e}",
-                        style::error_label("error:")
-                    );
-                })
-                .ok()
-        });
-        print_local_csra_info(path, &mut archive, cache_archive.as_mut().zip(vdbcache_opt));
-        return;
+/// Detail view for a local archive, rendered from the shared [`InfoRecord`].
+fn print_local_record(rec: &InfoRecord) {
+    println!("{}", style::header(&rec.accession));
+    if let Some(path) = &rec.path {
+        println!("  {}    {}", style::label("Path:"), style::path(path));
     }
-
-    let cursor = match VdbCursor::open(&mut archive, path) {
-        Ok(c) => c,
-        Err(e) => {
-            eprintln!("  {} cursor open failed: {e}", style::error_label("error:"));
-            return;
-        }
-    };
-
-    let platform = cursor.platform().unwrap_or("unknown").to_string();
-    let blob_count = cursor.read_col().blob_count();
-    let spot_count: u64 = cursor
-        .read_col()
-        .blobs()
-        .iter()
-        .map(|b| b.id_range as u64)
-        .sum();
-    let read_lengths = cursor.metadata_read_lengths().unwrap_or_default();
-    let layout = match read_lengths.len() {
-        0 => "unknown".to_string(),
-        1 => format!("SINGLE ({}bp)", read_lengths[0]),
-        n => format!("{n} reads × {read_lengths:?}bp"),
-    };
-
-    let mut columns: Vec<&str> = Vec::new();
-    columns.push("READ");
-    if cursor.quality_col().is_some() {
-        columns.push("QUALITY");
+    if let Some(size) = rec.size_bytes {
+        println!(
+            "  {}    {}",
+            style::label("Size:"),
+            style::value(format_size(size))
+        );
     }
-    if cursor.read_len_col().is_some() {
-        columns.push("READ_LEN");
+    if let Some(platform) = &rec.platform {
+        println!("  {} {}", style::label("Platform:"), style::value(platform));
     }
-    if cursor.name_col().is_some() {
-        columns.push("NAME");
+    print_read_structure(rec);
+    if let Some(spots) = rec.spots {
+        println!(
+            "  {}   {}",
+            style::label("Spots:"),
+            style::count(thousands(spots))
+        );
     }
-
-    println!("  {} {}", style::label("Platform:"), style::value(platform));
-    println!("  {}  {}", style::label("Layout:"), style::value(layout));
-    println!(
-        "  {}   {}",
-        style::label("Spots:"),
-        style::count(spot_count)
-    );
-    println!(
-        "  {}   {}",
-        style::label("Blobs:"),
-        style::count(blob_count)
-    );
-    println!(
-        "  {} {}",
-        style::label("Columns:"),
-        style::value(columns.join(", "))
-    );
+    if let Some(blobs) = rec.blobs {
+        println!("  {}   {}", style::label("Blobs:"), style::count(blobs));
+    }
+    if !rec.columns.is_empty() {
+        println!(
+            "  {} {}",
+            style::label("Columns:"),
+            style::value(rec.columns.join(", "))
+        );
+    }
+    if rec.archive_type == "cSRA" {
+        println!(
+            "  {} {}",
+            style::label("Note:"),
+            style::value("decode via `sracha fastq` (not supported by plain VDB cursor)")
+        );
+    }
 }
 
-fn print_local_csra_info<R: std::io::Read + std::io::Seek>(
-    path: &std::path::Path,
-    archive: &mut sracha_core::vdb::kar::KarArchive<R>,
-    vdbcache: Option<(&mut sracha_core::vdb::kar::KarArchive<R>, &std::path::Path)>,
-) {
-    use sracha_core::vdb::csra::CsraCursor;
-
-    let csra = match CsraCursor::open_any(archive, path, vdbcache) {
-        Ok(c) => c,
-        Err(e) => {
-            eprintln!("  {} cSRA cursor failed: {e}", style::error_label("error:"));
-            return;
-        }
-    };
-
-    println!(
-        "  {} {}",
-        style::label("Platform:"),
-        style::value("reference-compressed cSRA")
-    );
-    println!(
-        "  {}   {}",
-        style::label("Spots:"),
-        style::count(csra.row_count())
-    );
-    println!(
-        "  {} {}",
-        style::label("Columns:"),
-        style::value(
-            "CMP_READ, PRIMARY_ALIGNMENT_ID, READ_LEN, READ_TYPE, QUALITY (+ PRIMARY_ALIGNMENT + REFERENCE)"
-        )
-    );
-    println!(
-        "  {} {}",
-        style::label("Note:"),
-        style::value("decode via `sracha fastq` (not supported by plain VDB cursor)")
-    );
+/// The `Layout:` and `Reads:` lines shared by every detail view.
+fn print_read_structure(rec: &InfoRecord) {
+    let layout = rec.layout();
+    if !layout.is_empty() {
+        println!("  {}  {}", style::label("Layout:"), style::value(layout));
+    }
+    if !rec.read_lengths.is_empty() {
+        println!(
+            "  {}   {}",
+            style::label("Reads:"),
+            style::value(rec.reads_label())
+        );
+    }
 }
 
 fn print_resolved(resolved: &ResolvedAccession) {
@@ -1603,38 +1519,19 @@ fn print_resolved(resolved: &ResolvedAccession) {
     );
 
     if let Some(ref ri) = resolved.run_info {
-        let layout = match ri.nreads {
-            1 => "SINGLE".to_string(),
-            2 => "PAIRED".to_string(),
-            n => format!("{n}-read"),
-        };
-        let read_desc = if !ri.avg_read_len.is_empty()
-            && ri.avg_read_len.iter().all(|&l| l == ri.avg_read_len[0])
-        {
-            format!("{}×{}bp", ri.nreads, ri.avg_read_len[0])
-        } else {
-            ri.avg_read_len
-                .iter()
-                .map(|l| format!("{l}bp"))
-                .collect::<Vec<_>>()
-                .join("+")
-        };
-        let spots = ri
-            .spots
-            .map(|s| format!(", {} spots", style::count(thousands(s))))
-            .unwrap_or_default();
-        let bases = ri
-            .spots
-            .map(|s| format!(", {}", style::value(format_bases(s * ri.spot_len as u64))))
-            .unwrap_or_default();
-        println!(
-            "  {}   {} {}{}{}",
-            style::label("Layout:"),
-            style::value(layout),
-            style::value(read_desc),
-            spots,
-            bases,
-        );
+        print_read_structure(&InfoRecord::from_resolved(resolved));
+        if let Some(spots) = ri.spots {
+            println!(
+                "  {}   {}",
+                style::label("Spots:"),
+                style::count(thousands(spots))
+            );
+            println!(
+                "  {}   {}",
+                style::label("Bases:"),
+                style::value(format_bases(spots * ri.spot_len as u64))
+            );
+        }
         if let Some(ref plat) = ri.platform {
             println!("  {} {}", style::label("Platform:"), style::value(plat),);
         }
@@ -1736,77 +1633,44 @@ fn print_info_table(entries: &[InfoEntry<'_>], size_overrides: Option<&[u64]>) {
 
     for (idx, entry) in entries.iter().enumerate() {
         match entry {
-            InfoEntry::Ok(r) => {
+            InfoEntry::Ok(_) | InfoEntry::Local(_) => {
+                let rec = match entry {
+                    InfoEntry::Ok(r) => InfoRecord::from_resolved(r),
+                    InfoEntry::Local(rec) => (**rec).clone(),
+                    InfoEntry::Error { .. } => unreachable!(),
+                };
                 let row_size = size_overrides
                     .and_then(|s| s.get(idx).copied())
-                    .unwrap_or(r.sra_file.size);
-                let layout = r
-                    .run_info
-                    .as_ref()
-                    .map(|ri| match ri.nreads {
-                        1 => "SINGLE".to_string(),
-                        2 => "PAIRED".to_string(),
-                        n => format!("{n}-read"),
-                    })
+                    .or(rec.size_bytes)
+                    .unwrap_or(0);
+                let layout = Some(rec.layout())
+                    .filter(|l| !l.is_empty())
                     .unwrap_or_else(|| "?".into());
-                let reads = r
-                    .run_info
-                    .as_ref()
-                    .map(|ri| {
-                        if !ri.avg_read_len.is_empty()
-                            && ri.avg_read_len.iter().all(|&l| l == ri.avg_read_len[0])
-                        {
-                            format!("{}×{}bp", ri.nreads, ri.avg_read_len[0])
-                        } else {
-                            ri.avg_read_len
-                                .iter()
-                                .map(|l| format!("{l}bp"))
-                                .collect::<Vec<_>>()
-                                .join("+")
-                        }
-                    })
-                    .unwrap_or_else(|| "-".into());
-                let platform = r
-                    .run_info
-                    .as_ref()
-                    .and_then(|ri| ri.platform.clone())
-                    .unwrap_or_else(|| "-".into());
-                let spots = r
-                    .run_info
-                    .as_ref()
-                    .and_then(|ri| ri.spots)
+                let platform = rec.platform.clone().unwrap_or_else(|| "-".into());
+                let spots = rec
+                    .spots
                     .map(|s| {
                         total_spots += s;
                         thousands(s)
                     })
                     .unwrap_or_else(|| "-".into());
-                let source = r
-                    .sra_file
-                    .mirrors
-                    .first()
-                    .map(|m| m.service.clone())
-                    .unwrap_or_else(|| "-".into());
-                // SDL ships modern reference-compressed cSRA with a
-                // `.sra.vdbcache` sidecar carrying PRIMARY_ALIGNMENT /
-                // REFERENCE. Its presence is the strongest remote signal
-                // short of opening the archive. Legacy monolithic cSRA
-                // (pre-split like VDB-3418) has no sidecar and will read
-                // as "SRA" here — a known blind spot.
-                let archive_type = if r.vdbcache_file.is_some() {
-                    "cSRA"
-                } else {
-                    "SRA"
-                };
+                let source = rec.source.clone().unwrap_or_else(|| {
+                    if rec.path.is_some() {
+                        "local".into()
+                    } else {
+                        "-".into()
+                    }
+                });
                 total_size += row_size;
                 ok_count += 1;
 
                 builder.push_record([
-                    r.accession.clone(),
+                    rec.accession.clone(),
                     format_size(row_size),
                     layout,
-                    reads,
+                    rec.reads_label(),
                     platform,
-                    archive_type.into(),
+                    rec.archive_type.into(),
                     spots,
                     source,
                 ]);
