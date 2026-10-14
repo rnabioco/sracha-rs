@@ -1944,63 +1944,13 @@ fn write_run_metadata(
         return written;
     };
 
-    let row = crate::metadata::RunMetadata {
-        accession: accession.to_string(),
-        url: config.metadata_url.clone(),
-        size_bytes: config.metadata_size,
-        md5: config.metadata_md5.clone(),
-        source_service: config.metadata_service.clone(),
-        spots: config.run_info.as_ref().and_then(|r| r.spots),
-        spot_len: config.run_info.as_ref().map(|r| r.spot_len),
-        nreads: config.run_info.as_ref().map(|r| r.nreads),
-        avg_read_len: config
-            .run_info
-            .as_ref()
-            .map(|r| r.avg_read_len.clone())
-            .unwrap_or_default(),
-        platform: config.run_info.as_ref().and_then(|r| r.platform.clone()),
-        instrument_model: config
-            .run_info
-            .as_ref()
-            .and_then(|r| r.instrument_model.clone()),
-        library_strategy: config
-            .run_info
-            .as_ref()
-            .and_then(|r| r.library_strategy.clone()),
-        library_source: config
-            .run_info
-            .as_ref()
-            .and_then(|r| r.library_source.clone()),
-        library_selection: config
-            .run_info
-            .as_ref()
-            .and_then(|r| r.library_selection.clone()),
-        library_layout: config
-            .run_info
-            .as_ref()
-            .and_then(|r| r.library_layout.clone()),
-        library_name: config
-            .run_info
-            .as_ref()
-            .and_then(|r| r.library_name.clone()),
-        experiment: config.run_info.as_ref().and_then(|r| r.experiment.clone()),
-        study: config.run_info.as_ref().and_then(|r| r.study.clone()),
-        bioproject: config.run_info.as_ref().and_then(|r| r.bioproject.clone()),
-        sample: config.run_info.as_ref().and_then(|r| r.sample.clone()),
-        biosample: config.run_info.as_ref().and_then(|r| r.biosample.clone()),
-        scientific_name: config
-            .run_info
-            .as_ref()
-            .and_then(|r| r.scientific_name.clone()),
-        tax_id: config.run_info.as_ref().and_then(|r| r.tax_id),
-        bases: config.run_info.as_ref().and_then(|r| r.bases),
-        size_mb: config.run_info.as_ref().and_then(|r| r.size_mb),
-        release_date: config
-            .run_info
-            .as_ref()
-            .and_then(|r| r.release_date.clone()),
-        load_date: config.run_info.as_ref().and_then(|r| r.load_date.clone()),
-    };
+    let row = config
+        .metadata_row
+        .clone()
+        .unwrap_or_else(|| crate::metadata::RunMetadata {
+            accession: accession.to_string(),
+            ..Default::default()
+        });
     let rows = [row];
     let stem = config.accession_output_dir(accession).join(accession);
     let tsv_path = stem.with_extension("metadata.tsv");
@@ -2364,10 +2314,7 @@ mod tests {
             qual_defline: None,
             folder_per_accession: false,
             metadata: Some(metadata),
-            metadata_url: None,
-            metadata_md5: None,
-            metadata_size: None,
-            metadata_service: None,
+            metadata_row: None,
             refseq_paths: Vec::new(),
             refseq_cache_dir: None,
         }

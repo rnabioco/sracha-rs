@@ -10,6 +10,7 @@ use std::path::Path;
 
 use serde::Serialize;
 
+use crate::delimited::{join_list, write_row};
 use crate::error::Result;
 use crate::sdl::ResolvedAccession;
 
@@ -25,7 +26,7 @@ pub enum MetadataFormat {
 }
 
 /// One row of run metadata — the full set of fields written to the sidecar.
-#[derive(Clone, Debug, Serialize)]
+#[derive(Clone, Debug, Default, Serialize)]
 pub struct RunMetadata {
     pub accession: String,
     pub url: Option<String>,
@@ -95,59 +96,93 @@ impl RunMetadata {
     }
 }
 
-const TSV_HEADER: &str = "accession\turl\tsize_bytes\tmd5\tsource_service\tspots\tspot_len\tnreads\tavg_read_len\tplatform\tinstrument_model\tlibrary_strategy\tlibrary_source\tlibrary_selection\tlibrary_layout\tlibrary_name\texperiment\tstudy\tbioproject\tsample\tbiosample\tscientific_name\ttax_id\tbases\tsize_mb\trelease_date\tload_date";
+/// Sidecar column names, in output order. [`RunMetadata::cells`] yields values
+/// in this same order.
+pub const COLUMNS: [&str; 27] = [
+    "accession",
+    "url",
+    "size_bytes",
+    "md5",
+    "source_service",
+    "spots",
+    "spot_len",
+    "nreads",
+    "avg_read_len",
+    "platform",
+    "instrument_model",
+    "library_strategy",
+    "library_source",
+    "library_selection",
+    "library_layout",
+    "library_name",
+    "experiment",
+    "study",
+    "bioproject",
+    "sample",
+    "biosample",
+    "scientific_name",
+    "tax_id",
+    "bases",
+    "size_mb",
+    "release_date",
+    "load_date",
+];
 
-fn opt_str(v: &Option<String>) -> &str {
-    v.as_deref().unwrap_or("")
+fn opt_str(v: &Option<String>) -> String {
+    v.clone().unwrap_or_default()
 }
 
 fn opt_num<T: std::fmt::Display>(v: &Option<T>) -> String {
     v.as_ref().map(|x| x.to_string()).unwrap_or_default()
 }
 
+impl RunMetadata {
+    /// Every column rendered as text, in [`COLUMNS`] order. The single
+    /// source for the TSV sidecar and the `--dry-run` table. List-valued
+    /// columns use [`crate::delimited::LIST_SEP`].
+    pub fn cells(&self) -> [String; 27] {
+        [
+            self.accession.clone(),
+            opt_str(&self.url),
+            opt_num(&self.size_bytes),
+            opt_str(&self.md5),
+            opt_str(&self.source_service),
+            opt_num(&self.spots),
+            opt_num(&self.spot_len),
+            opt_num(&self.nreads),
+            join_list(&self.avg_read_len),
+            opt_str(&self.platform),
+            opt_str(&self.instrument_model),
+            opt_str(&self.library_strategy),
+            opt_str(&self.library_source),
+            opt_str(&self.library_selection),
+            opt_str(&self.library_layout),
+            opt_str(&self.library_name),
+            opt_str(&self.experiment),
+            opt_str(&self.study),
+            opt_str(&self.bioproject),
+            opt_str(&self.sample),
+            opt_str(&self.biosample),
+            opt_str(&self.scientific_name),
+            opt_num(&self.tax_id),
+            opt_num(&self.bases),
+            opt_num(&self.size_mb),
+            opt_str(&self.release_date),
+            opt_str(&self.load_date),
+        ]
+    }
+}
+
 /// Write a TSV sidecar to `path`, overwriting if present.
 pub fn write_tsv(path: &Path, rows: &[RunMetadata]) -> Result<()> {
-    let mut f = std::fs::File::create(path)?;
-    writeln!(f, "{}", TSV_HEADER)?;
+    let mut f = std::io::BufWriter::new(std::fs::File::create(path)?);
+    write_row(&mut f, &COLUMNS, b'\t')?;
     for r in rows {
-        let avg = r
-            .avg_read_len
-            .iter()
-            .map(|n| n.to_string())
-            .collect::<Vec<_>>()
-            .join(",");
-        writeln!(
-            f,
-            "{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}",
-            r.accession,
-            opt_str(&r.url),
-            opt_num(&r.size_bytes),
-            opt_str(&r.md5),
-            opt_str(&r.source_service),
-            opt_num(&r.spots),
-            opt_num(&r.spot_len),
-            opt_num(&r.nreads),
-            avg,
-            opt_str(&r.platform),
-            opt_str(&r.instrument_model),
-            opt_str(&r.library_strategy),
-            opt_str(&r.library_source),
-            opt_str(&r.library_selection),
-            opt_str(&r.library_layout),
-            opt_str(&r.library_name),
-            opt_str(&r.experiment),
-            opt_str(&r.study),
-            opt_str(&r.bioproject),
-            opt_str(&r.sample),
-            opt_str(&r.biosample),
-            opt_str(&r.scientific_name),
-            opt_num(&r.tax_id),
-            opt_num(&r.bases),
-            opt_num(&r.size_mb),
-            opt_str(&r.release_date),
-            opt_str(&r.load_date),
-        )?;
+        let cells = r.cells();
+        let refs: Vec<&str> = cells.iter().map(String::as_str).collect();
+        write_row(&mut f, &refs, b'\t')?;
     }
+    f.flush()?;
     Ok(())
 }
 
@@ -261,7 +296,7 @@ mod tests {
 
         let content = std::fs::read_to_string(&path).unwrap();
         let mut lines = content.lines();
-        assert_eq!(lines.next(), Some(TSV_HEADER));
+        assert_eq!(lines.next(), Some(COLUMNS.join("\t").as_str()));
         let data = lines.next().expect("data row present");
         assert!(lines.next().is_none(), "exactly one data row");
 
@@ -273,9 +308,41 @@ mod tests {
         assert_eq!(cols[2], "9876543");
         assert_eq!(cols[3], "deadbeef");
         assert_eq!(cols[4], "s3");
-        assert_eq!(cols[8], "151,151"); // avg_read_len joined by comma
+        assert_eq!(cols[8], "151;151"); // avg_read_len joined by `;`
         assert_eq!(cols[9], "ILLUMINA");
         assert_eq!(cols[20], "SAMN555");
+    }
+
+    #[test]
+    fn sidecar_row_matches_from_resolved() {
+        // Exercises the production path: the row `from_resolved` builds is
+        // exactly what lands in the sidecar, free text escaped.
+        let mut r = sample_resolved();
+        r.run_info.as_mut().unwrap().library_name = Some("lib\tA\nB".into());
+        let row = RunMetadata::from_resolved(&r);
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("SRR111222.metadata.tsv");
+        write_tsv(&path, std::slice::from_ref(&row)).unwrap();
+
+        let content = std::fs::read_to_string(&path).unwrap();
+        let lines: Vec<&str> = content.lines().collect();
+        assert_eq!(
+            lines.len(),
+            2,
+            "tabs/newlines in free text must not split rows"
+        );
+        let cols: Vec<&str> = lines[1].split('\t').collect();
+        assert_eq!(cols.len(), COLUMNS.len());
+        for (i, name) in COLUMNS.iter().enumerate() {
+            assert_eq!(cols[i], row.cells()[i].replace(['\t', '\n'], " "), "{name}");
+        }
+        let col = |n: &str| cols[COLUMNS.iter().position(|c| *c == n).unwrap()];
+        assert_eq!(col("library_name"), "lib A B");
+        assert_eq!(col("url"), "https://s3.example.com/SRR111222");
+        assert_eq!(col("source_service"), "s3");
+        assert_eq!(col("md5"), "deadbeef");
+        assert_eq!(col("size_bytes"), "9876543");
+        assert_eq!(col("load_date"), "2024-01-02");
     }
 
     #[test]

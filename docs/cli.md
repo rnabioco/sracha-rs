@@ -77,7 +77,7 @@ sracha get [OPTIONS] [ACCESSION]...
 | `--qual-defline <TEMPLATE>` | | Custom `+`-line template, same variables as `--seq-defline`; `+` alone writes a bare `+` ([#162](https://github.com/rnabioco/sracha-rs/issues/162)) |
 | `--min-read-len <N>` | | Minimum read length filter |
 | `--include-technical` | | Include technical reads (skipped by default) |
-| `--metadata <FORMAT>` | | Write a `<accession>.metadata.{tsv,json}` sidecar alongside each FASTQ output, capturing BioSample/SAMN, Sample/SRS, BioProject, library strategy/source/selection/layout, instrument, experiment, study, scientific name, tax id, bases, and release dates from the EUtils RunInfo CSV. Values: `tsv`, `json`, `both` |
+| `--metadata <FORMAT>` | | Write a `<accession>.metadata.{tsv,json}` sidecar alongside each FASTQ output, capturing BioSample/SAMN, Sample/SRS, BioProject, library strategy/source/selection/layout, instrument, experiment, study, scientific name, tax id, bases, and release dates from the EUtils RunInfo CSV. Values: `tsv`, `json`, `both`. In TSV, tabs/newlines inside values become spaces and list columns (`avg_read_len`) are `;`-joined, as in `--dry-run` and `info` |
 | `-Z, --stdout` | | Write to stdout (stream interleaved FASTQ, auto-delete temp SRA) |
 
 **Compression**

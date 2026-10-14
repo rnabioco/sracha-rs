@@ -34,6 +34,10 @@
   file) and dropped the `/MATE` suffix in `--split split-spot`/`interleaved`
   output. Both decode paths now share one record writer, and `split-spot`
   output on VDB-3418 is byte-identical to `fasterq-dump` ([#173]).
+- The `--metadata` sidecar and `--dry-run` now come from one row and one
+  delimited writer shared with `info`: embedded tabs/newlines in free text
+  (e.g. `library_name`) become spaces, and list columns such as
+  `avg_read_len` are joined with `;` instead of `,` ([#174]).
 
 [#166]: https://github.com/rnabioco/sracha-rs/issues/166
 [#167]: https://github.com/rnabioco/sracha-rs/issues/167
@@ -41,6 +45,7 @@
 [#181]: https://github.com/rnabioco/sracha-rs/issues/181
 [#172]: https://github.com/rnabioco/sracha-rs/issues/172
 [#173]: https://github.com/rnabioco/sracha-rs/issues/173
+[#174]: https://github.com/rnabioco/sracha-rs/issues/174
 
 ## 0.7.2 (2026-10-13)
 
