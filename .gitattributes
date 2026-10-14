@@ -1,0 +1,3 @@
+# The --help snapshots are compared byte for byte against clap's output, which
+# uses "\n". Keep them LF on every platform (Windows would check out CRLF).
+crates/sracha/tests/snapshots/* text eol=lf
