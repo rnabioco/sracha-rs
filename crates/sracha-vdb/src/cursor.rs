@@ -1016,6 +1016,28 @@ pub fn archive_platform<R: Read + Seek>(
         })
 }
 
+/// Read the run's static per-read structure from VDB metadata alone, without
+/// opening a column: `(read_type, read_len)` per read, where `read_type` is
+/// `b'B'` (biological) or `b'T'` (technical).
+///
+/// Same table-then-database precedence as [`VdbCursor`], so `sracha info` on a
+/// remote archive reports what a local open would. `None` when the metadata
+/// carries no read structure, or only zero lengths (variable-length runs keep
+/// their lengths in the physical `READ_LEN` column, which needs column reads).
+pub fn archive_read_structure<R: Read + Seek>(
+    archive: &mut KarArchive<R>,
+    table: &str,
+) -> Option<Vec<(u8, u32)>> {
+    let parse = |tree: Vec<u8>| crate::metadata::parse_read_structure(&tree).ok();
+    let descs = md_tree_data(archive, &format!("tbl/{table}/md/cur"))
+        .and_then(parse)
+        .or_else(|| md_tree_data(archive, "md/cur").and_then(parse))?;
+    if descs.iter().all(|d| d.read_len == 0) {
+        return None;
+    }
+    Some(descs.iter().map(|d| (d.read_type, d.read_len)).collect())
+}
+
 /// Reject archives that need ncbi-vdb's schema-aware virtual cursor.
 ///
 /// cSRA is NCBI's umbrella term for SRA files built from alignments.

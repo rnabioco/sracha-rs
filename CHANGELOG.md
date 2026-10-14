@@ -9,7 +9,16 @@
   `Layout`, `Reads` and `Spots` separately, with technical reads marked for
   local archives ([#166]).
 
+### Fixes
+
+- `sracha info` reported invented read lengths for remote runs (e.g.
+  `61bp+62bp` for SRR18918001, really `8bp(T)+50bp+16bp(T)+49bp`) because it
+  split NCBI's average evenly across the library layout. It now reads the
+  real structure from the archive's metadata with range requests and marks
+  any RunInfo fallback as an estimate ([#167]).
+
 [#166]: https://github.com/rnabioco/sracha-rs/issues/166
+[#167]: https://github.com/rnabioco/sracha-rs/issues/167
 
 ## 0.7.2 (2026-10-13)
 
