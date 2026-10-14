@@ -66,10 +66,11 @@ pub fn external_refs_needed<R: Read + Seek>(
         ColumnReader::open(archive, &format!("{col_base}/{name}"), sra_path).ok()
     };
 
-    // Bases embedded → nothing external to fetch, regardless of layout.
-    if open(archive, "CMP_READ").is_some() {
-        return Ok(Vec::new());
-    }
+    // A CMP_READ column means the bases may be embedded, but the column can
+    // exist and be empty (bam-load keeps it in the schema even when the
+    // assembly lives in external refseq objects). So decide per row below.
+    let cmp_read =
+        open(archive, "CMP_READ").map(|c| CachedColumn::new(c, ColumnKind::TwoNa));
 
     let (Some(seq_id), Some(seq_start), Some(seq_len)) = (
         open(archive, "SEQ_ID"),
@@ -90,7 +91,22 @@ pub fn external_refs_needed<R: Read + Seek>(
     let mut order: Vec<String> = Vec::new();
     let mut by_id: HashMap<String, ExternalRefNeed> = HashMap::new();
 
+    // Fully embedded archives are the common case and their CMP_READ is
+    // large: answer from the first row rather than decoding all of it.
+    if let Some(cmp) = &cmp_read
+        && row_count > 0
+        && cmp.two_na_row_len(first_row)? > 0
+    {
+        return Ok(Vec::new());
+    }
+
     for row in first_row..first_row + row_count as i64 {
+        // Embedded bases are read in place; they address nothing external.
+        if let Some(cmp) = &cmp_read
+            && cmp.two_na_row_len(row)? > 0
+        {
+            continue;
+        }
         let id_bytes = seq_id.read_byte_row(row)?;
         let id = String::from_utf8_lossy(&id_bytes).trim().to_string();
         if id.is_empty() {

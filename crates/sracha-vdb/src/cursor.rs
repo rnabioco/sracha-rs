@@ -1038,6 +1038,22 @@ pub fn archive_read_structure<R: Read + Seek>(
     Some(descs.iter().map(|d| (d.read_type, d.read_len)).collect())
 }
 
+/// The value of a static column (`col/{name}/row`) of `table`, from VDB
+/// metadata alone. Same table-then-database precedence as
+/// [`archive_read_structure`]. A static column holds one value shared by every
+/// row; bam-load uses it for fixed-layout runs instead of writing a physical
+/// column.
+pub fn archive_static_column<R: Read + Seek>(
+    archive: &mut KarArchive<R>,
+    table: &str,
+    name: &str,
+) -> Option<Vec<u8>> {
+    let row = |tree: Vec<u8>| crate::metadata::static_column_row(&tree, name);
+    md_tree_data(archive, &format!("tbl/{table}/md/cur"))
+        .and_then(row)
+        .or_else(|| md_tree_data(archive, "md/cur").and_then(row))
+}
+
 /// Reject archives that need ncbi-vdb's schema-aware virtual cursor.
 ///
 /// cSRA is NCBI's umbrella term for SRA files built from alignments.
