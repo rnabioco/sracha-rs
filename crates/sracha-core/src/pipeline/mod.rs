@@ -1185,6 +1185,129 @@ pub struct FastqStats {
     pub integrity: Arc<IntegrityDiag>,
 }
 
+/// Decode one local SRA file, choosing the cSRA or plain decoder and mapping
+/// archive-shape errors to user-facing ones. Shared by [`run_fastq`] and
+/// [`decode_sra`] so the two entry points cannot drift apart.
+///
+/// Returns `(spots_read, reads_written, output_files)`. `Error::Cancelled`
+/// passes through untouched so callers can clean up.
+fn decode_any(
+    sra_path: &std::path::Path,
+    acc: &str,
+    config: &PipelineConfig,
+    is_lite: bool,
+    diag: &Arc<IntegrityDiag>,
+) -> Result<(u64, u64, Vec<PathBuf>)> {
+    // Reference-compressed cSRA (bases in PRIMARY_ALIGNMENT + REFERENCE rather
+    // than a physical SEQUENCE.READ) can't decode through the regular
+    // VdbCursor; route it through CsraCursor's splice.
+    let vdbcache = csra_vdbcache_path(sra_path);
+    let decoded = if crate::vdb::csra::looks_like_decodable_csra(sra_path, vdbcache.as_deref())
+        .unwrap_or(false)
+    {
+        run_fastq_csra(sra_path, acc, config, vdbcache.as_deref())
+            .map(|s| (s.spots_read, s.reads_written, s.output_files))
+    } else {
+        decode_and_write(sra_path, acc, config, is_lite, diag)
+    };
+    match decoded {
+        // An unsupported archive shape: most commonly an aligned /
+        // reference-compressed cSRA whose PRIMARY_ALIGNMENT + REFERENCE tables
+        // live in an undownloaded .vdbcache. sracha can't emit correct FASTQ
+        // for these; surface CsraUnsupported so the CLI can offer ENA's FASTQ
+        // mirror instead of a dead-end decode error.
+        Err(Error::Vdb(sracha_vdb::Error::UnsupportedFormat { format, hint })) => {
+            Err(Error::CsraUnsupported {
+                accession: acc.to_string(),
+                message: format!("{format} \u{2014} {hint}"),
+            })
+        }
+        Err(e) => Err(wrap_blob_integrity(acc, e)),
+        ok => ok,
+    }
+}
+
+/// Text of the "paired layout requested on a single-end run" warning, or
+/// `None` when it does not apply.
+///
+/// Every spot produced exactly one read, so split-3 collapses to
+/// `{accession}.fastq` (no `_1`/`_2`) and interleaved has nothing to
+/// interleave. This is the common shape for long-read platforms and
+/// single-end Illumina; users usually didn't realize the layout.
+fn single_end_warning(
+    acc: &str,
+    config: &PipelineConfig,
+    spots_read: u64,
+    reads_written: u64,
+) -> Option<String> {
+    if spots_read == 0
+        || reads_written != spots_read
+        || !matches!(
+            config.split_mode,
+            SplitMode::Split3 | SplitMode::Interleaved
+        )
+    {
+        return None;
+    }
+    let requested = match config.split_mode {
+        SplitMode::Interleaved => "interleaved",
+        _ => "split-3",
+    };
+    Some(format!(
+        "warning: {acc}: --split {requested} requested but run is single-end \
+         ({spots_read} spots, 1 read each); output is a single file \u{2014} \
+         use --split split-spot to make this explicit"
+    ))
+}
+
+/// Post-decode steps shared by [`run_fastq`] and [`decode_sra`]: the
+/// single-end warning, the `sracha-stats.jsonl` line, and the strict
+/// integrity gate.
+#[allow(clippy::too_many_arguments)]
+fn finish_decode(
+    acc: &str,
+    config: &PipelineConfig,
+    spots_read: u64,
+    reads_written: u64,
+    output_files: &[PathBuf],
+    diag: &Arc<IntegrityDiag>,
+    sra_md5: Option<&str>,
+    sra_size: u64,
+) -> Result<()> {
+    if let Some(msg) = single_end_warning(acc, config, spots_read, reads_written) {
+        eprintln!("{msg}");
+    }
+
+    // One JSONL line per accession (passing or failing) in the shared
+    // `sracha-stats.jsonl`: a single grep-able audit log for a BioProject run.
+    if !config.stdout
+        && let Err(e) = write_stats_file(StatsEntry {
+            output_dir: &config.output_dir,
+            accession: acc,
+            spots_read,
+            reads_written,
+            sra_md5,
+            sra_size,
+            output_files,
+            diag,
+        })
+    {
+        tracing::warn!("{acc}: failed to append to sracha-stats.jsonl: {e}");
+    }
+
+    if diag.any() {
+        let summary = diag.summary();
+        if config.strict && diag.any_strict_fatal() {
+            return Err(Error::IntegrityFailure {
+                accession: acc.to_string(),
+                summary,
+            });
+        }
+        tracing::warn!("{acc}: integrity counters non-zero \u{2014} {summary}");
+    }
+    Ok(())
+}
+
 /// Convert a local SRA file to FASTQ without downloading.
 ///
 /// Opens the SRA file as a KAR archive, creates a VdbCursor, decodes VDB
@@ -1203,91 +1326,21 @@ pub fn run_fastq(
             .to_string()
     });
 
-    // Reference-compressed cSRA dispatch: archives whose bases live in
-    // PRIMARY_ALIGNMENT + REFERENCE rather than a physical SEQUENCE.READ
-    // can't decode through the regular VdbCursor; route them through
-    // CsraCursor's splice.
-    let vdbcache = csra_vdbcache_path(sra_path);
-    if crate::vdb::csra::looks_like_decodable_csra(sra_path, vdbcache.as_deref()).unwrap_or(false) {
-        return run_fastq_csra(sra_path, &acc, config, vdbcache.as_deref());
-    }
-
-    // Detect SRA-lite by checking if the quality column is absent.
-    // We pass `false` initially; decode_and_write will handle quality
-    // absence gracefully via sra_lite_quality fallback.
-    let is_lite = false;
-
     let diag = Arc::new(IntegrityDiag::default());
+    // Detect SRA-lite by checking if the quality column is absent: `false`
+    // here, and `decode_and_write` handles absence via `sra_lite_quality`.
     let (spots_read, reads_written, output_files) =
-        match decode_and_write(sra_path, &acc, config, is_lite, &diag) {
-            Ok(v) => v,
-            // An unsupported archive shape — most commonly an aligned /
-            // reference-compressed cSRA whose PRIMARY_ALIGNMENT + REFERENCE
-            // tables aren't present locally (they live in an undownloaded
-            // .vdbcache), so `looks_like_decodable_csra` routed it here rather
-            // than to CsraCursor. sracha can't emit correct FASTQ for these.
-            // Surface it as CsraUnsupported so the CLI can offer ENA's FASTQ
-            // mirror instead of a dead-end decode error.
-            Err(Error::Vdb(sracha_vdb::Error::UnsupportedFormat { format, hint })) => {
-                return Err(Error::CsraUnsupported {
-                    accession: acc.clone(),
-                    message: format!("{format} — {hint}"),
-                });
-            }
-            Err(e) => return Err(wrap_blob_integrity(&acc, e)),
-        };
-
-    // Warn (but don't fail) when a paired layout was requested on an
-    // effectively single-end run: every spot produced exactly one read, so
-    // split-3 collapses to `{accession}.fastq` (no `_1`/`_2`) and interleaved
-    // has nothing to interleave. This is the common shape for long-read
-    // platforms (PacBio/ONT, one biological read per spot) and single-end
-    // Illumina; users usually didn't realize the layout. `--split split-spot`
-    // expresses the single-file result explicitly, so point them at it.
-    if spots_read > 0
-        && reads_written == spots_read
-        && matches!(
-            config.split_mode,
-            SplitMode::Split3 | SplitMode::Interleaved
-        )
-    {
-        let requested = match config.split_mode {
-            SplitMode::Interleaved => "interleaved",
-            _ => "split-3",
-        };
-        eprintln!(
-            "warning: {acc}: --split {requested} requested but run is single-end \
-             ({spots_read} spots, 1 read each); output is a single file — \
-             use --split split-spot to make this explicit"
-        );
-    }
-
-    if !config.stdout
-        && let Err(e) = write_stats_file(StatsEntry {
-            output_dir: &config.output_dir,
-            accession: &acc,
-            spots_read,
-            reads_written,
-            sra_md5: None,
-            sra_size: 0,
-            output_files: &output_files,
-            diag: &diag,
-        })
-    {
-        tracing::warn!("{acc}: failed to append to sracha-stats.jsonl: {e}");
-    }
-
-    if diag.any() {
-        let summary = diag.summary();
-        if config.strict && diag.any_strict_fatal() {
-            return Err(Error::IntegrityFailure {
-                accession: acc,
-                summary,
-            });
-        } else {
-            tracing::warn!("{acc}: integrity counters non-zero — {summary}");
-        }
-    }
+        decode_any(sra_path, &acc, config, false, &diag)?;
+    finish_decode(
+        &acc,
+        config,
+        spots_read,
+        reads_written,
+        &output_files,
+        &diag,
+        None,
+        0,
+    )?;
 
     Ok(FastqStats {
         accession: acc,
@@ -2046,30 +2099,13 @@ pub fn decode_sra(downloaded: &DownloadedSra, config: &PipelineConfig) -> Result
     }
 
     let diag = Arc::new(IntegrityDiag::default());
-    // Reference-compressed cSRA needs CsraCursor, exactly as `run_fastq`
-    // does for local files. Without this, `sracha get` on an aligned run
-    // fell through to VdbCursor and died in `reject_if_csra`.
-    let vdbcache = csra_vdbcache_path(&downloaded.temp_path);
-    let decoded =
-        if crate::vdb::csra::looks_like_decodable_csra(&downloaded.temp_path, vdbcache.as_deref())
-            .unwrap_or(false)
-        {
-            run_fastq_csra(
-                &downloaded.temp_path,
-                &downloaded.accession,
-                config,
-                vdbcache.as_deref(),
-            )
-            .map(|s| (s.spots_read, s.reads_written, s.output_files))
-        } else {
-            decode_and_write(
-                &downloaded.temp_path,
-                &downloaded.accession,
-                config,
-                downloaded.is_lite,
-                &diag,
-            )
-        };
+    let decoded = decode_any(
+        &downloaded.temp_path,
+        &downloaded.accession,
+        config,
+        downloaded.is_lite,
+        &diag,
+    );
     let (spots_read, reads_written, mut output_files) = match decoded {
         Ok(result) => result,
         Err(Error::Cancelled { output_files }) => {
@@ -2107,19 +2143,10 @@ pub fn decode_sra(downloaded: &DownloadedSra, config: &PipelineConfig) -> Result
                 output_files: vec![],
             });
         }
-        // Aligned / reference-compressed cSRA sracha can't reconstruct (its
-        // PRIMARY_ALIGNMENT + REFERENCE tables live in an undownloaded
-        // .vdbcache, or the shape has no validated decoder). Surface as
-        // CsraUnsupported so the CLI can point the user at ENA's FASTQ mirror.
-        // The temp SRA is left in place (only the success path below removes
-        // it), so the suggested `--prefer-ena` re-run doesn't re-download.
-        Err(Error::Vdb(sracha_vdb::Error::UnsupportedFormat { format, hint })) => {
-            return Err(Error::CsraUnsupported {
-                accession: downloaded.accession.clone(),
-                message: format!("{format} — {hint}"),
-            });
-        }
-        Err(e) => return Err(wrap_blob_integrity(&downloaded.accession, e)),
+        // Unsupported shapes (`CsraUnsupported`) leave the temp SRA in place
+        // (only the success path below removes it), so the suggested
+        // `--prefer-ena` re-run doesn't re-download.
+        Err(e) => return Err(e),
     };
 
     // Clean up temp file (or preserve it in the output dir if requested).
@@ -2166,27 +2193,6 @@ pub fn decode_sra(downloaded: &DownloadedSra, config: &PipelineConfig) -> Result
         );
     }
 
-    // Append one JSONL line per accession (passing or failing) to the
-    // shared `sracha-stats.jsonl`. For a BioProject-scale run this yields
-    // a single grep-able audit log instead of one file per accession.
-    if !config.stdout
-        && let Err(e) = write_stats_file(StatsEntry {
-            output_dir: &config.output_dir,
-            accession: &downloaded.accession,
-            spots_read,
-            reads_written,
-            sra_md5: downloaded.sra_md5.as_deref(),
-            sra_size: downloaded.total_sra_size,
-            output_files: &output_files,
-            diag: &diag,
-        })
-    {
-        tracing::warn!(
-            "{}: failed to append to sracha-stats.jsonl: {e}",
-            downloaded.accession,
-        );
-    }
-
     tracing::info!(
         "{}: done -- {spots_read} spots, {reads_written} reads written, \
          {} transferred",
@@ -2194,20 +2200,16 @@ pub fn decode_sra(downloaded: &DownloadedSra, config: &PipelineConfig) -> Result
         crate::util::format_size(downloaded.bytes_transferred),
     );
 
-    if diag.any() {
-        let summary = diag.summary();
-        if config.strict && diag.any_strict_fatal() {
-            return Err(Error::IntegrityFailure {
-                accession: downloaded.accession.clone(),
-                summary,
-            });
-        } else {
-            tracing::warn!(
-                "{}: integrity counters non-zero — {summary}",
-                downloaded.accession,
-            );
-        }
-    }
+    finish_decode(
+        &downloaded.accession,
+        config,
+        spots_read,
+        reads_written,
+        &output_files,
+        &diag,
+        downloaded.sra_md5.as_deref(),
+        downloaded.total_sra_size,
+    )?;
 
     Ok(PipelineStats {
         accession: downloaded.accession.clone(),
@@ -2613,6 +2615,140 @@ mod tests {
         // id_range == 0 signals "covers all rows" — treat as synthetic.
         let blobs = vec![loc(1, 0)];
         assert!(validate_blob_ranges("ACC", &blobs, None).is_ok());
+    }
+
+    // -----------------------------------------------------------------------
+    // Post-decode steps shared by run_fastq and decode_sra
+    // -----------------------------------------------------------------------
+
+    /// Fixture path, or `None` (test skips) when the fixture isn't present.
+    fn fixture(name: &str) -> Option<PathBuf> {
+        let p = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("tests/fixtures")
+            .join(name);
+        p.exists().then_some(p)
+    }
+
+    /// Stats lines for `acc` in `dir`'s `sracha-stats.jsonl`.
+    fn stats_lines_for(dir: &std::path::Path, acc: &str) -> Vec<serde_json::Value> {
+        std::fs::read_to_string(stats_path(dir))
+            .unwrap_or_default()
+            .lines()
+            .map(|l| serde_json::from_str::<serde_json::Value>(l).unwrap())
+            .filter(|v| v["accession"] == acc)
+            .collect()
+    }
+
+    /// Run the fixture through `decode_sra` on a throwaway copy (it deletes
+    /// its input), writing output under `out`.
+    fn decode_sra_copy(fixture_path: &std::path::Path, acc: &str, out: &std::path::Path) {
+        let work = tempfile::tempdir().unwrap();
+        let temp_path = work.path().join(format!("{acc}.sra"));
+        std::fs::copy(fixture_path, &temp_path).unwrap();
+        let cfg = metadata_test_config(out, crate::metadata::MetadataFormat::Json);
+        let cfg = PipelineConfig {
+            metadata: None,
+            ..cfg
+        };
+        let size = std::fs::metadata(&temp_path).unwrap().len();
+        decode_sra(
+            &DownloadedSra {
+                temp_path,
+                bytes_transferred: 0,
+                total_sra_size: size,
+                is_lite: false,
+                accession: acc.to_string(),
+                sra_md5: Some("deadbeef".into()),
+            },
+            &cfg,
+        )
+        .unwrap();
+    }
+
+    fn plain_config(out: &std::path::Path) -> PipelineConfig {
+        PipelineConfig {
+            metadata: None,
+            ..metadata_test_config(out, crate::metadata::MetadataFormat::Json)
+        }
+    }
+
+    #[test]
+    fn single_end_warning_in_both_entry_points() {
+        // The warning text comes from one helper that `finish_decode` calls
+        // for both entry points; pin its conditions here.
+        let dir = tempfile::tempdir().unwrap();
+        let mut cfg = plain_config(dir.path());
+        let w = single_end_warning("SRR1", &cfg, 10, 10).expect("split-3 single-end warns");
+        assert!(w.contains("--split split-3") && w.contains("10 spots"));
+        cfg.split_mode = SplitMode::Interleaved;
+        assert!(
+            single_end_warning("SRR1", &cfg, 10, 10)
+                .unwrap()
+                .contains("interleaved")
+        );
+        assert!(single_end_warning("SRR1", &cfg, 10, 20).is_none(), "paired");
+        assert!(single_end_warning("SRR1", &cfg, 0, 0).is_none(), "empty");
+        cfg.split_mode = SplitMode::SplitSpot;
+        assert!(single_end_warning("SRR1", &cfg, 10, 10).is_none());
+
+        // Both entry points reach `finish_decode` on a real single-end run
+        // (SRR38889541: 25000 spots, 1 read each) and write the same stats.
+        let Some(fx) = fixture("SRR38889541.sra") else {
+            eprintln!("skipping: SRR38889541 fixture absent");
+            return;
+        };
+        let a = tempfile::tempdir().unwrap();
+        let b = tempfile::tempdir().unwrap();
+        run_fastq(&fx, Some("SRR38889541"), &plain_config(a.path())).unwrap();
+        decode_sra_copy(&fx, "SRR38889541", b.path());
+        for d in [a.path(), b.path()] {
+            let lines = stats_lines_for(d, "SRR38889541");
+            assert_eq!(lines.len(), 1, "one stats line in {}", d.display());
+            assert_eq!(lines[0]["spots_read"], 25000);
+            assert_eq!(lines[0]["reads_written"], 25000);
+        }
+    }
+
+    #[test]
+    fn csra_stats_line_written_by_fastq() {
+        // `run_fastq` used to return early for cSRA, skipping the stats line
+        // and the single-end warning that `decode_sra` handled.
+        let Some(fx) = fixture("VDB-3418.sra") else {
+            eprintln!("skipping: VDB-3418 fixture absent");
+            return;
+        };
+        let a = tempfile::tempdir().unwrap();
+        let b = tempfile::tempdir().unwrap();
+        run_fastq(&fx, Some("VDB-3418"), &plain_config(a.path())).unwrap();
+        decode_sra_copy(&fx, "VDB-3418", b.path());
+        let from_fastq = stats_lines_for(a.path(), "VDB-3418");
+        let from_get = stats_lines_for(b.path(), "VDB-3418");
+        assert_eq!(from_fastq.len(), 1, "fastq must write a cSRA stats line");
+        assert_eq!(from_get.len(), 1);
+        for key in ["spots_read", "reads_written", "integrity"] {
+            assert_eq!(from_fastq[0][key], from_get[0][key], "{key}");
+        }
+        assert_eq!(from_fastq[0]["spots_read"], 985);
+    }
+
+    #[test]
+    fn strict_gate_is_shared_by_finish_decode() {
+        let dir = tempfile::tempdir().unwrap();
+        let diag = Arc::new(IntegrityDiag::default());
+        diag.quality_overruns
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+
+        let mut cfg = plain_config(dir.path());
+        cfg.strict = false;
+        finish_decode("SRR9", &cfg, 5, 5, &[], &diag, None, 0).expect("non-strict only warns");
+
+        cfg.strict = true;
+        match finish_decode("SRR9", &cfg, 5, 5, &[], &diag, None, 0) {
+            Err(Error::IntegrityFailure { accession, .. }) => assert_eq!(accession, "SRR9"),
+            other => panic!("expected IntegrityFailure, got {other:?}"),
+        }
+        // The stats line is written before the gate fires, strict or not.
+        assert_eq!(stats_lines_for(dir.path(), "SRR9").len(), 2);
     }
 
     // -----------------------------------------------------------------------

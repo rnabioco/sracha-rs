@@ -70,7 +70,7 @@ sracha get [OPTIONS] [ACCESSION]...
 
 | Option | Default | Description |
 |--------|---------|-------------|
-| `--split <MODE>` | `split-3` | Split mode: `split-3`, `split-files`, `split-spot`, `interleaved` |
+| `--split <MODE>` | `split-3` | Split mode: `split-3`, `split-files`, `split-spot`, `interleaved`. `split-3` and `interleaved` on a single-end run print a warning and write one file |
 | `--paired-suffix <STYLE>` | `numeric` | Suffix style for paired/split FASTQ outputs: `numeric` (`_1`/`_2`, matches fasterq-dump and ENA) or `r` (`_R1`/`_R2`, matches Illumina BCL output) |
 | `--fasta` | | Output FASTA instead of FASTQ (drops quality scores) |
 | `--seq-defline <TEMPLATE>` | | Custom defline template, fasterq-dump `--seq-defline` syntax (see [Custom deflines](#custom-deflines)) |
@@ -169,7 +169,7 @@ sracha fastq [OPTIONS] <INPUT>...
 
 | Option | Default | Description |
 |--------|---------|-------------|
-| `--split <MODE>` | `split-3` | Split mode: `split-3`, `split-files`, `split-spot`, `interleaved` |
+| `--split <MODE>` | `split-3` | Split mode: `split-3`, `split-files`, `split-spot`, `interleaved`. `split-3` and `interleaved` on a single-end run print a warning and write one file |
 | `--paired-suffix <STYLE>` | `numeric` | Suffix style for paired/split FASTQ outputs: `numeric` (`_1`/`_2`, matches fasterq-dump and ENA) or `r` (`_R1`/`_R2`, matches Illumina BCL output) |
 | `--fasta` | | Output FASTA instead of FASTQ (drops quality scores) |
 | `--seq-defline <TEMPLATE>` | | Custom defline template, fasterq-dump `--seq-defline` syntax (see [Custom deflines](#custom-deflines)) |

@@ -38,6 +38,9 @@
   delimited writer shared with `info`: embedded tabs/newlines in free text
   (e.g. `library_name`) become spaces, and list columns such as
   `avg_read_len` are joined with `;` instead of `,` ([#174]).
+- `sracha get` now prints the single-end `--split` warning, and `sracha fastq`
+  on a cSRA run now appends its `sracha-stats.jsonl` line and prints the same
+  warning; both commands share one post-decode path ([#175]).
 
 [#166]: https://github.com/rnabioco/sracha-rs/issues/166
 [#167]: https://github.com/rnabioco/sracha-rs/issues/167
@@ -46,6 +49,7 @@
 [#172]: https://github.com/rnabioco/sracha-rs/issues/172
 [#173]: https://github.com/rnabioco/sracha-rs/issues/173
 [#174]: https://github.com/rnabioco/sracha-rs/issues/174
+[#175]: https://github.com/rnabioco/sracha-rs/issues/175
 
 ## 0.7.2 (2026-10-13)
 
