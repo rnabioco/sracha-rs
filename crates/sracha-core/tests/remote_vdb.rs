@@ -257,6 +257,34 @@ fn remote_vdb_dump_matches_local_for_a_row_range() {
     );
 }
 
+/// LINKAGE_GROUP on a BAM-loaded run is page-mapped with deduplicated
+/// records; rows 1-2 must come back as the text `vdb-dump` prints (#183).
+#[test]
+#[ignore] // reads SRR30022414 (2.5 GB) over HTTP range requests, a few KB
+fn remote_vdb_dump_linkage_group_is_text() {
+    let url = "https://sra-pub-run-odp.s3.amazonaws.com/sra/SRR30022414/SRR30022414";
+    let (mut remote, stats) = open_remote(url);
+    let spec = DumpSpec {
+        columns: vec!["LINKAGE_GROUP".into()],
+        exclude: Vec::new(),
+        rows: RowRanges::parse("1-2").unwrap(),
+        format: DumpFormat::Tab,
+        raw: false,
+    };
+    let out = dump::dump_to_vec(
+        &mut remote,
+        ColumnData::Ranged,
+        Some("PRIMARY_ALIGNMENT"),
+        spec,
+    )
+    .unwrap();
+    assert_eq!(
+        std::str::from_utf8(&out).unwrap(),
+        "1\tCB:TGGTGCATCATAGACC-1|UB:CTAACCCTAACC\n2\tCB:TCAAACCAGTCATCCC-1|UB:CTAACCCTAACC\n"
+    );
+    assert!(stats.bytes_fetched() < 8 * 1024 * 1024);
+}
+
 /// `info` must report the archive's own read structure, fetched with range
 /// requests, and agree with what a local open of the same file reports.
 #[test]

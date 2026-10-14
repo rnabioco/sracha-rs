@@ -96,9 +96,8 @@ pub fn infer_kind(col_name: &str) -> CellKind {
     match col_name {
         "READ" | "CMP_READ" => CellKind::Dna2na,
         "QUALITY" | "ORIGINAL_QUALITY" | "CMP_QUALITY" => CellKind::QualityPhred33,
-        "NAME" | "SPOT_NAME" | "SPOT_GROUP" | "LABEL" | "CS_KEY" | "NAME_FMT" => {
-            CellKind::AsciiBytes
-        }
+        "NAME" | "SPOT_NAME" | "SPOT_GROUP" | "LABEL" | "CS_KEY" | "NAME_FMT" | "LINKAGE_GROUP"
+        | "CMP_LINKAGE_GROUP" => CellKind::AsciiBytes,
         "READ_LEN" | "READ_START" | "LABEL_LEN" | "LABEL_START" | "POSITION" => CellKind::U32Array,
         "READ_TYPE" | "READ_FILTER" | "RD_FILTER" => CellKind::U8Array,
         "PLATFORM" | "NREADS" | "SPOT_FILTER" => CellKind::U8Scalar,
@@ -222,7 +221,10 @@ impl<R: Read + Seek> DumpRunner<R> {
                     });
                 }
                 Err(e) => {
-                    tracing::warn!("dump: skipping column {name}: {e}");
+                    tracing::warn!(
+                        "dump: skipping column {name}: not stored in this table (it may be \
+                         virtual, derived from other columns or tables): {e}"
+                    );
                 }
             }
         }
@@ -590,6 +592,20 @@ fn materialize_hex_fallback(
     row_count: u64,
 ) -> Result<(Vec<u8>, Vec<usize>)> {
     let raw = decode_zip_encoding(decoded).unwrap_or_else(|_| decoded.data.to_vec());
+
+    // A deduplicated blob stores each distinct value once; the page map's
+    // mapping says which rows share which record. Expand to one copy per row
+    // so the length summation below lines up with the payload.
+    let raw = match decoded.page_map.as_ref() {
+        Some(pm) if !pm.mapping.is_identity() => match pm.expand_rows(&raw, 1) {
+            Ok(expanded) => expanded,
+            Err(e) => {
+                tracing::debug!("dump: hex-fallback could not expand page_map rows: {e}");
+                raw
+            }
+        },
+        _ => raw,
+    };
 
     // Prefer the page_map's own lengths when present — columns like ALTREAD
     // that are stored with `trim<0,0>` carry per-row stored sizes here and
@@ -1090,6 +1106,54 @@ mod tests {
         assert_eq!(offsets, vec![0, 0, 0, 8, 8, 8]);
         // Bases come straight from the raw 2na payload (no deflate misfire).
         assert_eq!(bases, unpack_2na(&data, 8));
+    }
+
+    #[test]
+    fn linkage_group_is_text() {
+        assert_eq!(infer_kind("LINKAGE_GROUP"), CellKind::AsciiBytes);
+        assert_eq!(infer_kind("CMP_LINKAGE_GROUP"), CellKind::AsciiBytes);
+    }
+
+    /// Four rows of 3 bytes where rows 0-2 share one stored record: the
+    /// payload is 6 bytes, not 12. Mirrors LINKAGE_GROUP in SRR30022414.
+    fn dedup_blob(data: &[u8]) -> DecodedBlob<'static> {
+        use crate::blob::{BlobHeaderFrame, RowMapping};
+        DecodedBlob {
+            data: std::borrow::Cow::Owned(data.to_vec()),
+            adjust: 0,
+            big_endian: false,
+            headers: vec![BlobHeaderFrame {
+                flags: 0,
+                version: 1,
+                fmt: 0,
+                osize: data.len() as u64,
+                ops: vec![],
+                args: vec![],
+            }],
+            page_map: Some(PageMap {
+                data_recs: 2,
+                lengths: vec![3],
+                leng_runs: vec![4],
+                mapping: RowMapping::RepeatCounts(vec![3, 1]),
+            }),
+            row_length: None,
+        }
+    }
+
+    #[test]
+    fn hex_fallback_splits_deduplicated_page_map_rows() {
+        let blob = dedup_blob(b"abcdef");
+        let (bytes, offsets) = materialize_hex_fallback(&blob, 4).unwrap();
+        assert_eq!(bytes, b"abcabcabcdef");
+        assert_eq!(offsets, vec![0, 3, 6, 9, 12]);
+    }
+
+    #[test]
+    fn ascii_splits_deduplicated_page_map_rows() {
+        let blob = dedup_blob(b"abcdef");
+        let (bytes, offsets) = materialize_ascii(&blob, 4).unwrap();
+        assert_eq!(&bytes[offsets[2]..offsets[3]], b"abc");
+        assert_eq!(&bytes[offsets[3]..offsets[4]], b"def");
     }
 
     #[test]
