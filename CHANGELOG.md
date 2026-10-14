@@ -26,6 +26,10 @@
   an earlier run instead of downloading it again. The file is checked against
   the same size/MD5 test as a cached temp file, and a truncated or corrupt one
   is re-downloaded ([#193]).
+- Aligned (cSRA) runs with a fixed read layout, such as SRR9161642 and
+  SRR16071449, no longer fail with "READ_LEN is not a physical column". The
+  layout is read from static metadata, and external reference objects are now
+  fetched when `REFERENCE.CMP_READ` exists but is empty ([#192]).
 - `sracha vdb dump` rendered `LINKAGE_GROUP` as one hex blob on row 1 for
   BAM-loaded runs. It now prints text, and deduplicated page-mapped columns
   split into rows correctly ([#183]).
@@ -63,6 +67,7 @@
 [#183]: https://github.com/rnabioco/sracha-rs/issues/183
 [#184]: https://github.com/rnabioco/sracha-rs/issues/184
 [#193]: https://github.com/rnabioco/sracha-rs/issues/193
+[#192]: https://github.com/rnabioco/sracha-rs/issues/192
 [#172]: https://github.com/rnabioco/sracha-rs/issues/172
 [#173]: https://github.com/rnabioco/sracha-rs/issues/173
 [#174]: https://github.com/rnabioco/sracha-rs/issues/174

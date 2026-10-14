@@ -135,17 +135,44 @@ fn external_refseq_error() -> Error {
     )
 }
 
-/// Build the user-facing error for archives whose SEQUENCE table omits
-/// a physical READ_LEN column because every spot has the same
-/// fixed-length layout (values live in `tbl/SEQUENCE/md/cur/col/
-/// READ_LEN/row` as static metadata). sracha's CsraCursor currently
-/// requires physical READ_LEN; the static-metadata fallback is tracked
-/// as a follow-up.
-fn fixed_length_readlen_error() -> Error {
+/// Per-spot read lengths: a physical `READ_LEN` column, or — when every spot
+/// has the same layout — the single value bam-load stores as static metadata
+/// (`col/READ_LEN/row`) in place of a column.
+enum ReadLens {
+    Column(CachedColumn),
+    Fixed(Vec<u32>),
+}
+
+impl ReadLens {
+    fn row(&self, row_id: i64) -> Result<Vec<u32>> {
+        match self {
+            Self::Column(c) => c.read_u32_row(row_id),
+            Self::Fixed(lens) => Ok(lens.clone()),
+        }
+    }
+}
+
+/// Decode the little-endian `u32` array of a static `READ_LEN` value.
+fn parse_fixed_read_lens(bytes: &[u8]) -> Option<Vec<u32>> {
+    if bytes.is_empty() || !bytes.len().is_multiple_of(4) {
+        return None;
+    }
+    Some(
+        bytes
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .map(|c| u32::from_le_bytes(*c))
+            .collect(),
+    )
+}
+
+/// Build the user-facing error for archives that have neither a physical
+/// `SEQUENCE.READ_LEN` column nor a usable static `READ_LEN` value.
+fn missing_readlen_error() -> Error {
     Error::CsraUnsupported(
-        "cSRA: SEQUENCE.READ_LEN is not a physical column — this archive \
-         encodes a fixed spot layout in static metadata, which sracha does \
-         not yet synthesize."
+        "cSRA: SEQUENCE.READ_LEN is neither a physical column nor a static \
+         metadata value, so the spot layout cannot be determined."
             .into(),
     )
 }
@@ -191,7 +218,7 @@ pub struct CsraCursor {
     /// decodes its Ns as a confident `A`.
     cmp_altread: Option<CachedColumn>,
     primary_alignment_id: CachedColumn,
-    read_len: CachedColumn,
+    read_len: ReadLens,
     read_type: CachedColumn,
     quality: CachedColumn,
     /// `CMP_LINKAGE_GROUP`: the linkage group of spots with no alignment
@@ -269,9 +296,14 @@ impl CsraCursor {
         // shapes before we start opening columns. These checks are cheap
         // TOC scans so the error fires with useful guidance rather than
         // an opaque "idx1 not found" deep in the decoder.
-        if !archive_has_seq_column(main, &col_base, "READ_LEN") {
-            return Err(fixed_length_readlen_error());
-        }
+        let fixed_read_lens = if archive_has_seq_column(main, &col_base, "READ_LEN") {
+            None
+        } else {
+            let lens = crate::cursor::archive_static_column(main, "SEQUENCE", "READ_LEN")
+                .and_then(|b| parse_fixed_read_lens(&b))
+                .ok_or_else(missing_readlen_error)?;
+            Some(lens)
+        };
         // Reference bases must come from somewhere: embedded CMP_READ in
         // either archive, or external refseq objects the caller fetched.
         let have_refseqs = refseqs.is_some_and(|s| !s.is_empty());
@@ -304,7 +336,16 @@ impl CsraCursor {
                 None
             };
         let primary_alignment_id = open_col(main, "PRIMARY_ALIGNMENT_ID")?;
-        let read_len = open_col(main, "READ_LEN")?;
+        let read_len = match fixed_read_lens {
+            Some(lens) => ReadLens::Fixed(lens),
+            None => ReadLens::Column(
+                CachedColumn::new(
+                    open_col(main, "READ_LEN")?,
+                    ColumnKind::Irzip { elem_bits: 32 },
+                )
+                .labelled(ColLabel::SeqReadLen),
+            ),
+        };
         let read_type = open_col(main, "READ_TYPE")?;
         // Same QUALITY/ORIGINAL_QUALITY duality the plain cursor handles
         // (see `cursor.rs`); bam-load-produced cSRA often has only the
@@ -377,8 +418,7 @@ impl CsraCursor {
                 ColumnKind::Irzip { elem_bits: 64 },
             )
             .labelled(ColLabel::SeqAlignId),
-            read_len: CachedColumn::new(read_len, ColumnKind::Irzip { elem_bits: 32 })
-                .labelled(ColLabel::SeqReadLen),
+            read_len,
             read_type: CachedColumn::new(read_type, ColumnKind::Zip)
                 .labelled(ColLabel::SeqReadType),
             quality: CachedColumn::new(quality, ColumnKind::Zip).labelled(ColLabel::SeqQuality),
@@ -493,7 +533,7 @@ impl CsraCursor {
     /// Decode one SEQUENCE row's full bases + quality.
     pub fn read_spot(&self, row_id: i64) -> Result<SpotRead> {
         let align_ids = self.primary_alignment_id.read_i64_row(row_id)?;
-        let read_lens = self.read_len.read_u32_row(row_id)?;
+        let read_lens = self.read_len.row(row_id)?;
         let read_types = self.read_type.read_byte_row(row_id)?;
         let mut cmp_read_2na = match &self.cmp_read {
             Some(c) => c.read_2na_row(row_id)?,
@@ -609,6 +649,34 @@ mod linkage_group_tests {
     fn no_linkage_group_anywhere_is_empty() {
         let lg = resolve_linkage_group(&[7], lookup, || Ok(Vec::new())).unwrap();
         assert!(lg.is_empty());
+    }
+}
+
+#[cfg(test)]
+mod fixed_read_len_tests {
+    use super::{ReadLens, parse_fixed_read_lens};
+
+    #[test]
+    fn parses_little_endian_u32s() {
+        // SRR9161642: one 98-base read per spot.
+        assert_eq!(parse_fixed_read_lens(&[98, 0, 0, 0]), Some(vec![98]));
+        assert_eq!(
+            parse_fixed_read_lens(&[50, 0, 0, 0, 0, 1, 0, 0]),
+            Some(vec![50, 256]),
+        );
+    }
+
+    #[test]
+    fn rejects_empty_or_ragged() {
+        assert_eq!(parse_fixed_read_lens(&[]), None);
+        assert_eq!(parse_fixed_read_lens(&[1, 0, 0]), None);
+    }
+
+    #[test]
+    fn fixed_lens_are_the_same_for_every_row() {
+        let lens = ReadLens::Fixed(vec![50, 50]);
+        assert_eq!(lens.row(1).unwrap(), vec![50, 50]);
+        assert_eq!(lens.row(1_000_000).unwrap(), vec![50, 50]);
     }
 }
 

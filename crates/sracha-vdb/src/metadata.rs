@@ -150,6 +150,14 @@ fn read_static_col_read_structure(nodes: &[MetaNode]) -> Option<Vec<ReadDescript
     Some(descs)
 }
 
+/// The single stored value of a static column (`col/{name}/row`), or `None`
+/// when the metadata has no such node or it is empty.
+pub fn static_column_row(tree_data: &[u8], name: &str) -> Option<Vec<u8>> {
+    let nodes = parse_meta_nodes(tree_data).ok()?;
+    let node = find_meta_node(&nodes, &format!("col/{name}/row"))?;
+    (!node.value.is_empty()).then(|| node.value.clone())
+}
+
 /// Return the schema node's attribute name (e.g.
 /// `"NCBI:SRA:Illumina:tbl:phred:v2#1.0.4"` or
 /// `"NCBI:align:db:alignment_sorted#1.3"`) if present in the table-level
