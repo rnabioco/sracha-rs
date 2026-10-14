@@ -18,9 +18,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use rayon::prelude::*;
 
 use crate::compress::{DEFAULT_BLOCK_SIZE, ParGzWriter};
-use crate::download::{
-    DownloadConfig, TransferRetryPolicy, download_file, download_file_with_retries,
-};
+use crate::download::{DownloadConfig, TransferRetryPolicy, download_file_with_retries};
 use crate::error::{Error, Result};
 use crate::fastq::{
     CompressionMode, FastqConfig, IntegrityDiag, OutputSlot, QUALITY_HISTOGRAM_BINS, SplitMode,
@@ -48,6 +46,7 @@ pub use config::{PipelineConfig, PipelineStats};
 
 mod blob_decode;
 mod marker;
+mod object;
 pub mod refseq;
 mod validate;
 use blob_decode::{
@@ -56,6 +55,7 @@ use blob_decode::{
 use marker::{
     StatsEntry, check_completion_marker, marker_path, write_completion_marker, write_stats_file,
 };
+pub use object::{DownloadOutcome, ObjectTransfer, download_sra_object, vdbcache_path_for};
 pub use validate::{ValidationResult, run_validate};
 
 // ---------------------------------------------------------------------------
@@ -307,26 +307,6 @@ fn wrap_blob_integrity(accession: &str, err: Error) -> Error {
 fn csra_vdbcache_path(sra_path: &std::path::Path) -> Option<PathBuf> {
     let candidate = crate::vdb::csra::vdbcache_sidecar_path(sra_path);
     candidate.exists().then_some(candidate)
-}
-
-/// Select the best mirror URL for downloading — the same
-/// [`ResolvedFile::preferred_mirror`] that `info`, `get` and the sidecars report.
-fn select_mirror(resolved: &ResolvedAccession) -> Result<String> {
-    let best = resolved
-        .sra_file
-        .preferred_mirror()
-        .ok_or_else(|| Error::Download {
-            accession: resolved.accession.clone(),
-            message: "no download mirrors available".into(),
-        })?;
-
-    tracing::debug!(
-        "selected mirror: [{}] {}",
-        best.service,
-        &best.url[..best.url.len().min(80)],
-    );
-
-    Ok(best.url.clone())
 }
 
 /// Validate that the blob row-id ranges on a column form a contiguous,
@@ -1761,11 +1741,6 @@ pub async fn download_sra(
         });
     }
 
-    let url = select_mirror(resolved)?;
-    let urls = vec![url.clone()];
-
-    tracing::debug!("{accession}: starting full download from {url}");
-
     let temp_filename = format!(".sracha-tmp-{accession}.sra");
     let temp_path = acc_dir.join(&temp_filename);
 
@@ -1780,25 +1755,10 @@ pub async fn download_sra(
         progress: config.progress,
         resume: config.resume,
         client: config.http_client.clone(),
-        // KAR magic: "NCBI" + ".sra". Guards the size-match-skip path when
-        // SDL didn't supply an MD5, so a corrupt temp SRA from a crashed
-        // prior run can't feed garbage into the VDB decoder.
-        expected_prefix: Some(b"NCBI.sra".to_vec()),
+        expected_prefix: None,
     };
 
-    tracing::info!(
-        "{accession}: downloading {} to {}",
-        crate::util::format_size(total_sra_size),
-        temp_path.display(),
-    );
-
-    let dl_future = download_file(
-        &urls,
-        total_sra_size,
-        resolved.sra_file.md5.as_deref(),
-        &temp_path,
-        &dl_config,
-    );
+    let dl_future = download_sra_object(resolved, &temp_path, &dl_config);
 
     let dl_result = if let Some(ref flag) = config.cancelled {
         let flag = flag.clone();
@@ -1814,6 +1774,7 @@ pub async fn download_sra(
                     let _ = tokio::fs::remove_file(&temp_path).await;
                     let sidecar = crate::download::progress_path(&temp_path);
                     let _ = tokio::fs::remove_file(&sidecar).await;
+                    remove_temp_vdbcache(&temp_path);
                     tracing::info!("{accession}: download cancelled (partial discarded)");
                 } else {
                     tracing::info!("{accession}: download cancelled (partial kept for resume)");
@@ -1827,17 +1788,24 @@ pub async fn download_sra(
 
     tracing::info!(
         "{accession}: download complete ({})",
-        crate::util::format_size(dl_result.size),
+        crate::util::format_size(dl_result.archive.size),
     );
 
     Ok(DownloadedSra {
         temp_path,
-        bytes_transferred: dl_result.bytes_transferred,
+        bytes_transferred: dl_result.archive.bytes_transferred,
         total_sra_size,
         is_lite: resolved.sra_file.is_lite,
         accession: accession.clone(),
-        sra_md5: dl_result.md5,
+        sra_md5: dl_result.archive.md5,
     })
+}
+
+/// Delete the temp `.vdbcache` companion of `temp_sra` and its progress sidecar.
+fn remove_temp_vdbcache(temp_sra: &std::path::Path) {
+    let cache = vdbcache_path_for(temp_sra);
+    let _ = std::fs::remove_file(crate::download::progress_path(&cache));
+    let _ = std::fs::remove_file(&cache);
 }
 
 /// Download pre-computed ENA FASTQ.gz files directly — no VDB decode involved.
@@ -2062,6 +2030,7 @@ pub fn decode_sra(downloaded: &DownloadedSra, config: &PipelineConfig) -> Result
         let _ = std::fs::remove_file(&downloaded.temp_path);
         let sidecar = crate::download::progress_path(&downloaded.temp_path);
         let _ = std::fs::remove_file(&sidecar);
+        remove_temp_vdbcache(&downloaded.temp_path);
 
         // Backfill metadata sidecar(s) the user asked for that a prior run
         // didn't record. The completion marker is keyed on the FASTQ output
@@ -2126,6 +2095,7 @@ pub fn decode_sra(downloaded: &DownloadedSra, config: &PipelineConfig) -> Result
             // skip the download.
             if config.stdout {
                 let _ = std::fs::remove_file(&downloaded.temp_path);
+                remove_temp_vdbcache(&downloaded.temp_path);
                 tracing::info!(
                     "{}: cancelled, cleaned up {} partial output file(s) and temp SRA",
                     downloaded.accession,
@@ -2163,6 +2133,12 @@ pub fn decode_sra(downloaded: &DownloadedSra, config: &PipelineConfig) -> Result
         // Drop the progress sidecar — download is fully verified at this point.
         let sidecar = crate::download::progress_path(&downloaded.temp_path);
         let _ = std::fs::remove_file(&sidecar);
+        // The decoder probes `<archive>.vdbcache`, so keep the pair together.
+        let cache = vdbcache_path_for(&downloaded.temp_path);
+        if cache.exists() {
+            let _ = std::fs::rename(&cache, vdbcache_path_for(&kept));
+        }
+        let _ = std::fs::remove_file(crate::download::progress_path(&cache));
     } else if let Err(e) = std::fs::remove_file(&downloaded.temp_path) {
         tracing::warn!(
             "{}: failed to remove temp file {}: {e}",
@@ -2170,6 +2146,8 @@ pub fn decode_sra(downloaded: &DownloadedSra, config: &PipelineConfig) -> Result
             downloaded.temp_path.display(),
         );
     }
+    // No-op when `keep_sra` already moved the vdbcache next to the kept archive.
+    remove_temp_vdbcache(&downloaded.temp_path);
 
     // Write run-metadata sidecar(s), if requested. Done before the
     // completion marker so the marker records the metadata file sizes too
@@ -2239,7 +2217,6 @@ mod tests {
     use super::blob_decode::{encode_raw_quality_for_fastq, expand_via_page_map};
     use super::marker::{iso8601_now_utc, stats_path};
     use super::*;
-    use crate::sdl::{ResolvedFile, ResolvedMirror};
     use crate::vdb::blob;
 
     #[test]
@@ -2272,20 +2249,6 @@ mod tests {
         );
         assert_eq!(resolve_fallback_read_lengths(None, Some(&[])), None);
         assert_eq!(resolve_fallback_read_lengths(None, None), None);
-    }
-
-    fn make_resolved(mirrors: Vec<ResolvedMirror>) -> ResolvedAccession {
-        ResolvedAccession {
-            accession: "SRR000001".into(),
-            sra_file: ResolvedFile {
-                mirrors,
-                size: 1000,
-                md5: None,
-                is_lite: false,
-            },
-            vdbcache_file: None,
-            run_info: None,
-        }
     }
 
     fn metadata_test_config(
@@ -2361,90 +2324,6 @@ mod tests {
 
         // A second backfill finds everything present and writes nothing.
         assert!(write_run_metadata(&cfg, "SRR000001", true).is_empty());
-    }
-
-    #[test]
-    fn select_mirror_prefers_s3() {
-        let resolved = make_resolved(vec![
-            ResolvedMirror {
-                url: "https://ncbi.example.com/f".into(),
-                service: "ncbi".into(),
-            },
-            ResolvedMirror {
-                url: "https://gs.example.com/f".into(),
-                service: "gs".into(),
-            },
-            ResolvedMirror {
-                url: "https://s3.example.com/f".into(),
-                service: "s3".into(),
-            },
-        ]);
-        let url = select_mirror(&resolved).unwrap();
-        assert_eq!(url, "https://s3.example.com/f");
-    }
-
-    #[test]
-    fn select_mirror_prefers_gs_over_ncbi() {
-        let resolved = make_resolved(vec![
-            ResolvedMirror {
-                url: "https://ncbi.example.com/f".into(),
-                service: "ncbi".into(),
-            },
-            ResolvedMirror {
-                url: "https://gs.example.com/f".into(),
-                service: "gs".into(),
-            },
-        ]);
-        let url = select_mirror(&resolved).unwrap();
-        assert_eq!(url, "https://gs.example.com/f");
-    }
-
-    #[test]
-    fn select_mirror_empty_errors() {
-        let resolved = make_resolved(vec![]);
-        assert!(select_mirror(&resolved).is_err());
-    }
-
-    #[test]
-    fn select_mirror_s3_direct_equivalent() {
-        let resolved = make_resolved(vec![
-            ResolvedMirror {
-                url: "https://gs.example.com/f".into(),
-                service: "gs".into(),
-            },
-            ResolvedMirror {
-                url: "https://s3-direct.example.com/f".into(),
-                service: "s3-direct".into(),
-            },
-        ]);
-        let url = select_mirror(&resolved).unwrap();
-        assert_eq!(url, "https://s3-direct.example.com/f");
-    }
-
-    #[test]
-    fn select_mirror_sra_ncbi_over_ncbi() {
-        let resolved = make_resolved(vec![
-            ResolvedMirror {
-                url: "https://ncbi.example.com/f".into(),
-                service: "ncbi".into(),
-            },
-            ResolvedMirror {
-                url: "https://sra-ncbi.example.com/f".into(),
-                service: "sra-ncbi".into(),
-            },
-        ]);
-        let url = select_mirror(&resolved).unwrap();
-        assert_eq!(url, "https://sra-ncbi.example.com/f");
-    }
-
-    #[test]
-    fn select_mirror_unknown_service_fallback() {
-        let resolved = make_resolved(vec![ResolvedMirror {
-            url: "https://other.example.com/f".into(),
-            service: "unknown-cdn".into(),
-        }]);
-        let url = select_mirror(&resolved).unwrap();
-        assert_eq!(url, "https://other.example.com/f");
     }
 
     // -----------------------------------------------------------------------

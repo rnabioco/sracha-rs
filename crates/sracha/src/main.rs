@@ -140,7 +140,14 @@ async fn main() -> Result<()> {
                     ..Default::default()
                 };
                 for file in &ena.fastq_files {
-                    let name = ena_fetch_filename(acc, file.slot);
+                    // ENA always serves numeric-suffixed gzip FASTQ.
+                    let name = sracha_core::fastq::output_filename(
+                        acc,
+                        file.slot,
+                        false,
+                        &sracha_core::fastq::CompressionMode::Gzip { level: 6 },
+                        sracha_core::fastq::PairedSuffix::Numeric,
+                    );
                     let out = args.output_dir.join(&name);
                     tracing::info!(
                         "{acc}: downloading ENA FASTQ {} ({}) to {}",
@@ -151,7 +158,7 @@ async fn main() -> Result<()> {
                     // ENA outages outlast the per-chunk retry budget, so
                     // re-enter the transfer (resuming from the sidecar)
                     // rather than losing a near-complete download.
-                    if let Err(e) = sracha_core::download::download_file_with_retries(
+                    let transferred = match sracha_core::download::download_file_with_retries(
                         std::slice::from_ref(&file.url),
                         file.size,
                         Some(&file.md5),
@@ -161,23 +168,21 @@ async fn main() -> Result<()> {
                     )
                     .await
                     {
-                        // Partial file + sidecar are preserved by download_file;
-                        // re-running resumes rather than starting over.
-                        eprintln!(
-                            "{}: ENA transfer failed after all resume attempts ({e}); \
+                        Ok(r) => r.bytes_transferred,
+                        Err(e) => {
+                            // Partial file + sidecar are preserved by download_file;
+                            // re-running resumes rather than starting over.
+                            eprintln!(
+                                "{}: ENA transfer failed after all resume attempts ({e}); \
                              partial download and resume state kept at {} — re-run with \
                              --prefer-ena to pick up where it left off",
-                            style::header(acc),
-                            style::path(out.display()),
-                        );
-                        return Err(e.into());
-                    }
-                    eprintln!(
-                        "{}: {} downloaded from [{}]",
-                        style::header(acc),
-                        style::value(format_size(file.size)),
-                        style::value("ena"),
-                    );
+                                style::header(acc),
+                                style::path(out.display()),
+                            );
+                            return Err(e.into());
+                        }
+                    };
+                    report_transfer(acc, transferred, file.size, "ena");
                     eprintln!("  wrote {}", style::path(out.display()));
                 }
             }
@@ -224,75 +229,38 @@ async fn main() -> Result<()> {
                 )?;
             }
 
+            let dl_config = sracha_core::download::DownloadConfig {
+                connections: args.connections,
+                force: args.force,
+                validate: !args.no_validate,
+                progress: !args.no_progress,
+                resume: !args.no_resume,
+                client: Some(http_client.clone()),
+                ..Default::default()
+            };
             for resolved in &resolved_all {
                 let acc = &resolved.accession;
-                let mirror = resolved
-                    .sra_file
-                    .preferred_mirror()
-                    .ok_or_else(|| anyhow::anyhow!("no mirrors for {acc}"))?;
-                let url = mirror.url.clone();
                 let output_path = args.output_dir.join(format!("{acc}.sra"));
-                let dl_config = sracha_core::download::DownloadConfig {
-                    connections: args.connections,
-                    force: args.force,
-                    validate: !args.no_validate,
-                    progress: !args.no_progress,
-                    resume: !args.no_resume,
-                    client: Some(http_client.clone()),
-                    ..Default::default()
-                };
-                tracing::info!(
-                    "{acc}: downloading {} from [{}] to {}",
-                    format_size(resolved.sra_file.size),
-                    mirror.service,
-                    output_path.display()
+                let outcome =
+                    sracha_core::pipeline::download_sra_object(resolved, &output_path, &dl_config)
+                        .await?;
+                report_transfer(
+                    acc,
+                    outcome.archive.bytes_transferred,
+                    outcome.archive.size,
+                    &outcome.archive.service,
                 );
-                sracha_core::download::download_file(
-                    &[url],
-                    resolved.sra_file.size,
-                    resolved.sra_file.md5.as_deref(),
-                    &output_path,
-                    &dl_config,
-                )
-                .await?;
-                eprintln!(
-                    "{}: {} downloaded from [{}]",
-                    style::header(acc),
-                    style::value(format_size(resolved.sra_file.size)),
-                    style::value(&mirror.service),
-                );
-                eprintln!("  wrote {}", style::path(output_path.display()));
-
-                // If SDL returned a vdbcache sidecar (modern cSRA
-                // archives split the REFERENCE / extra alignment
-                // columns out of the main KAR), download it next to
-                // the .sra so `sracha fastq` can find it via the
-                // `.sra.vdbcache` convention.
-                if let Some(ref vdb) = resolved.vdbcache_file {
-                    let vdb_mirror = vdb
-                        .preferred_mirror()
-                        .ok_or_else(|| anyhow::anyhow!("no vdbcache mirrors for {acc}"))?;
-                    let vdb_url = vdb_mirror.url.clone();
-                    let vdb_path = args.output_dir.join(format!("{acc}.sra.vdbcache"));
-                    tracing::info!(
-                        "{acc}: downloading vdbcache {} from [{}] to {}",
-                        format_size(vdb.size),
-                        vdb_mirror.service,
-                        vdb_path.display()
-                    );
-                    sracha_core::download::download_file(
-                        &[vdb_url],
+                eprintln!("  wrote {}", style::path(outcome.archive.path.display()));
+                // Split-archive cSRA keeps REFERENCE / alignment columns in a
+                // `.sra.vdbcache` that `sracha fastq` finds next to the .sra.
+                if let Some(vdb) = &outcome.vdbcache {
+                    report_transfer(
+                        &format!("{acc} vdbcache"),
+                        vdb.bytes_transferred,
                         vdb.size,
-                        vdb.md5.as_deref(),
-                        &vdb_path,
-                        &dl_config,
-                    )
-                    .await?;
-                    eprintln!(
-                        "  vdbcache {} wrote {}",
-                        style::value(format_size(vdb.size)),
-                        style::path(vdb_path.display())
+                        &vdb.service,
                     );
+                    eprintln!("  wrote {}", style::path(vdb.path.display()));
                 }
             }
             Ok(())
@@ -733,31 +701,12 @@ async fn main() -> Result<()> {
                         }
                         Err(e) => return Err(e.into()),
                     };
-                    let source = "ena";
-                    if stats.bytes_transferred == 0 {
-                        eprintln!(
-                            "{}: {} of {} cached (no download needed) from [{}]",
-                            style::header(&stats.accession),
-                            style::value(format_size(stats.total_sra_size)),
-                            style::value(format_size(stats.total_sra_size)),
-                            style::value(source),
-                        );
-                    } else if stats.bytes_transferred < stats.total_sra_size {
-                        eprintln!(
-                            "{}: {} of {} transferred from [{}] (resumed)",
-                            style::header(&stats.accession),
-                            style::value(format_size(stats.bytes_transferred)),
-                            style::value(format_size(stats.total_sra_size)),
-                            style::value(source),
-                        );
-                    } else {
-                        eprintln!(
-                            "{}: {} downloaded from [{}]",
-                            style::header(&stats.accession),
-                            style::value(format_size(stats.total_sra_size)),
-                            style::value(source),
-                        );
-                    }
+                    report_transfer(
+                        &stats.accession,
+                        stats.bytes_transferred,
+                        stats.total_sra_size,
+                        "ena",
+                    );
                     for path in &stats.output_files {
                         eprintln!("  wrote {}", style::path(path.display()));
                     }
@@ -834,31 +783,17 @@ async fn main() -> Result<()> {
                                 "{}: outputs already exist, skipped (use --force to re-process)",
                                 style::header(&stats.accession),
                             );
-                        } else if stats.bytes_transferred == 0 {
-                            eprintln!(
-                                "{}: {} spots, {} reads written (cached, no download needed)",
-                                style::header(&stats.accession),
-                                style::count(stats.spots_read),
-                                style::count(stats.reads_written),
-                            );
-                        } else if stats.bytes_transferred < stats.total_sra_size {
-                            eprintln!(
-                                "{}: {} spots, {} reads written, {} of {} transferred from [{}] (resumed)",
-                                style::header(&stats.accession),
-                                style::count(stats.spots_read),
-                                style::count(stats.reads_written),
-                                style::value(format_size(stats.bytes_transferred)),
-                                style::value(format_size(stats.total_sra_size)),
-                                style::value(&source),
-                            );
                         } else {
                             eprintln!(
-                                "{}: {} spots, {} reads written, {} downloaded from [{}]",
+                                "{}: {} spots, {} reads written, {}",
                                 style::header(&stats.accession),
                                 style::count(stats.spots_read),
                                 style::count(stats.reads_written),
-                                style::value(format_size(stats.total_sra_size)),
-                                style::value(&source),
+                                transfer_phrase(
+                                    stats.bytes_transferred,
+                                    stats.total_sra_size,
+                                    &source,
+                                ),
                             );
                         }
                         if !args.stdout {
@@ -1322,16 +1257,38 @@ async fn suggest_ena_fallback(client: &reqwest::Client, accession: &str, message
     }
 }
 
-/// Output filename for `fetch --prefer-ena`. ENA always serves gzip'd FASTQ,
-/// so the extension is fixed; the slot determines the suffix.
-fn ena_fetch_filename(accession: &str, slot: sracha_core::fastq::OutputSlot) -> String {
-    use sracha_core::fastq::OutputSlot;
-    match slot {
-        OutputSlot::Single | OutputSlot::Unpaired => format!("{accession}.fastq.gz"),
-        OutputSlot::Read1 => format!("{accession}_1.fastq.gz"),
-        OutputSlot::Read2 => format!("{accession}_2.fastq.gz"),
-        OutputSlot::ReadN(n) => format!("{accession}_{}.fastq.gz", n + 1),
+/// How a transfer ended, phrased for the summary line: "cached" when nothing
+/// moved, "resumed" when only part of the file did, "downloaded" otherwise.
+fn transfer_phrase(bytes_transferred: u64, total: u64, source: &str) -> String {
+    if bytes_transferred == 0 {
+        format!(
+            "{} cached (no download needed)",
+            style::value(format_size(total)),
+        )
+    } else if bytes_transferred < total {
+        format!(
+            "{} of {} transferred from [{}] (resumed)",
+            style::value(format_size(bytes_transferred)),
+            style::value(format_size(total)),
+            style::value(source),
+        )
+    } else {
+        format!(
+            "{} downloaded from [{}]",
+            style::value(format_size(total)),
+            style::value(source),
+        )
     }
+}
+
+/// The one transfer summary line: `ACC: <size> downloaded|cached|resumed ...`.
+/// `get`'s decode summary reuses [`transfer_phrase`] for its tail.
+fn report_transfer(acc: &str, bytes_transferred: u64, total: u64, source: &str) {
+    eprintln!(
+        "{}: {}",
+        style::header(acc),
+        transfer_phrase(bytes_transferred, total, source),
+    );
 }
 
 /// Like [`resolve_to_runs`] but routes project resolution through ENA's
