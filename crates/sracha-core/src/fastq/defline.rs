@@ -15,6 +15,7 @@
 //! | `$ri` | read id      |
 //! | `$sn` | spot name    |
 //! | `$rl` | read length  |
+//! | `$lg` | linkage group |
 //!
 //! `$sn` resolves to the run's `NAME`/`SPOT_NAME` column. For Illumina that is
 //! the reconstructed instrument name (`M05881:542:...`); for long-read
@@ -25,6 +26,10 @@
 //! one name, not separate VDB columns, so they are exposed only as part of
 //! `$sn` (which is also the default header's description field) rather than as
 //! standalone variables.
+//!
+//! `$lg` is the spot's `LINKAGE_GROUP`, the tag text bam-load keeps for
+//! barcoded runs (a 10x cell barcode and UMI, `CB:ACGT-1|UB:TTGA`). It is
+//! empty for runs that have none, and only the cSRA decode path reads it.
 //!
 //! `$$` emits a literal `$`. A leading `@`/`>` is accepted (so `fasterq-dump`
 //! templates like `@$ac.$si.$ri` paste in unchanged) but stripped — the record
@@ -47,6 +52,8 @@ enum DeflineVar {
     SpotName,
     /// `$rl` — length of this read in bases.
     ReadLen,
+    /// `$lg` — the spot's `LINKAGE_GROUP` (empty when absent).
+    LinkageGroup,
 }
 
 /// A single compiled token: either literal bytes or a variable to substitute.
@@ -111,6 +118,7 @@ impl DeflineTemplate {
                 b"ri" => DeflineVar::ReadId,
                 b"sn" => DeflineVar::SpotName,
                 b"rl" => DeflineVar::ReadLen,
+                b"lg" => DeflineVar::LinkageGroup,
                 b"sg" => {
                     return Err(format!(
                         "spot-group ($sg) is not supported in {flag}; {SUPPORTED}"
@@ -133,7 +141,16 @@ impl DeflineTemplate {
         Ok(DeflineTemplate { tokens })
     }
 
+    /// Whether the template references `$lg`. Decoders check this once so runs
+    /// that do not use it never read the linkage-group columns.
+    pub fn uses_linkage_group(&self) -> bool {
+        self.tokens
+            .iter()
+            .any(|t| matches!(t, DeflineToken::Var(DeflineVar::LinkageGroup)))
+    }
+
     /// Append the substituted defline *body* (no `@`/`>` prefix, no newline).
+    #[allow(clippy::too_many_arguments)]
     fn append_body(
         &self,
         out: &mut Vec<u8>,
@@ -142,6 +159,7 @@ impl DeflineTemplate {
         read_id: u32,
         spot_name: Option<&[u8]>,
         read_len: usize,
+        linkage_group: &[u8],
     ) {
         let mut itoa_buf = itoa::Buffer::new();
         for tok in &self.tokens {
@@ -162,6 +180,7 @@ impl DeflineTemplate {
                 DeflineToken::Var(DeflineVar::ReadLen) => {
                     out.extend_from_slice(itoa_buf.format(read_len).as_bytes())
                 }
+                DeflineToken::Var(DeflineVar::LinkageGroup) => out.extend_from_slice(linkage_group),
             }
         }
     }
@@ -174,6 +193,8 @@ pub struct QualLine<'a> {
     pub template: &'a DeflineTemplate,
     pub spot_id: &'a [u8],
     pub read_id: u32,
+    /// The spot's `LINKAGE_GROUP`; empty when absent.
+    pub linkage_group: &'a [u8],
 }
 
 impl QualLine<'_> {
@@ -191,12 +212,13 @@ impl QualLine<'_> {
             self.read_id,
             spot_name,
             read_len,
+            self.linkage_group,
         );
     }
 }
 
 const SUPPORTED: &str = "supported variables: $ac (accession) $si (spot id) \
-                         $ri (read id) $sn (spot name) $rl (read length), \
+                         $ri (read id) $sn (spot name) $rl (read length) $lg (linkage group), \
                          and $$ for a literal '$'";
 
 /// Append one read as a FASTQ (or FASTA) record using a compiled template.
@@ -214,6 +236,7 @@ pub fn append_record_templated(
     spot_id: &[u8],
     read_id: u32,
     spot_name: Option<&[u8]>,
+    linkage_group: &[u8],
     sequence: &[u8],
     quality: &[u8],
     qual_template: Option<&DeflineTemplate>,
@@ -223,7 +246,15 @@ pub fn append_record_templated(
 
     out.push(if fasta { b'>' } else { b'@' });
     let body_start = out.len();
-    template.append_body(out, run_name, spot_id, read_id, spot_name, len);
+    template.append_body(
+        out,
+        run_name,
+        spot_id,
+        read_id,
+        spot_name,
+        len,
+        linkage_group,
+    );
     let body_end = out.len();
     out.push(b'\n');
 
@@ -238,7 +269,15 @@ pub fn append_record_templated(
     // unless `--qual-defline` supplies its own template.
     out.push(b'+');
     if let Some(q) = qual_template {
-        q.append_body(out, run_name, spot_id, read_id, spot_name, len);
+        q.append_body(
+            out,
+            run_name,
+            spot_id,
+            read_id,
+            spot_name,
+            len,
+            linkage_group,
+        );
     } else {
         out.extend_from_within(body_start..body_end);
     }
@@ -255,7 +294,7 @@ mod tests {
 
     fn body(t: &DeflineTemplate, name: Option<&[u8]>) -> String {
         let mut out = Vec::new();
-        t.append_body(&mut out, "SRR000001", b"42", 1, name, 4);
+        t.append_body(&mut out, "SRR000001", b"42", 1, name, 4, b"");
         String::from_utf8(out).unwrap()
     }
 
@@ -299,6 +338,35 @@ mod tests {
         assert_eq!(body(&t, None), "cost=$42");
     }
 
+    fn body_lg(t: &DeflineTemplate, lg: &[u8]) -> String {
+        let mut out = Vec::new();
+        t.append_body(&mut out, "SRR000001", b"42", 1, None, 4, lg);
+        String::from_utf8(out).unwrap()
+    }
+
+    #[test]
+    fn parses_lg() {
+        let t = DeflineTemplate::parse("@$si $lg").unwrap();
+        assert!(t.uses_linkage_group());
+        assert_eq!(
+            body_lg(&t, b"CB:TGGTGCATCATAGACC-1|UB:CTAACCCTAACC"),
+            "42 CB:TGGTGCATCATAGACC-1|UB:CTAACCCTAACC"
+        );
+        // Accepted in --qual-defline too.
+        assert!(
+            DeflineTemplate::parse_qual("+$lg")
+                .unwrap()
+                .uses_linkage_group()
+        );
+        assert!(!DeflineTemplate::parse("@$si").unwrap().uses_linkage_group());
+    }
+
+    #[test]
+    fn lg_empty_when_absent() {
+        let t = DeflineTemplate::parse("$si:$lg:end").unwrap();
+        assert_eq!(body_lg(&t, b""), "42::end");
+    }
+
     #[test]
     fn rejects_spot_group() {
         let err = DeflineTemplate::parse("@$ac.$sg").unwrap_err();
@@ -321,7 +389,7 @@ mod tests {
         let t = DeflineTemplate::parse("@$ac.$si.$ri").unwrap();
         let mut out = Vec::new();
         append_record_templated(
-            &mut out, &t, false, "SRR1", b"7", 2, None, b"ACGT", b"IIII", None, None,
+            &mut out, &t, false, "SRR1", b"7", 2, None, b"", b"ACGT", b"IIII", None, None,
         );
         assert_eq!(
             String::from_utf8(out).unwrap(),
@@ -334,7 +402,7 @@ mod tests {
         let t = DeflineTemplate::parse("@$ac.$si.$ri").unwrap();
         let mut out = Vec::new();
         append_record_templated(
-            &mut out, &t, true, "SRR1", b"7", 2, None, b"ACGT", b"", None, None,
+            &mut out, &t, true, "SRR1", b"7", 2, None, b"", b"ACGT", b"", None, None,
         );
         assert_eq!(String::from_utf8(out).unwrap(), ">SRR1.7.2\nACGT\n");
     }
@@ -352,6 +420,7 @@ mod tests {
             b"7",
             2,
             None,
+            b"",
             b"ACGT",
             b"IIII",
             Some(&q),
@@ -376,6 +445,7 @@ mod tests {
             b"7",
             2,
             None,
+            b"",
             b"ACGT",
             b"IIII",
             Some(&q),
@@ -400,6 +470,7 @@ mod tests {
             b"7",
             1,
             None,
+            b"",
             b"ACGT",
             b"",
             Some(&q),

@@ -1432,6 +1432,11 @@ fn run_fastq_csra(
         refseqs,
         reference: crate::vdb::reference::ReferenceLayout::open(&mut archive, sra_path)?
             .map(Arc::new),
+        // Read the barcode columns only when a defline template asks for them.
+        linkage_group: [&config.seq_defline, &config.qual_defline]
+            .into_iter()
+            .flatten()
+            .any(|t| t.uses_linkage_group()),
     };
     // Open the vdbcache sidecar when present. Each decode worker opens
     // its own copy below (mmap/file handles are not Send across rayon
@@ -1563,6 +1568,11 @@ fn run_fastq_csra(
         let mut itoa_buf = itoa::Buffer::new();
         for row_id in start..end {
             let s = csra.read_spot(row_id)?;
+            let linkage_group = if shared.linkage_group {
+                csra.linkage_group(row_id)?
+            } else {
+                Vec::new()
+            };
             let sequence = fourna_to_ascii(&s.bases);
             let quality: Vec<u8> = s.quality.iter().map(|q| q.wrapping_add(33)).collect();
             let spot_num_str = itoa_buf.format(row_id).to_string();
@@ -1576,6 +1586,7 @@ fn run_fastq_csra(
                 read_types: s.read_types,
                 read_filter: Vec::new(),
                 spot_group: Vec::new(),
+                linkage_group,
             };
             for (slot, rec) in crate::fastq::format_spot(&spot, acc, &fastq_config) {
                 let entry = per_slot.entry(slot).or_insert_with(|| (Vec::new(), 0));

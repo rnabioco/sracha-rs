@@ -16,6 +16,9 @@
   title, study, design, mirrors and read structure, with `null` for unknown
   values. TSV/CSV gain `format` (`normalized`/`lite`), `bases` and
   `bases_estimated` columns ([#181]).
+- `--seq-defline` / `--qual-defline` accept `$lg`, the spot's `LINKAGE_GROUP`
+  (e.g. a 10x cell barcode and UMI) from bam-loaded cSRA archives; empty when
+  the run has none ([#184]).
 
 ### Fixes
 
@@ -54,6 +57,7 @@
 [#168]: https://github.com/rnabioco/sracha-rs/issues/168
 [#181]: https://github.com/rnabioco/sracha-rs/issues/181
 [#183]: https://github.com/rnabioco/sracha-rs/issues/183
+[#184]: https://github.com/rnabioco/sracha-rs/issues/184
 [#172]: https://github.com/rnabioco/sracha-rs/issues/172
 [#173]: https://github.com/rnabioco/sracha-rs/issues/173
 [#174]: https://github.com/rnabioco/sracha-rs/issues/174

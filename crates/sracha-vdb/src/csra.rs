@@ -176,6 +176,10 @@ pub struct CsraShared {
     pub refseqs: Option<Arc<RefSeqStore>>,
     /// The REFERENCE table's chunk layout.
     pub reference: Option<Arc<ReferenceLayout>>,
+    /// Open the `LINKAGE_GROUP` / `CMP_LINKAGE_GROUP` columns so
+    /// [`CsraCursor::linkage_group`] can serve them. Off by default: runs
+    /// that never ask for the barcode read neither column.
+    pub linkage_group: bool,
 }
 
 pub struct CsraCursor {
@@ -190,6 +194,10 @@ pub struct CsraCursor {
     read_len: CachedColumn,
     read_type: CachedColumn,
     quality: CachedColumn,
+    /// `CMP_LINKAGE_GROUP`: the linkage group of spots with no alignment
+    /// (their `PRIMARY_ALIGNMENT.LINKAGE_GROUP` row does not exist). Only
+    /// opened when requested via [`CsraShared::linkage_group`].
+    cmp_linkage_group: Option<CachedColumn>,
 
     alignment: AlignmentCursor,
     reference: ReferenceCursor,
@@ -249,6 +257,7 @@ impl CsraCursor {
     ) -> Result<Self> {
         let refseqs = shared.and_then(|s| s.refseqs.as_ref());
         let layout = shared.and_then(|s| s.reference.as_ref());
+        let want_lg = shared.is_some_and(|s| s.linkage_group);
         // SEQUENCE-side columns always live in the main archive — the
         // vdbcache only carries the alignment + reference halves.
         let col_base = inspect::column_base_path_public(main, Some("SEQUENCE"))?;
@@ -288,6 +297,12 @@ impl CsraCursor {
         } else {
             None
         };
+        let cmp_linkage_group =
+            if want_lg && archive_has_seq_column(main, &col_base, "CMP_LINKAGE_GROUP") {
+                Some(open_col(main, "CMP_LINKAGE_GROUP")?)
+            } else {
+                None
+            };
         let primary_alignment_id = open_col(main, "PRIMARY_ALIGNMENT_ID")?;
         let read_len = open_col(main, "READ_LEN")?;
         let read_type = open_col(main, "READ_TYPE")?;
@@ -312,16 +327,16 @@ impl CsraCursor {
                 if !main_has_ref_cmp_read && !have_refseqs {
                     return Err(external_refseq_error());
                 }
-                let alignment = AlignmentCursor::open(main, main_path)?;
+                let alignment = AlignmentCursor::open_with(main, main_path, want_lg)?;
                 let reference =
                     ReferenceCursor::open_with_external(main, main_path, refseqs, layout)?;
                 (alignment, reference)
             }
             Some((cache, cache_path)) => {
                 let alignment = if primary_in_main {
-                    AlignmentCursor::open(main, main_path)?
+                    AlignmentCursor::open_with(main, main_path, want_lg)?
                 } else if archive_has_table(cache, "PRIMARY_ALIGNMENT") {
-                    AlignmentCursor::open(cache, cache_path)?
+                    AlignmentCursor::open_with(cache, cache_path, want_lg)?
                 } else {
                     return Err(Error::Format(
                         "cSRA: PRIMARY_ALIGNMENT table not found in main archive or vdbcache"
@@ -367,6 +382,7 @@ impl CsraCursor {
             read_type: CachedColumn::new(read_type, ColumnKind::Zip)
                 .labelled(ColLabel::SeqReadType),
             quality: CachedColumn::new(quality, ColumnKind::Zip).labelled(ColLabel::SeqQuality),
+            cmp_linkage_group: cmp_linkage_group.map(|c| CachedColumn::new(c, ColumnKind::Zip)),
             alignment,
             reference,
             row_count,
@@ -453,6 +469,27 @@ impl CsraCursor {
         Ok(FastqStats { spots })
     }
 
+    /// The spot's `LINKAGE_GROUP` text (e.g. `CB:ACGT-1|UB:TTGA`), empty when
+    /// the run has none or the cursor was not opened with
+    /// [`CsraShared::linkage_group`].
+    ///
+    /// bam-load stores it per alignment (`PRIMARY_ALIGNMENT.LINKAGE_GROUP`),
+    /// joined to the spot through `SEQUENCE.PRIMARY_ALIGNMENT_ID`; a spot
+    /// with no alignment carries it in `SEQUENCE.CMP_LINKAGE_GROUP` instead.
+    /// The first aligned read with a non-empty value wins, then the
+    /// unaligned fallback.
+    pub fn linkage_group(&self, row_id: i64) -> Result<Vec<u8>> {
+        let align_ids = self.primary_alignment_id.read_i64_row(row_id)?;
+        resolve_linkage_group(
+            &align_ids,
+            |id| self.alignment.read_linkage_group(id),
+            || match &self.cmp_linkage_group {
+                Some(c) => c.read_byte_row(row_id),
+                None => Ok(Vec::new()),
+            },
+        )
+    }
+
     /// Decode one SEQUENCE row's full bases + quality.
     pub fn read_spot(&self, row_id: i64) -> Result<SpotRead> {
         let align_ids = self.primary_alignment_id.read_i64_row(row_id)?;
@@ -512,6 +549,66 @@ impl CsraCursor {
             read_lens,
             read_types,
         })
+    }
+}
+
+/// Pick a spot's linkage group: the first aligned read whose alignment row
+/// has a non-empty one, else the spot's own unaligned `CMP_LINKAGE_GROUP`.
+/// An `align_id` of 0 means the read is unaligned.
+fn resolve_linkage_group(
+    align_ids: &[i64],
+    mut aligned: impl FnMut(i64) -> Result<Vec<u8>>,
+    unaligned: impl FnOnce() -> Result<Vec<u8>>,
+) -> Result<Vec<u8>> {
+    for &id in align_ids {
+        if id > 0 {
+            let lg = aligned(id)?;
+            if !lg.is_empty() {
+                return Ok(lg);
+            }
+        }
+    }
+    unaligned()
+}
+
+#[cfg(test)]
+mod linkage_group_tests {
+    use super::resolve_linkage_group;
+
+    fn lookup(id: i64) -> crate::error::Result<Vec<u8>> {
+        Ok(match id {
+            1 => b"CB:AAAA-1|UB:CCCC".to_vec(),
+            2 => b"CB:GGGG-1|UB:TTTT".to_vec(),
+            _ => Vec::new(),
+        })
+    }
+
+    fn cmp() -> crate::error::Result<Vec<u8>> {
+        Ok(b"CB:NNNN-1|UB:NNNN".to_vec())
+    }
+
+    #[test]
+    fn aligned_spot_uses_alignment_row() {
+        let lg = resolve_linkage_group(&[2], lookup, cmp).unwrap();
+        assert_eq!(lg, b"CB:GGGG-1|UB:TTTT");
+    }
+
+    #[test]
+    fn first_aligned_read_wins_and_skips_unaligned_slots() {
+        let lg = resolve_linkage_group(&[0, 1, 2], lookup, cmp).unwrap();
+        assert_eq!(lg, b"CB:AAAA-1|UB:CCCC");
+    }
+
+    #[test]
+    fn unaligned_spot_falls_back_to_cmp_linkage_group() {
+        let lg = resolve_linkage_group(&[0], lookup, cmp).unwrap();
+        assert_eq!(lg, b"CB:NNNN-1|UB:NNNN");
+    }
+
+    #[test]
+    fn no_linkage_group_anywhere_is_empty() {
+        let lg = resolve_linkage_group(&[7], lookup, || Ok(Vec::new())).unwrap();
+        assert!(lg.is_empty());
     }
 }
 
