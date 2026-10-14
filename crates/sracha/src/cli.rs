@@ -279,7 +279,8 @@ pub struct FastqArgs {
 
     /// Custom defline template (fasterq-dump `--seq-defline` syntax).
     /// Variables: $ac (accession) $si (spot id) $ri (read id) $sn (spot/read
-    /// name) $rl (read length); $$ is a literal '$'. Example: '@$ac.$si.$ri'.
+    /// name) $rl (read length) $lg (LINKAGE_GROUP, e.g. 10x 'CB:..|UB:..';
+    /// cSRA runs only); $$ is a literal '$'. Example: '@$ac.$si.$ri'.
     /// For PacBio/ONT, $sn is the native read name (e.g. PacBio
     /// 'm64012_.../ccs', ONT '<uuid> ch=.. start_time=..'); it is also the
     /// default header. The '+' line mirrors this. ($sg/spot-group unsupported.)
@@ -423,7 +424,8 @@ pub struct GetArgs {
 
     /// Custom defline template (fasterq-dump `--seq-defline` syntax).
     /// Variables: $ac (accession) $si (spot id) $ri (read id) $sn (spot/read
-    /// name) $rl (read length); $$ is a literal '$'. Example: '@$ac.$si.$ri'.
+    /// name) $rl (read length) $lg (LINKAGE_GROUP, e.g. 10x 'CB:..|UB:..';
+    /// cSRA runs only); $$ is a literal '$'. Example: '@$ac.$si.$ri'.
     /// For PacBio/ONT, $sn is the native read name (e.g. PacBio
     /// 'm64012_.../ccs', ONT '<uuid> ch=.. start_time=..'); it is also the
     /// default header. The '+' line mirrors this. ($sg/spot-group unsupported.)

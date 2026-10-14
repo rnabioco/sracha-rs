@@ -232,6 +232,9 @@ pub struct SpotRecord {
     pub read_filter: Vec<u8>,
     /// Barcode / sample group (may be empty).
     pub spot_group: Vec<u8>,
+    /// `LINKAGE_GROUP` (cell barcode / UMI tags); empty unless the decode
+    /// path was asked for it (`$lg` in a defline template).
+    pub linkage_group: Vec<u8>,
 }
 
 /// Split mode for FASTQ output.
@@ -642,6 +645,8 @@ pub(crate) struct SegmentRecord<'a> {
     /// Default-defline description: the original name, the synthesized spot
     /// number, or `None` when the table has no NAME column.
     pub description: Option<&'a [u8]>,
+    /// The spot's `LINKAGE_GROUP` (`$lg`); empty when absent.
+    pub linkage_group: &'a [u8],
     pub sequence: &'a [u8],
     /// Ignored (and may be empty) for FASTA output.
     pub quality: &'a [u8],
@@ -674,6 +679,7 @@ pub(crate) fn append_segment_record(
             seg.spot_number,
             seg.mate_idx,
             seg.original_name,
+            seg.linkage_group,
             seg.sequence,
             seg.quality,
             style.qual_defline,
@@ -724,6 +730,7 @@ pub(crate) fn append_segment_record(
                 template,
                 spot_id: seg.spot_number,
                 read_id: seg.mate_idx,
+                linkage_group: seg.linkage_group,
             }),
             diag,
         );
@@ -823,6 +830,7 @@ pub fn format_spot(
     route_segments_to_slots(
         &segments,
         &spot.name,
+        &spot.linkage_group,
         run_name,
         config,
         spot.read_lengths.len(),
@@ -889,6 +897,7 @@ fn filter_spot_segments<'a>(spot: &'a SpotRecord, config: &FastqConfig) -> Vec<R
 fn route_segments_to_slots(
     segments: &[ReadSegment<'_>],
     spot_name: &[u8],
+    linkage_group: &[u8],
     run_name: &str,
     config: &FastqConfig,
     spot_reads: usize,
@@ -911,6 +920,7 @@ fn route_segments_to_slots(
                 mate_idx: seg.mate_idx,
                 original_name: Some(spot_name),
                 description: Some(spot_name),
+                linkage_group,
                 sequence: seg.sequence,
                 quality: seg.quality,
             },
@@ -1019,6 +1029,7 @@ mod tests {
             read_types: vec![BIO],
             read_filter: vec![0], // pass
             spot_group: Vec::new(),
+            linkage_group: Vec::new(),
         }
     }
 
@@ -1042,6 +1053,7 @@ mod tests {
             read_types: vec![BIO, BIO],
             read_filter: vec![0, 0],
             spot_group: Vec::new(),
+            linkage_group: Vec::new(),
         }
     }
 
@@ -1073,6 +1085,7 @@ mod tests {
             read_types: vec![TECH, BIO, BIO],
             read_filter: vec![0, 0, 0],
             spot_group: Vec::new(),
+            linkage_group: Vec::new(),
         }
     }
 
@@ -1191,6 +1204,7 @@ mod tests {
             read_types: vec![BIO, BIO],
             read_filter: vec![0, 0],
             spot_group: Vec::new(),
+            linkage_group: Vec::new(),
         };
         let config = FastqConfig {
             split_mode: SplitMode::SplitFiles,
@@ -1437,6 +1451,7 @@ mod tests {
             read_types: vec![BIO, BIO],
             read_filter: vec![0, 0],
             spot_group: Vec::new(),
+            linkage_group: Vec::new(),
         };
         let config = FastqConfig {
             split_mode: SplitMode::Split3,
@@ -1458,6 +1473,7 @@ mod tests {
             read_types: vec![BIO, BIO],
             read_filter: vec![0, 0],
             spot_group: Vec::new(),
+            linkage_group: Vec::new(),
         };
         let config = FastqConfig {
             split_mode: SplitMode::Split3,
@@ -1479,6 +1495,7 @@ mod tests {
             read_types: vec![BIO, BIO],
             read_filter: vec![0, 0],
             spot_group: Vec::new(),
+            linkage_group: Vec::new(),
         };
         let config = FastqConfig {
             split_mode: SplitMode::Split3,
@@ -1525,6 +1542,7 @@ mod tests {
             read_types: Vec::new(),
             read_filter: Vec::new(),
             spot_group: Vec::new(),
+            linkage_group: Vec::new(),
         };
         let config = default_config();
         let results = format_spot(&spot, "SRR1", &config);
@@ -1548,6 +1566,7 @@ mod tests {
             read_types: vec![BIO, BIO, BIO],
             read_filter: vec![0, 0, 0],
             spot_group: Vec::new(),
+            linkage_group: Vec::new(),
         };
 
         let config = FastqConfig {
@@ -1581,6 +1600,7 @@ mod tests {
             read_types: vec![BIO, BIO, BIO],
             read_filter: vec![0, 0, 0],
             spot_group: Vec::new(),
+            linkage_group: Vec::new(),
         };
 
         let config = FastqConfig {
@@ -1623,6 +1643,7 @@ mod tests {
             read_types: slots.iter().map(|&(_, ty)| ty).collect(),
             read_filter: vec![0; slots.len()],
             spot_group: Vec::new(),
+            linkage_group: Vec::new(),
         }
     }
 
@@ -2170,6 +2191,7 @@ mod tests {
                 template: &q,
                 spot_id: b"1",
                 read_id: 2,
+                linkage_group: b"",
             }),
             None,
         );
@@ -2191,6 +2213,7 @@ mod tests {
                 template: &q,
                 spot_id: b"1",
                 read_id: 2,
+                linkage_group: b"",
             }),
             None,
         );
@@ -2216,6 +2239,7 @@ mod tests {
                 mate_idx,
                 original_name: name,
                 description: name,
+                linkage_group: b"",
                 sequence: b"ACGT",
                 quality: b"IIII",
             },
@@ -2270,6 +2294,26 @@ mod tests {
         assert_eq!(render_segment(&cfg, 2, None), "@RUN.7.2\nACGT\n+\nIIII\n");
     }
 
+    /// `$lg` reaches the header through the shared writer, from `SpotRecord`
+    /// (cSRA `format_spot`) alike, and is empty when the spot has none.
+    #[test]
+    fn linkage_group_flows_through_format_spot() {
+        let cfg = FastqConfig {
+            seq_defline: Some(DeflineTemplate::parse("@$si $lg").unwrap()),
+            ..Default::default()
+        };
+        let mut spot = csra_style_spot();
+        spot.linkage_group = b"CB:ACGT-1|UB:TTGA".to_vec();
+        let out = format_spot(&spot, "RUN", &cfg);
+        let text = String::from_utf8(out[0].1.data.clone()).unwrap();
+        assert!(text.starts_with("@7 CB:ACGT-1|UB:TTGA\n"), "{text}");
+
+        spot.linkage_group.clear();
+        let out = format_spot(&spot, "RUN", &cfg);
+        let text = String::from_utf8(out[0].1.data.clone()).unwrap();
+        assert!(text.starts_with("@7 \n"), "{text}");
+    }
+
     #[test]
     fn segment_record_long_spot_number_uses_heap_label() {
         // A label longer than the stack buffer must still come out intact.
@@ -2289,6 +2333,7 @@ mod tests {
                 mate_idx: 12,
                 original_name: None,
                 description: None,
+                linkage_group: b"",
                 sequence: b"AC",
                 quality: b"II",
             },
@@ -2310,6 +2355,7 @@ mod tests {
             read_types: vec![1, 1],
             read_filter: Vec::new(),
             spot_group: Vec::new(),
+            linkage_group: Vec::new(),
         }
     }
 

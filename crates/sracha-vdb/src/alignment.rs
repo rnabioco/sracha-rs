@@ -86,6 +86,9 @@ pub struct AlignmentCursor {
     has_ref_offset: CachedColumn,
     mismatch: CachedColumn,
     ref_offset: CachedColumn,
+    /// `LINKAGE_GROUP` (bam-load's `CB:..|UB:..` tag text). Opened only on
+    /// request, and only when the archive has it.
+    linkage_group: Option<CachedColumn>,
     row_count: u64,
     first_row: i64,
 }
@@ -93,6 +96,17 @@ pub struct AlignmentCursor {
 impl AlignmentCursor {
     /// Open the PRIMARY_ALIGNMENT columns in the archive.
     pub fn open<R: Read + Seek>(archive: &mut KarArchive<R>, sra_path: &Path) -> Result<Self> {
+        Self::open_with(archive, sra_path, false)
+    }
+
+    /// As [`open`](Self::open); with `with_linkage_group` also opens the
+    /// optional `LINKAGE_GROUP` column so [`read_linkage_group`](Self::read_linkage_group)
+    /// can serve it. Runs that never ask for it pay nothing.
+    pub fn open_with<R: Read + Seek>(
+        archive: &mut KarArchive<R>,
+        sra_path: &Path,
+        with_linkage_group: bool,
+    ) -> Result<Self> {
         let col_base = inspect::column_base_path_public(archive, Some("PRIMARY_ALIGNMENT"))?;
         let open = |archive: &mut KarArchive<R>, name: &str| -> Result<ColumnReader> {
             ColumnReader::open(archive, &format!("{col_base}/{name}"), sra_path)
@@ -104,6 +118,11 @@ impl AlignmentCursor {
         let has_ref_offset = open(archive, "HAS_REF_OFFSET")?;
         let mismatch = open(archive, "MISMATCH")?;
         let ref_offset = open(archive, "REF_OFFSET")?;
+        let linkage_group = if with_linkage_group {
+            open(archive, "LINKAGE_GROUP").ok()
+        } else {
+            None
+        };
 
         let first_row = global_ref_start.first_row_id().unwrap_or(1);
         let row_count = global_ref_start.row_count();
@@ -122,6 +141,7 @@ impl AlignmentCursor {
             mismatch: CachedColumn::new(mismatch, ColumnKind::Zip).labelled(ColLabel::PaMismatch),
             ref_offset: CachedColumn::new(ref_offset, ColumnKind::Irzip { elem_bits: 32 })
                 .labelled(ColLabel::PaRefOffset),
+            linkage_group: linkage_group.map(|c| CachedColumn::new(c, ColumnKind::Zip)),
             row_count,
             first_row,
         })
@@ -145,6 +165,15 @@ impl AlignmentCursor {
 
     pub fn first_ref_len(&self) -> Result<u32> {
         self.ref_len.read_scalar_u32(self.first_row)
+    }
+
+    /// `LINKAGE_GROUP` text of alignment `row_id`; empty when the column was
+    /// not requested or the archive lacks it.
+    pub fn read_linkage_group(&self, row_id: i64) -> Result<Vec<u8>> {
+        match &self.linkage_group {
+            Some(c) => c.read_byte_row(row_id),
+            None => Ok(Vec::new()),
+        }
     }
 
     /// Read one alignment row end-to-end: all six columns' values for

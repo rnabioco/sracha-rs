@@ -1854,3 +1854,54 @@ fn csra_split_spot_matches_fasterq_dump() {
         "cSRA split-spot output diverges from fasterq-dump"
     );
 }
+
+// ---------------------------------------------------------------------------
+// $lg / LINKAGE_GROUP (#184)
+// ---------------------------------------------------------------------------
+
+/// SRR30022414 is a 2.4 GiB 10x run loaded by bam-load: `LINKAGE_GROUP` lives
+/// in PRIMARY_ALIGNMENT, joined through SEQUENCE.PRIMARY_ALIGNMENT_ID. Point
+/// `SRACHA_SRR30022414` at a local copy (kept outside the repo, e.g. under
+/// `~/scratch`); the test also fetches ~700 MiB of external references.
+#[ignore]
+#[test]
+fn srr30022414_linkage_group_rows_1_and_2() {
+    use sracha_core::vdb::csra::{CsraCursor, CsraShared};
+    use sracha_core::vdb::kar::KarArchive;
+    use sracha_core::vdb::refseq::RefSeqStore;
+
+    let Some(path) = std::env::var_os("SRACHA_SRR30022414").map(PathBuf::from) else {
+        eprintln!("SRACHA_SRR30022414 not set; skipping");
+        return;
+    };
+    let tmp = tempfile::tempdir().unwrap();
+    let config = test_config(tmp.path(), SplitMode::Split3, CompressionMode::None);
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    let paths = rt
+        .block_on(sracha_core::pipeline::refseq::prepare_external_refseqs(
+            &path, None, &config,
+        ))
+        .unwrap();
+
+    let file = std::fs::File::open(&path).unwrap();
+    let mut archive = KarArchive::open(std::io::BufReader::new(file)).unwrap();
+    let shared = CsraShared {
+        refseqs: Some(std::sync::Arc::new(RefSeqStore::open(&paths).unwrap())),
+        reference: sracha_core::vdb::reference::ReferenceLayout::open(&mut archive, &path)
+            .unwrap()
+            .map(std::sync::Arc::new),
+        linkage_group: true,
+    };
+    let csra = CsraCursor::open_with_shared(&mut archive, &path, None, Some(&shared)).unwrap();
+    assert_eq!(
+        csra.linkage_group(1).unwrap(),
+        b"CB:TGGTGCATCATAGACC-1|UB:CTAACCCTAACC"
+    );
+    assert_eq!(
+        csra.linkage_group(2).unwrap(),
+        b"CB:TCAAACCAGTCATCCC-1|UB:CTAACCCTAACC"
+    );
+}

@@ -465,6 +465,7 @@ replaces the built-in FASTQ/FASTA header with a template, using the same
 | `$ri` | Read id — 1-based read number within the spot |
 | `$sn` | Spot name from the NAME column (empty when the archive has none) |
 | `$rl` | Read length in bases |
+| `$lg` | The spot's `LINKAGE_GROUP`, e.g. a 10x `CB:<barcode>-1\|UB:<UMI>` (empty when the run has none) |
 | `$$` | A literal `$` |
 
 ```bash
@@ -487,6 +488,15 @@ Notes:
 - `$sg` (spot-group) is **not supported**; a template using it is rejected at
   startup. Reference-compressed (cSRA) archives have no NAME column, so `$sn`
   expands to empty there.
+
+Notes on `$lg`:
+
+- `$lg` is read from bam-loaded (cSRA) archives, where `LINKAGE_GROUP` lives in
+  `PRIMARY_ALIGNMENT` (or `SEQUENCE.CMP_LINKAGE_GROUP` for unaligned spots). Plain
+  SRA runs have none, so it expands to empty. The column is only read when a
+  template uses `$lg`.
+- To pull a 10x barcode out as its own file:
+  `sracha fastq --seq-defline '@$si $lg' SRR30022414`.
 
 ## Coming from sra-tools
 

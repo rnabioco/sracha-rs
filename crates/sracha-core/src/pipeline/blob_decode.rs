@@ -1448,6 +1448,8 @@ pub(crate) fn decode_blob_to_fastq(
                         mate_idx: seg.mate_idx,
                         original_name,
                         description,
+                        // Only cSRA archives (bam-load) carry a linkage group.
+                        linkage_group: &[],
                         sequence: &sequence[range.clone()],
                         // FASTA output never reads quality; don't index it.
                         quality: if config.fasta { &[] } else { &quality[range] },
