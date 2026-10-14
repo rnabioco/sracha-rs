@@ -179,7 +179,7 @@ fn create_output_writer_for_slot(
     slot: OutputSlot,
     config: &PipelineConfig,
     compress_pool: &Option<Arc<rayon::ThreadPool>>,
-) -> (OutputWriter, PathBuf, PathBuf) {
+) -> Result<(OutputWriter, PathBuf, PathBuf)> {
     let filename = output_filename(
         accession,
         slot,
@@ -191,7 +191,7 @@ fn create_output_writer_for_slot(
     let final_path = out_dir.join(&filename);
     let tmp_path = out_dir.join(format!("{filename}.partial"));
 
-    let file = std::fs::File::create(&tmp_path).expect("failed to create output file");
+    let file = std::fs::File::create(&tmp_path)?;
     let buf = std::io::BufWriter::with_capacity(256 * 1024, file);
 
     let writer = match config.compression {
@@ -199,20 +199,40 @@ fn create_output_writer_for_slot(
             buf,
             level,
             DEFAULT_BLOCK_SIZE,
-            compress_pool.clone().expect("gzip pool must exist"),
+            compress_pool
+                .clone()
+                .ok_or_else(|| Error::Pipeline("gzip thread pool missing".into()))?,
         )),
         CompressionMode::Zstd { level, threads } => {
             let mut encoder = zstd::stream::write::Encoder::new(buf, level)
-                .expect("failed to create zstd encoder");
+                .map_err(|e| Error::Pipeline(format!("zstd encoder: {e}")))?;
             encoder
                 .multithread(threads)
-                .expect("failed to set zstd threads");
+                .map_err(|e| Error::Pipeline(format!("zstd threads: {e}")))?;
             OutputWriter::Zstd(encoder)
         }
         CompressionMode::None => OutputWriter::Plain(buf),
     };
 
-    (writer, final_path, tmp_path)
+    Ok((writer, final_path, tmp_path))
+}
+
+/// Dedicated thread pool for parallel gzip compression; `None` unless the
+/// output is gzip. One sizing rule for every decode path: twice the decode
+/// threads, capped at the hardware thread count.
+fn make_compress_pool(config: &PipelineConfig) -> Result<Option<Arc<rayon::ThreadPool>>> {
+    if !matches!(config.compression, CompressionMode::Gzip { .. }) {
+        return Ok(None);
+    }
+    let max_hw = std::thread::available_parallelism().map_or(usize::MAX, |p| p.get());
+    let compress_threads = (config.threads.max(1) * 2).min(max_hw);
+    Ok(Some(Arc::new(
+        rayon::ThreadPoolBuilder::new()
+            .num_threads(compress_threads)
+            .thread_name(|i| format!("pargz-{i}"))
+            .build()
+            .map_err(|e| Error::Pipeline(format!("failed to build gzip thread pool: {e}")))?,
+    )))
 }
 
 // ---------------------------------------------------------------------------
@@ -469,35 +489,11 @@ fn decode_and_write(
         .build()
         .map_err(|e| Error::Pipeline(format!("failed to build rayon thread pool: {e}")))?;
 
-    // Dedicated thread pool for parallel gzip compression (only needed for gzip).
-    let compress_pool: Option<Arc<rayon::ThreadPool>> =
-        if matches!(config.compression, CompressionMode::Gzip { .. }) {
-            let max_hw = std::thread::available_parallelism().map_or(usize::MAX, |p| p.get());
-            let compress_threads = (num_threads * 2).min(max_hw);
-            Some(Arc::new(
-                rayon::ThreadPoolBuilder::new()
-                    .num_threads(compress_threads)
-                    .thread_name(|i| format!("pargz-{i}"))
-                    .build()
-                    .map_err(|e| {
-                        Error::Pipeline(format!("failed to build gzip thread pool: {e}"))
-                    })?,
-            ))
-        } else {
-            None
-        };
+    let compress_pool = make_compress_pool(config)?;
 
     tracing::debug!("{accession}: using {num_threads} threads for decode");
 
-    let fastq_config = FastqConfig {
-        split_mode: config.split_mode,
-        skip_technical: config.skip_technical,
-        min_read_len: config.min_read_len,
-        fasta: config.fasta,
-        paired_suffix: config.paired_suffix,
-        seq_defline: config.seq_defline.clone(),
-        qual_defline: config.qual_defline.clone(),
-    };
+    let fastq_config = FastqConfig::from(config);
 
     // Create output directory (not needed for stdout mode).
     if !config.stdout {
@@ -721,16 +717,20 @@ fn decode_and_write(
                         let writer = if let Some(sw) = stdout_writer_ref {
                             sw
                         } else {
-                            writers_ref.entry(slot_out.slot).or_insert_with(|| {
-                                let (writer, final_path, tmp_path) = create_output_writer_for_slot(
-                                    accession,
-                                    slot_out.slot,
-                                    config,
-                                    &compress_pool,
-                                );
-                                output_paths_ref.push((final_path, tmp_path));
-                                writer
-                            })
+                            match writers_ref.entry(slot_out.slot) {
+                                std::collections::hash_map::Entry::Occupied(e) => e.into_mut(),
+                                std::collections::hash_map::Entry::Vacant(v) => {
+                                    let (writer, final_path, tmp_path) =
+                                        create_output_writer_for_slot(
+                                            accession,
+                                            slot_out.slot,
+                                            config,
+                                            &compress_pool,
+                                        )?;
+                                    output_paths_ref.push((final_path, tmp_path));
+                                    v.insert(writer)
+                                }
+                            }
                         };
 
                         writer.write_all(&slot_out.bytes).map_err(Error::Io)?;
@@ -1373,7 +1373,7 @@ fn run_fastq_csra(
     config: &PipelineConfig,
     vdbcache_path: Option<&std::path::Path>,
 ) -> Result<FastqStats> {
-    use crate::fastq::{CompressionMode, FastqConfig, OutputSlot, SpotRecord, output_filename};
+    use crate::fastq::{FastqConfig, OutputSlot, SpotRecord};
     use crate::vdb::csra::CsraCursor;
     use crate::vdb::kar::KarArchive;
     use crate::vdb::restore::fourna_to_ascii;
@@ -1432,15 +1432,7 @@ fn run_fastq_csra(
         }
     };
 
-    let fastq_config = FastqConfig {
-        split_mode: config.split_mode,
-        skip_technical: config.skip_technical,
-        min_read_len: config.min_read_len,
-        fasta: config.fasta,
-        paired_suffix: config.paired_suffix,
-        seq_defline: config.seq_defline.clone(),
-        qual_defline: config.qual_defline.clone(),
-    };
+    let fastq_config = FastqConfig::from(config);
 
     if !config.stdout {
         std::fs::create_dir_all(config.accession_output_dir(acc))?;
@@ -1457,19 +1449,8 @@ fn run_fastq_csra(
         None
     };
 
-    // Gzip pool reused across slot writers when --compress gzip is set.
-    let compress_pool: Option<Arc<rayon::ThreadPool>> = match config.compression {
-        CompressionMode::Gzip { .. } => {
-            let n = config.threads.max(1);
-            Some(Arc::new(
-                rayon::ThreadPoolBuilder::new()
-                    .num_threads(n)
-                    .build()
-                    .map_err(|e| Error::Pipeline(format!("gzip threadpool: {e}")))?,
-            ))
-        }
-        _ => None,
-    };
+    // Gzip pool reused across slot writers; same sizing as the plain path.
+    let compress_pool = make_compress_pool(config)?;
 
     // Partition the spot range into chunks of CHUNK_SIZE for parallel
     // decode. Each rayon worker opens its own CsraCursor (mmap is cheap;
@@ -1583,36 +1564,9 @@ fn run_fastq_csra(
         if writers.contains_key(&slot) {
             return Ok(());
         }
-        let filename = output_filename(
-            acc,
-            slot,
-            config.fasta,
-            &config.compression,
-            config.paired_suffix,
-        );
-        let out_dir = config.accession_output_dir(acc);
-        let final_path = out_dir.join(&filename);
-        let tmp_path = out_dir.join(format!("{filename}.partial"));
-        output_paths.push((final_path, tmp_path.clone()));
-        let file = std::fs::File::create(&tmp_path)?;
-        let buf = std::io::BufWriter::with_capacity(256 * 1024, file);
-        let w = match config.compression {
-            CompressionMode::Gzip { level } => OutputWriter::Gz(ParGzWriter::new(
-                buf,
-                level,
-                DEFAULT_BLOCK_SIZE,
-                compress_pool.clone().expect("gzip pool must exist"),
-            )),
-            CompressionMode::Zstd { level, threads } => {
-                let mut encoder = zstd::stream::write::Encoder::new(buf, level)
-                    .map_err(|e| Error::Pipeline(format!("zstd encoder: {e}")))?;
-                encoder
-                    .multithread(threads)
-                    .map_err(|e| Error::Pipeline(format!("zstd threads: {e}")))?;
-                OutputWriter::Zstd(encoder)
-            }
-            CompressionMode::None => OutputWriter::Plain(buf),
-        };
+        let (w, final_path, tmp_path) =
+            create_output_writer_for_slot(acc, slot, config, &compress_pool)?;
+        output_paths.push((final_path, tmp_path));
         writers.insert(slot, w);
         Ok(())
     };
