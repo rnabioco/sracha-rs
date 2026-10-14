@@ -235,7 +235,7 @@ prints its table of contents, schema, and metadata. Paths starting with
 record per accession. Columns: `accession`, `archive_type` (`SRA`/`cSRA`),
 `layout` (`SINGLE`/`PAIRED`/`N-read`), `nreads`, `spots`, `size_bytes`,
 `platform`, `md5`, `read_lengths` (`;`-separated, e.g. `8;50;16;49`) and
-`read_types` (`;`-separated `B`iological/`T`echnical) and `read_lengths_source`.
+`read_types` (`;`-separated `B`iological/`T`echnical), `read_lengths_source` and `title`.
 Missing fields are empty strings. Local `.sra` paths get a row alongside
 remote accessions; `--prefer-ena` is ignored with a stderr warning in these
 formats. `read_lengths` and `read_types` come from the archive's own metadata
@@ -244,10 +244,18 @@ included. If that fetch fails, `read_lengths` falls back to an estimate from
 NCBI RunInfo, shown as `~61bp+62bp` in the table, with `read_types` empty.
 `read_lengths_source` is `archive` or `runinfo` accordingly.
 
+`title` is the human-readable name of the run from NCBI's EFetch experiment
+XML: the sample title when the run has one, otherwise the experiment title
+(many runs have only the latter). The same fetch adds `Title`, `Study` and
+`Design` lines to the single-accession view and a `Title` column to the
+multi-run table. It is best-effort: if NCBI is slow or unavailable the
+fields are simply empty and the rest of the output is unaffected. Local
+`.sra` paths have no title.
+
 ```
 $ sracha info --format tsv SRR28588231.sra
-accession	archive_type	layout	nreads	spots	size_bytes	platform	md5	read_lengths	read_types	read_lengths_source
-SRR28588231	SRA	PAIRED	2	66220	23395841	ILLUMINA		301;301	B;B	archive
+accession	archive_type	layout	nreads	spots	size_bytes	platform	md5	read_lengths	read_types	read_lengths_source	title
+SRR28588231	SRA	PAIRED	2	66220	23395841	ILLUMINA		301;301	B;B	archive	
 ```
 
 ---

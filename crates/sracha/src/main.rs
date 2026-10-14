@@ -1054,12 +1054,18 @@ async fn main() -> Result<()> {
             // (#167). Read the real per-read structure from each archive's
             // metadata with range requests; a failed fetch keeps the
             // (flagged) estimate.
-            let sp = progress::Spinner::start("Reading read structure".to_string());
+            let sp = progress::Spinner::start("Reading read structure and titles".to_string());
             let urls: Vec<Option<String>> = resolved
                 .iter()
                 .map(|r| r.sra_file.mirrors.first().map(|m| m.url.clone()))
                 .collect();
-            let structures = sracha_core::info::fetch_read_structures(urls, 8).await;
+            // Descriptive fields (titles) come from the EFetch XML; fetch
+            // them alongside the structures. Both are best-effort.
+            let run_ids: Vec<String> = resolved.iter().map(|r| r.accession.clone()).collect();
+            let (structures, mut experiments) = tokio::join!(
+                sracha_core::info::fetch_read_structures(urls, 8),
+                sracha_core::sdl::fetch_experiment_info(&http_client, &run_ids),
+            );
             let records: Vec<InfoRecord> = resolved
                 .iter()
                 .zip(structures)
@@ -1068,10 +1074,11 @@ async fn main() -> Result<()> {
                     if let Some(rs) = rs {
                         rec.apply_read_structure(rs);
                     }
+                    rec.experiment = experiments.remove(&r.accession);
                     rec
                 })
                 .collect();
-            sp.finish("Read structure fetched".to_string());
+            sp.finish("Read structure and titles fetched".to_string());
 
             // `local_entries` is empty in table mode (printed above).
             let mut entries = local_entries;
@@ -1495,6 +1502,41 @@ fn print_local_record(rec: &InfoRecord) {
     }
 }
 
+/// Shorten a title for a table cell, ending in `…` when cut.
+fn truncate_title(title: &str, max: usize) -> String {
+    if title.chars().count() <= max {
+        return title.to_string();
+    }
+    let cut: String = title.chars().take(max.saturating_sub(1)).collect();
+    format!("{}…", cut.trim_end())
+}
+
+/// Title, study and design lines for a remote run's detail view. Shows the
+/// experiment title separately only when a sample title took precedence.
+fn print_descriptive_fields(rec: &InfoRecord) {
+    let Some(exp) = rec.experiment.as_ref() else {
+        return;
+    };
+    if let Some(title) = exp.title() {
+        println!("  {}    {}", style::label("Title:"), style::value(title));
+    }
+    if let (Some(sample), Some(experiment)) = (&exp.sample_title, &exp.experiment_title)
+        && sample != experiment
+    {
+        println!(
+            "  {}   {}",
+            style::label("Experiment:"),
+            style::value(experiment)
+        );
+    }
+    if let Some(study) = &exp.study_title {
+        println!("  {}    {}", style::label("Study:"), style::value(study));
+    }
+    if let Some(design) = &exp.design_description {
+        println!("  {}   {}", style::label("Design:"), style::value(design));
+    }
+}
+
 /// The `Layout:` and `Reads:` lines shared by every detail view.
 fn print_read_structure(rec: &InfoRecord) {
     let layout = rec.layout();
@@ -1514,6 +1556,7 @@ fn print_resolved(resolved: &ResolvedAccession, rec: &InfoRecord) {
     let f = &resolved.sra_file;
 
     println!("{}", style::header(&resolved.accession));
+    print_descriptive_fields(rec);
 
     // Size and format flavor on one line.
     let format_tag = if f.is_lite {
@@ -1648,7 +1691,13 @@ fn print_info_table(entries: &[InfoEntry<'_>], size_overrides: Option<&[u64]>) {
     let mut ok_count = 0usize;
     let mut builder = Builder::new();
 
-    builder.push_record([
+    // Only show a Title column when at least one run has a title, so the
+    // table does not grow a column of dashes for dry-run / local-only output.
+    let show_title = entries
+        .iter()
+        .any(|e| matches!(e, InfoEntry::Record(r) if r.title().is_some()));
+
+    let mut header: Vec<String> = [
         "Accession",
         "Size",
         "Layout",
@@ -1657,7 +1706,13 @@ fn print_info_table(entries: &[InfoEntry<'_>], size_overrides: Option<&[u64]>) {
         "Type",
         "Spots",
         "Source",
-    ]);
+    ]
+    .map(String::from)
+    .to_vec();
+    if show_title {
+        header.push("Title".into());
+    }
+    builder.push_record(header);
 
     for (idx, entry) in entries.iter().enumerate() {
         match entry {
@@ -1692,7 +1747,7 @@ fn print_info_table(entries: &[InfoEntry<'_>], size_overrides: Option<&[u64]>) {
                 total_size += row_size;
                 ok_count += 1;
 
-                builder.push_record([
+                let mut row = vec![
                     rec.accession.clone(),
                     format_size(row_size),
                     layout,
@@ -1701,10 +1756,14 @@ fn print_info_table(entries: &[InfoEntry<'_>], size_overrides: Option<&[u64]>) {
                     rec.archive_type.into(),
                     spots,
                     source,
-                ]);
+                ];
+                if show_title {
+                    row.push(truncate_title(rec.title().unwrap_or("-"), 60));
+                }
+                builder.push_record(row);
             }
             InfoEntry::Error { accession, .. } => {
-                builder.push_record([
+                let mut row = vec![
                     accession.clone(),
                     "-".into(),
                     "-".into(),
@@ -1713,7 +1772,11 @@ fn print_info_table(entries: &[InfoEntry<'_>], size_overrides: Option<&[u64]>) {
                     "-".into(),
                     "-".into(),
                     style::error_label("error"),
-                ]);
+                ];
+                if show_title {
+                    row.push("-".into());
+                }
+                builder.push_record(row);
             }
         }
     }
