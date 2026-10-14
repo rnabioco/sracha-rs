@@ -19,6 +19,9 @@
 
 ### Fixes
 
+- `sracha vdb dump` rendered `LINKAGE_GROUP` as one hex blob on row 1 for
+  BAM-loaded runs. It now prints text, and deduplicated page-mapped columns
+  split into rows correctly ([#183]).
 - `sracha info` reported invented read lengths for remote runs (e.g.
   `61bp+62bp` for SRR18918001, really `8bp(T)+50bp+16bp(T)+49bp`) because it
   split NCBI's average evenly across the library layout. It now reads the
@@ -46,6 +49,7 @@
 [#167]: https://github.com/rnabioco/sracha-rs/issues/167
 [#168]: https://github.com/rnabioco/sracha-rs/issues/168
 [#181]: https://github.com/rnabioco/sracha-rs/issues/181
+[#183]: https://github.com/rnabioco/sracha-rs/issues/183
 [#172]: https://github.com/rnabioco/sracha-rs/issues/172
 [#173]: https://github.com/rnabioco/sracha-rs/issues/173
 [#174]: https://github.com/rnabioco/sracha-rs/issues/174
