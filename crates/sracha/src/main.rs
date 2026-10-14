@@ -360,10 +360,7 @@ async fn main() -> Result<()> {
                     qual_defline: args.qual_defline.clone(),
                     folder_per_accession: args.folder_per_accession,
                     metadata: None,
-                    metadata_url: None,
-                    metadata_md5: None,
-                    metadata_size: None,
-                    metadata_service: None,
+                    metadata_row: None,
                     refseq_paths: Vec::new(),
                     refseq_cache_dir: args.refseq_cache.clone(),
                 };
@@ -645,39 +642,35 @@ async fn main() -> Result<()> {
             let make_config = {
                 let http_client = http_client.clone();
                 let cancelled = cancelled.clone();
-                move |resolved: &ResolvedAccession| {
-                    let primary = resolved.sra_file.preferred_mirror();
-                    sracha_core::pipeline::PipelineConfig {
-                        output_dir: args.output_dir.clone(),
-                        split_mode,
-                        compression,
-                        threads: args.threads,
-                        connections: args.connections,
-                        skip_technical: !args.include_technical,
-                        min_read_len: args.min_read_len,
-                        force: args.force,
-                        progress,
-                        run_info: resolved.run_info.clone(),
-                        fasta: args.fasta,
-                        resume: !args.no_resume,
-                        stdout: args.stdout,
-                        cancelled: Some(cancelled.clone()),
-                        strict: !args.no_strict,
-                        verify: args.verify,
-                        http_client: Some(http_client.clone()),
-                        keep_sra: args.keep_sra,
-                        paired_suffix: args.paired_suffix.into(),
-                        seq_defline: args.seq_defline.clone(),
-                        qual_defline: args.qual_defline.clone(),
-                        folder_per_accession: args.folder_per_accession,
-                        metadata: args.metadata.map(Into::into),
-                        metadata_url: primary.map(|m| m.url.clone()),
-                        metadata_md5: resolved.sra_file.md5.clone(),
-                        metadata_size: Some(resolved.sra_file.size),
-                        metadata_service: primary.map(|m| m.service.clone()),
-                        refseq_paths: Vec::new(),
-                        refseq_cache_dir: args.refseq_cache.clone(),
-                    }
+                move |resolved: &ResolvedAccession| sracha_core::pipeline::PipelineConfig {
+                    output_dir: args.output_dir.clone(),
+                    split_mode,
+                    compression,
+                    threads: args.threads,
+                    connections: args.connections,
+                    skip_technical: !args.include_technical,
+                    min_read_len: args.min_read_len,
+                    force: args.force,
+                    progress,
+                    run_info: resolved.run_info.clone(),
+                    fasta: args.fasta,
+                    resume: !args.no_resume,
+                    stdout: args.stdout,
+                    cancelled: Some(cancelled.clone()),
+                    strict: !args.no_strict,
+                    verify: args.verify,
+                    http_client: Some(http_client.clone()),
+                    keep_sra: args.keep_sra,
+                    paired_suffix: args.paired_suffix.into(),
+                    seq_defline: args.seq_defline.clone(),
+                    qual_defline: args.qual_defline.clone(),
+                    folder_per_accession: args.folder_per_accession,
+                    metadata: args.metadata.map(Into::into),
+                    metadata_row: args
+                        .metadata
+                        .map(|_| sracha_core::metadata::RunMetadata::from_resolved(resolved)),
+                    refseq_paths: Vec::new(),
+                    refseq_cache_dir: args.refseq_cache.clone(),
                 }
             };
 

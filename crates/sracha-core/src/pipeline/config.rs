@@ -80,16 +80,12 @@ pub struct PipelineConfig {
     ///
     /// [`decode_sra`]: crate::pipeline::decode_sra
     pub metadata: Option<crate::metadata::MetadataFormat>,
-    /// Primary download URL recorded into the metadata sidecar. Optional
-    /// because the `fastq` subcommand (local file decode) has no URL.
-    pub metadata_url: Option<String>,
-    /// MD5 of the SRA payload recorded into the metadata sidecar.
-    pub metadata_md5: Option<String>,
-    /// SDL-reported SRA size in bytes recorded into the metadata sidecar.
-    pub metadata_size: Option<u64>,
-    /// Mirror service label (e.g. `s3`, `gs`, `ncbi`) recorded into the
-    /// metadata sidecar.
-    pub metadata_service: Option<String>,
+    /// Run-metadata row written to the sidecar, built once by the caller
+    /// with [`RunMetadata::from_resolved`]. `None` for local-file decodes; a
+    /// sidecar requested without a row carries only the accession.
+    ///
+    /// [`RunMetadata::from_resolved`]: crate::metadata::RunMetadata::from_resolved
+    pub metadata_row: Option<crate::metadata::RunMetadata>,
     /// External reference objects already materialised on local disk, as
     /// `(REFERENCE.SEQ_ID, path)`. Populated by
     /// [`prepare_external_refseqs`] before decode so the sync decode path
@@ -181,10 +177,7 @@ mod tests {
             qual_defline: None,
             folder_per_accession,
             metadata: None,
-            metadata_url: None,
-            metadata_md5: None,
-            metadata_size: None,
-            metadata_service: None,
+            metadata_row: None,
             refseq_paths: Vec::new(),
             refseq_cache_dir: None,
         }

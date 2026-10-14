@@ -374,10 +374,7 @@ fn test_config(
         qual_defline: None,
         folder_per_accession: false,
         metadata: None,
-        metadata_url: None,
-        metadata_md5: None,
-        metadata_size: None,
-        metadata_service: None,
+        metadata_row: None,
         refseq_paths: Vec::new(),
         refseq_cache_dir: None,
     }

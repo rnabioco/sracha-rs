@@ -6,6 +6,8 @@
 //! (with styling and the `tabled` crate) stays in the CLI binary.
 
 use std::io::Write;
+
+use crate::delimited::write_row;
 use std::path::Path;
 
 use crate::sdl::{ExperimentInfo, ResolvedAccession};
@@ -309,7 +311,7 @@ impl InfoRecord {
 }
 
 fn join_semi(it: impl Iterator<Item = String>) -> String {
-    it.collect::<Vec<_>>().join(";")
+    it.collect::<Vec<_>>().join(crate::delimited::LIST_SEP)
 }
 
 /// The archive's stored per-read structure, read from VDB metadata.
@@ -402,7 +404,7 @@ const COLUMNS: &[&str] = &[
 /// (`delim = b','`) for pipeline consumption. Errored entries keep their
 /// accession column populated; other columns are left empty.
 pub fn write_delim<W: Write>(w: &mut W, entries: &[InfoEntry<'_>], delim: u8) {
-    write_row(w, COLUMNS, delim);
+    let _ = write_row(w, COLUMNS, delim);
 
     for entry in entries {
         let rec = match entry {
@@ -411,7 +413,7 @@ pub fn write_delim<W: Write>(w: &mut W, entries: &[InfoEntry<'_>], delim: u8) {
             InfoEntry::Error { accession, .. } => {
                 let mut row = vec![""; COLUMNS.len()];
                 row[0] = accession.as_str();
-                write_row(w, &row, delim);
+                let _ = write_row(w, &row, delim);
                 continue;
             }
         };
@@ -433,7 +435,7 @@ fn write_record<W: Write>(w: &mut W, rec: &InfoRecord, delim: u8) {
         (Some(_), true) => "true",
         (Some(_), false) => "false",
     };
-    write_row(
+    let _ = write_row(
         w,
         &[
             rec.accession.as_str(),
@@ -585,49 +587,6 @@ pub fn write_json<W: Write>(w: &mut W, entries: &[InfoEntry<'_>]) {
     let _ = w.flush();
 }
 
-fn write_row<W: Write>(w: &mut W, fields: &[&str], delim: u8) {
-    for (i, field) in fields.iter().enumerate() {
-        if i > 0 {
-            let _ = w.write_all(&[delim]);
-        }
-        if delim == b',' {
-            write_csv_field(w, field);
-        } else {
-            // TSV: collapse any embedded tab/newline to a single space so each
-            // record stays on one line and column alignment is preserved.
-            for ch in field.chars() {
-                let out = match ch {
-                    '\t' | '\n' | '\r' => ' ',
-                    c => c,
-                };
-                let mut buf = [0u8; 4];
-                let _ = w.write_all(out.encode_utf8(&mut buf).as_bytes());
-            }
-        }
-    }
-    let _ = writeln!(w);
-}
-
-fn write_csv_field<W: Write>(w: &mut W, field: &str) {
-    let needs_quote = field
-        .bytes()
-        .any(|b| b == b',' || b == b'"' || b == b'\n' || b == b'\r');
-    if !needs_quote {
-        let _ = w.write_all(field.as_bytes());
-        return;
-    }
-    let _ = w.write_all(b"\"");
-    for ch in field.chars() {
-        if ch == '"' {
-            let _ = w.write_all(b"\"\"");
-        } else {
-            let mut buf = [0u8; 4];
-            let _ = w.write_all(ch.encode_utf8(&mut buf).as_bytes());
-        }
-    }
-    let _ = w.write_all(b"\"");
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -655,29 +614,6 @@ mod tests {
             .lines()
             .map(String::from)
             .collect()
-    }
-
-    #[test]
-    fn csv_field_quotes_when_needed() {
-        let mut buf = Vec::new();
-        write_csv_field(&mut buf, "plain");
-        assert_eq!(buf, b"plain");
-
-        buf.clear();
-        write_csv_field(&mut buf, "has,comma");
-        assert_eq!(buf, b"\"has,comma\"");
-
-        buf.clear();
-        write_csv_field(&mut buf, "has\"quote");
-        assert_eq!(buf, b"\"has\"\"quote\"");
-    }
-
-    #[test]
-    fn tsv_row_collapses_tabs_and_newlines() {
-        let mut buf = Vec::new();
-        write_row(&mut buf, &["a\tb", "c\nd", "ok"], b'\t');
-        let s = String::from_utf8(buf).unwrap();
-        assert_eq!(s, "a b\tc d\tok\n");
     }
 
     #[test]

@@ -1,5 +1,6 @@
 pub mod accession;
 pub mod compress;
+pub mod delimited;
 pub mod download;
 pub mod dry_run;
 pub mod ena;
