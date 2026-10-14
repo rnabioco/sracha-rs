@@ -22,6 +22,10 @@
 
 ### Fixes
 
+- `sracha get --keep-sra` now reuses a kept `<acc>.sra` (and `.vdbcache`) from
+  an earlier run instead of downloading it again. The file is checked against
+  the same size/MD5 test as a cached temp file, and a truncated or corrupt one
+  is re-downloaded ([#193]).
 - `sracha vdb dump` rendered `LINKAGE_GROUP` as one hex blob on row 1 for
   BAM-loaded runs. It now prints text, and deduplicated page-mapped columns
   split into rows correctly ([#183]).
@@ -58,6 +62,7 @@
 [#181]: https://github.com/rnabioco/sracha-rs/issues/181
 [#183]: https://github.com/rnabioco/sracha-rs/issues/183
 [#184]: https://github.com/rnabioco/sracha-rs/issues/184
+[#193]: https://github.com/rnabioco/sracha-rs/issues/193
 [#172]: https://github.com/rnabioco/sracha-rs/issues/172
 [#173]: https://github.com/rnabioco/sracha-rs/issues/173
 [#174]: https://github.com/rnabioco/sracha-rs/issues/174

@@ -96,7 +96,9 @@ impl Respond for Ranged {
         if self.fail_start.load(Ordering::SeqCst) == start {
             return ResponseTemplate::new(503);
         }
-        ResponseTemplate::new(206).set_body_bytes(self.body[start as usize..=end as usize].to_vec())
+        ResponseTemplate::new(206)
+            .append_header("Content-Range", format!("bytes {start}-{end}/{}", last + 1))
+            .set_body_bytes(self.body[start as usize..=end as usize].to_vec())
     }
 }
 
@@ -250,5 +252,77 @@ async fn get_downloads_the_vdbcache_where_decode_looks_for_it() {
     assert_eq!(
         std::fs::read(&cache).expect("get must fetch the vdbcache"),
         vdb
+    );
+}
+
+fn keep_config(output_dir: &Path) -> PipelineConfig {
+    PipelineConfig {
+        keep_sra: true,
+        ..pipeline_config(output_dir)
+    }
+}
+
+#[tokio::test]
+async fn get_reuses_a_valid_kept_sra_and_its_vdbcache() {
+    let server = MockServer::start().await;
+    let sra = kar_payload(4096, 5);
+    let vdb = kar_payload(2048, 6);
+    let sra_starts = serve(&server, "/sra", &sra).await;
+    let vdb_starts = serve(&server, "/vdb", &vdb).await;
+
+    let dir = tempfile::tempdir().unwrap();
+    let kept = dir.path().join("SRR0000001.sra");
+    std::fs::write(&kept, &sra).unwrap();
+    std::fs::write(vdbcache_path_for(&kept), &vdb).unwrap();
+
+    let r = resolved(
+        file(format!("{}/sra", server.uri()), &sra, true),
+        Some(file(format!("{}/vdb", server.uri()), &vdb, true)),
+    );
+    let downloaded = download_sra(&r, &keep_config(dir.path())).await.unwrap();
+    assert_eq!(downloaded.bytes_transferred, 0);
+    assert!(sra_starts.lock().unwrap().is_empty());
+    assert!(vdb_starts.lock().unwrap().is_empty());
+    assert_eq!(std::fs::read(&downloaded.temp_path).unwrap(), sra);
+    assert_eq!(
+        std::fs::read(vdbcache_path_for(&downloaded.temp_path)).unwrap(),
+        vdb
+    );
+}
+
+#[tokio::test]
+async fn get_redownloads_a_truncated_kept_sra() {
+    let server = MockServer::start().await;
+    let sra = kar_payload(4096, 5);
+    let starts = serve(&server, "/sra", &sra).await;
+
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(dir.path().join("SRR0000001.sra"), &sra[..1000]).unwrap();
+
+    let r = resolved(file(format!("{}/sra", server.uri()), &sra, true), None);
+    let downloaded = download_sra(&r, &keep_config(dir.path())).await.unwrap();
+    assert!(downloaded.bytes_transferred > 0);
+    assert!(!starts.lock().unwrap().is_empty());
+    assert_eq!(std::fs::read(&downloaded.temp_path).unwrap(), sra);
+}
+
+#[tokio::test]
+async fn get_ignores_a_kept_sra_without_keep_sra() {
+    let server = MockServer::start().await;
+    let sra = kar_payload(4096, 5);
+    serve(&server, "/sra", &sra).await;
+
+    let dir = tempfile::tempdir().unwrap();
+    let kept = dir.path().join("SRR0000001.sra");
+    std::fs::write(&kept, &sra).unwrap();
+
+    let r = resolved(file(format!("{}/sra", server.uri()), &sra, true), None);
+    let downloaded = download_sra(&r, &pipeline_config(dir.path()))
+        .await
+        .unwrap();
+    assert!(downloaded.bytes_transferred > 0);
+    assert!(
+        kept.exists(),
+        "default behaviour leaves the kept file alone"
     );
 }

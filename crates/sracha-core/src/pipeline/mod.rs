@@ -1757,6 +1757,10 @@ pub async fn download_sra(
 
     tokio::fs::create_dir_all(&acc_dir).await?;
 
+    if config.keep_sra && !config.stdout && !config.force && config.resume {
+        adopt_kept_sra(&acc_dir, accession, &temp_path);
+    }
+
     let dl_config = DownloadConfig {
         connections: config.connections,
         auto_scale_connections: true,
@@ -1810,6 +1814,32 @@ pub async fn download_sra(
         accession: accession.clone(),
         sra_md5: dl_result.archive.md5,
     })
+}
+
+/// Move a `<acc>.sra` left by a previous `--keep-sra` run (and its
+/// `.vdbcache`) back to the temp path, so the normal download step validates it
+/// (size + MD5, or header probe) and skips the transfer when it is intact, or
+/// re-downloads it when truncated or corrupt. `decode_sra` moves it back to the
+/// kept name afterwards. Never overwrites an existing temp file.
+fn adopt_kept_sra(acc_dir: &std::path::Path, accession: &str, temp_path: &std::path::Path) {
+    let kept = acc_dir.join(format!("{accession}.sra"));
+    if !kept.is_file() || temp_path.exists() {
+        return;
+    }
+    match std::fs::rename(&kept, temp_path) {
+        Ok(()) => {
+            tracing::info!(
+                "{accession}: found kept {}, validating for reuse",
+                kept.display()
+            );
+            let kept_cache = vdbcache_path_for(&kept);
+            let temp_cache = vdbcache_path_for(temp_path);
+            if kept_cache.is_file() && !temp_cache.exists() {
+                let _ = std::fs::rename(&kept_cache, &temp_cache);
+            }
+        }
+        Err(e) => tracing::warn!("{accession}: cannot reuse kept {}: {e}", kept.display()),
+    }
 }
 
 /// Delete the temp `.vdbcache` companion of `temp_sra` and its progress sidecar.
