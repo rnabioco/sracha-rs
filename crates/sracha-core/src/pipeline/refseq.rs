@@ -116,42 +116,58 @@ pub async fn prepare_external_refseqs(
     // its whole backoff schedule waiting for metadata that never arrives.
     let response = client.resolve(&accessions, FormatPreference::Sra).await?;
 
-    let mut resolved: Vec<(String, ResolvedFile)> = Vec::new();
+    // (SEQ_ID, cache file name, file). A refseq object is cached under its
+    // own accession; a WGS contig under its project container's name, so
+    // every contig of one project shares a single download.
+    let mut resolved: Vec<(String, String, ResolvedFile)> = Vec::new();
     let mut unresolved: Vec<String> = Vec::new();
     for acc in &accessions {
-        let file = response
+        let result = response
             .results
             .iter()
-            .find(|r| r.bundle.as_deref() == Some(acc.as_str()))
+            .find(|r| r.bundle.as_deref() == Some(acc.as_str()));
+        let entry = result
             .and_then(|r| r.find_sra_file())
-            .and_then(|f| resolved_file_from_sdl(f).ok())
-            .filter(|f| !f.mirrors.is_empty());
-        match file {
-            Some(f) => resolved.push((acc.clone(), f)),
+            .map(|f| (acc.clone(), f))
+            .or_else(|| {
+                let f = result?.find_wgs_file()?;
+                let name = f.name.clone().filter(|n| is_safe_seq_id(n))?;
+                Some((name, f))
+            })
+            .and_then(|(name, f)| Some((name, resolved_file_from_sdl(f).ok()?)))
+            .filter(|(_, f)| !f.mirrors.is_empty());
+        match entry {
+            Some((name, f)) => resolved.push((acc.clone(), name, f)),
             None => unresolved.push(acc.clone()),
         }
     }
 
     // A cached copy is as good as a resolvable one — stay usable offline.
-    let unresolved: Vec<String> = unresolved
-        .into_iter()
-        .filter(|acc| !cache.join(acc).exists())
-        .collect();
-    if !unresolved.is_empty() {
+    // A WGS contig is found through the sidecar naming its container.
+    let mut offline: Vec<(String, PathBuf)> = Vec::new();
+    let mut missing: Vec<String> = Vec::new();
+    for acc in unresolved {
+        match cached_path_for(&cache, &acc) {
+            Some(path) => offline.push((acc, path)),
+            None => missing.push(acc),
+        }
+    }
+    if !missing.is_empty() {
         return Err(Error::Pipeline(format!(
             "cannot locate {} external reference object(s) ({}) — they are \
              not in {} and SDL has no record of them",
-            unresolved.len(),
-            unresolved.join(", "),
+            missing.len(),
+            missing.join(", "),
             cache.display(),
         )));
     }
 
-    let to_fetch: Vec<(String, ResolvedFile)> = resolved
-        .iter()
-        .filter(|(acc, f)| !is_cached(&cache.join(acc), f.size))
-        .cloned()
-        .collect();
+    let mut to_fetch: Vec<(String, ResolvedFile)> = Vec::new();
+    for (_, name, f) in &resolved {
+        if !is_cached(&cache.join(name), f.size) && !to_fetch.iter().any(|(n, _)| n == name) {
+            to_fetch.push((name.clone(), f.clone()));
+        }
+    }
 
     if !to_fetch.is_empty() {
         let total: u64 = to_fetch.iter().map(|(_, f)| f.size).sum();
@@ -164,13 +180,51 @@ pub async fn prepare_external_refseqs(
         fetch_all(&to_fetch, &cache, config).await?;
     }
 
-    Ok(resolved
-        .into_iter()
-        .map(|(acc, _)| {
-            let path = cache.join(&acc);
-            (acc, path)
-        })
-        .collect())
+    let mut paths = offline;
+    for (acc, name, _) in resolved {
+        if name != acc {
+            record_wgs_container(&cache, &acc, &name);
+        }
+        let path = cache.join(&name);
+        paths.push((acc, path));
+    }
+    Ok(paths)
+}
+
+/// Sidecar mapping a WGS contig to the container it lives in, so a later
+/// run can find the cached container without asking SDL.
+fn wgs_sidecar(cache: &Path, acc: &str) -> PathBuf {
+    cache.join(format!("{acc}.wgs"))
+}
+
+/// Best-effort: a missing sidecar only costs the offline fallback.
+fn record_wgs_container(cache: &Path, acc: &str, container: &str) {
+    let path = wgs_sidecar(cache, acc);
+    if std::fs::read_to_string(&path).is_ok_and(|s| s.trim() == container) {
+        return;
+    }
+    // Per-process temp name + rename, so a concurrent reader never sees a
+    // half-written name.
+    let tmp = cache.join(format!("{acc}.{}.wgs.tmp", std::process::id()));
+    if std::fs::write(&tmp, container).is_ok() && std::fs::rename(&tmp, &path).is_err() {
+        let _ = std::fs::remove_file(&tmp);
+    }
+}
+
+/// Local path of an already-cached object for `acc`, directly or through a
+/// WGS sidecar.
+fn cached_path_for(cache: &Path, acc: &str) -> Option<PathBuf> {
+    let direct = cache.join(acc);
+    if direct.exists() {
+        return Some(direct);
+    }
+    let container = std::fs::read_to_string(wgs_sidecar(cache, acc)).ok()?;
+    let container = container.trim();
+    if !is_safe_seq_id(container) {
+        return None;
+    }
+    let path = cache.join(container);
+    is_cached(&path, 0).then_some(path)
 }
 
 /// Scan the archive (or its vdbcache, when REFERENCE lives there) for the
@@ -351,6 +405,25 @@ mod tests {
         ));
         drop(first);
         assert!(other.try_lock().is_ok());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn wgs_contig_found_offline_through_sidecar() {
+        let dir = std::env::temp_dir().join(format!("sracha-wgs-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        assert!(cached_path_for(&dir, "JTFH01000001").is_none());
+        // Sidecar alone is not enough: the container must be cached too.
+        record_wgs_container(&dir, "JTFH01000001", "JTFH01.4");
+        assert!(cached_path_for(&dir, "JTFH01000001").is_none());
+        std::fs::write(dir.join("JTFH01.4"), b"NCBI.sra\0\0").unwrap();
+        assert_eq!(
+            cached_path_for(&dir, "JTFH01000001"),
+            Some(dir.join("JTFH01.4"))
+        );
+        // A hostile sidecar can't point outside the cache.
+        std::fs::write(dir.join("JTFH01000002.wgs"), "../../etc/passwd").unwrap();
+        assert!(cached_path_for(&dir, "JTFH01000002").is_none());
         let _ = std::fs::remove_dir_all(&dir);
     }
 

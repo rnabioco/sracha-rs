@@ -211,6 +211,9 @@ impl RefSeqObject {
     fn open(seq_id: &str, path: &Path) -> Result<Self> {
         let file = std::fs::File::open(path)?;
         let mut archive = KarArchive::open(std::io::BufReader::new(file))?;
+        if let Some(obj) = Self::open_wgs_contig(seq_id, path, &mut archive)? {
+            return Ok(obj);
+        }
         let col_base = inspect::column_base_path_public(&archive, None)?;
 
         // MAX_SEQ_LEN / TOTAL_SEQ_LEN / CIRCULAR are static metadata on a
@@ -272,6 +275,82 @@ impl RefSeqObject {
             total_seq_len,
             circular,
         })
+    }
+}
+
+impl RefSeqObject {
+    /// Open `seq_id` as one contig of a WGS project container
+    /// (`NCBI:WGS:tbl:nucleotide`), or `None` if `archive` isn't one.
+    ///
+    /// GRCh38's decoys (`JTFH01…`) live this way: a single database whose
+    /// `SEQUENCE` table holds one whole contig per row, accession =
+    /// `ACC_PREFIX` + zero-padded row id. Bases are the same 2na `READ` +
+    /// `ALTREAD` pair as a refseq object, and contigs are short, so the row
+    /// is decoded once into an [`RefSeqBases::Inline`] buffer.
+    fn open_wgs_contig<R: Read + Seek>(
+        seq_id: &str,
+        path: &Path,
+        archive: &mut KarArchive<R>,
+    ) -> Result<Option<Self>> {
+        let Some(meta) = inspect::read_table_metadata(archive, Some("SEQUENCE")) else {
+            return Ok(None);
+        };
+        let Some(prefix) = meta_bytes(&meta, "ACC_PREFIX") else {
+            return Ok(None);
+        };
+        let prefix = String::from_utf8_lossy(prefix);
+        let unversioned = seq_id.split('.').next().unwrap_or(seq_id);
+        let row: i64 = unversioned
+            .strip_prefix(prefix.as_ref())
+            .and_then(|n| n.parse().ok())
+            .ok_or_else(|| {
+                Error::Format(format!(
+                    "refseq {seq_id}: not a contig of WGS project {prefix}"
+                ))
+            })?;
+
+        let col_base = inspect::column_base_path_public(archive, Some("SEQUENCE"))?;
+        // The schema derives the contig number from a physical ACC_CONTIG
+        // column when present, else the row id. Only the row-id form is
+        // handled; refuse rather than mis-map contigs.
+        if ColumnReader::open(archive, &format!("{col_base}/ACC_CONTIG"), path).is_ok() {
+            return Err(Error::Format(format!(
+                "refseq {seq_id}: WGS container with explicit ACC_CONTIG is not supported"
+            )));
+        }
+
+        let read = CachedColumn::new(
+            ColumnReader::open(archive, &format!("{col_base}/READ"), path)?,
+            ColumnKind::TwoNa,
+        );
+        let len = read.two_na_row_len(row)?;
+        let mut bases = read.read_2na_range(row, 0, len)?;
+        // 2na is ACGT only; ALTREAD carries the ambiguity codes (N, IUPAC).
+        if let Ok(alt) = ColumnReader::open(archive, &format!("{col_base}/ALTREAD"), path) {
+            let mask = CachedColumn::new(alt, ColumnKind::Zip).read_byte_row(row)?;
+            overlay_altread(&mut bases, &mask);
+        }
+        // CIRCULAR is a per-row physical column here (absent for most
+        // projects, which means linear).
+        let circular = ColumnReader::open(archive, &format!("{col_base}/CIRCULAR"), path)
+            .ok()
+            .and_then(|c| {
+                CachedColumn::new(c, ColumnKind::Zip)
+                    .read_bool_row(row)
+                    .ok()
+            })
+            .is_some_and(|bits| bits.first() == Some(&1));
+
+        let total_seq_len = bases.len() as u64;
+        Ok(Some(Self {
+            seq_id: seq_id.to_string(),
+            bases: RefSeqBases::Inline(Arc::new(bases)),
+            max_seq_len: crate::reference::DEFAULT_MAX_SEQ_LEN,
+            first_row: 1,
+            row_count: 1,
+            total_seq_len,
+            circular,
+        }))
     }
 }
 
@@ -503,6 +582,40 @@ mod tests {
     fn store_is_send_and_sync() {
         fn assert_send_sync<T: Send + Sync>() {}
         assert_send_sync::<RefSeqStore>();
+    }
+
+    /// `JTFH01.4` is the GRCh38 decoy WGS container. Expected lengths and
+    /// flanks are from GenBank (efetch nuccore) for JTFH01000001/18.
+    #[test]
+    fn wgs_container_resolves_contigs_by_row() {
+        let path = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/JTFH01.4");
+        let text = |obj: &RefSeqObject| -> String {
+            let RefSeqBases::Inline(b) = &obj.bases else {
+                panic!("WGS contig must be inline");
+            };
+            b.iter()
+                .map(|&n| match n {
+                    1 => 'A',
+                    2 => 'C',
+                    4 => 'G',
+                    8 => 'T',
+                    _ => 'N',
+                })
+                .collect()
+        };
+        let one = RefSeqObject::open("JTFH01000001", &path).unwrap();
+        let s = text(&one);
+        assert_eq!(s.len(), 25139);
+        assert!(s.starts_with("CCATGTTGGCCAGGCTGGTCTCGAACTCCTGACCTCAGGT"));
+        assert!(s.ends_with("GGGGTGAGGCCATGGGGTTGAGGCTGTGGGGTGAGGCCGG"));
+        // A version suffix must not change the mapping.
+        let eighteen = RefSeqObject::open("JTFH01000018.1", &path).unwrap();
+        let s = text(&eighteen);
+        assert_eq!(s.len(), 7710);
+        assert!(s.starts_with("CACTCCATTCCATTCTCTTCCATTGATGTCCGTTCCATTC"));
+        assert!(s.ends_with("GGGCTCCCAATATCCACTTGCAGATTCTACAAAAAGAGAG"));
+        // Another project's accession is not a contig of this container.
+        assert!(RefSeqObject::open("JTFH02000001", &path).is_err());
     }
 
     #[test]

@@ -60,6 +60,15 @@ impl SdlResult {
         self.files.iter().find(|f| f.file_type == "vdbcache")
     }
 
+    /// Find the first WGS container entry (`object` = `wgs|<contig>`).
+    /// SDL answers a WGS contig accession with the whole project's VDB,
+    /// named by `name` (e.g. `JTFH01.4`), and leaves `type` unset.
+    pub fn find_wgs_file(&self) -> Option<&SdlFile> {
+        self.files
+            .iter()
+            .find(|f| f.object.as_deref().is_some_and(|o| o.starts_with("wgs|")))
+    }
+
     /// Whether this result indicates success.
     pub fn is_ok(&self) -> bool {
         self.status == Some(200)
@@ -69,8 +78,9 @@ impl SdlResult {
 /// A downloadable file for an accession.
 #[derive(Debug, Deserialize)]
 pub struct SdlFile {
-    /// File type: "sra", "vdbcache", etc.
-    #[serde(rename = "type")]
+    /// File type: "sra", "vdbcache", etc. Empty when SDL omits it, as it
+    /// does for WGS containers.
+    #[serde(default, rename = "type")]
     pub file_type: String,
     /// File name.
     pub name: Option<String>,
@@ -163,6 +173,29 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// SDL's answer for a WGS contig has no `type`, size or md5, and points
+    /// at the whole project container (real response for JTFH01000001).
+    #[test]
+    fn parses_wgs_container_without_type() {
+        let json = r#"{"version":"2","result":[
+          {"bundle":"JTFH01000001","status":200,"msg":"ok","files":[
+            {"object":"wgs|JTFH01000001","name":"JTFH01.4","noqual":true,
+             "locations":[{"service":"ncbi","link":"https://sra-download.ncbi.nlm.nih.gov/traces/wgs03/WGS/JT/FH/JTFH01.4"}]}]},
+          {"bundle":"NC_012920.1","status":200,"msg":"ok","files":[
+            {"object":"refseq|NC_012920.1","accession":"NC_012920.1","type":"sra","name":"NC_012920.1",
+             "size":26487,"locations":[{"service":"sra-ncbi","link":"https://x/NC_012920.1"}]}]}]}"#;
+        let resp: SdlResponse = serde_json::from_str(json).unwrap();
+        let wgs = &resp.results[0];
+        assert!(wgs.find_sra_file().is_none());
+        let f = wgs.find_wgs_file().unwrap();
+        assert_eq!(f.name.as_deref(), Some("JTFH01.4"));
+        assert_eq!(f.size, None);
+        // An ordinary refseq entry is not mistaken for a WGS container.
+        let nc = &resp.results[1];
+        assert!(nc.find_sra_file().is_some());
+        assert!(nc.find_wgs_file().is_none());
+    }
 
     #[test]
     fn parse_full_response() {
