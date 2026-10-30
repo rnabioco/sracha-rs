@@ -1,5 +1,23 @@
 # Changelog
 
+## 0.9.0 (2026-10-30)
+
+### Features
+
+- cSRA runs whose references are WGS contigs (e.g. GRCh38 decoys such as
+  `JTFH01000001`) now resolve. The contig's container is fetched once per
+  project and the contig is read from its SEQUENCE table; containers with an
+  explicit `ACC_CONTIG` column are rejected rather than mis-mapped ([#201]).
+
+### Fixes
+
+- Parallel `sracha get` processes sharing a refseq cache no longer race on
+  `<acc>.partial`. Each object takes an advisory lock before downloading and
+  re-checks the cache once it holds it ([#202]).
+
+[#201]: https://github.com/rnabioco/sracha-rs/issues/201
+[#202]: https://github.com/rnabioco/sracha-rs/issues/202
+
 ## 0.8.0 (2026-10-14)
 
 ### Features
