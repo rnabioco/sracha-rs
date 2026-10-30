@@ -242,11 +242,28 @@ async fn fetch_all(
         tasks.push(tokio::spawn(async move {
             let _permit = permit;
             let urls = mirror_urls(&file);
+            // The cache is shared across processes (parallel `sracha get`s
+            // fill it at once), so serialize per object with an advisory
+            // lock: the first process downloads, the rest wake up to a
+            // cached file. Without it, two processes share one `.partial`
+            // and one can rename it away (ENOENT) or keep writing into it
+            // after the rename (a corrupt cache entry).
+            let final_path = cache.join(&acc);
+            let lock = lock_object(&cache, &acc).await;
+            if is_cached(&final_path, file.size) {
+                return Ok::<(), Error>(());
+            }
             // Download to a sibling `.partial` and rename on success, so a
             // reader never sees a truncated object and an interrupted run
             // leaves a resumable file rather than a poisoned cache entry.
-            let partial = cache.join(format!("{acc}.partial"));
-            let final_path = cache.join(&acc);
+            // Under the lock the name can be shared (and so resumed by any
+            // process). If locking is unsupported (some network
+            // filesystems), use a per-process name instead: a duplicate
+            // download then wins last via the atomic rename.
+            let partial = match lock {
+                Some(_) => cache.join(format!("{acc}.partial")),
+                None => cache.join(format!("{acc}.{}.partial", std::process::id())),
+            };
             download_file_with_retries(
                 &urls,
                 file.size,
@@ -260,7 +277,8 @@ async fn fetch_all(
             std::fs::rename(&partial, &final_path).map_err(Error::Io)?;
             let sidecar = crate::download::progress_path(&partial);
             let _ = std::fs::remove_file(&sidecar);
-            Ok::<(), Error>(())
+            drop(lock);
+            Ok(())
         }));
     }
 
@@ -269,6 +287,34 @@ async fn fetch_all(
             .map_err(|e| Error::Pipeline(format!("refseq download panicked: {e}")))??;
     }
     Ok(())
+}
+
+/// Take an exclusive advisory lock on `<cache>/<acc>.lock`, waiting for any
+/// other process that holds it. The OS drops the lock if its holder dies, so
+/// there is no stale-lock cleanup. Lock files are left in place (empty), as
+/// removing them would race with a waiter. `None` when locking fails.
+async fn lock_object(cache: &Path, acc: &str) -> Option<std::fs::File> {
+    let path = cache.join(format!("{acc}.lock"));
+    let result = tokio::task::spawn_blocking(move || {
+        let file = std::fs::OpenOptions::new()
+            .create(true)
+            .truncate(false)
+            .write(true)
+            .open(path)?;
+        file.lock()?;
+        Ok::<_, std::io::Error>(file)
+    })
+    .await;
+    match result {
+        Ok(Ok(file)) => Some(file),
+        Ok(Err(e)) => {
+            tracing::debug!(
+                "refseq {acc}: cache lock unavailable ({e}); using per-process partial"
+            );
+            None
+        }
+        Err(_) => None,
+    }
 }
 
 /// Mirror URLs for a resolved file, cloud first — same preference order
@@ -287,6 +333,25 @@ mod tests {
     fn cache_dir_prefers_explicit_override() {
         let explicit = PathBuf::from("/tmp/explicit");
         assert_eq!(refseq_cache_dir(Some(&explicit)).unwrap(), explicit);
+    }
+
+    #[tokio::test]
+    async fn lock_object_serializes_holders() {
+        let dir = std::env::temp_dir().join(format!("sracha-lock-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let first = lock_object(&dir, "X1").await.expect("lock");
+        // A second handle must not get the lock while the first is held.
+        let other = std::fs::OpenOptions::new()
+            .write(true)
+            .open(dir.join("X1.lock"))
+            .unwrap();
+        assert!(matches!(
+            other.try_lock(),
+            Err(std::fs::TryLockError::WouldBlock)
+        ));
+        drop(first);
+        assert!(other.try_lock().is_ok());
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
