@@ -247,6 +247,10 @@ pub struct ResolvedAccession {
 /// Client for the NCBI SDL (Service Discovery Layer) API.
 pub struct SdlClient {
     http: reqwest::Client,
+    /// RunInfo rows already seen (project resolution fetches the full
+    /// RunInfo CSV just to list runs). `fetch_run_info_batch` serves these
+    /// without another EFetch.
+    run_info_cache: std::sync::Mutex<HashMap<String, RunInfo>>,
 }
 
 impl SdlClient {
@@ -259,7 +263,10 @@ impl SdlClient {
     /// connection pool (and TLS sessions) are reused across SDL, S3, and
     /// SRA downloads.
     pub fn with_client(http: reqwest::Client) -> Self {
-        Self { http }
+        Self {
+            http,
+            run_info_cache: std::sync::Mutex::new(HashMap::new()),
+        }
     }
 
     /// Access the inner reqwest client (for pipeline reuse).
@@ -478,7 +485,21 @@ impl SdlClient {
     /// Genuinely metadata-less runs remain `None` after the bound — no infinite loop.
     pub async fn fetch_run_info_batch(&self, accessions: &[String]) -> HashMap<String, RunInfo> {
         let mut result = HashMap::new();
-        let mut pending: Vec<String> = accessions.to_vec();
+        let mut pending: Vec<String> = Vec::new();
+        {
+            let cache = self
+                .run_info_cache
+                .lock()
+                .unwrap_or_else(|p| p.into_inner());
+            for acc in accessions {
+                match cache.get(acc) {
+                    Some(ri) => {
+                        result.insert(acc.clone(), ri.clone());
+                    }
+                    None => pending.push(acc.clone()),
+                }
+            }
+        }
 
         for attempt in 0..=MAX_API_RETRIES {
             for chunk in pending.chunks(EFETCH_BATCH_SIZE) {
@@ -623,6 +644,12 @@ impl SdlClient {
 
             let runs = parse_run_accessions_from_csv(&csv_body);
             run_accessions.extend(runs);
+            // The CSV already carries the read structure; keep it so the
+            // per-run resolve doesn't EFetch the same rows again.
+            self.run_info_cache
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .extend(parse_run_info_csv_multi(&csv_body));
         }
 
         if run_accessions.is_empty() {
@@ -1105,6 +1132,22 @@ mod tests {
         assert_eq!(r2.nreads, 1);
         assert_eq!(r2.spot_len, 150);
         assert_eq!(r2.avg_read_len, vec![150]);
+    }
+
+    #[tokio::test]
+    async fn run_info_batch_served_from_project_cache_without_network() {
+        let client = SdlClient::new();
+        client.run_info_cache.lock().unwrap().insert(
+            "SRR111".into(),
+            RunInfo {
+                spots: Some(7),
+                ..Default::default()
+            },
+        );
+        // Everything requested is cached, so no EFetch (and no retry sleep)
+        // can happen; a network attempt would at best return an empty map.
+        let got = client.fetch_run_info_batch(&["SRR111".to_string()]).await;
+        assert_eq!(got.get("SRR111").and_then(|r| r.spots), Some(7));
     }
 
     #[test]
