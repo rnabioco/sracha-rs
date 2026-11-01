@@ -92,12 +92,35 @@ pub async fn download_sra_object(
     cfg: &DownloadConfig,
 ) -> Result<DownloadOutcome> {
     let acc = &resolved.accession;
-    let archive = download_one(acc, &resolved.sra_file, "archive", archive_path, cfg).await?;
-    let vdbcache = match &resolved.vdbcache_file {
-        Some(vdb) => {
-            Some(download_one(acc, vdb, "vdbcache", &vdbcache_path_for(archive_path), cfg).await?)
+    // The vdbcache is independent of the archive and small (tens of MiB),
+    // so fetch both at once instead of tacking it on after the archive.
+    // It gets a modest slice of the connection budget and no progress bar
+    // of its own (two bars would fight over the terminal).
+    let archive_fut = download_one(acc, &resolved.sra_file, "archive", archive_path, cfg);
+    let vdbcache_fut = async {
+        match &resolved.vdbcache_file {
+            Some(vdb) => {
+                let side_cfg = DownloadConfig {
+                    connections: (cfg.connections / 4).max(2),
+                    progress: false,
+                    ..cfg.clone()
+                };
+                download_one(
+                    acc,
+                    vdb,
+                    "vdbcache",
+                    &vdbcache_path_for(archive_path),
+                    &side_cfg,
+                )
+                .await
+                .map(Some)
+            }
+            None => Ok(None),
         }
-        None => None,
     };
+    // Wait for both before surfacing an error so neither is cancelled
+    // mid-write; partial files resume on the next run either way.
+    let (archive, vdbcache) = tokio::join!(archive_fut, vdbcache_fut);
+    let (archive, vdbcache) = (archive?, vdbcache?);
     Ok(DownloadOutcome { archive, vdbcache })
 }
