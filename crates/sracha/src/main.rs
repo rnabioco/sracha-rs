@@ -1847,10 +1847,11 @@ async fn resolve_accessions_lenient(
             tracing::info!("using SDL for all accessions (--format sralite)");
         }
         let mut resolved: Vec<ResolvedAccession> = Vec::new();
-        for (acc, r) in run_accessions
-            .iter()
-            .zip(client.resolve_many(run_accessions, format).await?)
-        {
+        for (acc, r) in run_accessions.iter().zip(
+            client
+                .resolve_many_with(run_accessions, format, need_run_info)
+                .await?,
+        ) {
             match r {
                 Ok(r) => resolved.push(r),
                 Err(e) => unresolved.push((acc.clone(), e.to_string())),
@@ -1907,7 +1908,10 @@ async fn resolve_accessions_lenient(
     if !sdl_needed.is_empty() {
         let sdl_accs: Vec<String> = sdl_needed.iter().map(|(_, a)| a.clone()).collect();
         tracing::info!("falling back to SDL for {} accession(s)", sdl_accs.len());
-        let sdl_results = client.resolve_many(&sdl_accs, format).await?;
+        // RunInfo was already fetched (in parallel with the S3 probes) when
+        // `need_run_info` is set and is applied in Phase 3; don't EFetch it
+        // a second time for the fallback set.
+        let sdl_results = client.resolve_many_with(&sdl_accs, format, false).await?;
 
         for ((i, acc), result) in sdl_needed.into_iter().zip(sdl_results) {
             match result {
@@ -1940,7 +1944,8 @@ async fn resolve_accessions_lenient(
             "fetching MD5 from SDL for {} accession(s) (S3 multipart ETag)",
             md5_needed.len()
         );
-        let sdl_results = client.resolve_many(&md5_needed, format).await?;
+        // Only the MD5 is wanted here, so skip the RunInfo EFetch.
+        let sdl_results = client.resolve_many_with(&md5_needed, format, false).await?;
         let md5_map: std::collections::HashMap<String, String> = sdl_results
             .into_iter()
             .filter_map(|r| r.ok())

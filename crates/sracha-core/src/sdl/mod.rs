@@ -387,6 +387,19 @@ impl SdlClient {
         accessions: &[String],
         format: FormatPreference,
     ) -> Result<Vec<Result<ResolvedAccession>>> {
+        self.resolve_many_with(accessions, format, true).await
+    }
+
+    /// [`resolve_many`](Self::resolve_many), optionally skipping the EUtils
+    /// RunInfo call. Callers that already hold RunInfo (or don't want it)
+    /// avoid a redundant EFetch round-trip and its retry/backoff sleeps;
+    /// `run_info` is `None` on every result when `fetch_run_info` is false.
+    pub async fn resolve_many_with(
+        &self,
+        accessions: &[String],
+        format: FormatPreference,
+        fetch_run_info: bool,
+    ) -> Result<Vec<Result<ResolvedAccession>>> {
         if accessions.is_empty() {
             return Ok(Vec::new());
         }
@@ -395,7 +408,11 @@ impl SdlClient {
         let sdl_response = self.resolve(accessions, format).await?;
 
         // Single batched EUtils RunInfo call (non-fatal).
-        let run_info_map = self.fetch_run_info_batch(accessions).await;
+        let run_info_map = if fetch_run_info {
+            self.fetch_run_info_batch(accessions).await
+        } else {
+            HashMap::new()
+        };
 
         // Assemble per-accession results.
         let results = accessions
