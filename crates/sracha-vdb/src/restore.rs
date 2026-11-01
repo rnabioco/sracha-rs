@@ -86,7 +86,26 @@ pub fn align_restore_read(
     // carrying B operations over-advance `rri` and walk off the reference.
     let mut bi: i64 = 0;
 
-    for di in 0..read_len {
+    let mut di = 0usize;
+    while di < read_len {
+        // Fast path: mismatches and indels are rare, so most bases are a
+        // straight copy from the reference. When the next eight flags are
+        // all clear (and the reference covers them), copy eight at once;
+        // nothing is consumed from `mismatch` / `ref_offset` there, and
+        // `bi` just advances one per base.
+        if di + 8 <= read_len && rri >= 0 {
+            let r = rri as usize;
+            let flags = u64::from_ne_bytes(has_mismatch[di..di + 8].try_into().unwrap())
+                | u64::from_ne_bytes(has_ref_offset[di..di + 8].try_into().unwrap());
+            if flags == 0 && r + 8 <= ref_read.len() {
+                out[di..di + 8].copy_from_slice(&ref_read[r..r + 8]);
+                di += 8;
+                rri += 8;
+                bi += 8;
+                continue;
+            }
+        }
+
         if has_ref_offset[di] != 0 && bi >= 0 {
             let off = *ref_offset.get(roi).ok_or_else(|| {
                 Error::Format(format!(
@@ -120,6 +139,7 @@ pub fn align_restore_read(
 
         rri += 1;
         bi += 1;
+        di += 1;
     }
     Ok(out)
 }
@@ -237,6 +257,100 @@ pub fn seq_restore_read(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The original one-base-at-a-time implementation, kept as the oracle
+    /// for the block-copy fast path.
+    fn align_restore_read_scalar(
+        ref_read: &[u8],
+        has_mismatch: &[u8],
+        mismatch: &[u8],
+        has_ref_offset: &[u8],
+        ref_offset: &[i32],
+        read_len: usize,
+    ) -> Result<Vec<u8>> {
+        let mut out = vec![0u8; read_len];
+        let (mut mmi, mut roi, mut rri, mut bi) = (0usize, 0usize, 0i64, 0i64);
+        for di in 0..read_len {
+            if has_ref_offset[di] != 0 && bi >= 0 {
+                let off = *ref_offset
+                    .get(roi)
+                    .ok_or_else(|| Error::Format("ref_offset".into()))?;
+                bi = off as i64;
+                rri += bi;
+                roi += 1;
+            }
+            if has_mismatch[di] != 0 {
+                out[di] = *mismatch
+                    .get(mmi)
+                    .ok_or_else(|| Error::Format("mismatch".into()))?;
+                mmi += 1;
+            } else {
+                if rri < 0 || rri as usize >= ref_read.len() {
+                    return Err(Error::Format("ref cursor".into()));
+                }
+                out[di] = ref_read[rri as usize];
+            }
+            rri += 1;
+            bi += 1;
+        }
+        Ok(out)
+    }
+
+    /// Tiny deterministic PRNG so the equivalence test needs no dependency.
+    struct Lcg(u64);
+    impl Lcg {
+        fn next(&mut self) -> u64 {
+            self.0 = self
+                .0
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            self.0 >> 33
+        }
+    }
+
+    #[test]
+    fn block_copy_matches_scalar_on_random_inputs() {
+        let mut rng = Lcg(0x5eed);
+        for case in 0..4000 {
+            let read_len = (rng.next() % 220) as usize;
+            let ref_len = read_len + (rng.next() % 12) as usize;
+            let ref_read: Vec<u8> = (0..ref_len).map(|_| 1u8 << (rng.next() % 4)).collect();
+            // Vary flag density so both the fast path and the scalar path run.
+            let p_mm = [0, 2, 20][(case % 3) as usize];
+            let p_ro = [0, 1, 10][((case / 3) % 3) as usize];
+            let has_mismatch: Vec<u8> = (0..read_len)
+                .map(|_| u8::from(rng.next() % 100 < p_mm))
+                .collect();
+            let has_ref_offset: Vec<u8> = (0..read_len)
+                .map(|_| u8::from(rng.next() % 100 < p_ro))
+                .collect();
+            let n_mm = has_mismatch.iter().filter(|&&b| b != 0).count();
+            let n_ro = has_ref_offset.iter().filter(|&&b| b != 0).count();
+            let mismatch: Vec<u8> = (0..n_mm).map(|_| 1u8 << (rng.next() % 4)).collect();
+            let ref_offset: Vec<i32> = (0..n_ro).map(|_| (rng.next() % 9) as i32 - 3).collect();
+            let fast = align_restore_read(
+                &ref_read,
+                &has_mismatch,
+                &mismatch,
+                &has_ref_offset,
+                &ref_offset,
+                read_len,
+            );
+            let slow = align_restore_read_scalar(
+                &ref_read,
+                &has_mismatch,
+                &mismatch,
+                &has_ref_offset,
+                &ref_offset,
+                read_len,
+            );
+            match (fast, slow) {
+                (Ok(a), Ok(b)) => assert_eq!(a, b, "case {case}"),
+                (Err(_), Err(_)) => {}
+                (a, b) => panic!("case {case}: fast={a:?} slow={b:?}"),
+            }
+        }
+    }
 
     /// A BAM `B` (back-up) operation sets one negative REF_OFFSET but
     /// flags every base it rewinds over in HAS_REF_OFFSET. Only the first
