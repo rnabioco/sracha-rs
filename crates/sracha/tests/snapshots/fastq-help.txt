@@ -14,9 +14,9 @@ Options:
           Suppress all output except errors
 
   -t, --threads <THREADS>
-          Number of threads for decode
+          Number of threads for decode ("auto" = available CPUs, capped at 32)
           
-          [default: 8]
+          [default: auto]
 
       --no-progress
           Disable progress bar
