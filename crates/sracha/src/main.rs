@@ -770,19 +770,29 @@ async fn main() -> Result<()> {
                 // Aligned runs that keep only the chunk layout in REFERENCE
                 // need the assembly's bases on disk before decode starts.
                 // Async, and once per accession — rayon workers never fetch.
-                match sracha_core::pipeline::refseq::prepare_external_refseqs(
-                    &downloaded.temp_path,
-                    None,
-                    &pipeline_config,
-                )
-                .await
-                {
-                    Ok(paths) => pipeline_config.refseq_paths = paths,
-                    Err(e) => {
-                        suggest_ena_fallback(&http_client, &resolved.accession, &e.to_string())
+                //
+                // Skipped when the download phase short-circuited on a
+                // completion marker (outputs already exist): there is no temp
+                // SRA to scan, and `decode_sra` will skip on the marker too.
+                if downloaded.temp_path.exists() {
+                    match sracha_core::pipeline::refseq::prepare_external_refseqs(
+                        &downloaded.temp_path,
+                        None,
+                        &pipeline_config,
+                    )
+                    .await
+                    {
+                        Ok(paths) => pipeline_config.refseq_paths = paths,
+                        Err(e) => {
+                            suggest_ena_fallback(
+                                &http_client,
+                                &resolved.accession,
+                                &e.to_string(),
+                            )
                             .await;
-                        skipped_accessions.push(resolved.accession.clone());
-                        continue;
+                            skipped_accessions.push(resolved.accession.clone());
+                            continue;
+                        }
                     }
                 }
 
