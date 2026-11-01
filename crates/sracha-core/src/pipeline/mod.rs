@@ -1547,9 +1547,16 @@ fn run_fastq_csra(
     // The cursor (and its decoded-blob caches) lives in `cursor_slot` so a
     // worker reuses it across chunks instead of starting cold every <=1024
     // spots.
+    //
+    // Opens are serialized: each one maps ~20 columns, and eight workers
+    // doing that at once contend on the process's mmap lock (and against the
+    // page faults of workers that already started), which cost seconds of
+    // system time at startup.
+    let cursor_open_lock = std::sync::Mutex::new(());
     let decode_chunk =
         |cursor_slot: &mut Option<CsraCursor>, start: i64, end: i64| -> Result<Vec<SlotChunk>> {
             if cursor_slot.is_none() {
+                let _open = cursor_open_lock.lock().unwrap_or_else(|p| p.into_inner());
                 let file = std::fs::File::open(sra_path)?;
                 let mut archive = KarArchive::open(std::io::BufReader::new(file))?;
                 let mut cache_archive = match vdbcache_path {
