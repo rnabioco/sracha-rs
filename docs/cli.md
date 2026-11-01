@@ -94,7 +94,7 @@ sracha get [OPTIONS] [ACCESSION]...
 | Option | Default | Description |
 |--------|---------|-------------|
 | `-t, --threads <N>` | `auto` (CPUs, max 32) | Thread count for decode and compression |
-| `--connections <N>` | `8` | HTTP connections per file |
+| `--connections <N>` | `auto` (8, up to 24 on large files) | HTTP connections per file; an explicit number is used as given |
 
 **Download behavior**
 
@@ -141,7 +141,7 @@ sracha fetch [OPTIONS] [ACCESSION]...
 | `--accession-list <FILE>` | | Read accessions from a file (one per line) |
 | `-O, --output-dir <DIR>` | `.` | Output directory |
 | `--format <FORMAT>` | `sra` | Download format: `sra` (full quality) or `sralite` (simplified quality, smaller) |
-| `--connections <N>` | `8` | HTTP connections per file |
+| `--connections <N>` | `auto` (8, up to 24 on large files) | HTTP connections per file; an explicit number is used as given |
 | `--no-validate` | | Skip MD5 verification after download (verification is on by default) |
 | `-f, --force` | | Overwrite existing files |
 | `--no-resume` | | Disable download resume (re-download from scratch) |

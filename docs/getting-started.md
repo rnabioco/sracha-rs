@@ -241,7 +241,7 @@ transfer that may have been interrupted.
 ## Performance tuning
 
 ```bash
-# More download connections (default: 8)
+# More download connections (default: auto = 8, raised to 24 on large files; an explicit value is used as given)
 sracha get SRR28588231 --connections 12
 
 # More threads for decode and compression (default: auto = available CPUs, max 32)
