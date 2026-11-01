@@ -12,9 +12,9 @@ FASTQ), measured with `/usr/bin/time -v` as the largest of three runs.
 
 | File | Size | sracha | fasterq-dump | sracha ÷ fasterq |
 |:---|---:|---:|---:|---:|
-| SRR28588231 | 23 MiB | 195.9 MiB | 565.0 MiB | 0.35x |
-| SRR2584863 | 288 MiB | 1198.2 MiB | 430.4 MiB | 2.78x |
-| ERR1018173 | 1.94 GiB | 3398.8 MiB | 404.9 MiB | 8.39x |
+| SRR28588231 | 23 MiB | 191.7 MiB | 567.2 MiB | 0.34x |
+| SRR2584863 | 288 MiB | 1217.1 MiB | 429.8 MiB | 2.83x |
+| ERR1018173 | 1.94 GiB | 3407.9 MiB | 408.6 MiB | 8.34x |
 
 sracha is leaner than `fasterq-dump` on small files but uses more on large
 ones, and its peak RSS grows with archive size while `fasterq-dump` stays
