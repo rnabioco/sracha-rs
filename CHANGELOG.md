@@ -1,5 +1,46 @@
 # Changelog
 
+## 0.10.0 (2026-11-01)
+
+### Features
+
+- `sracha get` now keeps going when an accession fails to resolve, download
+  or decode: it reports the failure, finishes the rest, and exits non-zero
+  with a summary. `--fail-fast` restores stopping at the first failure
+  ([#207]).
+- `--threads` defaults to `auto` (available CPUs, capped at 32) instead of 8,
+  about 2x faster decode on a 32-core node ([#212]).
+
+### Fixes
+
+- An explicit `--connections N` is now used exactly; the downloader no longer
+  raises it to 24 on large files. The default is `auto` (8, scaled up on
+  large files) ([#214]).
+
+### Performance
+
+- cSRA decode is about 2.8x faster on SRR622461: each worker keeps one cursor
+  with a 4-blob cache on the alignment columns ([#206]), cursors open one at
+  a time, cutting startup from about 3 s to 1.5 s ([#217]), and bool rows and
+  unflagged reference runs are bulk-copied, about 14% less CPU ([#218]).
+- MD5 is computed while chunks download, so verification costs only the tail
+  ([#209]); the vdbcache downloads alongside the archive ([#213]).
+- Fewer redundant EUtils RunInfo fetches and retry sleeps while resolving
+  ([#208], [#210]), and `--prefer-ena` queries ENA concurrently with the NCBI
+  resolve ([#215]).
+
+[#206]: https://github.com/rnabioco/sracha-rs/pull/206
+[#207]: https://github.com/rnabioco/sracha-rs/pull/207
+[#208]: https://github.com/rnabioco/sracha-rs/pull/208
+[#209]: https://github.com/rnabioco/sracha-rs/pull/209
+[#210]: https://github.com/rnabioco/sracha-rs/pull/210
+[#212]: https://github.com/rnabioco/sracha-rs/pull/212
+[#213]: https://github.com/rnabioco/sracha-rs/pull/213
+[#214]: https://github.com/rnabioco/sracha-rs/pull/214
+[#215]: https://github.com/rnabioco/sracha-rs/pull/215
+[#217]: https://github.com/rnabioco/sracha-rs/pull/217
+[#218]: https://github.com/rnabioco/sracha-rs/pull/218
+
 ## 0.9.0 (2026-10-30)
 
 ### Features
