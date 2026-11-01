@@ -13,6 +13,10 @@ use crate::inspect;
 use crate::kar::KarArchive;
 use crate::kdb::ColumnReader;
 
+/// Blobs kept per PRIMARY_ALIGNMENT column: a spot's mates resolve to
+/// alignment ids that can sit in different blobs.
+const PA_SLOTS: usize = 4;
+
 /// All per-row fields sracha needs to reconstruct an aligned read.
 ///
 /// Byte slices are in the row's own encoding — conversion to the
@@ -132,14 +136,20 @@ impl AlignmentCursor {
                 global_ref_start,
                 ColumnKind::Irzip { elem_bits: 64 },
             )
+            .slots(PA_SLOTS)
             .labelled(ColLabel::PaGlobalRefStart),
             ref_len: CachedColumn::new(ref_len, ColumnKind::Irzip { elem_bits: 32 }),
             has_mismatch: CachedColumn::new(has_mismatch, ColumnKind::Zip)
+                .slots(PA_SLOTS)
                 .labelled(ColLabel::PaHasMismatch),
             has_ref_offset: CachedColumn::new(has_ref_offset, ColumnKind::Zip)
+                .slots(PA_SLOTS)
                 .labelled(ColLabel::PaHasRefOffset),
-            mismatch: CachedColumn::new(mismatch, ColumnKind::Zip).labelled(ColLabel::PaMismatch),
+            mismatch: CachedColumn::new(mismatch, ColumnKind::Zip)
+                .slots(PA_SLOTS)
+                .labelled(ColLabel::PaMismatch),
             ref_offset: CachedColumn::new(ref_offset, ColumnKind::Irzip { elem_bits: 32 })
+                .slots(PA_SLOTS)
                 .labelled(ColLabel::PaRefOffset),
             linkage_group: linkage_group.map(|c| CachedColumn::new(c, ColumnKind::Zip)),
             row_count,

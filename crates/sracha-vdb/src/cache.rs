@@ -199,7 +199,8 @@ impl DecodedColumnBlob {
     }
 }
 
-/// A `ColumnReader` plus a single-slot cache of its most-recent decoded blob.
+/// A `ColumnReader` plus a small most-recently-used cache of decoded blobs
+/// (one slot unless [`CachedColumn::slots`] raises it).
 ///
 /// Not thread-safe — expects to be owned by a single-threaded consumer
 /// (cSRA decode spawns one `CsraCursor` per rayon worker).
@@ -207,7 +208,9 @@ pub(crate) struct CachedColumn {
     col: Arc<ColumnReader>,
     kind: ColumnKind,
     label: ColLabel,
-    cache: RefCell<Option<DecodedColumnBlob>>,
+    /// Most-recently-used first; never longer than `max_slots`.
+    cache: RefCell<Vec<DecodedColumnBlob>>,
+    max_slots: usize,
 }
 
 impl CachedColumn {
@@ -224,8 +227,17 @@ impl CachedColumn {
             col,
             kind,
             label: ColLabel::Other,
-            cache: RefCell::new(None),
+            cache: RefCell::new(Vec::new()),
+            max_slots: 1,
         }
+    }
+
+    /// Keep up to `n` decoded blobs (LRU). Random-access columns such as
+    /// PRIMARY_ALIGNMENT, where a spot's mates land in different blobs,
+    /// thrash a single slot.
+    pub fn slots(mut self, n: usize) -> Self {
+        self.max_slots = n.max(1);
+        self
     }
 
     /// Tag this column for the diagnostic counters.
@@ -251,13 +263,16 @@ impl CachedColumn {
         let logical_offset = (row_id - start_id) as usize;
 
         {
-            let borrow = self.cache.borrow();
-            if let Some(cached) = borrow.as_ref()
-                && cached.start_id == start_id
-            {
+            let mut cache = self.cache.borrow_mut();
+            if let Some(pos) = cache.iter().position(|c| c.start_id == start_id) {
+                if pos != 0 {
+                    cache[..=pos].rotate_right(1);
+                }
+                drop(cache);
                 #[cfg(feature = "colstats")]
                 bump(&HITS, self.label, 1);
-                return f(cached, logical_offset);
+                let borrow = self.cache.borrow();
+                return f(&borrow[0], logical_offset);
             }
         }
         #[cfg(feature = "colstats")]
@@ -284,17 +299,25 @@ impl CachedColumn {
         #[cfg(feature = "colstats")]
         bump(&EXTENTS, self.label, extents.len() as u64);
 
-        *self.cache.borrow_mut() = Some(DecodedColumnBlob {
-            start_id,
-            bytes,
-            page_map,
-            extents,
-            row_length,
-        });
+        {
+            let mut cache = self.cache.borrow_mut();
+            if cache.len() >= self.max_slots {
+                cache.pop();
+            }
+            cache.insert(
+                0,
+                DecodedColumnBlob {
+                    start_id,
+                    bytes,
+                    page_map,
+                    extents,
+                    row_length,
+                },
+            );
+        }
 
         let borrow = self.cache.borrow();
-        let cached = borrow.as_ref().expect("just inserted");
-        f(cached, logical_offset)
+        f(&borrow[0], logical_offset)
     }
 
     // ----------------------------------------------------------------
