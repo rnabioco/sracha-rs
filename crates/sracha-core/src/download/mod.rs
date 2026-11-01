@@ -619,6 +619,90 @@ async fn compute_md5(path: &Path) -> Result<String> {
     })?
 }
 
+/// [`compute_md5`] with a spinner so a long verification pass is not silent.
+async fn compute_md5_with_spinner(path: &Path, show: bool) -> Result<String> {
+    let sp = show.then(|| {
+        let sp = indicatif::ProgressBar::new_spinner();
+        sp.set_message("verifying checksum");
+        sp.enable_steady_tick(std::time::Duration::from_millis(120));
+        sp
+    });
+    let out = compute_md5(path).await;
+    if let Some(sp) = sp {
+        sp.finish_and_clear();
+    }
+    out
+}
+
+/// Incrementally MD5 a chunked download as chunks complete.
+///
+/// MD5 is sequential, but chunks mostly finish in order, so the hasher
+/// consumes each contiguous run of completed chunks as it appears (chunks
+/// restored from a resume sidecar in `seed` count as completed). Receives
+/// completed chunk indices on `rx`; returns the digest once every chunk has
+/// been consumed, or `None` when the stream ended early (a failed download),
+/// in which case the caller hashes the finished file instead.
+async fn prefix_md5_task(
+    mut rx: tokio::sync::mpsc::UnboundedReceiver<usize>,
+    seed: HashSet<usize>,
+    path: PathBuf,
+    chunk_size: u64,
+    file_size: u64,
+    total_chunks: usize,
+) -> Option<String> {
+    let mut done = seed;
+    let mut next = 0usize;
+    let mut hasher = Some(Md5::new());
+    let mut map: Option<std::sync::Arc<memmap2::Mmap>> = None;
+
+    loop {
+        let mut run = 0usize;
+        while next + run < total_chunks && done.contains(&(next + run)) {
+            run += 1;
+        }
+        if run > 0 {
+            let h = hasher.take()?;
+            let first = next;
+            let m = map.clone();
+            let p = path.clone();
+            let (h, m) = tokio::task::spawn_blocking(move || {
+                let m = match m {
+                    Some(m) => m,
+                    None => {
+                        let f = std::fs::File::open(&p).ok()?;
+                        // SAFETY: only completed chunks are read, and each
+                        // is fully written before its index is sent. Other
+                        // chunks are written through the same file but never
+                        // overlap the ranges read here.
+                        std::sync::Arc::new(unsafe { memmap2::Mmap::map(&f).ok()? })
+                    }
+                };
+                let mut h = h;
+                for i in first..first + run {
+                    let start = i as u64 * chunk_size;
+                    let end = (start + chunk_size).min(file_size);
+                    h.update(m.get(start as usize..end as usize)?);
+                }
+                Some((h, m))
+            })
+            .await
+            .ok()??;
+            hasher = Some(h);
+            map = Some(m);
+            next += run;
+        }
+        if next >= total_chunks {
+            break;
+        }
+        done.insert(rx.recv().await?);
+        while let Ok(i) = rx.try_recv() {
+            done.insert(i);
+        }
+    }
+    let digest = hasher?.finalize();
+    Some(digest.iter().map(|b| format!("{b:02x}")).collect())
+}
+
 /// Read the first `prefix.len()` bytes of `path` and compare to `prefix`.
 ///
 /// Returns `false` when the file is shorter than `prefix` or the bytes
@@ -856,6 +940,9 @@ pub async fn download_file(
     };
 
     let bytes_transferred: u64;
+    // MD5 accumulated while the chunked download ran (see `prefix_md5_task`);
+    // `None` falls back to a full pass over the finished file.
+    let mut prefix_md5: Option<String> = None;
 
     if use_parallel {
         // --- Parallel chunked download (with resume support) ---
@@ -1017,6 +1104,23 @@ pub async fn download_file(
             // Channel for completed chunk indices (for progress sidecar updates).
             let (done_tx, mut done_rx) = tokio::sync::mpsc::unbounded_channel::<usize>();
 
+            // Hash the contiguous completed prefix while later chunks are
+            // still downloading, so verification costs only the tail.
+            let (md5_tx, md5_task) = if config.validate && expected_md5.is_some() {
+                let (tx, rx) = tokio::sync::mpsc::unbounded_channel::<usize>();
+                let task = tokio::spawn(prefix_md5_task(
+                    rx,
+                    progress.completed_chunks.clone(),
+                    output_path.to_path_buf(),
+                    chunk_size,
+                    file_size,
+                    total_chunks,
+                ));
+                (Some(tx), Some(task))
+            } else {
+                (None, None)
+            };
+
             let mut handles = Vec::with_capacity(chunks_to_download.len());
 
             for (chunk_idx, chunk) in chunks_to_download {
@@ -1026,6 +1130,7 @@ pub async fn download_file(
                 let f = shared_file.clone();
                 let pb_clone = pb.clone();
                 let tx = done_tx.clone();
+                let md5_tx = md5_tx.clone();
 
                 let handle = tokio::spawn(async move {
                     let _permit = sem.acquire().await.map_err(|e| Error::Download {
@@ -1037,6 +1142,9 @@ pub async fn download_file(
 
                     // Notify progress tracker.
                     let _ = tx.send(chunk_idx);
+                    if let Some(m) = md5_tx {
+                        let _ = m.send(chunk_idx);
+                    }
                     Ok::<(), Error>(())
                 });
 
@@ -1044,6 +1152,7 @@ pub async fn download_file(
             }
             // Drop our copy so the channel closes when all tasks finish.
             drop(done_tx);
+            drop(md5_tx);
 
             // Collect completed chunk indices and save progress on a timer.
             // A 2 s interval is plenty for resume granularity on a file that
@@ -1104,6 +1213,9 @@ pub async fn download_file(
 
             // Wait for progress saver to finish.
             let _ = progress_saver.await;
+            if let Some(task) = md5_task {
+                prefix_md5 = task.await.ok().flatten();
+            }
 
             if let Some(pb) = &pb {
                 if already_done > 0 {
@@ -1267,7 +1379,10 @@ pub async fn download_file(
 
     // Verify MD5 if requested.
     let md5_hex = if let (true, Some(expected)) = (config.validate, expected_md5) {
-        let computed = compute_md5(output_path).await?;
+        let computed = match prefix_md5 {
+            Some(h) => h,
+            None => compute_md5_with_spinner(output_path, config.progress).await?,
+        };
         if computed != expected {
             // Clean up the bad file.
             let _ = tokio::fs::remove_file(output_path).await;
@@ -1279,7 +1394,7 @@ pub async fn download_file(
         Some(computed)
     } else if config.validate {
         // Validate requested but no expected MD5 — compute anyway for the result.
-        Some(compute_md5(output_path).await?)
+        Some(compute_md5_with_spinner(output_path, config.progress).await?)
     } else {
         None
     };
@@ -1297,6 +1412,55 @@ pub async fn download_file(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    async fn prefix_md5_for(
+        order: &[usize],
+        seed: &[usize],
+        size: usize,
+        chunk: u64,
+    ) -> (Option<String>, String) {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("f.bin");
+        let data: Vec<u8> = (0..size).map(|i| (i * 31 % 251) as u8).collect();
+        std::fs::write(&path, &data).unwrap();
+        let total = plan_chunks(size as u64, chunk).len();
+        let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+        for &i in order {
+            tx.send(i).unwrap();
+        }
+        drop(tx);
+        let got = prefix_md5_task(
+            rx,
+            seed.iter().copied().collect(),
+            path.clone(),
+            chunk,
+            size as u64,
+            total,
+        )
+        .await;
+        (got, compute_md5(&path).await.unwrap())
+    }
+
+    #[tokio::test]
+    async fn prefix_md5_matches_full_hash_out_of_order() {
+        // 100 bytes in 7-byte chunks = 15 chunks (last one short).
+        let order = [3, 0, 2, 1, 14, 5, 4, 13, 12, 6, 7, 8, 11, 10, 9];
+        let (got, want) = prefix_md5_for(&order, &[], 100, 7).await;
+        assert_eq!(got.as_deref(), Some(want.as_str()));
+    }
+
+    #[tokio::test]
+    async fn prefix_md5_uses_resume_seed() {
+        let order = [4, 5, 6, 7];
+        let (got, want) = prefix_md5_for(&order, &[0, 1, 2, 3], 32, 4).await;
+        assert_eq!(got.as_deref(), Some(want.as_str()));
+    }
+
+    #[tokio::test]
+    async fn prefix_md5_is_none_when_chunks_missing() {
+        let (got, _) = prefix_md5_for(&[0, 1, 3], &[], 32, 4).await;
+        assert!(got.is_none());
+    }
 
     #[test]
     fn test_plan_chunks_exact() {
