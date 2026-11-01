@@ -1544,61 +1544,71 @@ fn run_fastq_csra(
     // Decode each chunk. The worker returns an ordered Vec of
     // (slot, record-bytes, record-count) so the writer stays sequential.
     type SlotChunk = (OutputSlot, Vec<u8>, u64);
-    let decode_chunk = |start: i64, end: i64| -> Result<Vec<SlotChunk>> {
-        let file = std::fs::File::open(sra_path)?;
-        let mut archive = KarArchive::open(std::io::BufReader::new(file))?;
-        let mut cache_archive = match vdbcache_path {
-            Some(p) => Some(KarArchive::open(std::io::BufReader::new(
-                std::fs::File::open(p)?,
-            ))?),
-            None => None,
-        };
-        let csra = {
-            let cache_opt: Option<(&mut KarArchive<_>, &std::path::Path)> =
-                match (&mut cache_archive, vdbcache_path) {
-                    (Some(a), Some(p)) => Some((a, p)),
-                    _ => None,
+    // The cursor (and its decoded-blob caches) lives in `cursor_slot` so a
+    // worker reuses it across chunks instead of starting cold every <=1024
+    // spots.
+    let decode_chunk =
+        |cursor_slot: &mut Option<CsraCursor>, start: i64, end: i64| -> Result<Vec<SlotChunk>> {
+            if cursor_slot.is_none() {
+                let file = std::fs::File::open(sra_path)?;
+                let mut archive = KarArchive::open(std::io::BufReader::new(file))?;
+                let mut cache_archive = match vdbcache_path {
+                    Some(p) => Some(KarArchive::open(std::io::BufReader::new(
+                        std::fs::File::open(p)?,
+                    ))?),
+                    None => None,
                 };
-            // `shared` holds Arcs of already-opened mmaps and the parsed
-            // REFERENCE layout: cheap to clone into each chunk, where only
-            // the per-worker blob caches get built fresh.
-            CsraCursor::open_with_shared(&mut archive, sra_path, cache_opt, Some(&shared))?
-        };
-        let mut per_slot: HashMap<OutputSlot, (Vec<u8>, u64)> = HashMap::new();
-        let mut itoa_buf = itoa::Buffer::new();
-        for row_id in start..end {
-            let s = csra.read_spot(row_id)?;
-            let linkage_group = if shared.linkage_group {
-                csra.linkage_group(row_id)?
-            } else {
-                Vec::new()
-            };
-            let sequence = fourna_to_ascii(&s.bases);
-            let quality: Vec<u8> = s.quality.iter().map(|q| q.wrapping_add(33)).collect();
-            let spot_num_str = itoa_buf.format(row_id).to_string();
-            let spot = SpotRecord {
-                name: spot_num_str.as_bytes().to_vec(),
-                sequence,
-                quality,
-                read_lengths: s.read_lens,
-                // Already INSDC `xread_type` bytes, orientation bits and all;
-                // `SpotRecord::read_types` takes them as-is.
-                read_types: s.read_types,
-                read_filter: Vec::new(),
-                spot_group: Vec::new(),
-                linkage_group,
-            };
-            for (slot, rec) in crate::fastq::format_spot(&spot, acc, &fastq_config) {
-                let entry = per_slot.entry(slot).or_insert_with(|| (Vec::new(), 0));
-                entry.0.extend_from_slice(&rec.data);
-                entry.1 += 1;
+                let cache_opt: Option<(&mut KarArchive<_>, &std::path::Path)> =
+                    match (&mut cache_archive, vdbcache_path) {
+                        (Some(a), Some(p)) => Some((a, p)),
+                        _ => None,
+                    };
+                // `shared` holds Arcs of already-opened mmaps and the parsed
+                // REFERENCE layout: cheap to clone into each worker, where only
+                // the per-worker blob caches get built fresh.
+                *cursor_slot = Some(CsraCursor::open_with_shared(
+                    &mut archive,
+                    sra_path,
+                    cache_opt,
+                    Some(&shared),
+                )?);
             }
-        }
-        Ok(per_slot
-            .into_iter()
-            .map(|(slot, (bytes, count))| (slot, bytes, count))
-            .collect())
-    };
+            let csra = cursor_slot.as_ref().expect("cursor just opened");
+            let mut per_slot: HashMap<OutputSlot, (Vec<u8>, u64)> = HashMap::new();
+            let mut itoa_buf = itoa::Buffer::new();
+            for row_id in start..end {
+                let s = csra.read_spot(row_id)?;
+                let linkage_group = if shared.linkage_group {
+                    csra.linkage_group(row_id)?
+                } else {
+                    Vec::new()
+                };
+                let sequence = fourna_to_ascii(&s.bases);
+                let quality: Vec<u8> = s.quality.iter().map(|q| q.wrapping_add(33)).collect();
+                let spot_num_str = itoa_buf.format(row_id).to_string();
+                let spot = SpotRecord {
+                    name: spot_num_str.as_bytes().to_vec(),
+                    sequence,
+                    quality,
+                    read_lengths: s.read_lens,
+                    // Already INSDC `xread_type` bytes, orientation bits and all;
+                    // `SpotRecord::read_types` takes them as-is.
+                    read_types: s.read_types,
+                    read_filter: Vec::new(),
+                    spot_group: Vec::new(),
+                    linkage_group,
+                };
+                for (slot, rec) in crate::fastq::format_spot(&spot, acc, &fastq_config) {
+                    let entry = per_slot.entry(slot).or_insert_with(|| (Vec::new(), 0));
+                    entry.0.extend_from_slice(&rec.data);
+                    entry.1 += 1;
+                }
+            }
+            Ok(per_slot
+                .into_iter()
+                .map(|(slot, (bytes, count))| (slot, bytes, count))
+                .collect())
+        };
 
     // Create a writer for this slot lazily (mirrors the plain path).
     let get_writer = |slot: OutputSlot,
@@ -1627,11 +1637,21 @@ fn run_fastq_csra(
         // several GB on a real run. Four chunks per thread keeps every
         // worker fed while capping the buffer at tens of MB.
         let batch = num_threads.saturating_mul(4).max(1);
+        // One cursor per pool worker, kept across windows.
+        let worker_cursors: Vec<std::sync::Mutex<Option<CsraCursor>>> = (0..num_threads)
+            .map(|_| std::sync::Mutex::new(None))
+            .collect();
         for window in chunks.chunks(batch) {
             let results: Vec<Result<Vec<SlotChunk>>> = pool.install(|| {
                 window
                     .par_iter()
-                    .map(|(s, e)| decode_chunk(*s, *e))
+                    .map(|(s, e)| {
+                        let idx = rayon::current_thread_index().unwrap_or(0);
+                        let mut slot = worker_cursors[idx]
+                            .lock()
+                            .unwrap_or_else(|p| p.into_inner());
+                        decode_chunk(&mut slot, *s, *e)
+                    })
                     .collect()
             });
             for (chunk_res, (s, e)) in results.into_iter().zip(window.iter()) {
@@ -1653,8 +1673,9 @@ fn run_fastq_csra(
             }
         }
     } else {
+        let mut cursor_slot: Option<CsraCursor> = None;
         for &(s, e) in &chunks {
-            let chunk = decode_chunk(s, e)?;
+            let chunk = decode_chunk(&mut cursor_slot, s, e)?;
             spots_read += (e - s) as u64;
             for (slot, bytes, records) in chunk {
                 if let Some(ref mut sw) = stdout_writer {
