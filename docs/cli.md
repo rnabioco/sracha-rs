@@ -93,7 +93,7 @@ sracha get [OPTIONS] [ACCESSION]...
 
 | Option | Default | Description |
 |--------|---------|-------------|
-| `-t, --threads <N>` | `8` | Thread count for decode and compression |
+| `-t, --threads <N>` | `auto` (CPUs, max 32) | Thread count for decode and compression |
 | `--connections <N>` | `8` | HTTP connections per file |
 
 **Download behavior**
@@ -195,7 +195,7 @@ sracha fastq [OPTIONS] <INPUT>...
 
 | Option | Default | Description |
 |--------|---------|-------------|
-| `-t, --threads <N>` | `8` | Thread count for decode and compression |
+| `-t, --threads <N>` | `auto` (CPUs, max 32) | Thread count for decode and compression |
 | `-O, --output-dir <DIR>` | `.` | Output directory |
 | `--folder-per-accession` | | Place each accession's outputs inside its own `<output-dir>/<accession>/` subdirectory |
 | `-f, --force` | | Overwrite existing files |
@@ -316,7 +316,7 @@ sracha validate [OPTIONS] <INPUT>...
 
 | Option | Default | Description |
 |--------|---------|-------------|
-| `-t, --threads <N>` | `8` | Thread count for decode |
+| `-t, --threads <N>` | `auto` (CPUs, max 32) | Thread count for decode |
 | `--no-progress` | | Disable progress bar |
 | `--md5 <HASH>` | | Expected MD5 hex; fail on mismatch. With multiple inputs every file must match |
 | `--offline` | | Skip the SDL lookup for the expected MD5 (air-gapped use) |

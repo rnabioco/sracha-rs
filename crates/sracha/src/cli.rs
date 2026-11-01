@@ -351,8 +351,8 @@ pub struct DecodeArgs {
     #[arg(long, help_heading = "Filtering")]
     pub include_technical: bool,
 
-    /// Number of threads for decode
-    #[arg(short, long, default_value_t = 8, display_order = 102)]
+    /// Number of threads for decode ("auto" = available CPUs, capped at 32)
+    #[arg(short, long, default_value = "auto", value_parser = parse_threads, display_order = 102)]
     pub threads: usize,
 
     /// Disable progress bar
@@ -390,6 +390,28 @@ pub struct DecodeArgs {
         display_order = 14
     )]
     pub refseq_cache: Option<PathBuf>,
+}
+
+/// Decode threads when `--threads` is `auto`: the CPUs this process may use
+/// (cgroup/affinity-aware), capped so a large node does not spawn a pool
+/// whose per-thread buffers dwarf the work.
+fn auto_threads() -> usize {
+    std::thread::available_parallelism()
+        .map(|n| n.get())
+        .unwrap_or(8)
+        .clamp(1, 32)
+}
+
+/// `--threads` value parser: a positive integer or `auto`.
+fn parse_threads(s: &str) -> Result<usize, String> {
+    if s.eq_ignore_ascii_case("auto") {
+        return Ok(auto_threads());
+    }
+    match s.parse::<usize>() {
+        Ok(0) => Err("threads must be at least 1".into()),
+        Ok(n) => Ok(n),
+        Err(_) => Err(format!("`{s}` is not a number or `auto`")),
+    }
 }
 
 #[derive(Args)]
@@ -632,8 +654,8 @@ pub struct ValidateArgs {
     #[arg(required = true)]
     pub inputs: Vec<String>,
 
-    /// Number of threads for decode
-    #[arg(short, long, default_value_t = 8)]
+    /// Number of threads for decode ("auto" = available CPUs, capped at 32)
+    #[arg(short, long, default_value = "auto", value_parser = parse_threads)]
     pub threads: usize,
 
     /// Disable progress bar
@@ -905,6 +927,16 @@ mod tests {
         assert!(g.no_resume && g.keep_sra);
         // get's own defaults are unchanged by the refactor.
         assert_eq!(get_args(&["get", "SRR1"]).connections, 8);
+    }
+
+    #[test]
+    fn threads_accepts_auto_and_numbers() {
+        assert_eq!(get_args(&["get", "SRR1", "-t", "3"]).threads, 3);
+        let auto = get_args(&["get", "SRR1"]).threads;
+        assert!((1..=32).contains(&auto));
+        assert_eq!(get_args(&["get", "SRR1", "-t", "auto"]).threads, auto);
+        assert!(parse_threads("0").is_err());
+        assert!(parse_threads("many").is_err());
     }
 
     #[test]

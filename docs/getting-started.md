@@ -244,7 +244,7 @@ transfer that may have been interrupted.
 # More download connections (default: 8)
 sracha get SRR28588231 --connections 12
 
-# More threads for decode and compression (default: 8)
+# More threads for decode and compression (default: auto = available CPUs, max 32)
 sracha get SRR28588231 --threads 16
 
 # Prefetch more accessions ahead of the decoder (default: 2)
