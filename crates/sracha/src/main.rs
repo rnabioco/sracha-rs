@@ -426,7 +426,7 @@ async fn main() -> Result<()> {
                 "Resolving {} accession(s)",
                 style::count(run_accessions.len()),
             ));
-            let resolved_all = resolve_accessions(
+            let (resolved_all, unresolved) = resolve_accessions_lenient(
                 &run_accessions,
                 &sdl_client,
                 args.prefer_sdl,
@@ -435,10 +435,28 @@ async fn main() -> Result<()> {
                 args.head_concurrency,
             )
             .await?;
+            if args.fail_fast
+                && let Some((_, message)) = unresolved.first()
+            {
+                anyhow::bail!("{message}");
+            }
             sp.finish(format!(
                 "Resolved {} accession(s)",
                 style::count(resolved_all.len()),
             ));
+            for (acc, message) in &unresolved {
+                eprintln!(
+                    "{} {}: {message} (continuing; use --fail-fast to stop at the first failure)",
+                    style::error_label("failed:"),
+                    style::header(acc),
+                );
+            }
+            if resolved_all.is_empty() && !unresolved.is_empty() {
+                anyhow::bail!(
+                    "none of the {} accession(s) could be resolved",
+                    unresolved.len()
+                );
+            }
 
             if args.dry_run {
                 use std::io::Write;
@@ -565,6 +583,11 @@ async fn main() -> Result<()> {
             // (external refseq, static READ_LEN). Each gets an ENA suggestion
             // inline; collected here so the batch exits non-zero at the end.
             let mut skipped_accessions: Vec<String> = Vec::new();
+            // Accessions that failed outright (404, retries exhausted,
+            // integrity check, ...). Unless `--fail-fast`, the batch carries
+            // on and reports them together at the end.
+            let n_unresolved = unresolved.len();
+            let mut failed_accessions: Vec<(String, String)> = unresolved;
             let mut interrupted_accession: Option<String> = None;
             let mut interrupt_phase: Option<InterruptPhase> = None;
 
@@ -661,7 +684,12 @@ async fn main() -> Result<()> {
                             interrupt_phase = Some(InterruptPhase::Ena);
                             break;
                         }
-                        Err(e) => return Err(e.into()),
+                        Err(e) if args.fail_fast => return Err(e.into()),
+                        Err(e) => {
+                            report_failure(&resolved.accession, &e);
+                            failed_accessions.push((resolved.accession.clone(), e.to_string()));
+                            continue;
+                        }
                     };
                     report_transfer(
                         &stats.accession,
@@ -680,25 +708,11 @@ async fn main() -> Result<()> {
                 let handle = pending_downloads
                     .pop_front()
                     .expect("queue is pre-seeded and topped up per iteration");
-                let downloaded = match handle.await {
-                    Ok(Ok(d)) => d,
-                    Ok(Err(sracha_core::error::Error::Cancelled { .. })) => {
-                        interrupted_accession = Some(resolved.accession.clone());
-                        interrupt_phase = Some(InterruptPhase::Download);
-                        break;
-                    }
-                    Ok(Err(e)) => return Err(e.into()),
-                    Err(join_err) => {
-                        if cancelled.load(Ordering::Relaxed) {
-                            interrupted_accession = Some(resolved.accession.clone());
-                            interrupt_phase = Some(InterruptPhase::Download);
-                            break;
-                        }
-                        return Err(anyhow::anyhow!("download task panicked: {join_err}"));
-                    }
-                };
+                let joined = handle.await;
 
                 // Top up the queue: find the next NCBI-bound index and spawn it.
+                // Done before inspecting the result so a failed accession
+                // doesn't starve the prefetch queue.
                 while next_prefetch_idx < resolved_all.len()
                     && ena_results[next_prefetch_idx].is_some()
                 {
@@ -710,6 +724,29 @@ async fn main() -> Result<()> {
                 }
                 // Skip trailing ENA indices after the one we just spawned.
                 let _ = i;
+
+                let downloaded = match joined {
+                    Ok(Ok(d)) => d,
+                    Ok(Err(sracha_core::error::Error::Cancelled { .. })) => {
+                        interrupted_accession = Some(resolved.accession.clone());
+                        interrupt_phase = Some(InterruptPhase::Download);
+                        break;
+                    }
+                    Ok(Err(e)) if args.fail_fast => return Err(e.into()),
+                    Ok(Err(e)) => {
+                        report_failure(&resolved.accession, &e);
+                        failed_accessions.push((resolved.accession.clone(), e.to_string()));
+                        continue;
+                    }
+                    Err(join_err) => {
+                        if cancelled.load(Ordering::Relaxed) {
+                            interrupted_accession = Some(resolved.accession.clone());
+                            interrupt_phase = Some(InterruptPhase::Download);
+                            break;
+                        }
+                        return Err(anyhow::anyhow!("download task panicked: {join_err}"));
+                    }
+                };
 
                 // Aligned runs that keep only the chunk layout in REFERENCE
                 // need the assembly's bases on disk before decode starts.
@@ -776,7 +813,11 @@ async fn main() -> Result<()> {
                         suggest_ena_fallback(&http_client, &accession, &message).await;
                         skipped_accessions.push(accession);
                     }
-                    Err(e) => return Err(e.into()),
+                    Err(e) if args.fail_fast => return Err(e.into()),
+                    Err(e) => {
+                        report_failure(&resolved.accession, &e);
+                        failed_accessions.push((resolved.accession.clone(), e.to_string()));
+                    }
                 }
             }
 
@@ -819,12 +860,34 @@ async fn main() -> Result<()> {
                 std::process::exit(130);
             }
 
+            if !failed_accessions.is_empty() {
+                eprintln!(
+                    "{} {} of {} accession(s) failed: {}",
+                    style::error_label("error:"),
+                    failed_accessions.len(),
+                    resolved_all.len() + n_unresolved,
+                    failed_accessions
+                        .iter()
+                        .map(|(a, _)| a.as_str())
+                        .collect::<Vec<_>>()
+                        .join(", "),
+                );
+            }
             if !skipped_accessions.is_empty() {
-                anyhow::bail!(
-                    "{} accession(s) skipped — sracha can't reconstruct their cSRA: {} \
+                eprintln!(
+                    "{} {} accession(s) skipped — sracha can't reconstruct their cSRA: {} \
                      (see the per-accession hints above for the ENA fallback)",
+                    style::error_label("error:"),
                     skipped_accessions.len(),
                     skipped_accessions.join(", "),
+                );
+            }
+            if !failed_accessions.is_empty() || !skipped_accessions.is_empty() {
+                anyhow::bail!(
+                    "{} of {} accession(s) did not complete ({} completed)",
+                    failed_accessions.len() + skipped_accessions.len(),
+                    resolved_all.len() + n_unresolved,
+                    completed_accessions.len(),
                 );
             }
 
@@ -1141,6 +1204,16 @@ async fn main() -> Result<()> {
         }
         Command::Vdb(args) => vdb_cmd::run(args.cmd).await,
     }
+}
+
+/// Print a one-line per-accession failure; the batch carries on unless
+/// `--fail-fast`.
+fn report_failure(accession: &str, err: &sracha_core::error::Error) {
+    eprintln!(
+        "{} {}: {err} (continuing; use --fail-fast to stop at the first failure)",
+        style::error_label("failed:"),
+        style::header(accession),
+    );
 }
 
 /// Collect accessions from positional arguments and an optional file.
@@ -1738,6 +1811,34 @@ async fn resolve_accessions(
     format: sracha_core::sdl::FormatPreference,
     head_concurrency: usize,
 ) -> Result<Vec<ResolvedAccession>> {
+    let (resolved, unresolved) = resolve_accessions_lenient(
+        run_accessions,
+        client,
+        prefer_sdl,
+        need_run_info,
+        format,
+        head_concurrency,
+    )
+    .await?;
+    if let Some((_, message)) = unresolved.into_iter().next() {
+        anyhow::bail!("{message}");
+    }
+    Ok(resolved)
+}
+
+/// Like [`resolve_accessions`], but an accession that cannot be resolved
+/// (SDL 404, no SRA file) is returned in the second vector as
+/// `(accession, message)` instead of failing the whole batch. Request-level
+/// failures (network, SDL unreachable) still return `Err`.
+async fn resolve_accessions_lenient(
+    run_accessions: &[String],
+    client: &SdlClient,
+    prefer_sdl: bool,
+    need_run_info: bool,
+    format: sracha_core::sdl::FormatPreference,
+    head_concurrency: usize,
+) -> Result<(Vec<ResolvedAccession>, Vec<(String, String)>)> {
+    let mut unresolved: Vec<(String, String)> = Vec::new();
     // SRA-lite files are not on the free S3 ODP bucket, so we must use SDL.
     if prefer_sdl || format == sracha_core::sdl::FormatPreference::Sralite {
         if prefer_sdl {
@@ -1745,12 +1846,17 @@ async fn resolve_accessions(
         } else {
             tracing::info!("using SDL for all accessions (--format sralite)");
         }
-        let resolved: Vec<ResolvedAccession> = client
-            .resolve_many(run_accessions, format)
-            .await?
-            .into_iter()
-            .collect::<std::result::Result<Vec<_>, _>>()?;
-        return Ok(resolved);
+        let mut resolved: Vec<ResolvedAccession> = Vec::new();
+        for (acc, r) in run_accessions
+            .iter()
+            .zip(client.resolve_many(run_accessions, format).await?)
+        {
+            match r {
+                Ok(r) => resolved.push(r),
+                Err(e) => unresolved.push((acc.clone(), e.to_string())),
+            }
+        }
+        return Ok((resolved, unresolved));
     }
 
     // Phase 1 + Phase 3 in parallel: the S3 HEAD storm and the EUtils
@@ -1810,7 +1916,10 @@ async fn resolve_accessions(
                     resolved[i] = Some(r);
                 }
                 Err(e) => {
-                    anyhow::bail!("{acc}: failed to resolve via both S3 and SDL: {e}");
+                    unresolved.push((
+                        acc.clone(),
+                        format!("{acc}: failed to resolve via both S3 and SDL: {e}"),
+                    ));
                 }
             }
         }
@@ -1859,7 +1968,7 @@ async fn resolve_accessions(
         }
     }
 
-    Ok(resolved)
+    Ok((resolved, unresolved))
 }
 
 /// Check whether confirmation is needed before downloading.

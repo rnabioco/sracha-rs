@@ -458,6 +458,12 @@ pub struct GetArgs {
     #[arg(long, help_heading = "Advanced", display_order = 3)]
     pub no_resume: bool,
 
+    /// Stop at the first accession that fails. By default a failure is
+    /// reported, the remaining accessions are processed, and the exit
+    /// status is non-zero with a summary at the end.
+    #[arg(long, help_heading = "Advanced", display_order = 4)]
+    pub fail_fast: bool,
+
     /// Skip the free-disk-space preflight check entirely. Useful when the
     /// output filesystem autoscales, or when `statvfs` reports a quota that
     /// doesn't reflect what the job can actually use.
@@ -899,6 +905,12 @@ mod tests {
         assert!(g.no_resume && g.keep_sra);
         // get's own defaults are unchanged by the refactor.
         assert_eq!(get_args(&["get", "SRR1"]).connections, 8);
+    }
+
+    #[test]
+    fn fail_fast_is_opt_in() {
+        assert!(!get_args(&["get", "SRR1"]).fail_fast);
+        assert!(get_args(&["get", "SRR1", "--fail-fast"]).fail_fast);
     }
 
     #[test]
