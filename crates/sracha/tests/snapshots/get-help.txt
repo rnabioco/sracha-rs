@@ -22,9 +22,9 @@ Options:
           [default: auto]
 
       --connections <CONNECTIONS>
-          HTTP connections per file
+          HTTP connections per file ("auto" = 8, raised to 24 on large files)
           
-          [default: 8]
+          [default: auto]
 
   -y, --yes
           Confirm project downloads and large downloads (>100 GiB)

@@ -1784,7 +1784,7 @@ pub async fn download_sra(
 
     let dl_config = DownloadConfig {
         connections: config.connections,
-        auto_scale_connections: true,
+        auto_scale_connections: config.auto_scale_connections,
         chunk_size: 0,
         force: config.force,
         validate: true,

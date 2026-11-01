@@ -24,6 +24,9 @@ pub struct PipelineConfig {
     pub threads: usize,
     /// Number of parallel HTTP connections for downloading.
     pub connections: usize,
+    /// Let the downloader raise `connections` on large files. `false` when
+    /// the user chose an explicit number.
+    pub auto_scale_connections: bool,
     /// Skip technical reads.
     pub skip_technical: bool,
     /// Minimum read length filter.
@@ -111,6 +114,7 @@ impl Default for PipelineConfig {
             compression: CompressionMode::Gzip { level: 1 },
             threads: 8,
             connections: 1,
+            auto_scale_connections: true,
             skip_technical: true,
             min_read_len: None,
             force: false,

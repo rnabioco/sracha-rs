@@ -213,8 +213,8 @@ pub struct FetchArgs {
     #[arg(short, long, help_heading = "Output")]
     pub force: bool,
 
-    /// HTTP connections per file
-    #[arg(long, default_value_t = 8)]
+    /// HTTP connections per file ("auto" = 8, raised to 24 on large files)
+    #[arg(long, default_value = "auto", value_parser = parse_connections)]
     pub connections: usize,
 
     /// Confirm project downloads and large downloads (>100 GiB)
@@ -414,6 +414,33 @@ fn parse_threads(s: &str) -> Result<usize, String> {
     }
 }
 
+/// Connections when `--connections` is `auto`.
+const AUTO_CONNECTIONS: usize = 8;
+
+/// `--connections` value parser: a positive integer, or `auto` (stored as 0
+/// so an explicit value can be told apart from the default).
+fn parse_connections(s: &str) -> Result<usize, String> {
+    if s.eq_ignore_ascii_case("auto") {
+        return Ok(0);
+    }
+    match s.parse::<usize>() {
+        Ok(0) => Err("connections must be at least 1".into()),
+        Ok(n) => Ok(n),
+        Err(_) => Err(format!("`{s}` is not a number or `auto`")),
+    }
+}
+
+/// Connection count to use for a parsed `--connections` value.
+pub fn connections_or_default(raw: usize) -> usize {
+    if raw == 0 { AUTO_CONNECTIONS } else { raw }
+}
+
+/// Whether the downloader may raise the connection count on large files:
+/// only when the user did not pick a number.
+pub fn auto_scale_connections(raw: usize) -> bool {
+    raw == 0
+}
+
 #[derive(Args)]
 pub struct FastqArgs {
     /// SRA file path(s) (.sra files from `sracha fetch`)
@@ -442,8 +469,8 @@ pub struct GetArgs {
     #[command(flatten)]
     pub decode: DecodeArgs,
 
-    /// HTTP connections per file
-    #[arg(long, default_value_t = 8, display_order = 103)]
+    /// HTTP connections per file ("auto" = 8, raised to 24 on large files)
+    #[arg(long, default_value = "auto", value_parser = parse_connections, display_order = 103)]
     pub connections: usize,
 
     /// Write run metadata (BioSample, library, instrument, etc.) sidecar
@@ -926,7 +953,13 @@ mod tests {
         assert_eq!(g.connections, 4);
         assert!(g.no_resume && g.keep_sra);
         // get's own defaults are unchanged by the refactor.
-        assert_eq!(get_args(&["get", "SRR1"]).connections, 8);
+        // Unset means auto (stored as 0): default 8, free to scale up.
+        let auto = get_args(&["get", "SRR1"]).connections;
+        assert_eq!(connections_or_default(auto), 8);
+        assert!(auto_scale_connections(auto));
+        // An explicit value is honoured exactly.
+        assert!(!auto_scale_connections(g.connections));
+        assert_eq!(connections_or_default(g.connections), 4);
     }
 
     #[test]

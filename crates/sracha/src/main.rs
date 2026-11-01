@@ -130,7 +130,8 @@ async fn main() -> Result<()> {
                     // ENA serves from a single Apache host; cap concurrency and
                     // skip the S3-tuned auto-scale floor to avoid connection
                     // limits. --connections may still lower it further.
-                    connections: args.connections.min(sracha_core::ena::ENA_MAX_CONNECTIONS),
+                    connections: cli::connections_or_default(args.connections)
+                        .min(sracha_core::ena::ENA_MAX_CONNECTIONS),
                     auto_scale_connections: false,
                     force: args.force,
                     validate: !args.no_validate,
@@ -230,7 +231,8 @@ async fn main() -> Result<()> {
             }
 
             let dl_config = sracha_core::download::DownloadConfig {
-                connections: args.connections,
+                connections: cli::connections_or_default(args.connections),
+                auto_scale_connections: cli::auto_scale_connections(args.connections),
                 force: args.force,
                 validate: !args.no_validate,
                 progress: !args.no_progress,
@@ -609,12 +611,14 @@ async fn main() -> Result<()> {
                 // Shared decode flags, built once; each accession layers its
                 // own run-info, sidecar row and download settings on top.
                 let base = args.pipeline_config(split_mode, compression);
-                let connections = args.connections;
+                let connections = cli::connections_or_default(args.connections);
+                let auto_scale_connections = cli::auto_scale_connections(args.connections);
                 let resume = !args.no_resume;
                 let keep_sra = args.keep_sra;
                 let metadata = args.metadata;
                 move |resolved: &ResolvedAccession| sracha_core::pipeline::PipelineConfig {
                     connections,
+                    auto_scale_connections,
                     run_info: resolved.run_info.clone(),
                     resume,
                     cancelled: Some(cancelled.clone()),
