@@ -125,6 +125,9 @@ Advanced:
       --no-resume
           Disable download resume (re-download from scratch)
 
+      --fail-fast
+          Stop at the first accession that fails. By default a failure is reported, the remaining accessions are processed, and the exit status is non-zero with a summary at the end
+
       --no-disk-check
           Skip the free-disk-space preflight check entirely. Useful when the output filesystem autoscales, or when `statvfs` reports a quota that doesn't reflect what the job can actually use
 
