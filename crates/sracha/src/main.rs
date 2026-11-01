@@ -428,15 +428,28 @@ async fn main() -> Result<()> {
                 "Resolving {} accession(s)",
                 style::count(run_accessions.len()),
             ));
-            let (resolved_all, unresolved) = resolve_accessions_lenient(
-                &run_accessions,
-                &sdl_client,
-                args.prefer_sdl,
-                !args.no_runinfo,
-                args.format.into(),
-                args.head_concurrency,
-            )
-            .await?;
+            // The ENA filereport lookup is independent of the NCBI resolve,
+            // so run them together under `--prefer-ena` instead of in series.
+            let (resolved, ena_pairs) = tokio::join!(
+                resolve_accessions_lenient(
+                    &run_accessions,
+                    &sdl_client,
+                    args.prefer_sdl,
+                    !args.no_runinfo,
+                    args.format.into(),
+                    args.head_concurrency,
+                ),
+                async {
+                    if ena_compatible {
+                        Some(
+                            sracha_core::ena::resolve_ena_many(&http_client, &run_accessions).await,
+                        )
+                    } else {
+                        None
+                    }
+                }
+            );
+            let (resolved_all, unresolved) = resolved?;
             if args.fail_fast
                 && let Some((_, message)) = unresolved.first()
             {
@@ -483,22 +496,24 @@ async fn main() -> Result<()> {
             // Resolved *before* the preflight below so the disk check can size
             // the transfer by what will actually be written: under
             // `--prefer-ena` the `.sra` object is never downloaded.
-            let ena_results: Vec<Option<sracha_core::ena::EnaResolved>> = if ena_compatible {
-                let sp = progress::Spinner::start(format!(
-                    "Querying ENA filereport for {} accession(s)",
-                    style::count(resolved_all.len()),
-                ));
-                let accs: Vec<String> = resolved_all.iter().map(|r| r.accession.clone()).collect();
-                let pairs = sracha_core::ena::resolve_ena_many(&http_client, &accs).await;
-                let ena_hits = pairs.iter().filter(|(_, v)| v.is_some()).count();
-                sp.finish(format!(
-                    "ENA serves {} of {} accession(s); rest will use NCBI",
-                    style::count(ena_hits),
-                    style::count(resolved_all.len()),
-                ));
-                pairs.into_iter().map(|(_, v)| v).collect()
-            } else {
-                vec![None; resolved_all.len()]
+            let ena_results: Vec<Option<sracha_core::ena::EnaResolved>> = match ena_pairs {
+                Some(pairs) => {
+                    // Align to `resolved_all` by accession: runs that failed
+                    // NCBI resolution were dropped from it.
+                    let mut by_acc: std::collections::HashMap<_, _> = pairs.into_iter().collect();
+                    let aligned: Vec<_> = resolved_all
+                        .iter()
+                        .map(|r| by_acc.remove(&r.accession).flatten())
+                        .collect();
+                    let ena_hits = aligned.iter().filter(|v| v.is_some()).count();
+                    eprintln!(
+                        "ENA serves {} of {} accession(s); rest will use NCBI",
+                        style::count(ena_hits),
+                        style::count(resolved_all.len()),
+                    );
+                    aligned
+                }
+                None => vec![None; resolved_all.len()],
             };
 
             // `get` decodes each NCBI archive to FASTQ written beside it, so
