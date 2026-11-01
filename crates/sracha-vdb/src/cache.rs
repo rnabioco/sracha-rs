@@ -199,6 +199,44 @@ impl DecodedColumnBlob {
     }
 }
 
+/// Each byte's bits, MSB first, as eight 0/1 bytes.
+const UNPACK_BITS: [[u8; 8]; 256] = {
+    let mut t = [[0u8; 8]; 256];
+    let mut b = 0;
+    while b < 256 {
+        let mut i = 0;
+        while i < 8 {
+            t[b][i] = ((b >> (7 - i)) & 1) as u8;
+            i += 1;
+        }
+        b += 1;
+    }
+    t
+};
+
+/// Unpack `len_bits` bits starting at bit `start_bits` of `bytes` (MSB-first
+/// within each byte) into one 0/1 byte per bit. `None` when the range runs
+/// past `bytes`. A byte at a time through [`UNPACK_BITS`] rather than a
+/// bounds-checked shift per bit.
+fn unpack_bit_row(bytes: &[u8], start_bits: usize, len_bits: usize) -> Option<Vec<u8>> {
+    if len_bits == 0 {
+        return Some(Vec::new());
+    }
+    let first = start_bits / 8;
+    let head = start_bits % 8;
+    let last = (start_bits + len_bits).div_ceil(8);
+    let src = bytes.get(first..last)?;
+    let mut out = Vec::with_capacity(src.len() * 8);
+    for &b in src {
+        out.extend_from_slice(&UNPACK_BITS[b as usize]);
+    }
+    if head != 0 {
+        out.copy_within(head..head + len_bits, 0);
+    }
+    out.truncate(len_bits);
+    Some(out)
+}
+
 /// A `ColumnReader` plus a small most-recently-used cache of decoded blobs
 /// (one slot unless [`CachedColumn::slots`] raises it).
 ///
@@ -334,17 +372,10 @@ impl CachedColumn {
             let extent = blob.extent(logical_offset)?;
             let start_bits = extent.offset as usize;
             let len_bits = extent.len as usize;
-            let mut out = Vec::with_capacity(len_bits);
-            for i in 0..len_bits {
-                let bit_idx = start_bits + i;
-                let byte = bit_idx / 8;
-                let bit = 7 - (bit_idx % 8);
-                let b = blob.bytes.get(byte).copied().ok_or_else(|| {
-                    Error::Format(format!("bool row {row_id}: bit {bit_idx} past payload"))
-                })?;
-                out.push((b >> bit) & 1);
-            }
-            Ok(out)
+            unpack_bit_row(&blob.bytes, start_bits, len_bits).ok_or_else(|| {
+                let bit_idx = (blob.bytes.len() * 8).max(start_bits);
+                Error::Format(format!("bool row {row_id}: bit {bit_idx} past payload"))
+            })
         })
     }
 
@@ -751,5 +782,32 @@ mod tests {
         assert_eq!(blob.extent(0).unwrap(), RowExtent { offset: 0, len: 3 });
         assert_eq!(blob.extent(2).unwrap(), RowExtent { offset: 3, len: 3 });
         assert!(blob.extent(3).is_err());
+    }
+}
+
+#[cfg(test)]
+mod unpack_tests {
+    #[test]
+    fn unpack_bit_row_matches_per_bit_loop() {
+        let bytes: Vec<u8> = (0..64u32)
+            .map(|i| (i.wrapping_mul(2654435761) >> 7) as u8)
+            .collect();
+        for start in 0..40usize {
+            for len in 0..120usize {
+                let want: Option<Vec<u8>> = (0..len)
+                    .map(|i| {
+                        let bit = start + i;
+                        bytes.get(bit / 8).map(|b| (b >> (7 - bit % 8)) & 1)
+                    })
+                    .collect();
+                assert_eq!(
+                    super::unpack_bit_row(&bytes, start, len),
+                    want,
+                    "{start}+{len}"
+                );
+            }
+        }
+        // Past the end.
+        assert_eq!(super::unpack_bit_row(&bytes, 63 * 8, 9), None);
     }
 }
