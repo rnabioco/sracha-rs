@@ -774,9 +774,9 @@ async fn main() -> Result<()> {
                 // Skipped when the download phase short-circuited on a
                 // completion marker (outputs already exist): there is no temp
                 // SRA to scan, and `decode_sra` will skip on the marker too.
-                if downloaded.temp_path.exists() {
+                if let Some(temp_path) = downloaded.temp_path.as_deref() {
                     match sracha_core::pipeline::refseq::prepare_external_refseqs(
-                        &downloaded.temp_path,
+                        temp_path,
                         None,
                         &pipeline_config,
                     )
@@ -784,12 +784,8 @@ async fn main() -> Result<()> {
                     {
                         Ok(paths) => pipeline_config.refseq_paths = paths,
                         Err(e) => {
-                            suggest_ena_fallback(
-                                &http_client,
-                                &resolved.accession,
-                                &e.to_string(),
-                            )
-                            .await;
+                            suggest_ena_fallback(&http_client, &resolved.accession, &e.to_string())
+                                .await;
                             skipped_accessions.push(resolved.accession.clone());
                             continue;
                         }

@@ -241,3 +241,27 @@ fn fastq_corrupt_input_reports_error() {
         .assert()
         .stderr(predicate::str::contains("error").or(predicate::str::contains("Error")));
 }
+
+/// Re-running `sracha get` on an accession whose outputs already exist must
+/// succeed and say so. The second run skips the download, so there is no temp
+/// SRA — a stage that assumed one once failed every rerun with ENOENT.
+#[test]
+#[ignore] // network: resolves and downloads SRR28588231 (~23 MiB)
+fn get_rerun_skips_completed_accession() {
+    let tmp = tempfile::tempdir().unwrap();
+    let run = || {
+        let mut cmd = bin();
+        cmd.current_dir(tmp.path()).args(["get", "SRR28588231"]);
+        cmd
+    };
+
+    run().assert().success();
+    let r1 = tmp.path().join("SRR28588231_1.fastq.gz");
+    let first = std::fs::read(&r1).expect("first run writes outputs");
+
+    run()
+        .assert()
+        .success()
+        .stderr(predicate::str::contains("outputs already exist"));
+    assert_eq!(std::fs::read(&r1).unwrap(), first, "outputs untouched");
+}
