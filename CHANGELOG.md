@@ -1,5 +1,16 @@
 # Changelog
 
+## 0.10.1 (2026-11-01)
+
+### Fixes
+
+- Re-running `sracha get` on an accession whose outputs already exist no
+  longer fails with `I/O error: No such file or directory` (and a misleading
+  "can't reconstruct their cSRA" hint). It now reports the outputs as
+  already complete and skips. Errors from external-reference prep are only
+  treated as a cSRA limitation when they are one; I/O and other errors are
+  reported as ordinary failures ([#220]).
+
 ## 0.10.0 (2026-11-01)
 
 ### Features
@@ -29,6 +40,7 @@
   ([#208], [#210]), and `--prefer-ena` queries ENA concurrently with the NCBI
   resolve ([#215]).
 
+[#220]: https://github.com/rnabioco/sracha-rs/pull/220
 [#206]: https://github.com/rnabioco/sracha-rs/pull/206
 [#207]: https://github.com/rnabioco/sracha-rs/pull/207
 [#208]: https://github.com/rnabioco/sracha-rs/pull/208
