@@ -1886,3 +1886,66 @@ fn srr30022414_linkage_group_rows_1_and_2() {
         b"CB:TCAAACCAGTCATCCC-1|UB:CTAACCCTAACC"
     );
 }
+
+/// Regression guard for re-running a finished accession. The second run's
+/// download phase short-circuits on the completion marker and leaves no temp
+/// SRA behind; every later stage must cope with that. A refseq scan once
+/// opened the missing file and every rerun died with ENOENT.
+///
+/// The temp SRA is pre-seeded with a matching MD5 so the download phase
+/// treats it as a cache hit — no network beyond the fixture itself.
+#[test]
+#[ignore] // requires SRR28588231 fixture (network on first run)
+fn rerun_of_completed_accession_skips_cleanly() {
+    let fixture = ensure_srr28588231();
+    let acc = "SRR28588231";
+    let out = tempfile::tempdir().unwrap();
+    let mut config = test_config(out.path(), SplitMode::Split3, CompressionMode::None);
+    config.force = false;
+
+    let mut resolved = resolved_for_cancel(acc);
+    resolved.sra_file.size = std::fs::metadata(&fixture).unwrap().len();
+    resolved.sra_file.md5 = Some(md5_file(&fixture));
+
+    let rt = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    let run = |seed_temp: bool| {
+        if seed_temp {
+            std::fs::copy(&fixture, out.path().join(format!(".sracha-tmp-{acc}.sra"))).unwrap();
+        }
+        rt.block_on(async {
+            let downloaded = sracha_core::pipeline::download_sra(&resolved, &config)
+                .await
+                .unwrap();
+            let had_temp = downloaded.temp_path.is_some();
+            let stats = tokio::task::block_in_place(|| {
+                sracha_core::pipeline::decode_sra(&downloaded, &config)
+            })
+            .unwrap();
+            (had_temp, stats)
+        })
+    };
+
+    let (had_temp, first) = run(true);
+    assert!(had_temp, "first run decodes from a temp SRA");
+    assert!(first.spots_read > 0);
+    let before: Vec<Vec<u8>> = first
+        .output_files
+        .iter()
+        .map(|p| std::fs::read(p).unwrap())
+        .collect();
+
+    // Second run: nothing seeded, marker present.
+    let (had_temp, second) = run(false);
+    assert!(!had_temp, "marker hit must not claim a temp SRA exists");
+    assert_eq!(second.spots_read, 0, "rerun must skip decoding");
+    assert_eq!(second.output_files, first.output_files);
+    let after: Vec<Vec<u8>> = second
+        .output_files
+        .iter()
+        .map(|p| std::fs::read(p).unwrap())
+        .collect();
+    assert_eq!(before, after, "rerun must leave outputs untouched");
+}

@@ -1730,8 +1730,10 @@ fn run_fastq_csra(
 
 /// Result of the download phase of `run_get`.
 pub struct DownloadedSra {
-    /// Path to the temporary SRA file on disk.
-    pub temp_path: PathBuf,
+    /// Path to the temporary SRA file on disk, or `None` when the download
+    /// was skipped because a valid completion marker says the outputs already
+    /// exist (nothing was fetched, so there is no input to scan or decode).
+    pub temp_path: Option<PathBuf>,
     /// Bytes actually transferred over the network this session.
     pub bytes_transferred: u64,
     /// Total SRA file size on the server.
@@ -1768,10 +1770,8 @@ pub async fn download_sra(
         && check_completion_marker(&acc_dir, accession, config, total_sra_size).is_some()
     {
         tracing::info!("{accession}: outputs already exist, skipping download");
-        let temp_filename = format!(".sracha-tmp-{accession}.sra");
-        let temp_path = acc_dir.join(&temp_filename);
         return Ok(DownloadedSra {
-            temp_path,
+            temp_path: None,
             bytes_transferred: 0,
             total_sra_size,
             is_lite: resolved.sra_file.is_lite,
@@ -1835,7 +1835,7 @@ pub async fn download_sra(
     );
 
     Ok(DownloadedSra {
-        temp_path,
+        temp_path: Some(temp_path),
         bytes_transferred: dl_result.archive.bytes_transferred,
         total_sra_size,
         is_lite: resolved.sra_file.is_lite,
@@ -2096,10 +2096,12 @@ pub fn decode_sra(downloaded: &DownloadedSra, config: &PipelineConfig) -> Result
             downloaded.accession,
         );
         // Clean up temp SRA if the download produced one (cache hit path).
-        let _ = std::fs::remove_file(&downloaded.temp_path);
-        let sidecar = crate::download::progress_path(&downloaded.temp_path);
-        let _ = std::fs::remove_file(&sidecar);
-        remove_temp_vdbcache(&downloaded.temp_path);
+        if let Some(temp_path) = &downloaded.temp_path {
+            let _ = std::fs::remove_file(temp_path);
+            let sidecar = crate::download::progress_path(temp_path);
+            let _ = std::fs::remove_file(&sidecar);
+            remove_temp_vdbcache(temp_path);
+        }
 
         // Backfill metadata sidecar(s) the user asked for that a prior run
         // didn't record. The completion marker is keyed on the FASTQ output
@@ -2136,9 +2138,19 @@ pub fn decode_sra(downloaded: &DownloadedSra, config: &PipelineConfig) -> Result
         });
     }
 
+    // The download phase only omits the temp file when the completion marker
+    // matched; reaching here means the marker no longer validates (outputs
+    // were removed or changed in between), so there is nothing to decode.
+    let Some(temp_path) = downloaded.temp_path.as_deref() else {
+        return Err(Error::Pipeline(format!(
+            "{}: outputs were reported complete but no longer match; \
+             re-run with --force to regenerate them",
+            downloaded.accession,
+        )));
+    };
     let diag = Arc::new(IntegrityDiag::default());
     let decoded = decode_any(
-        &downloaded.temp_path,
+        temp_path,
         &downloaded.accession,
         config,
         downloaded.is_lite,
@@ -2163,8 +2175,8 @@ pub fn decode_sra(downloaded: &DownloadedSra, config: &PipelineConfig) -> Result
             // leave no artifacts). Otherwise keep it so the next run can
             // skip the download.
             if config.stdout {
-                let _ = std::fs::remove_file(&downloaded.temp_path);
-                remove_temp_vdbcache(&downloaded.temp_path);
+                let _ = std::fs::remove_file(temp_path);
+                remove_temp_vdbcache(temp_path);
                 tracing::info!(
                     "{}: cancelled, cleaned up {} partial output file(s) and temp SRA",
                     downloaded.accession,
@@ -2191,32 +2203,32 @@ pub fn decode_sra(downloaded: &DownloadedSra, config: &PipelineConfig) -> Result
     // Clean up temp file (or preserve it in the output dir if requested).
     if config.keep_sra && !config.stdout {
         let kept = acc_dir.join(format!("{}.sra", downloaded.accession));
-        if let Err(e) = std::fs::rename(&downloaded.temp_path, &kept) {
+        if let Err(e) = std::fs::rename(temp_path, &kept) {
             tracing::warn!(
                 "{}: failed to move temp SRA {} -> {}: {e}",
                 downloaded.accession,
-                downloaded.temp_path.display(),
+                temp_path.display(),
                 kept.display(),
             );
         }
         // Drop the progress sidecar — download is fully verified at this point.
-        let sidecar = crate::download::progress_path(&downloaded.temp_path);
+        let sidecar = crate::download::progress_path(temp_path);
         let _ = std::fs::remove_file(&sidecar);
         // The decoder probes `<archive>.vdbcache`, so keep the pair together.
-        let cache = vdbcache_path_for(&downloaded.temp_path);
+        let cache = vdbcache_path_for(temp_path);
         if cache.exists() {
             let _ = std::fs::rename(&cache, vdbcache_path_for(&kept));
         }
         let _ = std::fs::remove_file(crate::download::progress_path(&cache));
-    } else if let Err(e) = std::fs::remove_file(&downloaded.temp_path) {
+    } else if let Err(e) = std::fs::remove_file(temp_path) {
         tracing::warn!(
             "{}: failed to remove temp file {}: {e}",
             downloaded.accession,
-            downloaded.temp_path.display(),
+            temp_path.display(),
         );
     }
     // No-op when `keep_sra` already moved the vdbcache next to the kept archive.
-    remove_temp_vdbcache(&downloaded.temp_path);
+    remove_temp_vdbcache(temp_path);
 
     // Write run-metadata sidecar(s), if requested. Done before the
     // completion marker so the marker records the metadata file sizes too
@@ -2581,7 +2593,7 @@ mod tests {
         let size = std::fs::metadata(&temp_path).unwrap().len();
         decode_sra(
             &DownloadedSra {
-                temp_path,
+                temp_path: Some(temp_path),
                 bytes_transferred: 0,
                 total_sra_size: size,
                 is_lite: false,

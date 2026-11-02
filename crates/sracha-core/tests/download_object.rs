@@ -248,7 +248,7 @@ async fn get_downloads_the_vdbcache_where_decode_looks_for_it() {
     let downloaded = download_sra(&r, &pipeline_config(dir.path()))
         .await
         .unwrap();
-    let cache = vdbcache_path_for(&downloaded.temp_path);
+    let cache = vdbcache_path_for(downloaded.temp_path.as_deref().unwrap());
     assert_eq!(
         std::fs::read(&cache).expect("get must fetch the vdbcache"),
         vdb
@@ -283,9 +283,12 @@ async fn get_reuses_a_valid_kept_sra_and_its_vdbcache() {
     assert_eq!(downloaded.bytes_transferred, 0);
     assert!(sra_starts.lock().unwrap().is_empty());
     assert!(vdb_starts.lock().unwrap().is_empty());
-    assert_eq!(std::fs::read(&downloaded.temp_path).unwrap(), sra);
     assert_eq!(
-        std::fs::read(vdbcache_path_for(&downloaded.temp_path)).unwrap(),
+        std::fs::read(downloaded.temp_path.as_deref().unwrap()).unwrap(),
+        sra
+    );
+    assert_eq!(
+        std::fs::read(vdbcache_path_for(downloaded.temp_path.as_deref().unwrap())).unwrap(),
         vdb
     );
 }
@@ -303,7 +306,10 @@ async fn get_redownloads_a_truncated_kept_sra() {
     let downloaded = download_sra(&r, &keep_config(dir.path())).await.unwrap();
     assert!(downloaded.bytes_transferred > 0);
     assert!(!starts.lock().unwrap().is_empty());
-    assert_eq!(std::fs::read(&downloaded.temp_path).unwrap(), sra);
+    assert_eq!(
+        std::fs::read(downloaded.temp_path.as_deref().unwrap()).unwrap(),
+        sra
+    );
 }
 
 #[tokio::test]
