@@ -1920,9 +1920,10 @@ fn rerun_of_completed_accession_skips_cleanly() {
                 .await
                 .unwrap();
             let had_temp = downloaded.temp_path.is_some();
-            let stats =
-                tokio::task::block_in_place(|| sracha_core::pipeline::decode_sra(&downloaded, &config))
-                    .unwrap();
+            let stats = tokio::task::block_in_place(|| {
+                sracha_core::pipeline::decode_sra(&downloaded, &config)
+            })
+            .unwrap();
             (had_temp, stats)
         })
     };
