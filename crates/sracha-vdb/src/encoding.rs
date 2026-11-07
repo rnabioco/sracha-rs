@@ -229,16 +229,15 @@ pub fn merge_altread_bin(bases: &mut [u8], altread_bytes: &[u8], num_bases: usiz
     // bases per u64 word and only visit the bytes of words that have a set
     // nibble.
     const LOW_NIBBLES: u64 = 0x0F0F_0F0F_0F0F_0F0F;
-    let mut base_chunks = bases.chunks_exact_mut(8);
-    let mut alt_chunks = alt.chunks_exact(8);
-    for (b, a) in (&mut base_chunks).zip(&mut alt_chunks) {
-        let word = u64::from_le_bytes(a.try_into().unwrap());
-        if word & LOW_NIBBLES == 0 {
+    let (base_chunks, base_rem) = bases.as_chunks_mut::<8>();
+    let (alt_chunks, alt_rem) = alt.as_chunks::<8>();
+    for (b, a) in base_chunks.iter_mut().zip(alt_chunks) {
+        if u64::from_le_bytes(*a) & LOW_NIBBLES == 0 {
             continue;
         }
         merge_altread_bin_scalar(b, a);
     }
-    merge_altread_bin_scalar(base_chunks.into_remainder(), alt_chunks.remainder());
+    merge_altread_bin_scalar(base_rem, alt_rem);
 }
 
 #[inline]
