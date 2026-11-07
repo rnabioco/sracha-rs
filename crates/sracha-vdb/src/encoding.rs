@@ -222,14 +222,35 @@ pub fn merge_altread(bases: &mut [u8], altread_packed: &[u8], num_bases: usize) 
 #[inline]
 pub fn merge_altread_bin(bases: &mut [u8], altread_bytes: &[u8], num_bases: usize) {
     let count = bases.len().min(num_bases).min(altread_bytes.len());
-    for i in 0..count {
-        let nibble = altread_bytes[i] & 0x0F;
+    let bases = &mut bases[..count];
+    let alt = &altread_bytes[..count];
+
+    // ALTREAD is overwhelmingly zero (ambiguity codes are rare), so test eight
+    // bases per u64 word and only visit the bytes of words that have a set
+    // nibble.
+    const LOW_NIBBLES: u64 = 0x0F0F_0F0F_0F0F_0F0F;
+    let mut base_chunks = bases.chunks_exact_mut(8);
+    let mut alt_chunks = alt.chunks_exact(8);
+    for (b, a) in (&mut base_chunks).zip(&mut alt_chunks) {
+        let word = u64::from_le_bytes(a.try_into().unwrap());
+        if word & LOW_NIBBLES == 0 {
+            continue;
+        }
+        merge_altread_bin_scalar(b, a);
+    }
+    merge_altread_bin_scalar(base_chunks.into_remainder(), alt_chunks.remainder());
+}
+
+#[inline]
+fn merge_altread_bin_scalar(bases: &mut [u8], alt: &[u8]) {
+    for (base, &a) in bases.iter_mut().zip(alt) {
+        let nibble = a & 0x0F;
         if nibble == 0 {
             continue;
         }
-        let base_4na = ASCII_TO_4NA[bases[i] as usize];
+        let base_4na = ASCII_TO_4NA[*base as usize];
         let merged = base_4na | nibble;
-        bases[i] = DNA_4NA[(merged & 0x0F) as usize];
+        *base = DNA_4NA[(merged & 0x0F) as usize];
     }
 }
 

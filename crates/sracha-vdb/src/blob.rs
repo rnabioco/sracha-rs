@@ -1609,20 +1609,44 @@ fn zlib_raw_decompress(data: &[u8], max_out: usize) -> Result<Vec<u8>> {
     deflate_decompress(data, max_out)
 }
 
+thread_local! {
+    /// Per-thread libdeflate decompressor. Allocating one costs a malloc plus
+    /// init; blobs are small and numerous, so reuse it.
+    static TL_DECOMPRESSOR: std::cell::RefCell<libdeflater::Decompressor> =
+        std::cell::RefCell::new(libdeflater::Decompressor::new());
+}
+
+/// Owned raw libdeflate decompressor handle (for the `_ex` API, which
+/// `libdeflater` does not expose). Freed when the thread exits.
+struct RawDecompressor(*mut libdeflate_sys::libdeflate_decompressor);
+
+impl Drop for RawDecompressor {
+    fn drop(&mut self) {
+        if !self.0.is_null() {
+            // SAFETY: pointer came from libdeflate_alloc_decompressor and is
+            // freed exactly once here.
+            unsafe { libdeflate_sys::libdeflate_free_decompressor(self.0) };
+        }
+    }
+}
+
+thread_local! {
+    static TL_RAW_DECOMPRESSOR: RawDecompressor =
+        // SAFETY: plain allocation call; null is handled by the caller.
+        RawDecompressor(unsafe { libdeflate_sys::libdeflate_alloc_decompressor() });
+}
+
 /// Fast raw-deflate decompression via libdeflate.
 ///
 /// `expected_size` is the expected output size. If the actual decompressed
 /// data is larger, falls back to flate2 streaming decoder.
 pub fn deflate_decompress(data: &[u8], expected_size: usize) -> Result<Vec<u8>> {
-    use libdeflater::Decompressor;
-
     if data.is_empty() {
         return Ok(Vec::new());
     }
 
-    let mut decompressor = Decompressor::new();
     let mut out = vec![0u8; expected_size];
-    match decompressor.deflate_decompress(data, &mut out) {
+    match TL_DECOMPRESSOR.with(|d| d.borrow_mut().deflate_decompress(data, &mut out)) {
         Ok(actual) => {
             out.truncate(actual);
             Ok(out)
@@ -1636,15 +1660,12 @@ pub fn deflate_decompress(data: &[u8], expected_size: usize) -> Result<Vec<u8>> 
 
 /// Fast zlib (with header) decompression via libdeflate.
 pub fn zlib_decompress(data: &[u8], expected_size: usize) -> Result<Vec<u8>> {
-    use libdeflater::Decompressor;
-
     if data.is_empty() {
         return Ok(Vec::new());
     }
 
-    let mut decompressor = Decompressor::new();
     let mut out = vec![0u8; expected_size];
-    match decompressor.zlib_decompress(data, &mut out) {
+    match TL_DECOMPRESSOR.with(|d| d.borrow_mut().zlib_decompress(data, &mut out)) {
         Ok(actual) => {
             out.truncate(actual);
             Ok(out)
@@ -1664,7 +1685,7 @@ pub(crate) fn deflate_decompress_ex(data: &[u8], expected_size: usize) -> Result
         return Ok((Vec::new(), 0));
     }
 
-    let decompressor = unsafe { libdeflate_sys::libdeflate_alloc_decompressor() };
+    let decompressor = TL_RAW_DECOMPRESSOR.with(|d| d.0);
     if decompressor.is_null() {
         return Err(Error::Format(
             "failed to allocate libdeflate decompressor".into(),
@@ -1686,8 +1707,6 @@ pub(crate) fn deflate_decompress_ex(data: &[u8], expected_size: usize) -> Result
             &mut actual_out,
         )
     };
-
-    unsafe { libdeflate_sys::libdeflate_free_decompressor(decompressor) };
 
     if ret == 0 {
         // LIBDEFLATE_SUCCESS
