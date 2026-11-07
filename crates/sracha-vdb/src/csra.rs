@@ -20,7 +20,7 @@ use crate::kdb::ColumnReader;
 use crate::reference::ReferenceCursor;
 use crate::reference::ReferenceLayout;
 use crate::refseq::RefSeqStore;
-use crate::restore::{align_restore_read, seq_restore_read};
+use crate::restore::{align_restore_read, seq_restore_read_into};
 
 /// Given a `.sra` path, return the canonical `.sra.vdbcache` sibling path
 /// (NCBI's default layout — `sracha fetch` saves the vdbcache with that
@@ -144,11 +144,22 @@ enum ReadLens {
 }
 
 impl ReadLens {
-    fn row(&self, row_id: i64) -> Result<Vec<u32>> {
+    fn row_into(&self, row_id: i64, out: &mut Vec<u32>) -> Result<()> {
         match self {
-            Self::Column(c) => c.read_u32_row(row_id),
-            Self::Fixed(lens) => Ok(lens.clone()),
+            Self::Column(c) => c.read_u32_row_into(row_id, out),
+            Self::Fixed(lens) => {
+                out.clear();
+                out.extend_from_slice(lens);
+                Ok(())
+            }
         }
+    }
+
+    #[cfg(test)]
+    fn row(&self, row_id: i64) -> Result<Vec<u32>> {
+        let mut out = Vec::new();
+        self.row_into(row_id, &mut out)?;
+        Ok(out)
     }
 }
 
@@ -251,6 +262,23 @@ pub struct SpotRead {
     pub read_lens: Vec<u32>,
     /// Per-read type bitfield (SEQUENCE.READ_TYPE).
     pub read_types: Vec<u8>,
+}
+
+/// Reusable per-worker buffers for [`CsraCursor::read_spot_into`], so the
+/// hot loop allocates nothing per spot once the buffers have grown.
+#[derive(Debug, Default)]
+pub struct SpotScratch {
+    /// Reconstructed bases in 4na-bin; same meaning as [`SpotRead::bases`].
+    pub bases: Vec<u8>,
+    /// Raw Phred bytes, one per base.
+    pub quality: Vec<u8>,
+    /// Per-read lengths.
+    pub read_lens: Vec<u32>,
+    /// Per-read INSDC `xread_type` bytes.
+    pub read_types: Vec<u8>,
+    align_ids: Vec<i64>,
+    cmp_read: Vec<u8>,
+    altmask: Vec<u8>,
 }
 
 impl CsraCursor {
@@ -532,41 +560,55 @@ impl CsraCursor {
 
     /// Decode one SEQUENCE row's full bases + quality.
     pub fn read_spot(&self, row_id: i64) -> Result<SpotRead> {
-        let align_ids = self.primary_alignment_id.read_i64_row(row_id)?;
-        let read_lens = self.read_len.row(row_id)?;
-        let read_types = self.read_type.read_byte_row(row_id)?;
-        let mut cmp_read_2na = match &self.cmp_read {
-            Some(c) => c.read_2na_row(row_id)?,
-            None => Vec::new(),
-        };
+        let mut sc = SpotScratch::default();
+        self.read_spot_into(row_id, &mut sc)?;
+        Ok(SpotRead {
+            bases: sc.bases,
+            quality: sc.quality,
+            read_lens: sc.read_lens,
+            read_types: sc.read_types,
+        })
+    }
+
+    /// [`read_spot`](Self::read_spot) into reusable buffers.
+    pub fn read_spot_into(&self, row_id: i64, sc: &mut SpotScratch) -> Result<()> {
+        self.primary_alignment_id
+            .read_i64_row_into(row_id, &mut sc.align_ids)?;
+        self.read_len.row_into(row_id, &mut sc.read_lens)?;
+        self.read_type
+            .read_byte_row_into(row_id, &mut sc.read_types)?;
+        sc.cmp_read.clear();
+        if let Some(c) = &self.cmp_read {
+            c.append_2na_range(row_id, 0, usize::MAX, &mut sc.cmp_read)?;
+        }
         // Restore ambiguity codes into the unaligned bases before splicing:
         // 2na has no N, so the mask is the only thing that distinguishes an
         // uncalled base from an A.
         if let Some(alt) = &self.cmp_altread
-            && !cmp_read_2na.is_empty()
+            && !sc.cmp_read.is_empty()
         {
-            let mask = alt.read_byte_row(row_id)?;
-            crate::refseq::overlay_altread(&mut cmp_read_2na, &mask);
+            alt.read_byte_row_into(row_id, &mut sc.altmask)?;
+            crate::refseq::overlay_altread(&mut sc.cmp_read, &sc.altmask);
         }
-        let quality = self.quality.read_byte_row(row_id)?;
+        self.quality.read_byte_row_into(row_id, &mut sc.quality)?;
 
-        if read_lens.len() != align_ids.len() || read_types.len() != align_ids.len() {
+        if sc.read_lens.len() != sc.align_ids.len() || sc.read_types.len() != sc.align_ids.len() {
             return Err(Error::Format(format!(
                 "csra row {row_id}: inconsistent per-read array lengths \
                  (align_ids={}, read_lens={}, read_types={})",
-                align_ids.len(),
-                read_lens.len(),
-                read_types.len(),
+                sc.align_ids.len(),
+                sc.read_lens.len(),
+                sc.read_types.len(),
             )));
         }
 
         // Splice via seq_restore_read. fetch_aligned resolves an alignment
         // row id to its reference-oriented bases via align_restore_read.
-        let bases = seq_restore_read(
-            &cmp_read_2na,
-            &align_ids,
-            &read_lens,
-            &read_types,
+        seq_restore_read_into(
+            &sc.cmp_read,
+            &sc.align_ids,
+            &sc.read_lens,
+            &sc.read_types,
             |alignment_id| {
                 let row = self.alignment.read_row(alignment_id)?;
                 let ref_read = self
@@ -581,14 +623,8 @@ impl CsraCursor {
                     row.has_mismatch.len(),
                 )
             },
-        )?;
-
-        Ok(SpotRead {
-            bases,
-            quality,
-            read_lens,
-            read_types,
-        })
+            &mut sc.bases,
+        )
     }
 }
 
