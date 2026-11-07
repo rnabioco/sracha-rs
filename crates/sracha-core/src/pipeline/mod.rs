@@ -427,6 +427,10 @@ fn decode_and_write(
         config.run_info.as_ref().and_then(|ri| ri.spots),
     )?;
 
+    // Spot window (`-N`/`-X`): only the blobs overlapping it are decoded.
+    let spot_range = config.spot_range();
+    let windowed = spot_range.is_some();
+
     // Load Illumina name format templates from skey index.
     let (name_templates, name_spot_starts): (Vec<Vec<u8>>, Vec<i64>) =
         if cursor.has_illumina_name_parts() {
@@ -763,16 +767,29 @@ fn decode_and_write(
         // `spots_read` doesn't happen until it has processed a batch.
         // DRR045255 (3658 blobs) used to emit `spots_before=0` for batch 2
         // onwards, resetting the FASTQ defline spot number to 1.
-        let mut cumulative_spots: u64 = 0;
-        let mut blob_idx: usize = 0;
-        while blob_idx < num_blobs {
+        let (first_blob, end_blob, spots_skipped) = match spot_range {
+            Some((first, last)) => blob_window(
+                &cursor
+                    .read_col()
+                    .blobs()
+                    .iter()
+                    .map(|b| b.id_range)
+                    .collect::<Vec<_>>(),
+                first,
+                last,
+            ),
+            None => (0, num_blobs, 0),
+        };
+        let mut cumulative_spots: u64 = spots_skipped;
+        let mut blob_idx: usize = first_blob;
+        while blob_idx < end_blob {
             if let Some(ref flag) = config.cancelled
                 && flag.load(Ordering::Relaxed)
             {
                 break;
             }
 
-            let batch_end = (blob_idx + batch_size).min(num_blobs);
+            let batch_end = (blob_idx + batch_size).min(end_blob);
 
             let blob_id_ranges: Vec<u32> = (blob_idx..batch_end)
                 .map(|bi| cursor.read_col().blobs()[bi].id_range)
@@ -1015,6 +1032,7 @@ fn decode_and_write(
     // operate on reads within a spot, not on spots themselves, so every spot should
     // still be traversed.
     if let Some(expected) = config.run_info.as_ref().and_then(|ri| ri.spots)
+        && !windowed
         && expected != total_spots
     {
         // Don't rename partials into place if the spot count is wrong —
@@ -1070,7 +1088,7 @@ fn decode_and_write(
     // every other — #118 lost exactly half of five runs that way, with static
     // READ_LEN and the decoded buffer in perfect agreement at 50 of 100 bases
     // per spot.
-    if let Some(expected) = expected_bio_bases.filter(|&n| n > 0) {
+    if let Some(expected) = expected_bio_bases.filter(|&n| n > 0 && !windowed) {
         let seen = diag.bio_bases_seen.load(Ordering::Relaxed);
         if seen != expected {
             diag.base_count_mismatch.fetch_add(1, Ordering::Relaxed);
@@ -1094,7 +1112,7 @@ fn decode_and_write(
     // deliberately not the stored ones, so the histogram would disagree by
     // design — and a check that fires when nothing is wrong teaches people to
     // pass `--no-strict`.
-    if let Some(expected_hist) = expected_quality_hist.as_deref() {
+    if let Some(expected_hist) = expected_quality_hist.as_deref().filter(|_| !windowed) {
         let synthesized = diag.all_zero_quality_blobs.load(Ordering::Relaxed) != 0
             || diag.quality_overruns.load(Ordering::Relaxed) != 0;
         if config.fasta || is_lite || synthesized {
@@ -1140,7 +1158,7 @@ fn decode_and_write(
     // cannot see a run that emits the right total bases across the wrong
     // number of spots — issue #22 was exactly that. `sracha validate` has
     // always compared these; the conversion path never did.
-    if expected_spots > 0 && total_spots != expected_spots {
+    if expected_spots > 0 && !windowed && total_spots != expected_spots {
         diag.spot_count_mismatch.fetch_add(1, Ordering::Relaxed);
         tracing::warn!(
             "{accession}: decoded {total_spots} spots but the SEQUENCE table \
@@ -1181,10 +1199,23 @@ fn decode_any(
     // Reference-compressed cSRA (bases in PRIMARY_ALIGNMENT + REFERENCE rather
     // than a physical SEQUENCE.READ) can't decode through the regular
     // VdbCursor; route it through CsraCursor's splice.
+    if let Some((first, last)) = config.spot_range()
+        && first > last
+    {
+        return Err(Error::Pipeline(format!(
+            "{acc}: --min-spot-id ({first}) is greater than --max-spot-id ({last})"
+        )));
+    }
     let vdbcache = csra_vdbcache_path(sra_path);
     let decoded = if crate::vdb::csra::looks_like_decodable_csra(sra_path, vdbcache.as_deref())
         .unwrap_or(false)
     {
+        if config.spot_range().is_some() {
+            return Err(Error::Pipeline(format!(
+                "{acc}: --min-spot-id/--max-spot-id are not supported for \
+                 reference-compressed (cSRA) runs"
+            )));
+        }
         run_fastq_csra(sra_path, acc, config, vdbcache.as_deref())
             .map(|s| (s.spots_read, s.reads_written, s.output_files))
     } else {
@@ -1331,6 +1362,36 @@ pub fn run_fastq(
     })
 }
 
+/// Blobs overlapping the 1-based inclusive spot window `first..=last`.
+///
+/// `id_ranges` is each blob's row count in order. Returns
+/// `(first_blob, end_blob_exclusive, spots_before_first_blob)`; when the
+/// window lies past the last row, `first_blob == end_blob`.
+pub(crate) fn blob_window(id_ranges: &[u32], first: u64, last: u64) -> (usize, usize, u64) {
+    if first > last {
+        return (0, 0, 0);
+    }
+    let mut before = 0u64;
+    let mut start: Option<(usize, u64)> = None;
+    let mut end = id_ranges.len();
+    for (i, &n) in id_ranges.iter().enumerate() {
+        let lo = before + 1;
+        let hi = before + n as u64;
+        if start.is_none() && hi >= first {
+            start = Some((i, before));
+        }
+        if lo > last {
+            end = i;
+            break;
+        }
+        before = hi;
+    }
+    match start {
+        Some((s, b)) if s < end => (s, end, b),
+        _ => (end, end, before),
+    }
+}
+
 /// Compute the `spots_before` offset for each blob in a single decode
 /// batch, given the cumulative spot count before the batch and the
 /// batch's per-blob `id_range`s. Returns `(per_blob, total_spots_in_batch)`.
@@ -1352,7 +1413,30 @@ pub(crate) fn spots_before_per_blob_in_batch(
 
 #[cfg(test)]
 mod batch_spots_tests {
-    use super::spots_before_per_blob_in_batch;
+    use super::{blob_window, spots_before_per_blob_in_batch};
+
+    #[test]
+    fn blob_window_picks_overlapping_blobs() {
+        // Blobs cover spots 1-100, 101-300, 301-350.
+        let r = [100u32, 200, 50];
+        assert_eq!(blob_window(&r, 1, u64::MAX), (0, 3, 0));
+        assert_eq!(blob_window(&r, 1, 100), (0, 1, 0));
+        assert_eq!(blob_window(&r, 100, 101), (0, 2, 0));
+        assert_eq!(blob_window(&r, 101, 300), (1, 2, 100));
+        assert_eq!(blob_window(&r, 150, 320), (1, 3, 100));
+        assert_eq!(blob_window(&r, 350, 999), (2, 3, 300));
+    }
+
+    #[test]
+    fn blob_window_past_end_or_inverted_is_empty() {
+        let r = [100u32, 200];
+        let (s, e, _) = blob_window(&r, 301, 400);
+        assert_eq!(s, e);
+        let (s, e, _) = blob_window(&r, 50, 10);
+        assert_eq!(s, e);
+        let (s, e, _) = blob_window(&[], 1, 10);
+        assert_eq!(s, e);
+    }
 
     #[test]
     fn single_batch_starts_at_zero() {

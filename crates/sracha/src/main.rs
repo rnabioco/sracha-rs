@@ -409,7 +409,9 @@ async fn main() -> Result<()> {
                         | sracha_core::fastq::SplitMode::SplitFiles
                 )
                 && !args.fasta
-                && !args.stdout;
+                && !args.stdout
+                && args.min_spot_id.is_none()
+                && args.max_spot_id.is_none();
 
             if args.prefer_ena && !ena_compatible {
                 tracing::info!(

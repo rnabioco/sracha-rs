@@ -100,6 +100,10 @@ pub struct PipelineConfig {
     /// (`--refseq-cache`). `None` uses `$SRACHA_REFSEQ_DIR` or the
     /// platform cache dir.
     pub refseq_cache_dir: Option<PathBuf>,
+    /// First spot (1-based, inclusive) to convert (`--min-spot-id`).
+    pub min_spot_id: Option<u64>,
+    /// Last spot (1-based, inclusive) to convert (`--max-spot-id`).
+    pub max_spot_id: Option<u64>,
 }
 
 impl Default for PipelineConfig {
@@ -136,11 +140,25 @@ impl Default for PipelineConfig {
             metadata_row: None,
             refseq_paths: Vec::new(),
             refseq_cache_dir: None,
+            min_spot_id: None,
+            max_spot_id: None,
         }
     }
 }
 
 impl PipelineConfig {
+    /// The requested spot window as `(first, last)`, 1-based and inclusive,
+    /// or `None` when the whole run is converted.
+    pub fn spot_range(&self) -> Option<(u64, u64)> {
+        if self.min_spot_id.is_none() && self.max_spot_id.is_none() {
+            return None;
+        }
+        Some((
+            self.min_spot_id.unwrap_or(1).max(1),
+            self.max_spot_id.unwrap_or(u64::MAX),
+        ))
+    }
+
     /// Directory where outputs for `accession` should be written.
     /// With `folder_per_accession`, this is `output_dir / accession`.
     /// Otherwise it's `output_dir`.
@@ -185,6 +203,7 @@ impl From<&PipelineConfig> for crate::fastq::FastqConfig {
             paired_suffix: c.paired_suffix,
             seq_defline: c.seq_defline.clone(),
             qual_defline: c.qual_defline.clone(),
+            spot_range: c.spot_range(),
         }
     }
 }
@@ -202,6 +221,21 @@ mod tests {
             folder_per_accession,
             ..Default::default()
         }
+    }
+
+    #[test]
+    fn spot_range_is_none_by_default_and_fills_open_ends() {
+        let mut cfg = test_config(false);
+        assert_eq!(cfg.spot_range(), None);
+        cfg.max_spot_id = Some(10);
+        assert_eq!(cfg.spot_range(), Some((1, 10)));
+        cfg.min_spot_id = Some(5);
+        cfg.max_spot_id = None;
+        assert_eq!(cfg.spot_range(), Some((5, u64::MAX)));
+        assert_eq!(
+            crate::fastq::FastqConfig::from(&cfg).spot_range,
+            Some((5, u64::MAX))
+        );
     }
 
     #[test]

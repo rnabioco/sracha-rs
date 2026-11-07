@@ -104,6 +104,12 @@ Filtering:
       --min-read-len <MIN_READ_LEN>
           Minimum read length
 
+  -N, --min-spot-id <SPOT>
+          First spot to convert, 1-based and inclusive (fastq-dump `-N` / `--minSpotId`). Output is identical to that slice of a full conversion. Not supported for reference-compressed (cSRA) runs
+
+  -X, --max-spot-id <SPOT>
+          Last spot to convert, 1-based and inclusive (fastq-dump `-X` / `--maxSpotId`; with `--min-spot-id 1` this is fasterq-dump `--row-limit`). Not supported for cSRA runs
+
       --include-technical
           Include technical reads (skipped by default)
 

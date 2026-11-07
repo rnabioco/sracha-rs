@@ -1249,6 +1249,7 @@ pub(crate) fn decode_blob_to_fastq(
     }
     let mut segments: Vec<ReadSeg> = Vec::with_capacity(rps);
     let mut bio_bases_in_blob: u64 = 0;
+    let mut spots_outside_window: u64 = 0;
 
     while rl_cursor + rps <= read_lengths.len() {
         let spot_read_lengths = &read_lengths[rl_cursor..rl_cursor + rps];
@@ -1263,6 +1264,24 @@ pub(crate) fn decode_blob_to_fastq(
                 read_data.len(),
             );
             break;
+        }
+
+        // Spot window (`-N`/`-X`): step over spots outside it, advancing every
+        // per-spot cursor exactly as a decoded spot would so the spots inside
+        // the window read the same bytes as in a full conversion.
+        if let Some((first, last)) = config.spot_range {
+            let spot_number = spots_before + spot_idx_in_blob as u64 + 1;
+            if spot_number < first || spot_number > last {
+                seq_offset = seq_end;
+                if !quality_is_empty {
+                    qual_offset += spot_total_bases;
+                }
+                rt_offset += rps;
+                rl_cursor += rps;
+                spot_idx_in_blob += 1;
+                spots_outside_window += 1;
+                continue;
+            }
         }
 
         // Borrow slices directly -- no .to_vec().
@@ -1510,7 +1529,7 @@ pub(crate) fn decode_blob_to_fastq(
     }
     records.extend(slot_overflow);
 
-    Ok((records, spot_idx_in_blob as u64))
+    Ok((records, spot_idx_in_blob as u64 - spots_outside_window))
 }
 
 #[cfg(test)]
