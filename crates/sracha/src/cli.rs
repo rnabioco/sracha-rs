@@ -276,10 +276,10 @@ pub struct DecodeArgs {
     /// Custom defline template (fasterq-dump `--seq-defline` syntax).
     /// Variables: $ac (accession) $si (spot id) $ri (read id) $sn (spot/read
     /// name) $rl (read length) $lg (LINKAGE_GROUP, e.g. 10x 'CB:..|UB:..';
-    /// cSRA runs only); $$ is a literal '$'. Example: '@$ac.$si.$ri'.
+    /// cSRA runs only) $sg (SPOT_GROUP, e.g. barcode; non-cSRA runs only); $$ is a literal '$'. Example: '@$ac.$si.$ri'.
     /// For PacBio/ONT, $sn is the native read name (e.g. PacBio
     /// 'm64012_.../ccs', ONT '<uuid> ch=.. start_time=..'); it is also the
-    /// default header. The '+' line mirrors this. ($sg/spot-group unsupported.)
+    /// default header. The '+' line mirrors this.
     #[arg(
         long,
         value_name = "TEMPLATE",
@@ -346,6 +346,10 @@ pub struct DecodeArgs {
     /// Minimum read length
     #[arg(long, help_heading = "Filtering")]
     pub min_read_len: Option<u32>,
+
+    /// Keep only reads with this READ_FILTER value (like fastq-dump -R)
+    #[arg(long, value_enum, value_name = "VALUE", help_heading = "Filtering")]
+    pub read_filter: Option<ReadFilter>,
 
     /// Include technical reads (skipped by default)
     #[arg(long, help_heading = "Filtering")]
@@ -588,6 +592,7 @@ impl DecodeArgs {
             threads: self.threads,
             skip_technical: !self.include_technical,
             min_read_len: self.min_read_len,
+            read_filter: self.read_filter.map(Into::into),
             force: self.force,
             progress: !self.no_progress && !self.stdout,
             fasta: self.fasta,
@@ -758,6 +763,29 @@ impl From<SplitMode> for fastq::SplitMode {
             SplitMode::SplitFiles => fastq::SplitMode::SplitFiles,
             SplitMode::SplitSpot => fastq::SplitMode::SplitSpot,
             SplitMode::Interleaved => fastq::SplitMode::Interleaved,
+        }
+    }
+}
+
+#[derive(Clone, Copy, ValueEnum)]
+pub enum ReadFilter {
+    /// Reads that passed the platform quality filter
+    Pass,
+    /// Reads rejected by the platform quality filter
+    Reject,
+    /// Reads rejected by the submitter's criteria
+    Criteria,
+    /// Redacted reads
+    Redacted,
+}
+
+impl From<ReadFilter> for fastq::ReadFilter {
+    fn from(f: ReadFilter) -> Self {
+        match f {
+            ReadFilter::Pass => fastq::ReadFilter::Pass,
+            ReadFilter::Reject => fastq::ReadFilter::Reject,
+            ReadFilter::Criteria => fastq::ReadFilter::Criteria,
+            ReadFilter::Redacted => fastq::ReadFilter::Redacted,
         }
     }
 }

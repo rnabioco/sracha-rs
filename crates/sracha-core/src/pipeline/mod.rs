@@ -525,6 +525,23 @@ fn decode_and_write(
     let read_type_blob_count = cursor.read_type_col().map_or(0, |c| c.blob_count());
     let read_type_cs = cursor.read_type_col().map_or(0, |c| c.meta().checksum_type);
 
+    // READ_FILTER drives `--read-filter` and the SRA-lite reject quality;
+    // SPOT_GROUP is only read when a defline template uses `$sg`. Neither
+    // column is touched otherwise.
+    let has_read_filter =
+        (fastq_config.read_filter.is_some() || is_lite) && cursor.read_filter_col().is_some();
+    let read_filter_cs = cursor
+        .read_filter_col()
+        .map_or(0, |c| c.meta().checksum_type);
+    let has_spot_group = [&fastq_config.seq_defline, &fastq_config.qual_defline]
+        .into_iter()
+        .flatten()
+        .any(|t| t.uses_spot_group())
+        && cursor.spot_group_col().is_some();
+    let spot_group_cs = cursor
+        .spot_group_col()
+        .map_or(0, |c| c.meta().checksum_type);
+
     let has_altread = cursor.altread_col().is_some();
     let has_illumina_name_parts = cursor.has_illumina_name_parts();
     let _altread_blob_count = cursor.altread_col().map_or(0, |c| c.blob_count());
@@ -856,6 +873,36 @@ fn decode_and_write(
                             (&[], 0, 0)
                         };
 
+                        // READ_FILTER and SPOT_GROUP, by row id like READ_TYPE.
+                        let (rf_raw, rf_id_range, rf_start_id): (&[u8], u64, i64) =
+                            if has_read_filter {
+                                let col = cursor.read_filter_col().unwrap();
+                                match col.find_blob(read_start_id) {
+                                    Some(blob) => (
+                                        col.read_raw_blob_slice(blob.start_id)?,
+                                        blob.id_range as u64,
+                                        blob.start_id,
+                                    ),
+                                    None => (&[], 0, 0),
+                                }
+                            } else {
+                                (&[], 0, 0)
+                            };
+                        let (sg_raw, sg_id_range, sg_start_id): (&[u8], u64, i64) =
+                            if has_spot_group {
+                                let col = cursor.spot_group_col().unwrap();
+                                match col.find_blob(read_start_id) {
+                                    Some(blob) => (
+                                        col.read_raw_blob_slice(blob.start_id)?,
+                                        blob.id_range as u64,
+                                        blob.start_id,
+                                    ),
+                                    None => (&[], 0, 0),
+                                }
+                            } else {
+                                (&[], 0, 0)
+                            };
+
                         // ALTREAD column: 4na ambiguity mask (also triggers
                         // Illumina name reconstruction when X + Y present).
                         //
@@ -937,6 +984,16 @@ fn decode_and_write(
                             read_type_id_range: rt_id_range,
                             read_type_start_id: rt_start_id,
                             read_type_cs,
+                            read_filter_raw: rf_raw,
+                            read_filter_id_range: rf_id_range,
+                            read_filter_start_id: rf_start_id,
+                            read_filter_cs,
+                            has_read_filter,
+                            spot_group_raw: sg_raw,
+                            spot_group_id_range: sg_id_range,
+                            spot_group_start_id: sg_start_id,
+                            spot_group_cs,
+                            has_spot_group,
                             altread_raw: alt_raw,
                             altread_id_range: alt_id_range,
                             altread_start_id: alt_start_id,

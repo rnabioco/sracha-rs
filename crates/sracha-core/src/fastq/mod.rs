@@ -269,6 +269,8 @@ pub struct FastqConfig {
     pub skip_technical: bool,
     /// Discard reads shorter than this length, if set.
     pub min_read_len: Option<u32>,
+    /// Keep only reads whose `READ_FILTER` equals this value, if set.
+    pub read_filter: Option<ReadFilter>,
     /// Output FASTA instead of FASTQ (drops quality line).
     pub fasta: bool,
     /// Suffix style for paired/split output filenames.
@@ -289,6 +291,7 @@ impl Default for FastqConfig {
             split_mode: SplitMode::Split3,
             skip_technical: true,
             min_read_len: None,
+            read_filter: None,
             fasta: false,
             paired_suffix: PairedSuffix::Numeric,
             seq_defline: None,
@@ -318,6 +321,41 @@ pub enum OutputSlot {
     Unpaired,
     /// `_N.fastq[.gz]` (Nth read in SplitFiles mode, 0-indexed).
     ReadN(u32),
+}
+
+/// Value of the INSDC `READ_FILTER` column (`fastq-dump -R` semantics).
+///
+/// With `--read-filter <value>` only reads whose `READ_FILTER` equals that
+/// value are written. The numeric codes are the `INSDC:SRA:read_filter`
+/// values; a read of a run without a `READ_FILTER` column counts as `Pass`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ReadFilter {
+    /// Read passed the platform quality filter (0).
+    Pass = 0,
+    /// Read was rejected by the platform quality filter (1).
+    Reject = 1,
+    /// Read was rejected by the submitter's criteria (2).
+    Criteria = 2,
+    /// Read was redacted (3).
+    Redacted = 3,
+}
+
+impl ReadFilter {
+    /// The `INSDC:SRA:read_filter` code stored in the column.
+    pub fn code(self) -> u8 {
+        self as u8
+    }
+}
+
+impl std::fmt::Display for ReadFilter {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            ReadFilter::Pass => "pass",
+            ReadFilter::Reject => "reject",
+            ReadFilter::Criteria => "criteria",
+            ReadFilter::Redacted => "redacted",
+        })
+    }
 }
 
 /// Filename suffix style for paired / split FASTQ outputs.
@@ -647,6 +685,8 @@ pub(crate) struct SegmentRecord<'a> {
     pub description: Option<&'a [u8]>,
     /// The spot's `LINKAGE_GROUP` (`$lg`); empty when absent.
     pub linkage_group: &'a [u8],
+    /// The spot's `SPOT_GROUP` (`$sg`); empty when absent.
+    pub spot_group: &'a [u8],
     pub sequence: &'a [u8],
     /// Ignored (and may be empty) for FASTA output.
     pub quality: &'a [u8],
@@ -680,6 +720,7 @@ pub(crate) fn append_segment_record(
             seg.mate_idx,
             seg.original_name,
             seg.linkage_group,
+            seg.spot_group,
             seg.sequence,
             seg.quality,
             style.qual_defline,
@@ -731,6 +772,7 @@ pub(crate) fn append_segment_record(
                 spot_id: seg.spot_number,
                 read_id: seg.mate_idx,
                 linkage_group: seg.linkage_group,
+                spot_group: seg.spot_group,
             }),
             diag,
         );
@@ -831,6 +873,7 @@ pub fn format_spot(
         &segments,
         &spot.name,
         &spot.linkage_group,
+        &spot.spot_group,
         run_name,
         config,
         spot.read_lengths.len(),
@@ -898,6 +941,7 @@ fn route_segments_to_slots(
     segments: &[ReadSegment<'_>],
     spot_name: &[u8],
     linkage_group: &[u8],
+    spot_group: &[u8],
     run_name: &str,
     config: &FastqConfig,
     spot_reads: usize,
@@ -921,6 +965,7 @@ fn route_segments_to_slots(
                 original_name: Some(spot_name),
                 description: Some(spot_name),
                 linkage_group,
+                spot_group,
                 sequence: seg.sequence,
                 quality: seg.quality,
             },
@@ -2192,6 +2237,7 @@ mod tests {
                 spot_id: b"1",
                 read_id: 2,
                 linkage_group: b"",
+                spot_group: b"",
             }),
             None,
         );
@@ -2214,6 +2260,7 @@ mod tests {
                 spot_id: b"1",
                 read_id: 2,
                 linkage_group: b"",
+                spot_group: b"",
             }),
             None,
         );
@@ -2240,6 +2287,7 @@ mod tests {
                 original_name: name,
                 description: name,
                 linkage_group: b"",
+                spot_group: b"",
                 sequence: b"ACGT",
                 quality: b"IIII",
             },
@@ -2334,6 +2382,7 @@ mod tests {
                 original_name: None,
                 description: None,
                 linkage_group: b"",
+                spot_group: b"",
                 sequence: b"AC",
                 quality: b"II",
             },
