@@ -347,6 +347,30 @@ pub struct DecodeArgs {
     #[arg(long, help_heading = "Filtering")]
     pub min_read_len: Option<u32>,
 
+    /// First spot to convert, 1-based and inclusive (fastq-dump `-N`
+    /// / `--minSpotId`). Output is identical to that slice of a full
+    /// conversion. Not supported for reference-compressed (cSRA) runs.
+    #[arg(
+        short = 'N',
+        long,
+        value_name = "SPOT",
+        value_parser = clap::value_parser!(u64).range(1..),
+        help_heading = "Filtering"
+    )]
+    pub min_spot_id: Option<u64>,
+
+    /// Last spot to convert, 1-based and inclusive (fastq-dump `-X`
+    /// / `--maxSpotId`; with `--min-spot-id 1` this is fasterq-dump
+    /// `--row-limit`). Not supported for cSRA runs.
+    #[arg(
+        short = 'X',
+        long,
+        value_name = "SPOT",
+        value_parser = clap::value_parser!(u64).range(1..),
+        help_heading = "Filtering"
+    )]
+    pub max_spot_id: Option<u64>,
+
     /// Include technical reads (skipped by default)
     #[arg(long, help_heading = "Filtering")]
     pub include_technical: bool,
@@ -588,6 +612,8 @@ impl DecodeArgs {
             threads: self.threads,
             skip_technical: !self.include_technical,
             min_read_len: self.min_read_len,
+            min_spot_id: self.min_spot_id,
+            max_spot_id: self.max_spot_id,
             force: self.force,
             progress: !self.no_progress && !self.stdout,
             fasta: self.fasta,

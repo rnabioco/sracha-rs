@@ -35,6 +35,8 @@ struct CompletionMarker {
     fasta: bool,
     skip_technical: bool,
     min_read_len: Option<u32>,
+    #[serde(default)]
+    spot_range: Option<(u64, u64)>,
     output_files: Vec<(String, u64)>,
 }
 
@@ -220,6 +222,7 @@ pub(crate) fn write_completion_marker(
         fasta: config.fasta,
         skip_technical: config.skip_technical,
         min_read_len: config.min_read_len,
+        spot_range: config.spot_range(),
         output_files: file_entries,
     };
 
@@ -266,6 +269,9 @@ pub(crate) fn check_completion_marker(
         return None;
     }
     if marker.min_read_len != config.min_read_len {
+        return None;
+    }
+    if marker.spot_range != config.spot_range() {
         return None;
     }
 
@@ -406,6 +412,10 @@ mod tests {
 
         let mut other = test_config(dir.path());
         other.min_read_len = Some(25);
+        assert!(check_completion_marker(dir.path(), "SRR1", &other, 1234).is_none());
+
+        let mut other = test_config(dir.path());
+        other.max_spot_id = Some(100);
         assert!(check_completion_marker(dir.path(), "SRR1", &other, 1234).is_none());
     }
 

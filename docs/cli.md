@@ -77,6 +77,8 @@ sracha get [OPTIONS] [ACCESSION]...
 | `--qual-defline <TEMPLATE>` | | Custom `+`-line template, same variables as `--seq-defline`; `+` alone writes a bare `+` ([#162](https://github.com/rnabioco/sracha-rs/issues/162)) |
 | `--min-read-len <N>` | | Minimum read length filter |
 | `--include-technical` | | Include technical reads (skipped by default) |
+| `-N, --min-spot-id <SPOT>` | | First spot to convert, 1-based and inclusive. Output is byte-identical to that slice of a full conversion (spot numbers in deflines are unchanged). Not supported for cSRA runs; skips the ENA fast path |
+| `-X, --max-spot-id <SPOT>` | | Last spot to convert, 1-based and inclusive. `-X N` alone matches fasterq-dump `--row-limit N` |
 | `--metadata <FORMAT>` | | Write a `<accession>.metadata.{tsv,json}` sidecar alongside each FASTQ output, capturing BioSample/SAMN, Sample/SRS, BioProject, library strategy/source/selection/layout, instrument, experiment, study, scientific name, tax id, bases, and release dates from the EUtils RunInfo CSV. Values: `tsv`, `json`, `both`. In TSV, tabs/newlines inside values become spaces and list columns (`avg_read_len`) are `;`-joined, as in `--dry-run` and `info` |
 | `-Z, --stdout` | | Write to stdout (stream interleaved FASTQ, auto-delete temp SRA) |
 
@@ -180,6 +182,8 @@ sracha fastq [OPTIONS] <INPUT>...
 | `--qual-defline <TEMPLATE>` | | Custom `+`-line template, same variables as `--seq-defline`; `+` alone writes a bare `+` ([#162](https://github.com/rnabioco/sracha-rs/issues/162)) |
 | `--min-read-len <N>` | | Minimum read length filter |
 | `--include-technical` | | Include technical reads (skipped by default) |
+| `-N, --min-spot-id <SPOT>` | | First spot to convert, 1-based and inclusive. Output is byte-identical to that slice of a full conversion (spot numbers in deflines are unchanged). Not supported for cSRA runs; skips the ENA fast path |
+| `-X, --max-spot-id <SPOT>` | | Last spot to convert, 1-based and inclusive. `-X N` alone matches fasterq-dump `--row-limit N` |
 | `-Z, --stdout` | | Write to stdout (implies `--no-progress`) |
 
 **Compression**
@@ -515,6 +519,7 @@ How common `fasterq-dump` / `fastq-dump` options map to sracha:
 | `--seq-defline <FMT>` | `--seq-defline <FMT>` | Common variables; see [above](#custom-deflines) |
 | `--include-technical` | `--include-technical` | Technical reads skipped by default in both |
 | `-M, --min-read-len <N>` | `--min-read-len <N>` | Same |
+| `-N, --minSpotId <N>` / `-X, --maxSpotId <N>` | `-N, --min-spot-id <N>` / `-X, --max-spot-id <N>` | 1-based, inclusive. fasterq-dump `--row-limit N` is `-X N` |
 | `-p, --progress` | (on by default) | Disable with `--no-progress` |
 | `-t, --temp <DIR>` | (automatic) | Temp files are managed internally |
 | `--qual-defline <FMT>` | `--qual-defline <FMT>` | Same variables as `--seq-defline`; `+` alone writes a bare `+` line |
