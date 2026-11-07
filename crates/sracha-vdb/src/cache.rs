@@ -381,7 +381,16 @@ impl CachedColumn {
 
     /// Variable-length byte record (MISMATCH, READ_TYPE, QUALITY).
     pub fn read_byte_row(&self, row_id: i64) -> Result<Vec<u8>> {
+        let mut out = Vec::new();
+        self.read_byte_row_into(row_id, &mut out)?;
+        Ok(out)
+    }
+
+    /// [`read_byte_row`](Self::read_byte_row) into a caller-owned buffer
+    /// (cleared first), so a per-spot loop reuses one allocation.
+    pub fn read_byte_row_into(&self, row_id: i64, out: &mut Vec<u8>) -> Result<()> {
         debug_assert!(matches!(self.kind, ColumnKind::Zip));
+        out.clear();
         self.with_blob(row_id, |blob, logical_offset| {
             let extent = blob.extent(logical_offset)?;
             let start = extent.offset as usize;
@@ -393,7 +402,8 @@ impl CachedColumn {
                     blob.bytes.len()
                 )));
             }
-            Ok(blob.bytes[start..end].to_vec())
+            out.extend_from_slice(&blob.bytes[start..end]);
+            Ok(())
         })
     }
 
@@ -420,9 +430,11 @@ impl CachedColumn {
         })
     }
 
-    /// Variable-length u32 record (SEQUENCE.READ_LEN).
-    pub fn read_u32_row(&self, row_id: i64) -> Result<Vec<u32>> {
+    /// Variable-length u32 record (SEQUENCE.READ_LEN), into a caller-owned
+    /// buffer (cleared first).
+    pub fn read_u32_row_into(&self, row_id: i64, out: &mut Vec<u32>) -> Result<()> {
         debug_assert!(matches!(self.kind, ColumnKind::Irzip { elem_bits: 32 }));
+        out.clear();
         self.with_blob(row_id, |blob, logical_offset| {
             let extent = blob.extent(logical_offset)?;
             let start = (extent.offset as usize) * 4;
@@ -434,18 +446,29 @@ impl CachedColumn {
                     blob.bytes.len()
                 )));
             }
-            Ok(blob.bytes[start..end]
-                .as_chunks::<4>()
-                .0
-                .iter()
-                .map(|&c| u32::from_le_bytes(c))
-                .collect())
+            out.extend(
+                blob.bytes[start..end]
+                    .as_chunks::<4>()
+                    .0
+                    .iter()
+                    .map(|&c| u32::from_le_bytes(c)),
+            );
+            Ok(())
         })
     }
 
     /// Variable-length i64 record (SEQUENCE.PRIMARY_ALIGNMENT_ID).
     pub fn read_i64_row(&self, row_id: i64) -> Result<Vec<i64>> {
+        let mut out = Vec::new();
+        self.read_i64_row_into(row_id, &mut out)?;
+        Ok(out)
+    }
+
+    /// [`read_i64_row`](Self::read_i64_row) into a caller-owned buffer
+    /// (cleared first).
+    pub fn read_i64_row_into(&self, row_id: i64, out: &mut Vec<i64>) -> Result<()> {
         debug_assert!(matches!(self.kind, ColumnKind::Irzip { elem_bits: 64 }));
+        out.clear();
         self.with_blob(row_id, |blob, logical_offset| {
             let extent = blob.extent(logical_offset)?;
             let start = (extent.offset as usize) * 8;
@@ -457,12 +480,14 @@ impl CachedColumn {
                     blob.bytes.len()
                 )));
             }
-            Ok(blob.bytes[start..end]
-                .as_chunks::<8>()
-                .0
-                .iter()
-                .map(|&c| i64::from_le_bytes(c))
-                .collect())
+            out.extend(
+                blob.bytes[start..end]
+                    .as_chunks::<8>()
+                    .0
+                    .iter()
+                    .map(|&c| i64::from_le_bytes(c)),
+            );
+            Ok(())
         })
     }
 
@@ -516,21 +541,28 @@ impl CachedColumn {
         })
     }
 
-    /// 2na-packed variable-length record, unpacked into 4na-bin bytes
-    /// (one nibble per byte). Used for `REFERENCE.CMP_READ` and
-    /// `SEQUENCE.CMP_READ`.
-    pub fn read_2na_row(&self, row_id: i64) -> Result<Vec<u8>> {
-        self.read_2na_range(row_id, 0, usize::MAX)
-    }
-
     /// `take` bases of a 2na row starting `skip` bases into it.
     ///
     /// Callers that want a short span out of a wide row should use this
-    /// rather than slicing [`read_2na_row`](Self::read_2na_row): a refseq
+    /// rather than slicing the whole row: a refseq
     /// chunk is 5,000 bases and an alignment typically needs ~100, so
     /// unpacking the whole row throws away 98% of the work. `take` is
     /// clamped to what the row actually holds.
     pub fn read_2na_range(&self, row_id: i64, skip: usize, take: usize) -> Result<Vec<u8>> {
+        let mut out = Vec::new();
+        self.append_2na_range(row_id, skip, take, &mut out)?;
+        Ok(out)
+    }
+
+    /// [`read_2na_range`](Self::read_2na_range), appending to `out` rather
+    /// than allocating.
+    pub fn append_2na_range(
+        &self,
+        row_id: i64,
+        skip: usize,
+        take: usize,
+        out: &mut Vec<u8>,
+    ) -> Result<()> {
         debug_assert!(matches!(self.kind, ColumnKind::TwoNa));
         self.with_blob(row_id, |blob, logical_offset| {
             let (start_bases, len_bases) = two_na_extent(blob, logical_offset)?;
@@ -539,26 +571,18 @@ impl CachedColumn {
             let start_bases = start_bases + skipped;
             let len_bases = (len_bases - skipped).min(take);
             if len_bases == 0 {
-                return Ok(Vec::new());
+                return Ok(());
             }
-            let start_bits = start_bases * 2;
-
-            // 2na → 4na nibble lookup. Bases are MSB-first within each
-            // byte (verified by cross-check against vdb-dump on
-            // HAS_MISMATCH row 1 of VDB-3418).
-            const LUT_2NA_TO_4NA: [u8; 4] = [0x1, 0x2, 0x4, 0x8]; // A C G T
-            let mut out = Vec::with_capacity(len_bases);
-            for i in 0..len_bases {
-                let bit_idx = start_bits + i * 2;
-                let byte = bit_idx / 8;
-                let shift = 6 - (bit_idx % 8);
-                let b = blob.bytes.get(byte).copied().ok_or_else(|| {
-                    Error::Format(format!("2na row {row_id}: bit {bit_idx} past payload"))
-                })?;
-                let code = (b >> shift) & 0x03;
-                out.push(LUT_2NA_TO_4NA[code as usize]);
+            // One bounds check up front; the unpack below then never fails.
+            let last_byte = (start_bases + len_bases - 1) / 4;
+            if last_byte >= blob.bytes.len() {
+                return Err(Error::Format(format!(
+                    "2na row {row_id}: bit {} past payload",
+                    (start_bases + len_bases - 1) * 2
+                )));
             }
-            Ok(out)
+            unpack_2na_to_4na(&blob.bytes, start_bases, len_bases, out);
+            Ok(())
         })
     }
 
@@ -570,6 +594,50 @@ impl CachedColumn {
         self.with_blob(row_id, |blob, logical_offset| {
             Ok(two_na_extent(blob, logical_offset)?.1)
         })
+    }
+}
+
+/// 2na byte → four 4na nibbles (A C G T → 0x1 0x2 0x4 0x8), first base in
+/// the most significant bit pair (verified against vdb-dump on HAS_MISMATCH
+/// row 1 of VDB-3418).
+static LUT_2NA_BYTE: [[u8; 4]; 256] = {
+    let map = [0x1u8, 0x2, 0x4, 0x8];
+    let mut t = [[0u8; 4]; 256];
+    let mut b = 0;
+    while b < 256 {
+        t[b] = [
+            map[(b >> 6) & 3],
+            map[(b >> 4) & 3],
+            map[(b >> 2) & 3],
+            map[b & 3],
+        ];
+        b += 1;
+    }
+    t
+};
+
+/// Append `len` bases starting at base index `start` of the 2na-packed
+/// `bytes` to `out` as 4na nibbles. The caller guarantees the range lies
+/// inside `bytes`.
+fn unpack_2na_to_4na(bytes: &[u8], start: usize, len: usize, out: &mut Vec<u8>) {
+    out.reserve(len);
+    let mut remaining = len;
+    let mut byte_idx = start / 4;
+    let head = start % 4;
+    if head != 0 {
+        let n = (4 - head).min(remaining);
+        out.extend_from_slice(&LUT_2NA_BYTE[bytes[byte_idx] as usize][head..head + n]);
+        remaining -= n;
+        byte_idx += 1;
+    }
+    let full = remaining / 4;
+    for &b in &bytes[byte_idx..byte_idx + full] {
+        out.extend_from_slice(&LUT_2NA_BYTE[b as usize]);
+    }
+    byte_idx += full;
+    remaining -= full * 4;
+    if remaining > 0 {
+        out.extend_from_slice(&LUT_2NA_BYTE[bytes[byte_idx] as usize][..remaining]);
     }
 }
 
@@ -677,6 +745,26 @@ fn decode_integer_bytes(decoded: &DecodedBlob<'_>, elem_bits: u32) -> Result<Vec
 mod tests {
     use super::*;
     use crate::blob::{PageMap, RowMapping};
+
+    #[test]
+    fn unpack_2na_matches_scalar_for_every_window() {
+        let bytes: Vec<u8> = (0..23u32).map(|i| (i * 37 + 11) as u8).collect();
+        let scalar = |i: usize| -> u8 {
+            let bit = i * 2;
+            [0x1, 0x2, 0x4, 0x8][((bytes[bit / 8] >> (6 - bit % 8)) & 3) as usize]
+        };
+        let total = bytes.len() * 4;
+        for start in 0..total {
+            for len in 0..=(total - start) {
+                let mut out = vec![0xAA];
+                unpack_2na_to_4na(&bytes, start, len, &mut out);
+                let want: Vec<u8> = std::iter::once(0xAA)
+                    .chain((start..start + len).map(scalar))
+                    .collect();
+                assert_eq!(out, want, "start={start} len={len}");
+            }
+        }
+    }
 
     fn pm(mapping: RowMapping, lengths: Vec<u32>, leng_runs: Vec<u32>) -> PageMap {
         let data_recs = match &mapping {
