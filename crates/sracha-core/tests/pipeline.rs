@@ -1949,3 +1949,78 @@ fn rerun_of_completed_accession_skips_cleanly() {
         .collect();
     assert_eq!(before, after, "rerun must leave outputs untouched");
 }
+
+/// Concatenated text of every output file, keyed by file name.
+fn read_outputs(files: &[PathBuf]) -> Vec<(String, String)> {
+    let mut out: Vec<(String, String)> = files
+        .iter()
+        .map(|p| {
+            (
+                p.file_name().unwrap().to_string_lossy().into_owned(),
+                std::fs::read_to_string(p).unwrap(),
+            )
+        })
+        .collect();
+    out.sort();
+    out
+}
+
+/// A `-N`/`-X` window must equal the matching slice of the full output, for
+/// every split mode.
+#[ignore] // requires network on first run; cached thereafter
+#[test]
+fn spot_window_matches_slice_of_full_output() {
+    let sra_path = ensure_srr28588231();
+    let (first, last) = (1000u64, 2500u64);
+    for split in [
+        SplitMode::Split3,
+        SplitMode::SplitFiles,
+        SplitMode::SplitSpot,
+        SplitMode::Interleaved,
+    ] {
+        let full_dir = tempfile::tempdir().unwrap();
+        let full_cfg = test_config(full_dir.path(), split, CompressionMode::None);
+        let full =
+            sracha_core::pipeline::run_fastq(&sra_path, Some("SRR28588231"), &full_cfg).unwrap();
+
+        let win_dir = tempfile::tempdir().unwrap();
+        let win_cfg = PipelineConfig {
+            min_spot_id: Some(first),
+            max_spot_id: Some(last),
+            ..test_config(win_dir.path(), split, CompressionMode::None)
+        };
+        let win =
+            sracha_core::pipeline::run_fastq(&sra_path, Some("SRR28588231"), &win_cfg).unwrap();
+        assert_eq!(win.spots_read, last - first + 1, "{split}");
+
+        let expected: Vec<(String, String)> = read_outputs(&full.output_files)
+            .into_iter()
+            .map(|(name, text)| {
+                let kept: String = text
+                    .lines()
+                    .collect::<Vec<_>>()
+                    .chunks(4)
+                    .filter(|rec| {
+                        // `@SRR28588231.<spot> ...`
+                        let spot: u64 = rec[0][1..]
+                            .split(' ')
+                            .next()
+                            .unwrap()
+                            .split('.')
+                            .nth(1)
+                            .unwrap()
+                            .split('/')
+                            .next()
+                            .unwrap()
+                            .parse()
+                            .unwrap();
+                        (first..=last).contains(&spot)
+                    })
+                    .flat_map(|rec| rec.iter().map(|l| format!("{l}\n")))
+                    .collect();
+                (name, kept)
+            })
+            .collect();
+        assert_eq!(read_outputs(&win.output_files), expected, "{split}");
+    }
+}
