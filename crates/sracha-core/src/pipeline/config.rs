@@ -31,6 +31,9 @@ pub struct PipelineConfig {
     pub skip_technical: bool,
     /// Minimum read length filter.
     pub min_read_len: Option<u32>,
+    /// Keep only reads whose `READ_FILTER` equals this value
+    /// (`--read-filter`, `fastq-dump -R` semantics). `None` keeps all reads.
+    pub read_filter: Option<crate::fastq::ReadFilter>,
     /// Overwrite existing output files.
     pub force: bool,
     /// Show progress indicators.
@@ -117,6 +120,7 @@ impl Default for PipelineConfig {
             auto_scale_connections: true,
             skip_technical: true,
             min_read_len: None,
+            read_filter: None,
             force: false,
             progress: false,
             run_info: None,
@@ -181,6 +185,7 @@ impl From<&PipelineConfig> for crate::fastq::FastqConfig {
             split_mode: c.split_mode,
             skip_technical: c.skip_technical,
             min_read_len: c.min_read_len,
+            read_filter: c.read_filter,
             fasta: c.fasta,
             paired_suffix: c.paired_suffix,
             seq_defline: c.seq_defline.clone(),

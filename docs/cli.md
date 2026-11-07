@@ -76,6 +76,7 @@ sracha get [OPTIONS] [ACCESSION]...
 | `--seq-defline <TEMPLATE>` | | Custom defline template, fasterq-dump `--seq-defline` syntax (see [Custom deflines](#custom-deflines)) |
 | `--qual-defline <TEMPLATE>` | | Custom `+`-line template, same variables as `--seq-defline`; `+` alone writes a bare `+` ([#162](https://github.com/rnabioco/sracha-rs/issues/162)) |
 | `--min-read-len <N>` | | Minimum read length filter |
+| `--read-filter <VALUE>` | | Keep only reads whose `READ_FILTER` is `pass`, `reject`, `criteria` or `redacted` (like `fastq-dump -R`) |
 | `--include-technical` | | Include technical reads (skipped by default) |
 | `--metadata <FORMAT>` | | Write a `<accession>.metadata.{tsv,json}` sidecar alongside each FASTQ output, capturing BioSample/SAMN, Sample/SRS, BioProject, library strategy/source/selection/layout, instrument, experiment, study, scientific name, tax id, bases, and release dates from the EUtils RunInfo CSV. Values: `tsv`, `json`, `both`. In TSV, tabs/newlines inside values become spaces and list columns (`avg_read_len`) are `;`-joined, as in `--dry-run` and `info` |
 | `-Z, --stdout` | | Write to stdout (stream interleaved FASTQ, auto-delete temp SRA) |
@@ -179,6 +180,7 @@ sracha fastq [OPTIONS] <INPUT>...
 | `--seq-defline <TEMPLATE>` | | Custom defline template, fasterq-dump `--seq-defline` syntax (see [Custom deflines](#custom-deflines)) |
 | `--qual-defline <TEMPLATE>` | | Custom `+`-line template, same variables as `--seq-defline`; `+` alone writes a bare `+` ([#162](https://github.com/rnabioco/sracha-rs/issues/162)) |
 | `--min-read-len <N>` | | Minimum read length filter |
+| `--read-filter <VALUE>` | | Keep only reads whose `READ_FILTER` is `pass`, `reject`, `criteria` or `redacted` (like `fastq-dump -R`) |
 | `--include-technical` | | Include technical reads (skipped by default) |
 | `-Z, --stdout` | | Write to stdout (implies `--no-progress`) |
 
@@ -485,8 +487,10 @@ Notes:
 - When a template is given, the `split-spot`/`interleaved` modes do **not** add
   their implicit `<spot>/<mate>` suffix — use `$ri` in the template to
   distinguish mates instead.
-- `$sg` (spot-group) is **not supported**; a template using it is rejected at
-  startup. Reference-compressed (cSRA) archives have no NAME column, so `$sn`
+- `$sg` is the spot's `SPOT_GROUP` (barcode / sample name), read from plain
+  (non-cSRA) archives; it expands to empty when the run has no `SPOT_GROUP`
+  column and on cSRA archives. Splitting output files by spot group is not
+  supported. Reference-compressed (cSRA) archives have no NAME column, so `$sn`
   expands to empty there.
 
 Notes on `$lg`:

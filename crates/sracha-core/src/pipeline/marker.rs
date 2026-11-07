@@ -35,6 +35,9 @@ struct CompletionMarker {
     fasta: bool,
     skip_technical: bool,
     min_read_len: Option<u32>,
+    /// `--read-filter` value; absent in markers written before the option.
+    #[serde(default)]
+    read_filter: Option<String>,
     output_files: Vec<(String, u64)>,
 }
 
@@ -220,6 +223,7 @@ pub(crate) fn write_completion_marker(
         fasta: config.fasta,
         skip_technical: config.skip_technical,
         min_read_len: config.min_read_len,
+        read_filter: config.read_filter.map(|f| f.to_string()),
         output_files: file_entries,
     };
 
@@ -266,6 +270,9 @@ pub(crate) fn check_completion_marker(
         return None;
     }
     if marker.min_read_len != config.min_read_len {
+        return None;
+    }
+    if marker.read_filter != config.read_filter.map(|f| f.to_string()) {
         return None;
     }
 

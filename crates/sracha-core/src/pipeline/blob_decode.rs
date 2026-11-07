@@ -107,6 +107,71 @@ pub(crate) use crate::vdb::blob_codecs::{
     decode_irzip_column, decode_quality_encoding, decode_raw, decode_zip_encoding,
 };
 
+/// `INSDC:SRA:read_filter` value for a rejected read.
+const READ_FILTER_REJECT: u8 = crate::fastq::ReadFilter::Reject as u8;
+
+/// Overwrite the synthesized quality of every rejected read with the SRA-lite
+/// reject score, mirroring ncbi-vdb's `syn_quality` (Q3 for
+/// `READ_FILTER == REJECT`, Q30 otherwise).
+///
+/// `buf` holds one byte per base of the blob; `read_lengths` and `filters` are
+/// both flat per-read arrays (`spot * reads_per_spot + read`). Stops quietly at the shorter of the inputs.
+fn apply_reject_quality(buf: &mut [u8], read_lengths: &[u32], filters: &[u8]) {
+    let reject =
+        crate::vdb::encoding::SRA_LITE_REJECT_QUAL + crate::vdb::encoding::QUAL_PHRED_OFFSET;
+    let mut offset = 0usize;
+    for (i, &len) in read_lengths.iter().enumerate() {
+        let end = (offset + len as usize).min(buf.len());
+        if filters.get(i) == Some(&READ_FILTER_REJECT) && offset < end {
+            buf[offset..end].fill(reject);
+        }
+        offset += len as usize;
+        if offset >= buf.len() {
+            break;
+        }
+    }
+}
+
+/// Decode the SPOT_GROUP rows covering one READ blob into per-spot strings.
+///
+/// Returns `None` when the column is absent, empty, or cannot be resolved to
+/// per-row extents (callers then emit an empty `$sg`).
+fn decode_spot_groups(raw: &RawBlobData<'_>, num_spots: usize) -> Result<Option<FlatBytes>> {
+    if !raw.has_spot_group || raw.spot_group_raw.is_empty() || num_spots == 0 {
+        return Ok(None);
+    }
+    let decoded = decode_raw(
+        raw.spot_group_raw,
+        raw.spot_group_cs,
+        raw.spot_group_id_range,
+    )?;
+    let zipped = decode_zip_encoding(&decoded)?;
+    let bytes: &[u8] = if zipped.is_empty() {
+        &decoded.data
+    } else {
+        &zipped
+    };
+    let skip = (raw.read_start_id - raw.spot_group_start_id).max(0) as usize;
+    let mut out = FlatBytes::with_capacity(num_spots, num_spots);
+    if let Some(pm) = decoded.page_map.as_ref() {
+        let Ok(extents) = pm.row_extents_range(skip, num_spots) else {
+            return Ok(None);
+        };
+        for e in extents {
+            let s = e.offset as usize;
+            let end = s + e.len as usize;
+            out.push(bytes.get(s..end).unwrap_or(&[]));
+        }
+    } else if let Some(row_len) = decoded.row_length.map(|l| l as usize).filter(|&l| l > 0) {
+        for r in skip..skip + num_spots {
+            out.push(bytes.get(r * row_len..(r + 1) * row_len).unwrap_or(&[]));
+        }
+    } else {
+        return Ok(None);
+    }
+    Ok(Some(out))
+}
+
 /// Materialize the READ_TYPE rows covering one READ blob, one row per spot.
 ///
 /// VDB stores only the distinct READ_TYPE rows; the page map says how many
@@ -251,6 +316,22 @@ pub(crate) struct RawBlobData<'a> {
     pub(crate) read_type_start_id: i64,
     /// Checksum type for the READ_TYPE column.
     pub(crate) read_type_cs: u8,
+    /// READ_FILTER column raw bytes (empty if not requested or absent).
+    pub(crate) read_filter_raw: &'a [u8],
+    pub(crate) read_filter_id_range: u64,
+    /// First row id covered by the READ_FILTER blob (located by row id, like
+    /// READ_TYPE).
+    pub(crate) read_filter_start_id: i64,
+    pub(crate) read_filter_cs: u8,
+    /// Whether READ_FILTER should be read (column present and needed).
+    pub(crate) has_read_filter: bool,
+    /// SPOT_GROUP column raw bytes (empty if not requested or absent).
+    pub(crate) spot_group_raw: &'a [u8],
+    pub(crate) spot_group_id_range: u64,
+    pub(crate) spot_group_start_id: i64,
+    pub(crate) spot_group_cs: u8,
+    /// Whether SPOT_GROUP should be read (column present and `$sg` used).
+    pub(crate) has_spot_group: bool,
     /// Whether there is a READ_LEN column at all.
     pub(crate) has_read_len: bool,
     /// Whether there is a NAME column at all.
@@ -1178,6 +1259,39 @@ pub(crate) fn decode_blob_to_fastq(
         Vec::new()
     };
 
+    // READ_FILTER has the same shape as READ_TYPE (one u8 per read, run-length
+    // encoded across spots), so it is expanded the same way. Only read when a
+    // `--read-filter` or the SRA-lite quality synthesis needs it.
+    let read_filter_data: Vec<u8> = if raw.has_read_filter && !raw.read_filter_raw.is_empty() {
+        let rfdecoded = decode_raw(
+            raw.read_filter_raw,
+            raw.read_filter_cs,
+            raw.read_filter_id_range,
+        )?;
+        let raw_bytes = decode_zip_encoding(&rfdecoded)?;
+        let page_map = rfdecoded.page_map;
+        let bytes = if !raw_bytes.is_empty() {
+            raw_bytes
+        } else {
+            rfdecoded.data.into_owned()
+        };
+        read_type_rows_for_blob(
+            &bytes,
+            page_map.as_ref(),
+            reads_per_spot.max(1),
+            (raw.read_start_id - raw.read_filter_start_id).max(0) as usize,
+            raw.read_id_range as usize,
+        )
+    } else {
+        Vec::new()
+    };
+
+    if let Some(buf) = lite_qual_buf.as_mut()
+        && !read_filter_data.is_empty()
+    {
+        apply_reject_quality(buf, &read_lengths, &read_filter_data);
+    }
+
     if blob_idx == 0 {
         tracing::debug!(
             "READ_TYPE: {} values, has_read_type={}, first_10={:?}",
@@ -1194,6 +1308,8 @@ pub(crate) fn decode_blob_to_fastq(
     // directly into the decoded column data and call format_read.
     // ------------------------------------------------------------------
     let rps = reads_per_spot.max(1);
+    let spot_groups: Option<FlatBytes> =
+        decode_spot_groups(raw, read_lengths.len().checked_div(rps).unwrap_or(0))?;
     // Per-slot output accumulators. At most 2-4 slots in realistic configs
     // (Split3 -> Read1/Read2/Unpaired, SplitSpot/Interleaved -> Single,
     // SplitFiles -> ReadN(0..rps)). Use a fixed-size LUT indexed by slot
@@ -1347,6 +1463,14 @@ pub(crate) fn decode_blob_to_fastq(
             &[] // empty = all biological (checked below)
         };
 
+        let spot_read_filters: &[u8] = read_filter_data
+            .get(spot_idx_in_blob * rps..(spot_idx_in_blob + 1) * rps)
+            .unwrap_or(&[]);
+        let spot_group: &[u8] = spot_groups
+            .as_ref()
+            .and_then(|g| g.get(spot_idx_in_blob))
+            .unwrap_or(&[]);
+
         // ------------------------------------------------------------------
         // Inline format_spot logic: split reads, filter, route, format.
         // ------------------------------------------------------------------
@@ -1380,6 +1504,15 @@ pub(crate) fn decode_blob_to_fastq(
 
             // Filter: skip technical reads if configured.
             if config.skip_technical && !biological {
+                read_offset = end;
+                continue;
+            }
+
+            // Filter: keep only reads with the requested READ_FILTER value
+            // (`--read-filter`); a run without the column counts as `pass`.
+            if let Some(want) = config.read_filter
+                && spot_read_filters.get(i).copied().unwrap_or(0) != want.code()
+            {
                 read_offset = end;
                 continue;
             }
@@ -1450,6 +1583,7 @@ pub(crate) fn decode_blob_to_fastq(
                         description,
                         // Only cSRA archives (bam-load) carry a linkage group.
                         linkage_group: &[],
+                        spot_group,
                         sequence: &sequence[range.clone()],
                         // FASTA output never reads quality; don't index it.
                         quality: if config.fasta { &[] } else { &quality[range] },
