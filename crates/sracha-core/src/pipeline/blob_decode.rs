@@ -257,12 +257,19 @@ fn read_type_rows_for_blob(
 /// silently skipped the offset — that branch misfired on files whose
 /// raw Phred distribution happened to be entirely in [33, 126] (e.g.
 /// DRR040728) and produced systematic off-by-33 quality divergence.
-pub(super) fn encode_raw_quality_for_fastq(quality_data: &[u8]) -> (Vec<u8>, bool) {
-    let is_empty = quality_data.is_empty() || quality_data.iter().all(|&b| b == 0);
-    if is_empty {
+pub(super) fn encode_raw_quality_for_fastq(mut quality_data: Vec<u8>) -> (Vec<u8>, bool) {
+    // Single fused pass over the owned buffer: apply `+33` (saturating, same
+    // as `phred_to_ascii`) in place while OR-accumulating the raw bytes so an
+    // all-zero blob is detected without a second scan or a second buffer.
+    let mut any = 0u8;
+    for b in quality_data.iter_mut() {
+        any |= *b;
+        *b = b.saturating_add(crate::vdb::encoding::QUAL_PHRED_OFFSET);
+    }
+    if any == 0 {
         return (Vec::new(), true);
     }
-    (crate::vdb::encoding::phred_to_ascii(quality_data), false)
+    (quality_data, false)
 }
 
 // ---------------------------------------------------------------------------
@@ -712,13 +719,14 @@ pub(crate) fn decode_blob_to_fastq(
             diag.quality_histogram.publish(&local);
         }
 
-        let (all, is_empty) = encode_raw_quality_for_fastq(&quality_data);
-        if is_empty && !quality_data.is_empty() {
+        let quality_len = quality_data.len();
+        let (all, is_empty) = encode_raw_quality_for_fastq(quality_data);
+        if is_empty && quality_len != 0 {
             diag.all_zero_quality_blobs.fetch_add(1, Ordering::Relaxed);
             tracing::warn!(
                 "quality blob {} is all-zero ({} bytes) — synthesizing Phred fallback",
                 blob_idx,
-                quality_data.len(),
+                quality_len,
             );
         }
         (all, is_empty)
@@ -1756,7 +1764,7 @@ mod tests {
 
     #[test]
     fn encode_raw_quality_empty_input_is_empty() {
-        let (out, is_empty) = encode_raw_quality_for_fastq(&[]);
+        let (out, is_empty) = encode_raw_quality_for_fastq(Vec::new());
         assert!(out.is_empty());
         assert!(is_empty);
     }
@@ -1766,7 +1774,7 @@ mod tests {
         // All-zero is the sentinel for "quality column absent or
         // placeholder" — the caller must synthesize a fallback rather
         // than emitting a run of '!'.
-        let (out, is_empty) = encode_raw_quality_for_fastq(&[0; 8]);
+        let (out, is_empty) = encode_raw_quality_for_fastq(vec![0; 8]);
         assert!(out.is_empty());
         assert!(is_empty);
     }
@@ -1776,7 +1784,7 @@ mod tests {
         // Q0 mixed with other scores must pass through as '!' — srf-load
         // archives (e.g. DRR000918) legitimately store Q0.
         let raw = [0u8, 30, 0, 40, 0];
-        let (out, is_empty) = encode_raw_quality_for_fastq(&raw);
+        let (out, is_empty) = encode_raw_quality_for_fastq(raw.to_vec());
         assert!(!is_empty);
         assert_eq!(out, vec![b'!', b'?', b'!', b'I', b'!']);
     }
@@ -1784,7 +1792,7 @@ mod tests {
     #[test]
     fn encode_raw_quality_known_phred_values() {
         let raw = [0u8, 10, 20, 30, 40, 50, 60];
-        let (out, is_empty) = encode_raw_quality_for_fastq(&raw);
+        let (out, is_empty) = encode_raw_quality_for_fastq(raw.to_vec());
         assert!(!is_empty);
         assert_eq!(out, raw.iter().map(|&b| b + 33).collect::<Vec<_>>());
     }
@@ -1795,7 +1803,7 @@ mod tests {
         // regression test pins the boundary: any non-zero numeric input
         // must have +33 applied.
         let raw = *b"?I"; // 63, 73 — plausibly ASCII, must still +33
-        let (out, is_empty) = encode_raw_quality_for_fastq(&raw);
+        let (out, is_empty) = encode_raw_quality_for_fastq(raw.to_vec());
         assert!(!is_empty);
         assert_eq!(out, vec![63 + 33, 73 + 33]);
     }
@@ -1803,7 +1811,7 @@ mod tests {
     #[test]
     fn encode_raw_quality_saturates_on_overflow() {
         let raw = [250u8];
-        let (out, is_empty) = encode_raw_quality_for_fastq(&raw);
+        let (out, is_empty) = encode_raw_quality_for_fastq(raw.to_vec());
         assert!(!is_empty);
         assert_eq!(out, vec![255u8]); // saturating_add caps at u8::MAX
     }

@@ -2819,7 +2819,7 @@ mod tests {
         // heuristic. Output must be input + 33 (with Q2 floor, but all
         // inputs here are > 2 already).
         let raw = vec![33u8, 40, 50, 60, 80];
-        let (encoded, is_empty) = encode_raw_quality_for_fastq(&raw);
+        let (encoded, is_empty) = encode_raw_quality_for_fastq(raw.clone());
         assert!(!is_empty);
         assert_eq!(encoded, vec![33 + 33, 40 + 33, 50 + 33, 60 + 33, 80 + 33]);
     }
@@ -2827,7 +2827,7 @@ mod tests {
     #[test]
     fn encode_quality_applies_phred33_offset_to_low_values() {
         let raw = vec![5u8, 10, 15, 20];
-        let (encoded, is_empty) = encode_raw_quality_for_fastq(&raw);
+        let (encoded, is_empty) = encode_raw_quality_for_fastq(raw.clone());
         assert!(!is_empty);
         assert_eq!(encoded, vec![5 + 33, 10 + 33, 15 + 33, 20 + 33]);
     }
@@ -2840,14 +2840,14 @@ mod tests {
         // Q0 and fasterq-dump emits `!` — flooring regressed that file
         // on every Q<2 byte.
         let raw = vec![0u8, 1, 2, 3];
-        let (encoded, is_empty) = encode_raw_quality_for_fastq(&raw);
+        let (encoded, is_empty) = encode_raw_quality_for_fastq(raw.clone());
         assert!(!is_empty);
         assert_eq!(encoded, vec![b'!', b'"', b'#', b'$']);
     }
 
     #[test]
     fn encode_quality_empty_input_is_flagged_empty() {
-        let (encoded, is_empty) = encode_raw_quality_for_fastq(&[]);
+        let (encoded, is_empty) = encode_raw_quality_for_fastq(Vec::new());
         assert!(is_empty);
         assert!(encoded.is_empty());
     }
@@ -2856,7 +2856,7 @@ mod tests {
     fn encode_quality_all_zero_input_is_flagged_empty() {
         // All-zero blobs are a legitimate "no data" signal used by some
         // producers; caller synthesizes a fallback when empty=true.
-        let (encoded, is_empty) = encode_raw_quality_for_fastq(&[0, 0, 0, 0]);
+        let (encoded, is_empty) = encode_raw_quality_for_fastq(vec![0, 0, 0, 0]);
         assert!(is_empty);
         assert!(encoded.is_empty());
     }
@@ -2871,7 +2871,7 @@ mod tests {
         //   input 65 -> output 98  (not 65)
         //   input 93 -> output 126 (not 93)
         let raw = vec![33u8, 65, 93];
-        let (encoded, _) = encode_raw_quality_for_fastq(&raw);
+        let (encoded, _) = encode_raw_quality_for_fastq(raw.clone());
         assert_ne!(encoded, raw, "verbatim passthrough — heuristic regression");
         assert_eq!(encoded, vec![66, 98, 126]);
     }
