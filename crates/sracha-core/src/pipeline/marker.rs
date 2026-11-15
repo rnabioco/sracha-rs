@@ -38,6 +38,8 @@ struct CompletionMarker {
     /// `--read-filter` value; absent in markers written before the option.
     #[serde(default)]
     read_filter: Option<String>,
+    #[serde(default)]
+    spot_range: Option<(u64, u64)>,
     output_files: Vec<(String, u64)>,
 }
 
@@ -224,6 +226,7 @@ pub(crate) fn write_completion_marker(
         skip_technical: config.skip_technical,
         min_read_len: config.min_read_len,
         read_filter: config.read_filter.map(|f| f.to_string()),
+        spot_range: config.spot_range(),
         output_files: file_entries,
     };
 
@@ -273,6 +276,9 @@ pub(crate) fn check_completion_marker(
         return None;
     }
     if marker.read_filter != config.read_filter.map(|f| f.to_string()) {
+        return None;
+    }
+    if marker.spot_range != config.spot_range() {
         return None;
     }
 
@@ -413,6 +419,10 @@ mod tests {
 
         let mut other = test_config(dir.path());
         other.min_read_len = Some(25);
+        assert!(check_completion_marker(dir.path(), "SRR1", &other, 1234).is_none());
+
+        let mut other = test_config(dir.path());
+        other.max_spot_id = Some(100);
         assert!(check_completion_marker(dir.path(), "SRR1", &other, 1234).is_none());
     }
 

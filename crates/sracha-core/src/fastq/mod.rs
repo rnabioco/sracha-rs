@@ -283,6 +283,9 @@ pub struct FastqConfig {
     /// Optional custom `+`-line template (`--qual-defline`). `None` mirrors
     /// the sequence defline. Ignored for FASTA output.
     pub qual_defline: Option<DeflineTemplate>,
+    /// Restrict output to spots `first..=last` (1-based, inclusive), i.e.
+    /// fastq-dump `-N`/`-X`. `None` converts every spot.
+    pub spot_range: Option<(u64, u64)>,
 }
 
 impl Default for FastqConfig {
@@ -296,6 +299,7 @@ impl Default for FastqConfig {
             paired_suffix: PairedSuffix::Numeric,
             seq_defline: None,
             qual_defline: None,
+            spot_range: None,
         }
     }
 }
@@ -1060,6 +1064,7 @@ pub fn append_spot(out: &mut SlotBufs, spot: &SpotParts<'_>, run_name: &str, con
                 original_name: Some(spot.name),
                 description: Some(spot.name),
                 linkage_group: spot.linkage_group,
+                spot_group: b"",
                 sequence: &spot.sequence[range.clone()],
                 quality: &spot.quality[range],
             },
