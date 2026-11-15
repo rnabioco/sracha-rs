@@ -880,25 +880,39 @@ pub fn format_spot(
     )
 }
 
-/// Split a spot's concatenated sequence/quality into per-read segments,
-/// applying the filters governed by [`FastqConfig`] (zero-length, technical,
-/// min-length). Extracted from [`format_spot`] so the filter invariants can
-/// be tested without also exercising the output-slot routing.
-fn filter_spot_segments<'a>(spot: &'a SpotRecord, config: &FastqConfig) -> Vec<ReadSegment<'a>> {
-    let mut segments: Vec<ReadSegment<'a>> = Vec::with_capacity(spot.read_lengths.len());
+/// Byte span of one surviving read within a spot's concatenated
+/// sequence/quality, plus what routing needs to know about it.
+#[derive(Clone, Copy)]
+struct SegmentSpan {
+    start: usize,
+    len: usize,
+    mate_idx: u32,
+    biological: bool,
+}
+
+/// The per-read filters shared by every spot formatter: bounds, zero-length,
+/// technical, min-length. Pushes the survivors onto `out` (cleared first).
+fn filter_spans(
+    read_lengths: &[u32],
+    read_types: &[u8],
+    seq_len: usize,
+    qual_len: usize,
+    config: &FastqConfig,
+    out: &mut Vec<SegmentSpan>,
+) {
+    out.clear();
     let mut offset: usize = 0;
 
-    for (i, &rlen) in spot.read_lengths.iter().enumerate() {
+    for (i, &rlen) in read_lengths.iter().enumerate() {
         let rlen = rlen as usize;
         let end = offset + rlen;
 
         // Bounds check: if the read extends past our data, skip it.
-        if end > spot.sequence.len() || end > spot.quality.len() {
+        if end > seq_len || end > qual_len {
             break;
         }
 
-        let seq = &spot.sequence[offset..end];
-        let qual = &spot.quality[offset..end];
+        let start = offset;
         offset = end;
 
         // Filter: skip zero-length reads — fasterq-dump drops these.
@@ -909,7 +923,7 @@ fn filter_spot_segments<'a>(spot: &'a SpotRecord, config: &FastqConfig) -> Vec<R
             continue;
         }
 
-        let biological = read_is_biological(&spot.read_types, i);
+        let biological = read_is_biological(read_types, i);
 
         // Filter: skip technical reads if configured.
         if config.skip_technical && !biological {
@@ -923,15 +937,137 @@ fn filter_spot_segments<'a>(spot: &'a SpotRecord, config: &FastqConfig) -> Vec<R
             continue;
         }
 
-        segments.push(ReadSegment {
-            sequence: seq,
-            quality: qual,
+        out.push(SegmentSpan {
+            start,
+            len: rlen,
             mate_idx: (i + 1) as u32,
             biological,
         });
     }
+}
 
-    segments
+/// Split a spot's concatenated sequence/quality into per-read segments,
+/// applying the filters governed by [`FastqConfig`] (zero-length, technical,
+/// min-length). Extracted from [`format_spot`] so the filter invariants can
+/// be tested without also exercising the output-slot routing.
+fn filter_spot_segments<'a>(spot: &'a SpotRecord, config: &FastqConfig) -> Vec<ReadSegment<'a>> {
+    let mut spans = Vec::with_capacity(spot.read_lengths.len());
+    filter_spans(
+        &spot.read_lengths,
+        &spot.read_types,
+        spot.sequence.len(),
+        spot.quality.len(),
+        config,
+        &mut spans,
+    );
+    spans
+        .into_iter()
+        .map(|sp| ReadSegment {
+            sequence: &spot.sequence[sp.start..sp.start + sp.len],
+            quality: &spot.quality[sp.start..sp.start + sp.len],
+            mate_idx: sp.mate_idx,
+            biological: sp.biological,
+        })
+        .collect()
+}
+
+/// Everything about one spot that [`append_spot`] reads, borrowed so the
+/// caller can keep reusing its own buffers.
+pub struct SpotParts<'a> {
+    /// Spot number, as ASCII.
+    pub name: &'a [u8],
+    pub linkage_group: &'a [u8],
+    /// Concatenated bases of every read (ASCII).
+    pub sequence: &'a [u8],
+    /// Concatenated Phred+33 quality of every read.
+    pub quality: &'a [u8],
+    pub read_lengths: &'a [u32],
+    pub read_types: &'a [u8],
+}
+
+/// Accumulated record bytes for one output slot.
+pub struct SlotBuf {
+    pub slot: OutputSlot,
+    pub bytes: Vec<u8>,
+    pub records: u64,
+}
+
+/// Per-slot output buffers filled by [`append_spot`]. A spot touches at most
+/// a handful of slots, so lookup is a linear scan.
+#[derive(Default)]
+pub struct SlotBufs {
+    bufs: Vec<SlotBuf>,
+    spans: Vec<SegmentSpan>,
+}
+
+impl SlotBufs {
+    fn buf_for(&mut self, slot: OutputSlot) -> &mut SlotBuf {
+        let i = match self.bufs.iter().position(|b| b.slot == slot) {
+            Some(i) => i,
+            None => {
+                self.bufs.push(SlotBuf {
+                    slot,
+                    bytes: Vec::new(),
+                    records: 0,
+                });
+                self.bufs.len() - 1
+            }
+        };
+        &mut self.bufs[i]
+    }
+
+    /// Hand back the accumulated buffers, leaving this empty.
+    pub fn take(&mut self) -> Vec<SlotBuf> {
+        std::mem::take(&mut self.bufs)
+    }
+}
+
+/// [`format_spot`] without the intermediate allocations: filters and routes
+/// the spot's reads exactly as `format_spot` does, but renders each record
+/// straight onto the slot's buffer in `out`.
+pub fn append_spot(out: &mut SlotBufs, spot: &SpotParts<'_>, run_name: &str, config: &FastqConfig) {
+    let mut spans = std::mem::take(&mut out.spans);
+    filter_spans(
+        spot.read_lengths,
+        spot.read_types,
+        spot.sequence.len(),
+        spot.quality.len(),
+        config,
+        &mut spans,
+    );
+    let style = RecordStyle::from(config);
+    let bio_reads = spans.iter().filter(|s| s.biological).count();
+    for (emit_idx, sp) in spans.iter().enumerate() {
+        let slot = slot_for_segment(
+            config.split_mode,
+            sp.mate_idx,
+            emit_idx,
+            bio_reads,
+            spot.read_lengths.len(),
+        );
+        let range = sp.start..sp.start + sp.len;
+        let buf = out.buf_for(slot);
+        // cSRA's SEQUENCE table carries no NAME column, so the spot number
+        // doubles as the name (see `route_segments_to_slots`).
+        append_segment_record(
+            &mut buf.bytes,
+            style,
+            config.split_mode,
+            &SegmentRecord {
+                run_name,
+                spot_number: spot.name,
+                mate_idx: sp.mate_idx,
+                original_name: Some(spot.name),
+                description: Some(spot.name),
+                linkage_group: spot.linkage_group,
+                sequence: &spot.sequence[range.clone()],
+                quality: &spot.quality[range],
+            },
+            None,
+        );
+        buf.records += 1;
+    }
+    out.spans = spans;
 }
 
 /// Format the filtered `segments` and pair each with its [`slot_for_segment`]
@@ -1079,6 +1215,57 @@ mod tests {
     }
 
     /// Build a paired-read spot (two biological reads concatenated).
+    #[test]
+    fn append_spot_matches_format_spot() {
+        let mut spot = paired_read_spot(b"7", b"AACC", b"IIII", b"GGTTA", b"?????");
+        spot.read_lengths.push(0);
+        spot.read_types.push(0);
+        for mode in [
+            SplitMode::Split3,
+            SplitMode::SplitFiles,
+            SplitMode::SplitSpot,
+            SplitMode::Interleaved,
+        ] {
+            for min_read_len in [None, Some(5)] {
+                let cfg = FastqConfig {
+                    split_mode: mode,
+                    min_read_len,
+                    ..FastqConfig::default()
+                };
+                let mut want: Vec<(OutputSlot, Vec<u8>, u64)> = Vec::new();
+                for (slot, rec) in format_spot(&spot, "RUN", &cfg) {
+                    match want.iter_mut().find(|w| w.0 == slot) {
+                        Some(w) => {
+                            w.1.extend_from_slice(&rec.data);
+                            w.2 += 1;
+                        }
+                        None => want.push((slot, rec.data, 1)),
+                    }
+                }
+                let mut out = SlotBufs::default();
+                append_spot(
+                    &mut out,
+                    &SpotParts {
+                        name: &spot.name,
+                        linkage_group: &[],
+                        sequence: &spot.sequence,
+                        quality: &spot.quality,
+                        read_lengths: &spot.read_lengths,
+                        read_types: &spot.read_types,
+                    },
+                    "RUN",
+                    &cfg,
+                );
+                let got: Vec<_> = out
+                    .take()
+                    .into_iter()
+                    .map(|b| (b.slot, b.bytes, b.records))
+                    .collect();
+                assert_eq!(got, want, "{mode:?} min_read_len={min_read_len:?}");
+            }
+        }
+    }
+
     fn paired_read_spot(
         name: &[u8],
         seq1: &[u8],

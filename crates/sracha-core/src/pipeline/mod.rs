@@ -1463,10 +1463,10 @@ fn run_fastq_csra(
     config: &PipelineConfig,
     vdbcache_path: Option<&std::path::Path>,
 ) -> Result<FastqStats> {
-    use crate::fastq::{FastqConfig, OutputSlot, SpotRecord};
-    use crate::vdb::csra::CsraCursor;
+    use crate::fastq::{FastqConfig, OutputSlot, SlotBufs, SpotParts};
+    use crate::vdb::csra::{CsraCursor, SpotScratch};
     use crate::vdb::kar::KarArchive;
-    use crate::vdb::restore::fourna_to_ascii;
+    use crate::vdb::restore::fourna_to_ascii_in_place;
 
     // External reference objects, opened once and shared by every decode
     // worker: the mmaps are immutable, and each worker gets its own blob
@@ -1556,7 +1556,8 @@ fn run_fastq_csra(
     // Opening CsraCursor inside rayon workers means we don't need to
     // share the top-level one; drop it here to release its file handle
     // and avoid the small double-open cost on single-threaded paths.
-    let mut total_spots = csra.row_count();
+    let table_rows = csra.row_count();
+    let mut total_spots = table_rows;
     // Diagnostic: cap the decode so a measurement run takes a minute
     // instead of an hour. Unset in normal use.
     if let Ok(v) = std::env::var("SRACHA_MAX_SPOTS")
@@ -1601,6 +1602,13 @@ fn run_fastq_csra(
     // Decode each chunk. The worker returns an ordered Vec of
     // (slot, record-bytes, record-count) so the writer stays sequential.
     type SlotChunk = (OutputSlot, Vec<u8>, u64);
+    let diag = Arc::new(IntegrityDiag::default());
+    let is_cancelled = || {
+        config
+            .cancelled
+            .as_ref()
+            .is_some_and(|f| f.load(Ordering::Relaxed))
+    };
     // The cursor (and its decoded-blob caches) lives in `cursor_slot` so a
     // worker reuses it across chunks instead of starting cold every <=1024
     // spots.
@@ -1638,39 +1646,50 @@ fn run_fastq_csra(
                 )?);
             }
             let csra = cursor_slot.as_ref().expect("cursor just opened");
-            let mut per_slot: HashMap<OutputSlot, (Vec<u8>, u64)> = HashMap::new();
+            if is_cancelled() {
+                return Ok(Vec::new());
+            }
+            // Buffers are reused across the chunk's spots; only the per-slot
+            // output (handed to the writer) is allocated per chunk.
+            let mut out = SlotBufs::default();
+            let mut scratch = SpotScratch::default();
+            let mut linkage_group: Vec<u8> = Vec::new();
             let mut itoa_buf = itoa::Buffer::new();
             for row_id in start..end {
-                let s = csra.read_spot(row_id)?;
-                let linkage_group = if shared.linkage_group {
-                    csra.linkage_group(row_id)?
-                } else {
-                    Vec::new()
-                };
-                let sequence = fourna_to_ascii(&s.bases);
-                let quality: Vec<u8> = s.quality.iter().map(|q| q.wrapping_add(33)).collect();
-                let spot_num_str = itoa_buf.format(row_id).to_string();
-                let spot = SpotRecord {
-                    name: spot_num_str.as_bytes().to_vec(),
-                    sequence,
-                    quality,
-                    read_lengths: s.read_lens,
-                    // Already INSDC `xread_type` bytes, orientation bits and all;
-                    // `SpotRecord::read_types` takes them as-is.
-                    read_types: s.read_types,
-                    read_filter: Vec::new(),
-                    spot_group: Vec::new(),
-                    linkage_group,
-                };
-                for (slot, rec) in crate::fastq::format_spot(&spot, acc, &fastq_config) {
-                    let entry = per_slot.entry(slot).or_insert_with(|| (Vec::new(), 0));
-                    entry.0.extend_from_slice(&rec.data);
-                    entry.1 += 1;
+                csra.read_spot_into(row_id, &mut scratch)?;
+                if shared.linkage_group {
+                    linkage_group = csra.linkage_group(row_id)?;
                 }
+                fourna_to_ascii_in_place(&mut scratch.bases);
+                for q in scratch.quality.iter_mut() {
+                    *q = q.wrapping_add(33);
+                }
+                // `read_spot` guarantees per-read array agreement; this
+                // catches a quality stream that disagrees with the bases.
+                if scratch.quality.len() != scratch.bases.len() {
+                    diag.quality_length_mismatches
+                        .fetch_add(1, Ordering::Relaxed);
+                }
+                crate::fastq::append_spot(
+                    &mut out,
+                    &SpotParts {
+                        name: itoa_buf.format(row_id).as_bytes(),
+                        linkage_group: &linkage_group,
+                        sequence: &scratch.bases,
+                        quality: &scratch.quality,
+                        read_lengths: &scratch.read_lens,
+                        // Already INSDC `xread_type` bytes, orientation bits
+                        // and all; taken as-is.
+                        read_types: &scratch.read_types,
+                    },
+                    acc,
+                    &fastq_config,
+                );
             }
-            Ok(per_slot
+            Ok(out
+                .take()
                 .into_iter()
-                .map(|(slot, (bytes, count))| (slot, bytes, count))
+                .map(|b| (b.slot, b.bytes, b.records))
                 .collect())
         };
 
@@ -1706,6 +1725,9 @@ fn run_fastq_csra(
             .map(|_| std::sync::Mutex::new(None))
             .collect();
         for window in chunks.chunks(batch) {
+            if is_cancelled() {
+                break;
+            }
             let results: Vec<Result<Vec<SlotChunk>>> = pool.install(|| {
                 window
                     .par_iter()
@@ -1739,6 +1761,9 @@ fn run_fastq_csra(
     } else {
         let mut cursor_slot: Option<CsraCursor> = None;
         for &(s, e) in &chunks {
+            if is_cancelled() {
+                break;
+            }
             let chunk = decode_chunk(&mut cursor_slot, s, e)?;
             spots_read += (e - s) as u64;
             for (slot, bytes, records) in chunk {
@@ -1757,11 +1782,29 @@ fn run_fastq_csra(
         }
     }
 
+    // On cancel, drop the writers unfinalized and hand the partial outputs
+    // back for the caller to delete (same contract as the plain path).
+    if is_cancelled() {
+        drop(writers);
+        return Err(Error::Cancelled {
+            output_files: output_paths.into_iter().map(|(_, tmp)| tmp).collect(),
+        });
+    }
+
     if let Some(sw) = stdout_writer {
         sw.finish().map_err(Error::Io)?;
     }
     for (_, writer) in writers {
         writer.finish().map_err(Error::Io)?;
+    }
+
+    // Every row of the SEQUENCE table should have been decoded. The
+    // SRACHA_MAX_SPOTS diagnostic cap deliberately breaks that, so skip then.
+    if total_spots == table_rows && spots_read != table_rows {
+        diag.spot_count_mismatch.fetch_add(1, Ordering::Relaxed);
+        tracing::warn!(
+            "{acc}: decoded {spots_read} spots but the SEQUENCE table holds {table_rows} rows",
+        );
     }
 
     let mut final_paths = Vec::with_capacity(output_paths.len());
@@ -1781,7 +1824,7 @@ fn run_fastq_csra(
         spots_read,
         reads_written,
         output_files: final_paths,
-        integrity: Arc::new(IntegrityDiag::default()),
+        integrity: diag,
     })
 }
 

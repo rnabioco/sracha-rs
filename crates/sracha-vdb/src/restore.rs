@@ -156,10 +156,21 @@ pub fn reverse_complement_4na(bases: &mut [u8]) {
 /// ambiguity codes; `N` for anything outside the standard 15-value
 /// range, including the 0-nibble "gap").
 pub fn fourna_to_ascii(bases: &[u8]) -> Vec<u8> {
-    // Indexed by low 4 bits. 0x0 = gap (we emit 'N' rather than '-' to
-    // keep FASTQ callers happy). This is the same mapping vdb-dump uses.
-    const LUT: [u8; 16] = *b"NACMGRSVTWYHKDBN";
-    bases.iter().map(|&b| LUT[(b & 0x0F) as usize]).collect()
+    bases
+        .iter()
+        .map(|&b| FOURNA_ASCII[(b & 0x0F) as usize])
+        .collect()
+}
+
+/// Indexed by low 4 bits. 0x0 = gap (we emit 'N' rather than '-' to
+/// keep FASTQ callers happy). This is the same mapping vdb-dump uses.
+const FOURNA_ASCII: [u8; 16] = *b"NACMGRSVTWYHKDBN";
+
+/// [`fourna_to_ascii`], rewriting `bases` in place.
+pub fn fourna_to_ascii_in_place(bases: &mut [u8]) {
+    for b in bases {
+        *b = FOURNA_ASCII[(*b & 0x0F) as usize];
+    }
 }
 
 /// Splice a full SEQUENCE spot's bases together from per-read alignment
@@ -196,8 +207,30 @@ pub fn seq_restore_read(
     align_ids: &[i64],
     read_lens: &[u32],
     read_types: &[u8],
-    mut fetch_aligned: impl FnMut(i64) -> Result<Vec<u8>>,
+    fetch_aligned: impl FnMut(i64) -> Result<Vec<u8>>,
 ) -> Result<Vec<u8>> {
+    let mut out = Vec::new();
+    seq_restore_read_into(
+        cmp_rd,
+        align_ids,
+        read_lens,
+        read_types,
+        fetch_aligned,
+        &mut out,
+    )?;
+    Ok(out)
+}
+
+/// [`seq_restore_read`] into a caller-owned buffer (cleared first), so a
+/// per-spot loop reuses one allocation.
+pub fn seq_restore_read_into(
+    cmp_rd: &[u8],
+    align_ids: &[i64],
+    read_lens: &[u32],
+    read_types: &[u8],
+    mut fetch_aligned: impl FnMut(i64) -> Result<Vec<u8>>,
+    out: &mut Vec<u8>,
+) -> Result<()> {
     let num_reads = align_ids.len();
     if read_lens.len() != num_reads || read_types.len() != num_reads {
         return Err(Error::Format(format!(
@@ -209,7 +242,8 @@ pub fn seq_restore_read(
     }
 
     let total: usize = read_lens.iter().map(|&n| n as usize).sum();
-    let mut out = Vec::with_capacity(total);
+    out.clear();
+    out.reserve(total);
     let mut cmp_cursor = 0usize;
 
     for i in 0..num_reads {
@@ -251,7 +285,7 @@ pub fn seq_restore_read(
         }
     }
 
-    Ok(out)
+    Ok(())
 }
 
 #[cfg(test)]
